@@ -23,59 +23,48 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// KairosClusterSpec defines the desired state of KairosCluster
-type KairosClusterSpec struct {
+// OSUpgradeSpec defines the desired state of OSUpgrade
+type OSUpgradeSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	CloudConfig string            `json:"cloudConfig,omitempty"`
-	Options     map[string]string `json:"options,omitempty"`
-	Device      string            `json:"device,omitempty"`
-	Nodes       int               `json:"nodes,omitempty"`
+	// Foo is an example field of OSUpgrade. Edit osupgrade_types.go to remove/update
+	Image string `json:"image,omitempty"`
 
-	// TODO: This is optional - and should be a secretRef
-	BootstrapToken string `json:"bootstrapToken,omitempty"`
-	ControlToken   string `json:"controlToken,omitempty"`
+	ClusterSelector map[string]string `json:"clusterSelector,omitempty"`
+	MachineSelector map[string]string `json:"machineSelector,omitempty"`
+
+	Cordon  bool           `json:"cordon,omitempty"`
+	Drain   *DrainSpec     `json:"drain,omitempty"`
 }
 
-var (
-	ProvisioningState State = "Provisioning"
-	DeployingState    State = "Deployed"
-)
-
-type State string
-
-// KairosClusterStatus defines the observed state of KairosCluster
-type KairosClusterStatus struct {
+// OSUpgradeStatus defines the observed state of OSUpgrade
+type OSUpgradeStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Status string `json:"status,omitempty"`
-
-	State *State `json:"state,omitempty"`
-	Nodes int    `json:"nodes,omitempty"`
 }
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 
-// KairosCluster is the Schema for the kairosclusters API
-type KairosCluster struct {
+// OSUpgrade is the Schema for the osupgrades API
+type OSUpgrade struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   KairosClusterSpec   `json:"spec,omitempty"`
-	Status KairosClusterStatus `json:"status,omitempty"`
+	Spec   OSUpgradeSpec   `json:"spec,omitempty"`
+	Status OSUpgradeStatus `json:"status,omitempty"`
 }
 
 //+kubebuilder:object:root=true
 
-// KairosClusterList contains a list of KairosCluster
-type KairosClusterList struct {
+// OSUpgradeList contains a list of OSUpgrade
+type OSUpgradeList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []KairosCluster `json:"items"`
+	Items           []OSUpgrade `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&KairosCluster{}, &KairosClusterList{})
+	SchemeBuilder.Register(&OSUpgrade{}, &OSUpgradeList{})
 }

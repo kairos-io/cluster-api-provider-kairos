@@ -39,7 +39,7 @@ func (r *KairosClusterReconciler) registerer(cluster infrastructurev1alpha3.Kair
 
 	switch cluster.Status.State {
 	case &infrastructurev1alpha3.DeployingState:
-		fmt.Println("Deploying", cluster.ClusterName)
+		fmt.Println("Deploying", cluster.Name)
 		if cluster.Status.Nodes == cluster.Spec.Nodes {
 			helper, err := patch.NewHelper(&cluster, r.Client)
 			if err != nil {
@@ -82,13 +82,13 @@ func (r *KairosClusterReconciler) initialize(cluster infrastructurev1alpha3.Kair
 		return ctrl.Result{}, errors.Wrapf(err, "re-enqueue %s", cluster.Name)
 	}
 
-	if cluster.Spec.NetworkToken == "" {
+	if cluster.Spec.ControlToken == "" {
 		token := nodepair.GenerateToken()
 		helper, err := patch.NewHelper(&cluster, r.Client)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		cluster.Spec.NetworkToken = token
+		cluster.Spec.ControlToken = token
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 		defer cancel()
 		if err := helper.Patch(ctx, &cluster); err != nil {

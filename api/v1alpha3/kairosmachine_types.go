@@ -27,7 +27,10 @@ import (
 type KairosMachineSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	UUID string `json:"uuid,omitempty"`
+	UUID         string `json:"uuid,omitempty"`
+	ControlToken string `json:"controlToken,omitempty"`
+
+	OSImage string `json:"osImage,omitempty"`
 }
 
 // KairosMachineStatus defines the observed state of KairosMachine
