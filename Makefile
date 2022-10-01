@@ -178,3 +178,15 @@ e2e-tests:
 	KUBE_VERSION=${KUBE_VERSION} $(ROOT_DIR)/script/test.sh
 
 kind-e2e-tests: kind-setup clusterctl capi-init install undeploy-dev deploy-dev e2e-tests
+
+k3d-setup:
+	k3d cluster create || true
+	$(MAKE) k3d-setup-image
+
+k3d-setup-image: docker-build
+	k3d image import ${IMG}
+
+k3d-e2e-tests: k3d-setup clusterctl capi-init install undeploy-dev deploy-dev e2e-tests
+
+k3d-install:
+	wget -q -O - https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
