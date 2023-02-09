@@ -1179,6 +1179,8 @@ github.com/mudler/edgevpn v0.14.3 h1:DuSChXqwpcZ7KGC5b2DQm+tkYWZw+KE8oNo/b9Bhn08
 github.com/mudler/edgevpn v0.14.3/go.mod h1:isLYopGyALVtE1qtRvMI/cTMKYmgmVB5X0eP7xVJCD4=
 github.com/mudler/edgevpn v0.19.2-0.20221223001546-170dbcf5d23b h1:1hmivpZFHgb212dOEGOMfFuOM3rILR7k7SF4fLWsGoo=
 github.com/mudler/edgevpn v0.19.2-0.20221223001546-170dbcf5d23b/go.mod h1:SyEGMhe1pavbZVR0RMBIWO04g4EmaJdJx4CThLB+GT0=
+github.com/mudler/edgevpn v0.19.2 h1:dXChHBq6leMcrDWpKR0tB9GEKxmc7pwRjsnDv/QRXKE=
+github.com/mudler/edgevpn v0.19.2/go.mod h1:SyEGMhe1pavbZVR0RMBIWO04g4EmaJdJx4CThLB+GT0=
 github.com/mudler/go-isterminal v0.0.0-20211031135732-5e4e06fc5a58 h1:bMXak5giXxc++J/TUY7qW24D8ASxqLQRqOoduuFgdIM=
 github.com/mudler/go-isterminal v0.0.0-20211031135732-5e4e06fc5a58/go.mod h1:bZC4k76DbPOxOcMq6Z9oEKAZrOhsfh9jAZ9Hu3qVAQI=
 github.com/mudler/go-nodepair v0.0.0-20220507212557-7d47aa3cc1f1 h1:CJZab2AadIHFmrLPXzU025RJDAtVbHaStVaUnfT1v2k=
