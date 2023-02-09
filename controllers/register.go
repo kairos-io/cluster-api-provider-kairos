@@ -181,7 +181,6 @@ func newNode(loglevel, token string) *node.Node {
 			AutoRelay:      true,
 			RelayV1:        true,
 			MaxConnections: 10,
-			MaxStreams:     10,
 		},
 	}
 
