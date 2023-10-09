@@ -15,7 +15,7 @@ require (
 require (
 	github.com/ipfs/go-log/v2 v2.5.1
 	github.com/mudler/edgevpn v0.19.2
-	github.com/mudler/go-nodepair v0.0.0-20221223092639-ba399a66fdfb
+	github.com/mudler/go-nodepair d3490b3b686c
 	github.com/onsi/ginkgo/v2 v2.1.3
 	github.com/rancher-sandbox/ele-testhelpers v0.0.0-20220606123621-c453b2009412
 	k8s.io/api v0.23.5
