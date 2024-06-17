@@ -1436,6 +1436,8 @@ github.com/rancher-sandbox/ele-testhelpers v0.0.0-20220606123621-c453b2009412 h1
 github.com/rancher-sandbox/ele-testhelpers v0.0.0-20220606123621-c453b2009412/go.mod h1:rZj2a+V44LvtFVH/vsFXtHYIWMP1Q9aSrl6RGLbk49A=
 github.com/rancher-sandbox/ele-testhelpers v0.0.0-20240412110134-536443696b01 h1:aF8X89bdjBDnMc+K+VYZu0k0sGW6we/WHp9fZn+/iA4=
 github.com/rancher-sandbox/ele-testhelpers v0.0.0-20240412110134-536443696b01/go.mod h1:Ex+a/ng4u2BvcGQdQjTHI48h88bQ6k2a7q8rnvU0XbQ=
+github.com/rancher-sandbox/ele-testhelpers v0.0.0-20240531071842-35c37fffa28c h1:XPooGQpIZ4fYnkQkJeRh6TuI36ckeYGihsNWPZYL9sA=
+github.com/rancher-sandbox/ele-testhelpers v0.0.0-20240531071842-35c37fffa28c/go.mod h1:Ex+a/ng4u2BvcGQdQjTHI48h88bQ6k2a7q8rnvU0XbQ=
 github.com/raulk/clock v1.1.0 h1:dpb29+UKMbLqiU/jqIJptgLR1nn23HLgMY0sTCDza5Y=
 github.com/raulk/clock v1.1.0/go.mod h1:3MpVxdZ/ODBQDxbN+kzshf5OSZwPjtMDx6BBXBmOeY0=
 github.com/raulk/go-watchdog v1.2.0 h1:konN75pw2BMmZ+AfuAm5rtFsWcJpKF3m02rKituuXNo=
