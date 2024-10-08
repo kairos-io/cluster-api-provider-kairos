@@ -8,7 +8,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	k8s.io/apimachinery v0.23.5
 	k8s.io/client-go v0.23.5
-	sigs.k8s.io/cluster-api v1.1.4
+	sigs.k8s.io/cluster-api v1.8.4
 	sigs.k8s.io/controller-runtime v0.11.2
 )
 
