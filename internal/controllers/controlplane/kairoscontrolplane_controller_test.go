@@ -52,8 +52,9 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: controlplanev1beta2.KairosControlPlaneSpec{
-			Replicas: &replicas,
-			Version:  "v1.30.0+k0s.0",
+			Replicas:     &replicas,
+			Version:      "v1.30.0+k0s.0",
+			Distribution: "k3s",
 			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
 				InfrastructureRef: corev1.ObjectReference{
 					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
@@ -132,6 +133,7 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(kairosConfig.Spec.SingleNode).To(BeTrue())
 	g.Expect(kairosConfig.Spec.Role).To(Equal("control-plane"))
+	g.Expect(kairosConfig.Spec.Distribution).To(Equal("k3s"))
 }
 
 func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {

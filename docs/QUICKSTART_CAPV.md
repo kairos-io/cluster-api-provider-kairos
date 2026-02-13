@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPV (vSphere)
 
-This guide walks you through creating a single-node k0s cluster on Kairos using Cluster API with the vSphere provider (CAPV).
+This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV).
 
 ## Prerequisites
 
@@ -16,21 +16,13 @@ This guide walks you through creating a single-node k0s cluster on Kairos using 
 
 4. **CAPV**: Cluster API Provider vSphere installed and configured
 
-5. **Kairos CAPI Provider**: This provider installed
+5. **Kairos CAPI Provider**: Installed via make (see [Install guide](INSTALL.md))
 
 ### Installing Prerequisites
 
-#### 1. Install Cluster API
+#### 1. Install Cluster API and CAPV
 
-```bash
-# Install clusterctl
-curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.11.0/clusterctl-linux-amd64 -o clusterctl
-chmod +x clusterctl
-sudo mv clusterctl /usr/local/bin/
-
-# Initialize CAPI with vSphere
-clusterctl init --infrastructure vsphere
-```
+Install CAPI and CAPV using your preferred method. See the [Cluster API book](https://cluster-api.sigs.k8s.io/) for details.
 
 #### 2. Configure vSphere Credentials
 
@@ -102,15 +94,11 @@ kubectl label namespace default vsphere-identity=allowed
 #### 3. Install Kairos CAPI Provider
 
 ```bash
-# Apply CRDs
-kubectl apply -f config/crd/bases
-
-# Apply RBAC
-kubectl apply -f config/rbac
-
-# Deploy the manager
-kubectl apply -f config/manager/manager.yaml
+make docker-build
+make deploy
 ```
+
+See [INSTALL.md](INSTALL.md) for full install steps.
 
 ## Creating a Cluster
 
@@ -130,7 +118,10 @@ Before applying the manifest, ensure you have:
 
 ### Step 2: Customize the Sample Manifest
 
-Edit `config/samples/capv/kairos_cluster_k0s_single_node.yaml`:
+Edit the sample manifest you want to use:
+
+- k0s single node: `config/samples/capv/kairos_cluster_k0s_single_node.yaml`
+- k3s single node: `config/samples/capv/kairos_cluster_k3s_single_node.yaml`
 
 #### Update Cluster
 
@@ -248,6 +239,9 @@ spec:
 
 ```bash
 kubectl apply -f config/samples/capv/kairos_cluster_k0s_single_node.yaml
+
+# Or for k3s:
+# kubectl apply -f config/samples/capv/kairos_cluster_k3s_single_node.yaml
 ```
 
 ### Step 4: Monitor Cluster Creation
@@ -272,13 +266,13 @@ kubectl get vspherevms
 ### Step 5: Verify Cluster
 
 ```bash
-# Get kubeconfig
-clusterctl get kubeconfig kairos-cluster > kairos-kubeconfig.yaml
+# Get kubeconfig (from the cluster secret)
+kubectl get secret kairos-cluster-kubeconfig -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
 
 # Check nodes
 kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
 
-# Verify k0s is running
+# Verify k0s/k3s is running
 kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system
 ```
 
@@ -363,7 +357,7 @@ kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager
 ## Security Considerations
 
 1. **Credentials**: Use `VSphereClusterIdentity` instead of inline credentials
-2. **User Password**: Change default `userPassword` from "kairos" for production
+2. **User Password**: Change default `userPassword` from "kairos" for non-dev use
 3. **SSH Access**: Use `githubUser` or `sshPublicKey` instead of password-based access
 4. **Worker Tokens**: Use `WorkerTokenSecretRef` instead of inline `WorkerToken`
 
@@ -379,9 +373,6 @@ kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager
 ```bash
 # Delete the cluster
 kubectl delete -f config/samples/capv/kairos_cluster_k0s_single_node.yaml
-
-# Or use clusterctl
-clusterctl delete cluster kairos-cluster
 
 # Note: This will delete VMs in vSphere
 ```

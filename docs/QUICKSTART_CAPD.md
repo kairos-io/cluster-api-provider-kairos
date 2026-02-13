@@ -4,37 +4,25 @@ This guide walks you through creating a single-node k0s cluster on Kairos using 
 
 ## Prerequisites
 
-1. **Management Cluster**: A Kubernetes cluster (can be kind, minikube, or any Kubernetes cluster)
+1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster)
 2. **Cluster API**: CAPI v1.11+ installed
 3. **CAPD**: Cluster API Provider Docker installed
-4. **Kairos CAPI Provider**: This provider installed
+4. **Kairos CAPI Provider**: Installed via make (see [Install guide](INSTALL.md))
 
 ### Installing Prerequisites
 
-#### 1. Install Cluster API
+#### 1. Install Cluster API and CAPD
 
-```bash
-# Install clusterctl
-curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.11.0/clusterctl-linux-amd64 -o clusterctl
-chmod +x clusterctl
-sudo mv clusterctl /usr/local/bin/
-
-# Initialize CAPI
-clusterctl init --infrastructure docker
-```
+Install CAPI and CAPD using your preferred method. See the [Cluster API book](https://cluster-api.sigs.k8s.io/) for details.
 
 #### 2. Install Kairos CAPI Provider
 
 ```bash
-# Apply CRDs
-kubectl apply -f config/crd/bases
-
-# Apply RBAC
-kubectl apply -f config/rbac
-
-# Deploy the manager (or build and deploy your own image)
-kubectl apply -f config/manager/manager.yaml
+make docker-build
+make deploy
 ```
+
+See [INSTALL.md](INSTALL.md) for full install steps.
 
 ## Creating a Cluster
 
@@ -82,8 +70,8 @@ kubectl get nodes --kubeconfig=<path-to-kubeconfig>
 ### Step 5: Verify k0s is Running
 
 ```bash
-# Get kubeconfig for the cluster
-clusterctl get kubeconfig kairos-cluster > kairos-kubeconfig.yaml
+# Get kubeconfig for the cluster (from the cluster secret)
+kubectl get secret kairos-cluster-kubeconfig -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
 
 # Check nodes
 kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
@@ -93,7 +81,7 @@ kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system
 ```
 
 Notes:
-- Kubeconfig retrieval uses SSH to the control plane node. Ensure SSH access is available for the Kairos user credentials in your KairosConfigTemplate.
+- Kubeconfig retrieval may use SSH to the control plane node depending on the infrastructure provider. Ensure SSH access is available for the Kairos user credentials in your KairosConfigTemplate.
 
 ## Troubleshooting
 
@@ -140,8 +128,8 @@ Once your control plane is ready, you can add worker nodes using a `MachineDeplo
 First, you need to obtain a worker join token from your k0s control plane:
 
 ```bash
-# Get kubeconfig for the cluster
-clusterctl get kubeconfig kairos-cluster > kairos-kubeconfig.yaml
+# Get kubeconfig for the cluster (from the cluster secret)
+kubectl get secret kairos-cluster-kubeconfig -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
 
 # Option 1: If you have access to the control plane node
 # SSH into the control plane and run:
@@ -207,8 +195,5 @@ The worker `KairosConfigTemplate` supports:
 ```bash
 # Delete the cluster
 kubectl delete -f config/samples/capd/kairos_cluster_k0s_single_node.yaml
-
-# Or use clusterctl
-clusterctl delete cluster kairos-cluster
 ```
 

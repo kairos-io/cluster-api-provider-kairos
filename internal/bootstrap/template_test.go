@@ -205,6 +205,154 @@ func TestRenderK0sCloudConfig_CapkBootstrapTrap(t *testing.T) {
 	}
 }
 
+func TestRenderK3sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
+	data := TemplateData{
+		Role:           "control-plane",
+		SingleNode:     true,
+		Hostname:       "kairos-control-plane-k3s-0",
+		UserName:       "kairos",
+		UserPassword:   "kairos",
+		UserGroups:     []string{"admin"},
+		HostnamePrefix: "metal-",
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "#cloud-config") {
+		t.Error("Missing cloud-config header")
+	}
+
+	if !strings.Contains(result, "hostname: kairos-control-plane-k3s-0") {
+		t.Error("Missing or incorrect explicit hostname")
+	}
+
+	if !strings.Contains(result, "k3s:") {
+		t.Error("Missing k3s block")
+	}
+
+	if !strings.Contains(result, "enabled: true") {
+		t.Error("Missing k3s enabled flag")
+	}
+
+	if strings.Contains(result, "k3s-agent:") {
+		t.Error("Should not have k3s-agent block for control-plane")
+	}
+
+	// k3s uses top-level write_files + runcmd (like k0s CAPK)
+	if !strings.Contains(result, "path: /etc/systemd/system/kairos-k3s-post-bootstrap.service") {
+		t.Error("Missing kairos-k3s-post-bootstrap.service in write_files")
+	}
+	if !strings.Contains(result, "path: /usr/local/bin/kairos-k3s-post-bootstrap.sh") {
+		t.Error("Missing kairos-k3s-post-bootstrap.sh in write_files")
+	}
+	if !strings.Contains(result, "systemctl enable kairos-k3s-post-bootstrap.service") {
+		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
+	}
+}
+
+func TestRenderK3sCloudConfig_Worker(t *testing.T) {
+	data := TemplateData{
+		Role:         "worker",
+		UserName:     "kairos",
+		UserPassword: "kairos",
+		UserGroups:   []string{"admin"},
+		K3sServerURL: "https://10.0.0.10:6443",
+		K3sToken:     "test-k3s-token",
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "k3s-agent:") {
+		t.Error("Missing k3s-agent block")
+	}
+
+	if !strings.Contains(result, "--server https://10.0.0.10:6443") {
+		t.Error("Missing k3s agent --server arg")
+	}
+
+	if !strings.Contains(result, "--token-file /etc/rancher/k3s/token") {
+		t.Error("Missing k3s agent --token-file arg")
+	}
+
+	if !strings.Contains(result, "path: /etc/rancher/k3s/token") {
+		t.Error("Missing k3s token file write_files entry")
+	}
+
+	if !strings.Contains(result, "test-k3s-token") {
+		t.Error("Missing k3s token in file content")
+	}
+
+	if strings.Contains(result, "\nk3s:\n") {
+		t.Error("Should not have k3s server block for worker")
+	}
+}
+
+func TestRenderK3sCloudConfig_ControlPlaneWithProviderID(t *testing.T) {
+	data := TemplateData{
+		Role:         "control-plane",
+		SingleNode:   true,
+		Hostname:     "kairos-control-plane-k3s-0",
+		ProviderID:   "vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc",
+		UserName:     "kairos",
+		UserPassword: "kairos",
+		UserGroups:   []string{"admin"},
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "provider-id=vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc") {
+		t.Error("Missing providerID in k3s config/ExecStartPre when ProviderID is set")
+	}
+	if !strings.Contains(result, "/etc/rancher/k3s/config.yaml.d/90-provider-id.yaml") {
+		t.Error("Missing k3s config file drop-in for providerID when ProviderID is set")
+	}
+	if !strings.Contains(result, "kubectl patch node $(hostname)") {
+		t.Error("Missing k0s-style post-bootstrap providerID patch when ProviderID is set")
+	}
+	if !strings.Contains(result, "ExecStartPre=") {
+		t.Error("Missing ExecStartPre in systemd override when ProviderID is set (writes config before k3s)")
+	}
+	if strings.Contains(result, "kairos-k3s-discover-provider-id.sh") {
+		t.Error("Should not have discovery script when ProviderID is set")
+	}
+}
+
+func TestRenderK3sCloudConfig_ControlPlaneWithoutProviderID(t *testing.T) {
+	data := TemplateData{
+		Role:           "control-plane",
+		SingleNode:     true,
+		Hostname:       "kairos-control-plane-k3s-0",
+		UserName:       "kairos",
+		UserPassword:   "kairos",
+		UserGroups:     []string{"admin"},
+		HostnamePrefix: "metal-",
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "kairos-k3s-discover-provider-id.sh") {
+		t.Error("Missing providerID discovery script when ProviderID is not set")
+	}
+	if !strings.Contains(result, "z-provider-id.conf") {
+		t.Error("Missing systemd override when ProviderID is not set")
+	}
+	if !strings.Contains(result, "90-provider-id.yaml") {
+		t.Error("Missing k3s config file write in discovery script when ProviderID is not set")
+	}
+}
+
 func TestRenderK0sCloudConfig_CapvTemplateExcludesCapkBlocks(t *testing.T) {
 	data := TemplateData{
 		Role:         "control-plane",

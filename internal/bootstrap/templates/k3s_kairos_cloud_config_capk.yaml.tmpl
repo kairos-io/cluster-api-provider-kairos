@@ -1,0 +1,306 @@
+#cloud-config
+
+{{- /* 
+Template inputs (from Go):
+
+  .Role              string   // "control-plane" or "worker"
+  .SingleNode        bool     // true for single-node control-plane
+  .Hostname          string   // explicit hostname (optional)
+  .UserName          string   // e.g. "kairos"
+  .UserPassword      string   // e.g. "kairos"
+  .UserGroups        []string // e.g. ["admin"]
+  .GitHubUser        string   // e.g. "YOUR_GITHUB_USER" (optional)
+  .SSHPublicKey      string   // alternative to GitHubUser (optional)
+  .K3sServerURL      string   // server URL for k3s agents
+  .K3sToken          string   // used only for workers
+  .Manifests         []Manifest // optional manifests
+  .HostnamePrefix    string   // e.g. "metal-"
+  .DNSServers        []string // optional DNS resolvers
+  .Install           *InstallConfig // install configuration (optional)
+  .ProviderID        string   // providerID for Node (e.g., "vsphere://<vm-uuid>")
+*/ -}}
+
+{{/* Hostname: prefer explicit name, else use hostname prefix with Kairos templating for machine ID */}}
+{{/* The {{ trunc 4 .MachineID }} is Kairos templating syntax, output literally */}}
+{{- if .Hostname }}
+hostname: {{ .Hostname }}
+{{- else if .HostnamePrefix }}
+hostname: {{ .HostnamePrefix }}{{ "{{ trunc 4 .MachineID }}" }}
+{{- end }}
+
+{{- if .Install }}
+install:
+  auto: {{ .Install.Auto }}
+  device: "{{ .Install.Device }}"
+  reboot: {{ .Install.Reboot }}
+{{- end }}
+
+users:
+- name: {{ .UserName }}
+  passwd: {{ .UserPassword }}
+  groups:
+  {{- range .UserGroups }}
+    - {{ . }}
+  {{- end }}
+  {{- if or .GitHubUser .SSHPublicKey }}
+  ssh_authorized_keys:
+  {{- if .GitHubUser }}
+    - github:{{ .GitHubUser }}
+  {{- end }}
+  {{- if .SSHPublicKey }}
+    - {{ .SSHPublicKey }}
+  {{- end }}
+  {{- end }}
+- name: capk
+  groups: [users, admin]
+
+{{- if eq .Role "control-plane" }}
+
+# Control-plane node configuration
+# Pass providerID at k3s startup so node registers with correct providerID (avoids k3s:// vs kubevirt:// mismatch)
+# Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
+k3s:
+  enabled: true
+  {{- if .ProviderID }}
+  args:
+    - --kubelet-arg=provider-id={{ .ProviderID }}
+  {{- end }}
+
+{{- else }}
+
+# Worker node configuration
+k3s-agent:
+  enabled: true
+  args:
+    - --server {{ .K3sServerURL }}
+    - --token-file /etc/rancher/k3s/token
+
+{{- end }}
+
+{{- /* write_files: worker token + post-bootstrap service/script (like k0s CAPK) */}}
+write_files:
+  {{- if and (eq .Role "control-plane") .ProviderID }}
+  - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      # ProviderID for CAPI/CAPK node matching (k3s loads this on every start)
+      kubelet-arg:
+        - provider-id={{ .ProviderID }}
+  {{- end }}
+  {{- if and (ne .Role "control-plane") .K3sToken }}
+  - path: /etc/rancher/k3s/token
+    permissions: "0644"
+    content: |
+      {{ .K3sToken }}
+  {{- end }}
+  {{- if or .Hostname .HostnamePrefix }}
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      {{- if .Hostname }}
+      {{ .Hostname }}
+      {{- else }}
+      {{ .HostnamePrefix }}{{ "{{ trunc 4 .MachineID }}" }}
+      {{- end }}
+  {{- end }}
+  - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      [Unit]
+      Description=Kairos k3s post-bootstrap tasks
+      {{- if eq .Role "control-plane" }}
+      After=k3s.service
+      Wants=k3s.service
+      {{- else }}
+      After=k3s-agent.service
+      Wants=k3s-agent.service
+      {{- end }}
+      
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k3s-post-bootstrap.sh
+      
+      [Install]
+      WantedBy=multi-user.target
+  {{- if eq .Role "control-plane" }}
+  # Systemd override: write providerID to k3s config before k3s starts.
+  # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
+  # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      [Service]
+      {{- if .ProviderID }}
+      ExecStartPre=/bin/sh -c 'mkdir -p /etc/rancher/k3s/config.yaml.d && printf "kubelet-arg:\n  - provider-id={{ .ProviderID }}\n" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml'
+      {{- else }}
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-discover-provider-id.sh || true'
+      {{- end }}
+  {{- end }}
+  {{- if and (eq .Role "control-plane") (not .ProviderID) }}
+  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre)
+  # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
+  - path: /usr/local/bin/kairos-k3s-discover-provider-id.sh
+    permissions: "0755"
+    owner: 0
+    group: 0
+    content: |
+      #!/bin/bash
+      set -e
+      PROVIDER_ID=""
+      # Try DMI product_uuid first (KubeVirt VMs may expose UUID)
+      if [ -f /sys/class/dmi/id/product_uuid ]; then
+        RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
+        HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
+          FORMATTED="${HEX:0:8}-${HEX:8:4}-${HEX:12:4}-${HEX:16:4}-${HEX:20:12}"
+          PROVIDER_ID="kubevirt://${FORMATTED}"
+          echo "Discovered providerID: $PROVIDER_ID"
+        fi
+      fi
+      # Fallback: CAPK often uses kubevirt://namespace/vm-name (hostname usually matches vm name)
+      {{- if and .ClusterNS .Hostname }}
+      if [ -z "$PROVIDER_ID" ]; then
+        PROVIDER_ID="kubevirt://{{ .ClusterNS }}/{{ .Hostname }}"
+        echo "Discovered providerID: $PROVIDER_ID (fallback)"
+      fi
+      {{- end }}
+      if [ -n "$PROVIDER_ID" ]; then
+        mkdir -p /etc/rancher/k3s/config.yaml.d
+        printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+      fi
+  {{- end }}
+  - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
+    permissions: "0755"
+    owner: 0
+    group: 0
+    content: |
+      #!/bin/bash
+      set -e
+      
+      {{- if .IsKubeVirt }}
+      # CAPK: always mark bootstrap success on script exit
+      mark_bootstrap_success() {
+        mkdir -p /run/cluster-api
+        echo "success" > /run/cluster-api/bootstrap-success.complete
+        chmod 0644 /run/cluster-api/bootstrap-success.complete
+      }
+      trap mark_bootstrap_success EXIT
+      {{- end }}
+      
+      {{- if .HostnamePrefix }}
+      # Enforce hostname from cloud-config on immutable rootfs
+      if [ -f /usr/local/etc/hostname ]; then
+        /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
+        if ! grep -qE "127\.0\.1\.1[[:space:]]+$(cat /usr/local/etc/hostname)" /etc/hosts; then
+          echo "127.0.1.1 $(cat /usr/local/etc/hostname)" >> /etc/hosts
+        fi
+      fi
+      {{- end }}
+
+      {{- if .Manifests }}
+      # Write k3s manifests
+      echo "Writing k3s manifests..."
+      mkdir -p /var/lib/rancher/k3s/server/manifests
+      {{- range .Manifests }}
+      mkdir -p /var/lib/rancher/k3s/server/manifests/{{ .Name }}
+      cat > /var/lib/rancher/k3s/server/manifests/{{ .Name }}/{{ .File }} << 'MANIFEST_EOF'
+{{ .Content }}
+MANIFEST_EOF
+      chmod 0644 /var/lib/rancher/k3s/server/manifests/{{ .Name }}/{{ .File }}
+      echo "Written manifest: /var/lib/rancher/k3s/server/manifests/{{ .Name }}/{{ .File }}"
+      {{- end }}
+      {{- end }}
+      
+      {{- if .ProviderID }}
+      # Fallback: post-bootstrap providerID patch (same approach as k0s CAPK single-node)
+      # If k3s registered with k3s://hostname, providerID is immutable and patch will fail - that's expected.
+      # If node has empty providerID, patch will succeed and unblock Machine-to-Node matching.
+      echo "Waiting for k3s node to be registered..."
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      MAX_WAIT=300
+      ELAPSED=0
+      while ! kubectl get node $(hostname) &>/dev/null; do
+        if [ $ELAPSED -ge $MAX_WAIT ]; then
+          echo "WARN: Timeout waiting for node to be registered (providerID patch skipped)"
+          break
+        fi
+        echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
+      done
+      
+      if kubectl get node $(hostname) &>/dev/null; then
+        echo "Attempting to set providerID={{ .ProviderID }} on node $(hostname)..."
+        for i in $(seq 1 30); do
+          if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' 2>/dev/null; then
+            echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
+            break
+          fi
+          # If node already has providerID (immutable), patch fails - don't retry
+          CURRENT=$(kubectl get node $(hostname) -o jsonpath='{.spec.providerID}' 2>/dev/null || echo "")
+          if [ -n "$CURRENT" ]; then
+            echo "Node already has providerID=$CURRENT (immutable), skipping patch"
+            break
+          fi
+          echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+          sleep 5
+        done
+      fi
+      {{- end }}
+      
+      # Mark bootstrap success for CAPI/CAPK consumers
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+      
+      echo "k3s post-bootstrap tasks completed successfully"
+
+{{- /* DNS overrides and bootstrap stages */}}
+stages:
+  boot:
+    {{- if and (eq .Role "control-plane") (not .ProviderID) }}
+    - name: "Discover providerID for k3s (VM self-discovery)"
+      commands:
+        - /usr/local/bin/kairos-k3s-discover-provider-id.sh || true
+    {{- end }}
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    - name: "Allow SSH password authentication"
+      files:
+        - path: /etc/ssh/sshd_config.d/60-kairos-capi.conf
+          permissions: "0644"
+          owner: 0
+          group: 0
+          content: |
+            PasswordAuthentication yes
+            KbdInteractiveAuthentication yes
+      commands:
+        - mkdir -p /etc/ssh/sshd_config.d
+        - systemctl restart sshd || systemctl restart ssh || true
+    - name: "Ensure k3s directories exist"
+      commands:
+        - mkdir -p /etc/rancher/k3s
+        - mkdir -p /etc/rancher/k3s/config.yaml.d
+    {{- if .DNSServers }}
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+        {{- range .DNSServers }}
+          - {{ . }}
+        {{- end }}
+        path: "/etc/resolv.conf"
+    {{- end }}
+
+runcmd:
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable kairos-k3s-post-bootstrap.service || true

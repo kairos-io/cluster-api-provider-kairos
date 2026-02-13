@@ -59,6 +59,14 @@ spec:
                   spec:
                     description: Spec is the specification of the KairosControlPlane
                     properties:
+                      distribution:
+                        default: k0s
+                        description: Distribution specifies the Kubernetes distribution
+                          to install
+                        enum:
+                        - k0s
+                        - k3s
+                        type: string
                       kairosConfigTemplate:
                         description: |-
                           KairosConfigTemplate is a reference to a KairosConfigTemplate resource

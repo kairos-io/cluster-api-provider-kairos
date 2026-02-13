@@ -54,6 +54,7 @@ import (
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
 var errLBEndpointNotReady = errors.New("control plane load balancer endpoint not ready")
+var errK3sTokenNotReady = errors.New("k3s token secret not ready")
 
 // KairosConfigReconciler reconciles a KairosConfig object
 type KairosConfigReconciler struct {
@@ -335,20 +336,27 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 					// Check if providerID is present in the script
 					hasProviderIDInSecret := strings.Contains(cloudConfigStr, currentProviderID)
 
-					// Check if there's a k0s post-bootstrap service (indicating providerID was included)
+					distribution := kairosConfig.Spec.Distribution
+					if distribution == "" {
+						distribution = "k0s"
+					}
+					// Check if there's a post-bootstrap service (indicating providerID was included)
 					// If Machine has providerID but secret has no service, we need to regenerate
-					hasK0sPostBootstrapService := strings.Contains(cloudConfigStr, "kairos-k0s-post-bootstrap.service")
+					hasPostBootstrapService := strings.Contains(cloudConfigStr, "kairos-k0s-post-bootstrap.service")
+					if distribution == "k3s" {
+						hasPostBootstrapService = strings.Contains(cloudConfigStr, "kairos-k3s-post-bootstrap.service")
+					}
 					// Ensure SSH enable stage exists (regression guard for CAPV access)
 					hasSSHEnableStage := strings.Contains(cloudConfigStr, "systemctl enable --now sshd") ||
 						strings.Contains(cloudConfigStr, "systemctl enable --now ssh")
 					hasSSHPassAuth := strings.Contains(cloudConfigStr, "PasswordAuthentication yes")
 
-					if currentProviderID != "" && (!hasProviderIDInSecret || !hasK0sPostBootstrapService) {
-						log.Info("Bootstrap secret missing providerID in k0s post-bootstrap service, regenerating to include it",
+					if currentProviderID != "" && (!hasProviderIDInSecret || !hasPostBootstrapService) {
+						log.Info("Bootstrap secret missing providerID in post-bootstrap service, regenerating to include it",
 							"secret", *kairosConfig.Status.DataSecretName,
 							"providerID", currentProviderID,
 							"hasProviderIDInSecret", hasProviderIDInSecret,
-							"hasK0sPostBootstrapService", hasK0sPostBootstrapService)
+							"hasPostBootstrapService", hasPostBootstrapService)
 						needsRegeneration = true
 					}
 					if !hasSSHEnableStage || !hasSSHPassAuth {
@@ -397,6 +405,10 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	if err != nil {
 		if errors.Is(err, errLBEndpointNotReady) {
 			log.Info("Waiting for control plane LoadBalancer endpoint before generating cloud-config")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if errors.Is(err, errK3sTokenNotReady) {
+			log.Info("Waiting for k3s token secret before generating cloud-config")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to generate cloud-config: %w", err)
@@ -482,10 +494,17 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		// Verify providerID is included in the cloud-config
 		// cloudConfig is plain text, no need to decode
 		hasProviderIDInSecret := strings.Contains(cloudConfig, currentProviderID)
-		// Check for the systemd service that sets providerID (runs after k0s.service starts)
-		hasK0sPostBootstrapService := strings.Contains(cloudConfig, "kairos-k0s-post-bootstrap.service")
+		distribution := kairosConfig.Spec.Distribution
+		if distribution == "" {
+			distribution = "k0s"
+		}
+		// Check for the systemd service that sets providerID (runs after k3s/k0s service starts)
+		hasPostBootstrapService := strings.Contains(cloudConfig, "kairos-k0s-post-bootstrap.service")
+		if distribution == "k3s" {
+			hasPostBootstrapService = strings.Contains(cloudConfig, "kairos-k3s-post-bootstrap.service")
+		}
 
-		if hasProviderIDInSecret && hasK0sPostBootstrapService {
+		if hasProviderIDInSecret && hasPostBootstrapService {
 			kairosConfig.Status.Ready = true
 			log.Info("Bootstrap data secret created with providerID", "secret", secretName, "providerID", currentProviderID)
 		} else {
@@ -494,7 +513,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 				"secret", secretName,
 				"providerID", currentProviderID,
 				"hasProviderID", hasProviderIDInSecret,
-				"hasK0sPostBootstrapService", hasK0sPostBootstrapService)
+				"hasPostBootstrapService", hasPostBootstrapService)
 			kairosConfig.Status.Ready = false
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
@@ -688,7 +707,7 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 	case "k0s":
 		return r.generateK0sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
 	case "k3s":
-		return "", fmt.Errorf("k3s distribution not yet implemented")
+		return r.generateK3sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
 	default:
 		return "", fmt.Errorf("unsupported distribution: %s", distribution)
 	}
@@ -895,6 +914,203 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 
 	// Render template
 	return bootstrap.RenderK0sCloudConfig(templateData)
+}
+
+func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
+	// Determine single-node mode
+	singleNode := kairosConfig.Spec.SingleNode
+	if !singleNode && role == "control-plane" && machine != nil {
+		ownerRef := metav1.GetControllerOf(machine)
+		if ownerRef != nil && ownerRef.Kind == "KairosControlPlane" {
+			log.V(4).Info("Control plane node, single-node mode determined from spec", "singleNode", singleNode)
+		}
+	}
+
+	// Resolve k3s token if needed (for worker nodes)
+	// Precedence: K3sTokenSecretRef > K3sToken > WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token
+	var k3sToken string
+	if role == "worker" {
+		if kairosConfig.Spec.K3sTokenSecretRef != nil {
+			secretKey := types.NamespacedName{
+				Namespace: kairosConfig.Namespace,
+				Name:      kairosConfig.Spec.K3sTokenSecretRef.Name,
+			}
+			if kairosConfig.Spec.K3sTokenSecretRef.Namespace != "" {
+				secretKey.Namespace = kairosConfig.Spec.K3sTokenSecretRef.Namespace
+			}
+
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, secretKey, secret); err != nil {
+				if apierrors.IsNotFound(err) {
+					return "", errK3sTokenNotReady
+				}
+				return "", fmt.Errorf("failed to get k3s token secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
+			}
+
+			key := kairosConfig.Spec.K3sTokenSecretRef.Key
+			if key == "" {
+				key = "token"
+			}
+
+			if tokenData, ok := secret.Data[key]; ok {
+				k3sToken = string(tokenData)
+			} else {
+				return "", fmt.Errorf("k3s token secret %s/%s does not contain key '%s'", secretKey.Namespace, secretKey.Name, key)
+			}
+		} else if kairosConfig.Spec.K3sToken != "" {
+			k3sToken = kairosConfig.Spec.K3sToken
+		} else if kairosConfig.Spec.WorkerTokenSecretRef != nil {
+			secretKey := types.NamespacedName{
+				Namespace: kairosConfig.Namespace,
+				Name:      kairosConfig.Spec.WorkerTokenSecretRef.Name,
+			}
+			if kairosConfig.Spec.WorkerTokenSecretRef.Namespace != "" {
+				secretKey.Namespace = kairosConfig.Spec.WorkerTokenSecretRef.Namespace
+			}
+
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, secretKey, secret); err != nil {
+				if apierrors.IsNotFound(err) {
+					return "", errK3sTokenNotReady
+				}
+				return "", fmt.Errorf("failed to get worker token secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
+			}
+
+			key := kairosConfig.Spec.WorkerTokenSecretRef.Key
+			if key == "" {
+				key = "token"
+			}
+
+			if tokenData, ok := secret.Data[key]; ok {
+				k3sToken = string(tokenData)
+			} else {
+				return "", fmt.Errorf("worker token secret %s/%s does not contain key '%s'", secretKey.Namespace, secretKey.Name, key)
+			}
+		} else if kairosConfig.Spec.WorkerToken != "" {
+			k3sToken = kairosConfig.Spec.WorkerToken
+		} else if kairosConfig.Spec.TokenSecretRef != nil {
+			secretKey := types.NamespacedName{
+				Namespace: cluster.Namespace,
+				Name:      kairosConfig.Spec.TokenSecretRef.Name,
+			}
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, secretKey, secret); err != nil {
+				if apierrors.IsNotFound(err) {
+					return "", errK3sTokenNotReady
+				}
+				return "", fmt.Errorf("failed to get token secret: %w", err)
+			}
+			if tokenData, ok := secret.Data["token"]; ok {
+				k3sToken = string(tokenData)
+			} else if tokenData, ok := secret.Data["value"]; ok {
+				k3sToken = string(tokenData)
+			} else {
+				return "", fmt.Errorf("token secret does not contain 'token' or 'value' key")
+			}
+		} else if kairosConfig.Spec.Token != "" {
+			k3sToken = kairosConfig.Spec.Token
+		}
+
+		if k3sToken == "" {
+			return "", fmt.Errorf("k3s worker requires a join token: set k3sTokenSecretRef, k3sToken, workerTokenSecretRef, workerToken, tokenSecretRef, or token")
+		}
+		if serverAddress == "" {
+			return "", fmt.Errorf("k3s worker requires serverAddress or cluster controlPlaneEndpoint")
+		}
+	}
+
+	// Set defaults for user configuration
+	userName := kairosConfig.Spec.UserName
+	if userName == "" {
+		userName = "kairos"
+	}
+	userPassword := kairosConfig.Spec.UserPassword
+	if userPassword == "" {
+		userPassword = "kairos"
+	}
+	userGroups := kairosConfig.Spec.UserGroups
+	if len(userGroups) == 0 {
+		userGroups = []string{"admin"}
+	}
+
+	// Set hostname prefix (default to "metal-" if not specified)
+	hostnamePrefix := kairosConfig.Spec.HostnamePrefix
+	if hostnamePrefix == "" {
+		hostnamePrefix = "metal-"
+	}
+
+	// Prefer explicit hostname, otherwise use Machine name
+	hostname := kairosConfig.Spec.Hostname
+	if hostname == "" && machine != nil {
+		hostname = machine.Name
+	}
+
+	// Set install configuration (with defaults)
+	var installConfig *bootstrap.InstallConfig
+	if kairosConfig.Spec.Install != nil {
+		installConfig = &bootstrap.InstallConfig{
+			Auto:   true,
+			Device: "auto",
+			Reboot: true,
+		}
+		if kairosConfig.Spec.Install.Auto != nil {
+			installConfig.Auto = *kairosConfig.Spec.Install.Auto
+		}
+		if kairosConfig.Spec.Install.Device != "" {
+			installConfig.Device = kairosConfig.Spec.Install.Device
+		}
+		if kairosConfig.Spec.Install.Reboot != nil {
+			installConfig.Reboot = *kairosConfig.Spec.Install.Reboot
+		}
+	}
+
+	if installConfig != nil {
+		log.Info("Using install configuration", "auto", installConfig.Auto, "device", installConfig.Device, "reboot", installConfig.Reboot)
+	} else {
+		log.Info("No install configuration provided; install block will be omitted")
+	}
+
+	// Get providerID from Machine's infrastructure reference
+	providerID := r.getProviderID(ctx, log, machine)
+
+	// Build template data
+	templateData := bootstrap.TemplateData{
+		Role:                                role,
+		SingleNode:                          singleNode,
+		Hostname:                            hostname,
+		UserName:                            userName,
+		UserPassword:                        userPassword,
+		UserGroups:                          userGroups,
+		GitHubUser:                          kairosConfig.Spec.GitHubUser,
+		SSHPublicKey:                        kairosConfig.Spec.SSHPublicKey,
+		Manifests:                           kairosConfig.Spec.Manifests,
+		HostnamePrefix:                      hostnamePrefix,
+		DNSServers:                          kairosConfig.Spec.DNSServers,
+		PrimaryIP:                           kairosConfig.Spec.PrimaryIP,
+		MachineName:                         "",
+		ClusterNS:                           "",
+		IsKubeVirt:                          isKubevirtMachine(machine),
+		Install:                             installConfig,
+		ProviderID:                          providerID,
+		K3sServerURL:                        serverAddress,
+		K3sToken:                            k3sToken,
+		ControlPlaneLBServiceName:           "",
+		ControlPlaneLBServiceNamespace:      "",
+		ControlPlaneLBEndpoint:              "",
+		ManagementKubeconfigToken:           "",
+		ManagementKubeconfigSecretName:      "",
+		ManagementKubeconfigSecretNamespace: "",
+		ManagementAPIServer:                 "",
+	}
+
+	if machine != nil {
+		templateData.MachineName = machine.Name
+	}
+	if cluster != nil {
+		templateData.ClusterNS = cluster.Namespace
+	}
+
+	return bootstrap.RenderK3sCloudConfig(templateData)
 }
 
 func (r *KairosConfigReconciler) getControlPlaneLBEndpoint(ctx context.Context, namespace, name string) (string, error) {
@@ -1388,6 +1604,24 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 
 		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
 			log.V(4).Info("Found providerID in KubevirtMachine spec", "providerID", providerID, "machine", machine.Name, "kubevirtMachine", kubevirtMachineKey.Name)
+			return providerID
+		}
+	}
+
+	// For CAPD, get providerID from DockerMachine spec
+	if machine.Spec.InfrastructureRef.Kind == "DockerMachine" {
+		dockerMachine := &unstructured.Unstructured{}
+		dockerMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
+		dockerMachineKey := types.NamespacedName{
+			Name:      machine.Spec.InfrastructureRef.Name,
+			Namespace: machine.Spec.InfrastructureRef.Namespace,
+		}
+		if err := r.Get(ctx, dockerMachineKey, dockerMachine); err != nil {
+			log.V(4).Info("Failed to get DockerMachine for providerID", "machine", machine.Name, "dockerMachine", dockerMachineKey.Name, "error", err)
+			return ""
+		}
+		if providerID, found, err := unstructured.NestedString(dockerMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
+			log.V(4).Info("Found providerID in DockerMachine spec", "providerID", providerID, "machine", machine.Name, "dockerMachine", dockerMachineKey.Name)
 			return providerID
 		}
 	}

@@ -1,18 +1,25 @@
 # Quickstart: CAPK (KubeVirt)
 
-This guide sets up a local KubeVirt environment and provisions a single-node Kairos+k0s cluster using CAPK.
+This guide sets up a local KubeVirt environment and provisions a single-node Kairos+k0s or Kairos+k3s cluster using CAPK.
 
 ## Prerequisites
+
 - `docker`
 - `kind`
 - `kubectl`
-- `clusterctl`
 - `helm`
 - `virtctl` (from KubeVirt releases)
 - Go toolchain (for building `kubevirt-env`)
 
 ## Build the local helper
+
+```bash
+make kubevirt-env
 ```
+
+Or manually:
+
+```bash
 go build -o bin/kubevirt-env ./cmd/kubevirt-env
 ```
 
@@ -35,8 +42,15 @@ Notes:
 ```
 
 ## Create a test cluster
+
+```bash
+kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_single_node.yaml
 ```
-kubectl apply -f config/samples/capk/kairos_cluster_k0s_single_node.yaml
+
+For k3s:
+
+```bash
+kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_single_node.yaml
 ```
 
 ## Check status
@@ -44,14 +58,16 @@ kubectl apply -f config/samples/capk/kairos_cluster_k0s_single_node.yaml
 ./bin/kubevirt-env test-cluster-status
 ```
 
-Optional checks:
-```
-kubectl get svc <cluster>-control-plane-lb
-kubectl get secret <cluster>-kubeconfig
+Optional checks (cluster name from sample is `kairos-cluster-kv`):
+
+```bash
+kubectl get svc kairos-cluster-kv-control-plane-lb
+kubectl get secret kairos-cluster-kv-kubeconfig
 ```
 
 ## Optional: Run scripted flow
-```
+
+```bash
 make kubevirt-env
 make test-kubevirt
 ```

@@ -43,6 +43,12 @@ type KairosControlPlaneSpec struct {
 	// +kubebuilder:validation:Required
 	Version string `json:"version"`
 
+	// Distribution specifies the Kubernetes distribution to install
+	// +kubebuilder:validation:Enum=k0s;k3s
+	// +kubebuilder:default=k0s
+	// +optional
+	Distribution string `json:"distribution,omitempty"`
+
 	// MachineTemplate defines the template for creating control plane machines
 	// Contract: ControlPlane MUST expose machineTemplate
 	MachineTemplate KairosControlPlaneMachineTemplate `json:"machineTemplate"`

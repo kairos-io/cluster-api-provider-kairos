@@ -111,11 +111,11 @@ spec:
                         x-kubernetes-map-type: atomic
                       distribution:
                         default: k0s
-                        description: |-
-                          Distribution specifies the Kubernetes distribution to install
-                          Currently only k0s is supported. k3s support is planned for future releases.
+                        description: Distribution specifies the Kubernetes distribution
+                          to install
                         enum:
                         - k0s
+                        - k3s
                         type: string
                       dnsServers:
                         description: |-
@@ -194,15 +194,44 @@ spec:
                               When true, the system will reboot automatically after installation completes
                             type: boolean
                         type: object
+                      k3sToken:
+                        description: |-
+                          K3sToken is the join token for k3s nodes (inline specification)
+                          For production use, prefer K3sTokenSecretRef instead.
+                          If both K3sToken and K3sTokenSecretRef are set, K3sTokenSecretRef takes precedence.
+                        type: string
+                      k3sTokenSecretRef:
+                        description: |-
+                          K3sTokenSecretRef is a reference to a Secret containing the k3s join token
+                          The Secret must contain a key specified by K3sTokenSecretRef.Key (defaults to "token").
+                        properties:
+                          key:
+                            default: token
+                            description: |-
+                              Key is the key within the Secret that contains the token
+                              Defaults to "token" if not specified
+                            type: string
+                          name:
+                            description: Name is the name of the Secret
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace is the namespace of the Secret
+                              If not specified, defaults to the same namespace as the KairosConfig
+                            type: string
+                        required:
+                        - name
+                        type: object
                       kubernetesVersion:
                         description: KubernetesVersion specifies the Kubernetes version
                           to install
                         type: string
                       manifests:
                         description: |-
-                          Manifests are Kubernetes manifests to be placed in /var/lib/k0s/manifests/
-                          These will be automatically applied by k0s at cluster startup.
-                          Each manifest is placed at /var/lib/k0s/manifests/{Name}/{File}
+                          Manifests are Kubernetes manifests to be placed in the distribution manifests directory.
+                          These will be automatically applied by the distribution at cluster startup.
+                          k0s: /var/lib/k0s/manifests/{Name}/{File}
+                          k3s: /var/lib/rancher/k3s/server/manifests/{Name}/{File}
                         items:
                           description: |-
                             Manifest represents a Kubernetes manifest file to be deployed by k0s

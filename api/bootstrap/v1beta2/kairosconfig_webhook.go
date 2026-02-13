@@ -103,23 +103,37 @@ func (r *KairosConfig) validate() error {
 	}
 
 	// Validate distribution
-	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" {
+	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" && r.Spec.Distribution != "k3s" {
 		allErrs = append(allErrs, field.Invalid(
 			field.NewPath("spec", "distribution"),
 			r.Spec.Distribution,
-			"spec.distribution must be 'k0s' (k3s support is planned for future releases)",
+			"spec.distribution must be one of [k0s, k3s]",
 		))
 	}
 
 	// Validate worker token requirement
 	if r.Spec.Role == "worker" {
-		hasToken := r.Spec.WorkerToken != ""
-		hasTokenRef := r.Spec.WorkerTokenSecretRef != nil && r.Spec.WorkerTokenSecretRef.Name != ""
-		if !hasToken && !hasTokenRef {
-			allErrs = append(allErrs, field.Required(
-				field.NewPath("spec", "workerToken"),
-				"worker KairosConfig requires either spec.workerToken or spec.workerTokenSecretRef to be set",
-			))
+		switch r.Spec.Distribution {
+		case "k3s":
+			hasK3sToken := r.Spec.K3sToken != ""
+			hasK3sTokenRef := r.Spec.K3sTokenSecretRef != nil && r.Spec.K3sTokenSecretRef.Name != ""
+			hasWorkerToken := r.Spec.WorkerToken != ""
+			hasWorkerTokenRef := r.Spec.WorkerTokenSecretRef != nil && r.Spec.WorkerTokenSecretRef.Name != ""
+			if !hasK3sToken && !hasK3sTokenRef && !hasWorkerToken && !hasWorkerTokenRef {
+				allErrs = append(allErrs, field.Required(
+					field.NewPath("spec", "k3sToken"),
+					"k3s worker requires spec.k3sToken, spec.k3sTokenSecretRef, spec.workerToken, or spec.workerTokenSecretRef to be set",
+				))
+			}
+		default:
+			hasToken := r.Spec.WorkerToken != ""
+			hasTokenRef := r.Spec.WorkerTokenSecretRef != nil && r.Spec.WorkerTokenSecretRef.Name != ""
+			if !hasToken && !hasTokenRef {
+				allErrs = append(allErrs, field.Required(
+					field.NewPath("spec", "workerToken"),
+					"worker KairosConfig requires either spec.workerToken or spec.workerTokenSecretRef to be set",
+				))
+			}
 		}
 	}
 

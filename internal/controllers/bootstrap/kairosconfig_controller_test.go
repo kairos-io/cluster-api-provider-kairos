@@ -769,3 +769,135 @@ func TestGenerateK0sCloudConfig_HostnameTemplating(t *testing.T) {
 	// Should NOT contain Go template syntax
 	g.Expect(cloudConfig).NotTo(ContainSubstring("{{.MachineID}}"))
 }
+
+func TestGenerateK3sCloudConfig_WorkerTokenSecretRef(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "k3s-token-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"token": []byte("k3s-secret-token"),
+		},
+	}
+
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &KairosConfigReconciler{
+		Client: client,
+		Scheme: scheme,
+	}
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "worker",
+			Distribution:      "k3s",
+			KubernetesVersion: "v1.30.0+k3s.0",
+			K3sTokenSecretRef: &bootstrapv1beta2.WorkerTokenSecretReference{
+				Name: "k3s-token-secret",
+				Key:  "token",
+			},
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+		},
+	}
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-machine",
+			Namespace: "default",
+		},
+	}
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+	}
+
+	cloudConfig, err := reconciler.generateK3sCloudConfig(
+		context.Background(),
+		log.Log,
+		kairosConfig,
+		machine,
+		cluster,
+		"worker",
+		"https://control-plane:6443",
+	)
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cloudConfig).To(ContainSubstring("k3s-agent:"))
+	g.Expect(cloudConfig).To(ContainSubstring("k3s-secret-token"))
+}
+
+func TestGenerateK3sCloudConfig_WorkerTokenSecretMissing(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &KairosConfigReconciler{
+		Client: client,
+		Scheme: scheme,
+	}
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "worker",
+			Distribution:      "k3s",
+			KubernetesVersion: "v1.30.0+k3s.0",
+			K3sTokenSecretRef: &bootstrapv1beta2.WorkerTokenSecretReference{
+				Name: "k3s-token-secret",
+				Key:  "token",
+			},
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+		},
+	}
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-machine",
+			Namespace: "default",
+		},
+	}
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+	}
+
+	_, err := reconciler.generateK3sCloudConfig(
+		context.Background(),
+		log.Log,
+		kairosConfig,
+		machine,
+		cluster,
+		"worker",
+		"https://control-plane:6443",
+	)
+
+	g.Expect(err).To(Equal(errK3sTokenNotReady))
+}

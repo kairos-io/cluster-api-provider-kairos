@@ -1,0 +1,275 @@
+# ============================================================================
+# CAPK Sample: Single-Node k3s Cluster on Kairos OS with KubeVirt
+# ============================================================================
+#
+# SETUP INSTRUCTIONS:
+#
+# 1. Ensure KubeVirt local env is ready (see docs/QUICKSTART_CAPK.md)
+# 2. Upload the Kairos image to CDI:
+#    - kubevirt-env upload-kairos-image
+#
+# 3. Update the KubeVirtMachineTemplate below:
+#    - Adjust CPU/memory/disk sizes
+#    - If using a cloud disk image, set the rootdisk DataVolume name to that image
+#    - If using an ISO, set installeriso to the ISO DataVolume and
+#      create a blank install disk DataVolume (kairos-install-disk)
+#
+# 4. Apply the manifest:
+#    - kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_single_node.yaml
+#
+# ============================================================================
+
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: kairos-cluster-kv
+  namespace: default
+spec:
+  # CAPK requires a LoadBalancer Service for the control-plane API.
+  # Ensure a LoadBalancer implementation (e.g., MetalLB) is installed.
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: KubevirtCluster
+    name: kairos-cluster-kv
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KairosControlPlane
+    name: kairos-control-plane-kv-capk
+  # Required for k3s workers: set a stable API endpoint
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-LB-OR-VIP"
+    port: 6443
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtCluster
+metadata:
+  name: kairos-cluster-kv
+  namespace: default
+spec: {}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-control-plane-kv-capk
+  namespace: default
+spec:
+  replicas: 1
+  version: "v1.30.0+k3s.0"
+  distribution: k3s
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+      kind: KubevirtMachineTemplate
+      name: kairos-control-plane-template-hostmodel-capk
+      namespace: default
+  kairosConfigTemplate:
+    name: kairos-config-template-control-plane-capk
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kairos-control-plane-template-hostmodel-capk
+  namespace: default
+spec:
+  template:
+    spec:
+      virtualMachineTemplate:
+        spec:
+          runStrategy: Always
+          template:
+            metadata:
+              labels:
+                kubevirt.io/domain: kairos-control-plane-template
+            spec:
+              # Schedule on the bare metal node with KVM.
+              nodeSelector:
+                kubernetes.io/hostname: grogu
+              domain:
+                cpu:
+                  cores: 8
+                  # Use host-model to match KubeVirt CPU model labels
+                  model: host-passthrough
+                resources:
+                  requests:
+                    memory: 12Gi
+                devices:
+                  disks:
+                  # Match testVM behavior: install disk first, ISO second.
+                  - name: installeriso
+                    cdrom:
+                      bus: sata
+                    bootOrder: 2
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+                    bootOrder: 1
+                  interfaces:
+                  - name: default
+                    masquerade: {}
+                features:
+                  smm:
+                    enabled: true
+                  acpi:
+                    enabled: true
+                # Use UEFI boot (image has GPT partition table with EFI System partition)
+                # Disable secure boot to avoid boot issues
+                firmware:
+                  bootloader:
+                    efi:
+                      secureBoot: true
+              networks:
+              - name: default
+                #multus:
+                #  networkName: lan-bridge
+                pod: {}
+              volumes:
+              - name: installeriso
+                dataVolume:
+                  name: kairos-rootdisk
+              - name: rootdisk
+                dataVolume:
+                  name: kairos-install-disk
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-control-plane-capk
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      distribution: k3s
+      kubernetesVersion: "v1.30.0+k3s.0"
+      install:
+        auto: true
+        device: "/dev/vda"
+        reboot: true
+      dnsServers:
+        - "172.16.56.5"
+        - "8.8.8.8"
+      userName: kairos
+      userPassword: kairos
+      userGroups:
+        - admin
+      # Optional: Add GitHub user for SSH access
+      # githubUser: "your-github-username"
+      # Optional: Add SSH public key instead
+      # sshPublicKey: "ssh-rsa AAAAB3NzaC1yc2E..."
+---
+# Optional: Worker token secret (required for k3s agents)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-k3s-worker-token
+  namespace: default
+type: Opaque
+stringData:
+  token: "REPLACE-WITH-K3S-JOIN-TOKEN"
+---
+# Optional: Worker MachineDeployment (delete if you only want single-node control-plane)
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: kairos-workers
+  namespace: default
+spec:
+  clusterName: kairos-cluster-kv
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: kairos-cluster-kv
+      cluster.x-k8s.io/deployment-name: kairos-workers
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: kairos-cluster-kv
+        cluster.x-k8s.io/deployment-name: kairos-workers
+    spec:
+      version: "v1.30.0+k3s.0"
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          kind: KairosConfigTemplate
+          name: kairos-config-template-workers-capk
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+        kind: KubevirtMachineTemplate
+        name: kairos-worker-template-capk
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kairos-worker-template-capk
+  namespace: default
+spec:
+  template:
+    spec:
+      virtualMachineTemplate:
+        spec:
+          runStrategy: Always
+          template:
+            metadata:
+              labels:
+                kubevirt.io/domain: kairos-worker-template
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: grogu
+              domain:
+                cpu:
+                  cores: 4
+                  model: host-passthrough
+                resources:
+                  requests:
+                    memory: 8Gi
+                devices:
+                  disks:
+                  - name: installeriso
+                    cdrom:
+                      bus: sata
+                    bootOrder: 2
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+                    bootOrder: 1
+                  interfaces:
+                  - name: default
+                    masquerade: {}
+                features:
+                  smm:
+                    enabled: true
+                  acpi:
+                    enabled: true
+                firmware:
+                  bootloader:
+                    efi:
+                      secureBoot: true
+              networks:
+              - name: default
+                pod: {}
+              volumes:
+              - name: installeriso
+                dataVolume:
+                  name: kairos-rootdisk
+              - name: rootdisk
+                dataVolume:
+                  name: kairos-install-disk
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-workers-capk
+  namespace: default
+spec:
+  template:
+    spec:
+      role: worker
+      distribution: k3s
+      kubernetesVersion: "v1.30.0+k3s.0"
+      k3sTokenSecretRef:
+        name: kairos-k3s-worker-token
+        key: token
+      userName: kairos
+      userPassword: kairos
+      userGroups:
+        - admin

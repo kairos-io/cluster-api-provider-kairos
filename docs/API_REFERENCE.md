@@ -1,6 +1,6 @@
 # API Reference
 
-This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider.
+This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md).
 
 ## Table of Contents
 
@@ -24,11 +24,11 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `role` | `string` | Yes | `"worker"` | Node role: `"control-plane"` or `"worker"` |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution. Currently only `"k0s"` is supported. `"k3s"` is planned. |
+| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"` or `"k3s"` |
 | `kubernetesVersion` | `string` | Yes | - | Kubernetes version to install (e.g., `"v1.30.0+k0s.0"`) |
 | `singleNode` | `bool` | No | `false` | For control-plane: if `true`, configures k0s with `--single` flag for single-node mode |
 | `userName` | `string` | No | `"kairos"` | Username for the default user |
-| `userPassword` | `string` | No | `"kairos"` | Password for the default user. **WARNING:** Default is for development only, not production-safe |
+| `userPassword` | `string` | No | `"kairos"` | Password for the default user. Change for non-dev use. |
 | `userGroups` | `[]string` | No | `["admin"]` | Groups for the default user |
 | `githubUser` | `string` | No | - | GitHub username for SSH key access (fetches keys from GitHub) |
 | `sshPublicKey` | `string` | No | - | Raw SSH public key (alternative to `githubUser`) |
@@ -255,7 +255,7 @@ When `KairosControlPlane.spec.replicas == 1`, the controller automatically sets 
 
 ### Security Considerations
 
-- **User Password**: Always change the default `userPassword` for production use
+- **User Password**: Change the default `userPassword` for non-dev use
 - **Worker Tokens**: Prefer `workerTokenSecretRef` over inline `workerToken` for better security
 - **SSH Access**: Use `githubUser` or `sshPublicKey` instead of password-based access when possible
 

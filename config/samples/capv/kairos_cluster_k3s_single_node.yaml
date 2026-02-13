@@ -1,0 +1,268 @@
+# ============================================================================
+# CAPV Sample: Single-Node k3s Cluster on Kairos OS
+# ============================================================================
+#
+# SETUP INSTRUCTIONS:
+#
+# 1. FIRST, apply the VSphereClusterIdentity and Secret (at the bottom of this file)
+#    - Edit the Secret with your actual vSphere credentials
+#    - kubectl apply -f config/samples/capv/kairos_cluster_k3s_single_node.yaml
+#
+# 2. THEN, customize the VSphereCluster and VSphereMachineTemplate below:
+#    - Set server, datacenter, datastore, network, template names
+#    - Edit the values marked with TODO comments
+#
+# 3. FINALLY, apply the entire manifest again (or apply just the cluster parts)
+#    - kubectl apply -f config/samples/capv/kairos_cluster_k3s_single_node.yaml
+#
+# ============================================================================
+
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: kairos-cluster
+  namespace: default
+spec:
+  infrastructureRef:
+    # Note: In v1beta2, use apiGroup instead of apiVersion
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: VSphereCluster
+    name: kairos-cluster
+  controlPlaneRef:
+    # Note: In v1beta2, use apiGroup instead of apiVersion
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KairosControlPlane
+    name: kairos-control-plane
+  # Required for k3s workers: set a stable API endpoint
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-LB-OR-VIP"
+    port: 6443
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereCluster
+metadata:
+  name: kairos-cluster
+  namespace: default
+spec:
+  # Required: vCenter server FQDN or IP address
+  # IMPORTANT: Use only the hostname or IP address, NOT a URL with protocol/path
+  # Correct: "vcenter.example.com" or "172.16.56.10"
+  # Wrong: "https://vcenter.example.com" or "https://172.16.56.10/sdk"
+  server: "vcsa.lab.k8"
+  
+  # Optional: SSL thumbprint for vCenter certificate validation
+  # thumbprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD"
+  
+  # Option 1: Use VSphereClusterIdentity (RECOMMENDED for production)
+  # First, create a VSphereClusterIdentity and Secret (see below), then reference it:
+  identityRef:
+    kind: VSphereClusterIdentity
+    name: vsphere-credentials
+  # Note: identityRef does NOT have an apiVersion field
+  
+  # Option 2: Inline credentials (NOT RECOMMENDED - use only for testing)
+  # If you don't use identityRef, you can specify credentials directly:
+  # credentials:
+  #   username: "administrator@vsphere.local"
+  #   password: "your-password"
+  
+  # Note: datacenter is NOT specified here - it's specified in VSphereMachineTemplate instead
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-control-plane
+  namespace: default
+spec:
+  replicas: 1
+  version: "v1.30.0+k3s.0"
+  distribution: k3s
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: VSphereMachineTemplate
+      name: kairos-control-plane-template
+      namespace: default
+  kairosConfigTemplate:
+    name: kairos-config-template-control-plane
+    # Note: namespace is NOT specified here - it defaults to the same namespace as KairosControlPlane
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereMachineTemplate
+metadata:
+  name: kairos-control-plane-template
+  namespace: default
+spec:
+  template:
+    spec:
+      # TODO: Configure vSphere VM settings
+      # datacenter: "Datacenter"
+      # datastore: "Datastore"
+      # folder: "Folder"
+      # network:
+      #   devices:
+      #     - networkName: "VM Network"
+      # resourcePool: "ResourcePool"
+      # numCPUs: 2
+      # memoryMiB: 4096
+      # diskGiB: 50
+      # template: "kairos-template"  # Name of the Kairos VM template in vSphere
+      # cloneMode: "fullClone"
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      distribution: k3s
+      kubernetesVersion: "v1.30.0+k3s.0"
+      install:
+        auto: true
+        device: "auto"
+        reboot: true
+      userName: kairos
+      userPassword: kairos
+      userGroups:
+        - admin
+      # Optional: Add GitHub user for SSH access
+      # githubUser: "your-github-username"
+      # Optional: Add SSH public key instead
+      # sshPublicKey: "ssh-rsa AAAAB3NzaC1yc2E..."
+---
+# Optional: Worker token secret (required for k3s agents)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-k3s-worker-token
+  namespace: default
+type: Opaque
+stringData:
+  token: "REPLACE-WITH-K3S-JOIN-TOKEN"
+---
+# Optional: Worker MachineDeployment (delete if you only want single-node control-plane)
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: kairos-workers
+  namespace: default
+spec:
+  clusterName: kairos-cluster
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: kairos-cluster
+      cluster.x-k8s.io/deployment-name: kairos-workers
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: kairos-cluster
+        cluster.x-k8s.io/deployment-name: kairos-workers
+    spec:
+      version: "v1.30.0+k3s.0"
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          kind: KairosConfigTemplate
+          name: kairos-config-template-workers
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: VSphereMachineTemplate
+        name: kairos-worker-template
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereMachineTemplate
+metadata:
+  name: kairos-worker-template
+  namespace: default
+spec:
+  template:
+    spec:
+      # TODO: Configure vSphere VM settings for workers
+      # datacenter: "Datacenter"
+      # datastore: "Datastore"
+      # folder: "Folder"
+      # network:
+      #   devices:
+      #     - networkName: "VM Network"
+      # resourcePool: "ResourcePool"
+      # numCPUs: 2
+      # memoryMiB: 4096
+      # diskGiB: 50
+      # template: "kairos-template"  # Name of the Kairos VM template in vSphere
+      # cloneMode: "fullClone"
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-workers
+  namespace: default
+spec:
+  template:
+    spec:
+      role: worker
+      distribution: k3s
+      kubernetesVersion: "v1.30.0+k3s.0"
+      k3sTokenSecretRef:
+        name: kairos-k3s-worker-token
+        key: token
+      userName: kairos
+      userPassword: kairos
+      userGroups:
+        - admin
+---
+# ============================================================================
+# VSphere Credentials Setup (REQUIRED - apply this BEFORE the cluster manifest)
+# ============================================================================
+#
+# Step 1: Create a Secret with your vSphere credentials
+#
+# IMPORTANT:
+# 1. Replace the placeholder values with your actual vSphere credentials
+# 2. The Secret MUST be created in the capv-system namespace (where CAPV controller runs)
+# 3. Apply this Secret BEFORE applying the cluster manifest above
+#
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsphere-credentials-secret
+  namespace: capv-system  # IMPORTANT: MUST be in capv-system namespace (not the cluster namespace)
+type: Opaque
+stringData:
+  username: "administrator@vsphere.local"  # TODO: Replace with your vSphere username
+  password: "your-vsphere-password"        # TODO: Replace with your vSphere password
+---
+# Step 2: Create a VSphereClusterIdentity that references the Secret
+#
+# This allows the VSphereCluster to use the credentials securely.
+# The allowedNamespaces field controls which namespaces can use this identity.
+#
+# IMPORTANT NOTES:
+# - VSphereClusterIdentity is cluster-scoped (no namespace)
+# - The Secret referenced by secretName must be in capv-system namespace
+# - If using Option B (label selector), label your cluster namespace first:
+#   kubectl label namespace default vsphere-identity=allowed
+#
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereClusterIdentity
+metadata:
+  name: vsphere-credentials
+  # Note: VSphereClusterIdentity is cluster-scoped (no namespace)
+spec:
+  secretName: vsphere-credentials-secret  # References the Secret in capv-system namespace
+  allowedNamespaces:
+    # Use a selector to control which namespaces can use this identity
+    # Option A: Allow all namespaces (use with caution)
+    selector:
+      matchLabels: {}
+    # Option B: Allow specific namespaces by label (RECOMMENDED)
+    # First, label your namespaces:
+    #   kubectl label namespace default vsphere-identity=allowed
+    #   kubectl label namespace production vsphere-identity=allowed
+    # Then use:
+    # selector:
+    #   matchLabels:
+    #     vsphere-identity: allowed

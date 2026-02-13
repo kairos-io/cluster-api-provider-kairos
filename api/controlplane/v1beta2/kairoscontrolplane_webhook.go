@@ -50,6 +50,11 @@ func (r *KairosControlPlane) Default() {
 		replicas := int32(1)
 		r.Spec.Replicas = &replicas
 	}
+
+	// Set default distribution
+	if r.Spec.Distribution == "" {
+		r.Spec.Distribution = "k0s"
+	}
 }
 
 //+kubebuilder:webhook:path=/validate-controlplane-cluster-x-k8s-io-v1beta2-kairoscontrolplane,mutating=false,failurePolicy=fail,sideEffects=None,groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=create;update,versions=v1beta2,name=vkairoscontrolplane.kb.io,admissionReviewVersions=v1
@@ -84,6 +89,15 @@ func (r *KairosControlPlane) validate() error {
 			field.NewPath("spec", "replicas"),
 			*r.Spec.Replicas,
 			"spec.replicas must be greater than or equal to 1",
+		))
+	}
+
+	// Validate distribution
+	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" && r.Spec.Distribution != "k3s" {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec", "distribution"),
+			r.Spec.Distribution,
+			"spec.distribution must be one of [k0s, k3s]",
 		))
 	}
 

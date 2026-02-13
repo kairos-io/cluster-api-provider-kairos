@@ -183,6 +183,11 @@ func (in *KairosConfigSpec) DeepCopyInto(out *KairosConfigSpec) {
 		*out = new(WorkerTokenSecretReference)
 		**out = **in
 	}
+	if in.K3sTokenSecretRef != nil {
+		in, out := &in.K3sTokenSecretRef, &out.K3sTokenSecretRef
+		*out = new(WorkerTokenSecretReference)
+		**out = **in
+	}
 	if in.Manifests != nil {
 		in, out := &in.Manifests, &out.Manifests
 		*out = make([]Manifest, len(*in))

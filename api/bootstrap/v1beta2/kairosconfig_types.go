@@ -36,8 +36,7 @@ type KairosConfigSpec struct {
 	Role string `json:"role,omitempty"`
 
 	// Distribution specifies the Kubernetes distribution to install
-	// Currently only k0s is supported. k3s support is planned for future releases.
-	// +kubebuilder:validation:Enum=k0s
+	// +kubebuilder:validation:Enum=k0s;k3s
 	// +kubebuilder:default=k0s
 	Distribution string `json:"distribution,omitempty"`
 
@@ -125,9 +124,21 @@ type KairosConfigSpec struct {
 	// +optional
 	WorkerTokenSecretRef *WorkerTokenSecretReference `json:"workerTokenSecretRef,omitempty"`
 
-	// Manifests are Kubernetes manifests to be placed in /var/lib/k0s/manifests/
-	// These will be automatically applied by k0s at cluster startup.
-	// Each manifest is placed at /var/lib/k0s/manifests/{Name}/{File}
+	// K3sToken is the join token for k3s nodes (inline specification)
+	// For production use, prefer K3sTokenSecretRef instead.
+	// If both K3sToken and K3sTokenSecretRef are set, K3sTokenSecretRef takes precedence.
+	// +optional
+	K3sToken string `json:"k3sToken,omitempty"`
+
+	// K3sTokenSecretRef is a reference to a Secret containing the k3s join token
+	// The Secret must contain a key specified by K3sTokenSecretRef.Key (defaults to "token").
+	// +optional
+	K3sTokenSecretRef *WorkerTokenSecretReference `json:"k3sTokenSecretRef,omitempty"`
+
+	// Manifests are Kubernetes manifests to be placed in the distribution manifests directory.
+	// These will be automatically applied by the distribution at cluster startup.
+	// k0s: /var/lib/k0s/manifests/{Name}/{File}
+	// k3s: /var/lib/rancher/k3s/server/manifests/{Name}/{File}
 	// +optional
 	Manifests []Manifest `json:"manifests,omitempty"`
 
