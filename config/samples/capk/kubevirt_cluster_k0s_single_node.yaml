@@ -10,6 +10,7 @@
 #
 # 3. Update the KubeVirtMachineTemplate below:
 #    - Adjust CPU/memory/disk sizes
+#    - nodeSelector and DataVolume names are environment-specific; customize for your cluster
 #    - If using a cloud disk image, set the rootdisk DataVolume name to that image
 #    - If using an ISO, set installeriso to the ISO DataVolume and
 #      create a blank install disk DataVolume (kairos-install-disk)
@@ -68,6 +69,9 @@ metadata:
 spec:
   template:
     spec:
+      # Bypass SSH sentinel check - kubeconfig push avoids SSH; SSH may fail in bridged setups
+      virtualMachineBootstrapCheck:
+        checkStrategy: none
       virtualMachineTemplate:
         spec:
           runStrategy: Always
@@ -76,7 +80,7 @@ spec:
               labels:
                 kubevirt.io/domain: kairos-control-plane-template
             spec:
-              # Schedule on the bare metal node with KVM.
+              # Schedule on a node with KVM. Customize for your environment (e.g., remove or set to your node name).
               nodeSelector:
                 kubernetes.io/hostname: grogu
               domain:

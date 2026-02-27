@@ -1,6 +1,6 @@
 # Kairos CAPI Provider
 
-**Cluster API providers for Kairos OS. This project is under active development.**
+**Cluster API providers for Kairos OS.**
 
 ## Overview
 
@@ -11,7 +11,7 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 ## Status
 
-**Early development** - MVP implementation in progress. Supports single-node k0s and k3s clusters with CAPD, CAPV, and CAPK.
+Supports single-node k0s and k3s clusters with CAPD, CAPV, and CAPK.
 
 ## Target Versions
 
@@ -23,7 +23,6 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 ## Documentation
 
 - [Install guide](docs/INSTALL.md) - Development install using make
-- [Design](docs/DESIGN.md) - Architecture and design
 - [API Reference](docs/API_REFERENCE.md) - CRD reference
 - [Testing](docs/TESTING.md) - How to run tests
 

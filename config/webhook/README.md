@@ -2,6 +2,8 @@
 
 This directory contains the webhook configurations for the Kairos CAPI Provider.
 
+The webhook resources are named `mutating-webhook-configuration` and `validating-webhook-configuration` (see `manifests.yaml`). If you use a different kustomize overlay that adds name prefixes, adjust the patch commands accordingly.
+
 ## CA Bundle Injection
 
 The webhook configurations require a CA bundle to be injected into the `clientConfig.caBundle` field. This CA bundle comes from the certificate secret created by cert-manager.

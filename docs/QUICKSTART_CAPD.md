@@ -2,6 +2,8 @@
 
 This guide walks you through creating a single-node k0s cluster on Kairos using Cluster API with the Docker provider (CAPD).
 
+**Note:** The CAPD sample provided uses k0s. For k3s clusters, use [CAPV](QUICKSTART_CAPV.md) or [CAPK](QUICKSTART_CAPK.md).
+
 ## Prerequisites
 
 1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster)

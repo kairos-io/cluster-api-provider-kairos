@@ -10,6 +10,7 @@
 #
 # 3. Update the KubeVirtMachineTemplate below:
 #    - Adjust CPU/memory/disk sizes
+#    - nodeSelector and DataVolume names are environment-specific; customize for your cluster
 #    - If using a cloud disk image, set the rootdisk DataVolume name to that image
 #    - If using an ISO, set installeriso to the ISO DataVolume and
 #      create a blank install disk DataVolume (kairos-install-disk)
@@ -35,9 +36,10 @@ spec:
     apiGroup: controlplane.cluster.x-k8s.io
     kind: KairosControlPlane
     name: kairos-control-plane-kv-capk
-  # Required for k3s workers: set a stable API endpoint
+  # controlPlaneEndpoint is auto-populated by the controller from the LoadBalancer Service.
+  # Placeholder required for initial apply; MetalLB or similar assigns the LB IP.
   controlPlaneEndpoint:
-    host: "TODO-REPLACE-WITH-LB-OR-VIP"
+    host: "PLACEHOLDER-FOR-LB-IP"
     port: 6443
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
@@ -73,6 +75,9 @@ metadata:
 spec:
   template:
     spec:
+      # Bypass SSH sentinel check - kubeconfig push avoids SSH; SSH may fail in bridged setups
+      virtualMachineBootstrapCheck:
+        checkStrategy: none
       virtualMachineTemplate:
         spec:
           runStrategy: Always
@@ -81,7 +86,7 @@ spec:
               labels:
                 kubevirt.io/domain: kairos-control-plane-template
             spec:
-              # Schedule on the bare metal node with KVM.
+              # Schedule on a node with KVM. Customize for your environment (e.g., remove or set to your node name).
               nodeSelector:
                 kubernetes.io/hostname: grogu
               domain:
@@ -213,6 +218,7 @@ spec:
               labels:
                 kubevirt.io/domain: kairos-worker-template
             spec:
+              # Schedule on a node with KVM. Customize for your environment.
               nodeSelector:
                 kubernetes.io/hostname: grogu
               domain:

@@ -353,6 +353,78 @@ func TestRenderK3sCloudConfig_ControlPlaneWithoutProviderID(t *testing.T) {
 	}
 }
 
+func TestRenderK3sCloudConfig_CapkBootstrapTrap(t *testing.T) {
+	data := TemplateData{
+		Role:       "control-plane",
+		SingleNode: true,
+		UserName:   "kairos",
+		IsKubeVirt: true,
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "CAPK: always mark bootstrap success on script exit") {
+		t.Error("Missing CAPK bootstrap success trap for KubeVirt k3s")
+	}
+	if !strings.Contains(result, "bootstrap-success.complete") {
+		t.Error("Missing bootstrap success file creation for KubeVirt k3s")
+	}
+}
+
+func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
+	data := TemplateData{
+		Role:                                "control-plane",
+		SingleNode:                          true,
+		UserName:                            "kairos",
+		IsKubeVirt:                          true,
+		ManagementKubeconfigToken:           "test-token",
+		ManagementKubeconfigSecretName:      "cluster-kubeconfig",
+		ManagementKubeconfigSecretNamespace: "default",
+		ManagementAPIServer:                 "https://1.2.3.4:6443",
+		ControlPlaneLBEndpoint:              "10.0.0.1",
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "Push kubeconfig to management cluster without SSH") {
+		t.Error("Missing kubeconfig push block for CAPK k3s")
+	}
+	if !strings.Contains(result, "/etc/rancher/k3s/k3s.yaml") {
+		t.Error("Missing k3s kubeconfig path in push block")
+	}
+	if !strings.Contains(result, "https://10.0.0.1:6443") {
+		t.Error("Missing ControlPlaneLBEndpoint in kubeconfig server URL replacement")
+	}
+	if !strings.Contains(result, "systemctl enable kairos-k3s-post-bootstrap.service") {
+		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
+	}
+}
+
+func TestRenderK3sCloudConfig_CapkTlsSan(t *testing.T) {
+	data := TemplateData{
+		Role:                   "control-plane",
+		SingleNode:             true,
+		UserName:               "kairos",
+		IsKubeVirt:             true,
+		ControlPlaneLBEndpoint: "10.0.0.1",
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "--tls-san=10.0.0.1") {
+		t.Error("Missing --tls-san for ControlPlaneLBEndpoint in k3s CAPK template")
+	}
+}
+
 func TestRenderK0sCloudConfig_CapvTemplateExcludesCapkBlocks(t *testing.T) {
 	data := TemplateData{
 		Role:         "control-plane",

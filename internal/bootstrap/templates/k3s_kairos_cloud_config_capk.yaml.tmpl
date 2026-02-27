@@ -59,11 +59,17 @@ users:
 # Control-plane node configuration
 # Pass providerID at k3s startup so node registers with correct providerID (avoids k3s:// vs kubevirt:// mismatch)
 # Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
+# Add --tls-san for LB endpoint so management cluster can connect via LoadBalancer
 k3s:
   enabled: true
-  {{- if .ProviderID }}
+  {{- if or .ProviderID .ControlPlaneLBEndpoint }}
   args:
+  {{- if .ProviderID }}
     - --kubelet-arg=provider-id={{ .ProviderID }}
+  {{- end }}
+  {{- if .ControlPlaneLBEndpoint }}
+    - --tls-san={{ .ControlPlaneLBEndpoint }}
+  {{- end }}
   {{- end }}
 
 {{- else }}
@@ -156,23 +162,21 @@ write_files:
       #!/bin/bash
       set -e
       PROVIDER_ID=""
-      # Try DMI product_uuid first (KubeVirt VMs may expose UUID)
-      if [ -f /sys/class/dmi/id/product_uuid ]; then
+      # Prefer hostname: CAPK uses kubevirt://<vm-name> and hostname matches KubevirtMachine/VM name
+      {{- if .Hostname }}
+      PROVIDER_ID="kubevirt://{{ .Hostname }}"
+      echo "Discovered providerID: $PROVIDER_ID (hostname)"
+      {{- end }}
+      # Fallback: DMI product_uuid (KubeVirt VMs may expose UUID; only if hostname not available)
+      if [ -z "$PROVIDER_ID" ] && [ -f /sys/class/dmi/id/product_uuid ]; then
         RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
         HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
         if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
           FORMATTED="${HEX:0:8}-${HEX:8:4}-${HEX:12:4}-${HEX:16:4}-${HEX:20:12}"
           PROVIDER_ID="kubevirt://${FORMATTED}"
-          echo "Discovered providerID: $PROVIDER_ID"
+          echo "Discovered providerID: $PROVIDER_ID (DMI)"
         fi
       fi
-      # Fallback: CAPK often uses kubevirt://namespace/vm-name (hostname usually matches vm name)
-      {{- if and .ClusterNS .Hostname }}
-      if [ -z "$PROVIDER_ID" ]; then
-        PROVIDER_ID="kubevirt://{{ .ClusterNS }}/{{ .Hostname }}"
-        echo "Discovered providerID: $PROVIDER_ID (fallback)"
-      fi
-      {{- end }}
       if [ -n "$PROVIDER_ID" ]; then
         mkdir -p /etc/rancher/k3s/config.yaml.d
         printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
@@ -257,6 +261,67 @@ MANIFEST_EOF
       fi
       {{- end }}
       
+      {{- if .ManagementKubeconfigToken }}
+      # Push kubeconfig to management cluster without SSH (KubeVirt/CAPK)
+      # Update server URL to LB endpoint so management cluster can connect
+      push_kubeconfig() {
+        local kubeconfig_file="/etc/rancher/k3s/k3s.yaml"
+        if [ ! -f "${kubeconfig_file}" ]; then
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file}"
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push kubeconfig"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push kubeconfig"
+          return 1
+        fi
+        local kubeconfig_b64
+        {{- if .ControlPlaneLBEndpoint }}
+        local tmp_kubeconfig
+        tmp_kubeconfig=$(mktemp)
+        sed "s|https://[^[:space:]]*:6443|https://{{ .ControlPlaneLBEndpoint }}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
+        kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
+        rm -f "${tmp_kubeconfig}"
+        {{- else }}
+        kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
+        {{- end }}
+        local api="{{ .ManagementAPIServer }}"
+        local ns="{{ .ManagementKubeconfigSecretNamespace }}"
+        local name="{{ .ManagementKubeconfigSecretName }}"
+        local token="{{ .ManagementKubeconfigToken }}"
+        local payload
+        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" \
+          -X PUT \
+          --data "${payload}" \
+          "${url}" || true)
+        if [ "${status}" = "404" ]; then
+          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "${payload}" \
+            "${api}/api/v1/namespaces/${ns}/secrets" || true)
+        fi
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed kubeconfig to management secret ${ns}/${name}"
+          return 0
+        fi
+        echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
+        return 1
+      }
+      if ! push_kubeconfig; then
+        echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+      {{- end }}
+      
       # Mark bootstrap success for CAPI/CAPK consumers
       mkdir -p /run/cluster-api
       echo "success" > /run/cluster-api/bootstrap-success.complete
@@ -302,5 +367,7 @@ stages:
     {{- end }}
 
 runcmd:
+{{- if .IsKubeVirt }}
   - /bin/systemctl daemon-reload || true
   - /bin/systemctl enable kairos-k3s-post-bootstrap.service || true
+{{- end }}

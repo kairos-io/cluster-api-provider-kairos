@@ -157,6 +157,17 @@ func cloneKubevirtMachineTemplate(ctx context.Context, c client.Client, scheme *
 	kubevirtMachine.SetLabels(labels)
 	kubevirtMachine.SetAnnotations(annotations)
 
+	// Copy virtualMachineBootstrapCheck from template (e.g. checkStrategy: none to bypass SSH sentinel check)
+	// Template: spec.template.spec.virtualMachineBootstrapCheck -> KubevirtMachine: spec.virtualMachineBootstrapCheck
+	// Default to "none" when not set - kubeconfig push avoids SSH; SSH often fails in bridged/Virtio setups
+	bootstrapCheck := map[string]interface{}{"checkStrategy": "none"}
+	if fromTemplate, ok, _ := unstructured.NestedMap(template.UnstructuredContent(), "spec", "template", "spec", "virtualMachineBootstrapCheck"); ok && len(fromTemplate) > 0 {
+		bootstrapCheck = fromTemplate
+	}
+	if err := unstructured.SetNestedMap(kubevirtMachine.UnstructuredContent(), bootstrapCheck, "spec", "virtualMachineBootstrapCheck"); err != nil {
+		return nil, fmt.Errorf("failed to set virtualMachineBootstrapCheck: %w", err)
+	}
+
 	// Copy the virtualMachineTemplate.spec from the template
 	// Template structure: spec.template.spec.virtualMachineTemplate.spec
 	// KubevirtMachine structure: spec.virtualMachineTemplate.spec

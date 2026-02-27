@@ -1073,6 +1073,16 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 	// Get providerID from Machine's infrastructure reference
 	providerID := r.getProviderID(ctx, log, machine)
 
+	// CAPK: ensure kubeconfig push config and LB endpoint for KubeVirt control-plane (same as k0s)
+	var kubeconfigPush *kubeconfigPushConfig
+	if isKubevirtMachine(machine) && role == "control-plane" {
+		var err error
+		kubeconfigPush, err = r.ensureKubeconfigPushConfig(ctx, log, kairosConfig, cluster)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	// Build template data
 	templateData := bootstrap.TemplateData{
 		Role:                                role,
@@ -1102,12 +1112,29 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		ManagementKubeconfigSecretNamespace: "",
 		ManagementAPIServer:                 "",
 	}
-
+	if kubeconfigPush != nil {
+		templateData.ManagementKubeconfigToken = kubeconfigPush.Token
+		templateData.ManagementKubeconfigSecretName = kubeconfigPush.SecretName
+		templateData.ManagementKubeconfigSecretNamespace = kubeconfigPush.SecretNamespace
+		templateData.ManagementAPIServer = kubeconfigPush.APIServer
+	}
 	if machine != nil {
 		templateData.MachineName = machine.Name
 	}
 	if cluster != nil {
 		templateData.ClusterNS = cluster.Namespace
+		templateData.ControlPlaneLBServiceName = fmt.Sprintf("%s-%s", cluster.Name, controlPlaneLBServiceSuffix)
+		templateData.ControlPlaneLBServiceNamespace = cluster.Namespace
+	}
+	if cluster != nil && isKubevirtMachine(machine) && role == "control-plane" {
+		lbEndpoint, err := r.getControlPlaneLBEndpoint(ctx, cluster.Namespace, templateData.ControlPlaneLBServiceName)
+		if err != nil {
+			return "", fmt.Errorf("failed to get control plane LB endpoint: %w", err)
+		}
+		if lbEndpoint == "" {
+			return "", errLBEndpointNotReady
+		}
+		templateData.ControlPlaneLBEndpoint = lbEndpoint
 	}
 
 	return bootstrap.RenderK3sCloudConfig(templateData)

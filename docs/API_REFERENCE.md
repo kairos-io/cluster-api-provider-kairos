@@ -17,7 +17,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 **API Version:** `v1beta2`  
 **Kind:** `KairosConfig`
 
-`KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s.
+`KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s.
 
 ### Spec Fields
 
@@ -25,16 +25,20 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 |-------|------|----------|---------|-------------|
 | `role` | `string` | Yes | `"worker"` | Node role: `"control-plane"` or `"worker"` |
 | `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"` or `"k3s"` |
-| `kubernetesVersion` | `string` | Yes | - | Kubernetes version to install (e.g., `"v1.30.0+k0s.0"`) |
+| `kubernetesVersion` | `string` | Yes | - | Kubernetes version to install (e.g., `"v1.30.0+k0s.0"` or `"v1.30.0+k3s.0"`) |
 | `singleNode` | `bool` | No | `false` | For control-plane: if `true`, configures k0s with `--single` flag for single-node mode |
 | `userName` | `string` | No | `"kairos"` | Username for the default user |
 | `userPassword` | `string` | No | `"kairos"` | Password for the default user. Change for non-dev use. |
 | `userGroups` | `[]string` | No | `["admin"]` | Groups for the default user |
 | `githubUser` | `string` | No | - | GitHub username for SSH key access (fetches keys from GitHub) |
 | `sshPublicKey` | `string` | No | - | Raw SSH public key (alternative to `githubUser`) |
-| `workerToken` | `string` | No* | - | Inline worker join token. *Required for worker nodes if `workerTokenSecretRef` is not set |
-| `workerTokenSecretRef` | `WorkerTokenSecretReference` | No* | - | Reference to Secret containing worker token. *Required for worker nodes if `workerToken` is not set. Prefer this over inline token for security |
-| `manifests` | `[]Manifest` | No | - | Kubernetes manifests to deploy via k0s (placed in `/var/lib/k0s/manifests/`) |
+| `workerToken` | `string` | No* | - | Inline worker join token (k0s). *Required for k0s workers if `workerTokenSecretRef` is not set |
+| `workerTokenSecretRef` | `WorkerTokenSecretReference` | No* | - | Reference to Secret containing worker token (k0s). *Required for k0s workers if `workerToken` is not set. Prefer this over inline token for security |
+| `k3sToken` | `string` | No* | - | Inline k3s join token. *Required for k3s workers if `k3sTokenSecretRef` is not set |
+| `k3sTokenSecretRef` | `WorkerTokenSecretReference` | No* | - | Reference to Secret containing k3s join token. *Required for k3s workers if `k3sToken` is not set. Prefer this over inline token for security |
+| `manifests` | `[]Manifest` | No | - | Kubernetes manifests to deploy. k0s: `/var/lib/k0s/manifests/{name}/`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/` |
+| `preCommands` | `[]string` | No | - | Commands to run before k0s/k3s installation. Reserved for future use; not yet rendered in cloud-config |
+| `postCommands` | `[]string` | No | - | Commands to run after k0s/k3s installation. Reserved for future use; not yet rendered in cloud-config |
 | `pause` | `bool` | No | `false` | If `true`, pauses reconciliation |
 
 #### WorkerTokenSecretReference
@@ -49,7 +53,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | `string` | Yes | Directory name under `/var/lib/k0s/manifests/{name}/` |
+| `name` | `string` | Yes | Directory name. k0s: `/var/lib/k0s/manifests/{name}/{file}`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/{file}` |
 | `file` | `string` | Yes | Filename within the directory |
 | `content` | `string` | Yes | YAML content of the manifest |
 
@@ -82,6 +86,23 @@ spec:
   userGroups:
     - admin
   githubUser: "octocat"
+```
+
+For k3s workers, use `k3sTokenSecretRef` (or `k3sToken`):
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfig
+metadata:
+  name: kairos-config-worker
+  namespace: default
+spec:
+  role: worker
+  distribution: k3s
+  kubernetesVersion: "v1.30.0+k3s.0"
+  k3sTokenSecretRef:
+    name: k3s-worker-token
+    key: token
 ```
 
 ---
@@ -247,7 +268,11 @@ spec:
 
 ### Worker Token Requirements
 
-For `KairosConfig` with `role: worker`, either `workerToken` or `workerTokenSecretRef` must be set. The controller will fail reconciliation if neither is provided.
+For `KairosConfig` with `role: worker`:
+- **k0s**: Either `workerToken` or `workerTokenSecretRef` must be set.
+- **k3s**: Either `k3sToken` or `k3sTokenSecretRef` must be set (or `workerToken`/`workerTokenSecretRef` as fallback).
+
+The controller will fail reconciliation if no token is provided.
 
 ### Single-Node Mode
 

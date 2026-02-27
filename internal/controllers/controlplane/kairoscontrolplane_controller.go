@@ -897,17 +897,31 @@ func (r *KairosControlPlaneReconciler) reconcileKubeconfig(ctx context.Context, 
 		return fmt.Errorf("failed to retrieve kubeconfig from node: %w", err)
 	}
 
-	// k3s default kubeconfig uses https://127.0.0.1:6443 - update to node IP so management cluster can connect
+	// k3s default kubeconfig uses https://127.0.0.1:6443 - update to reachable address so management cluster can connect
+	// For KubeVirt, prefer LB endpoint over node IP (canonical reachable address from management cluster)
 	if kcp.Spec.Distribution == "k3s" {
-		nodeIP, nodeErr := r.getNodeIP(ctx, log, readyMachine)
-		sshHost, hostErr := resolveSSHHost(readyMachine, cluster, nodeIP, nodeErr, log)
-		if hostErr == nil && sshHost != "" {
-			updated, updateErr := updateKubeconfigServerToNodeIP(kubeconfig, sshHost, 6443)
+		serverHost := ""
+		if isKubevirtControlPlane(kcp) {
+			lbHost, lbPort, lbErr := r.getControlPlaneLBEndpoint(ctx, log, cluster)
+			if lbErr == nil && lbHost != "" && lbPort != 0 {
+				serverHost = lbHost
+				log.V(4).Info("Using LoadBalancer endpoint for k3s kubeconfig server", "host", lbHost, "port", lbPort)
+			}
+		}
+		if serverHost == "" {
+			nodeIP, nodeErr := r.getNodeIP(ctx, log, readyMachine)
+			sshHost, hostErr := resolveSSHHost(readyMachine, cluster, nodeIP, nodeErr, log)
+			if hostErr == nil && sshHost != "" {
+				serverHost = sshHost
+			}
+		}
+		if serverHost != "" {
+			updated, updateErr := updateKubeconfigServerToNodeIP(kubeconfig, serverHost, 6443)
 			if updateErr != nil {
 				log.Error(updateErr, "Failed to update kubeconfig server for k3s, using as-is")
 			} else {
 				kubeconfig = updated
-				log.Info("Updated k3s kubeconfig server to node IP", "nodeIP", sshHost)
+				log.Info("Updated k3s kubeconfig server", "host", serverHost)
 			}
 		}
 	}
@@ -1113,6 +1127,13 @@ func (r *KairosControlPlaneReconciler) getInfrastructureProviderID(ctx context.C
 		}
 		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
 			return providerID
+		}
+		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "status", "providerID"); err == nil && found && providerID != "" {
+			return providerID
+		}
+		// CAPK uses kubevirt://<KubevirtMachine.Name>; construct when VMI exists
+		if _, err := r.getKubevirtVMIIP(ctx, log, machine); err == nil {
+			return fmt.Sprintf("kubevirt://%s", kubevirtMachineKey.Name)
 		}
 	case "DockerMachine":
 		dockerMachine := &unstructured.Unstructured{}
@@ -1709,25 +1730,11 @@ func (r *KairosControlPlaneReconciler) executeK3sKubeconfigCommand(ctx context.C
 
 // updateClusterStatus updates the Cluster status based on control plane readiness
 func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
-	// Check if kubeconfig secret exists
 	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
 	secretKey := types.NamespacedName{
 		Name:      secretName,
 		Namespace: cluster.Namespace,
 	}
-
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			// Kubeconfig not ready yet - don't update cluster status, just return
-			// The cluster controller will handle status updates
-			log.V(4).Info("Kubeconfig secret not found, skipping cluster status update", "secret", secretName)
-			return nil
-		}
-		return err
-	}
-
-	log.Info("updateClusterStatus called", "cluster", cluster.Name, "kubeconfigExists", true)
 
 	// Re-fetch the cluster to ensure we have the latest version before updating
 	// This prevents conflicts with other controllers that might be updating the cluster
@@ -1740,9 +1747,8 @@ func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, 
 		return fmt.Errorf("failed to re-fetch cluster for updating: %w", err)
 	}
 
-	// Set controlPlaneEndpoint if not already set
-	// This is required for the Machine controller to connect to the workload cluster
-	// Track if we need to update the spec
+	// Set controlPlaneEndpoint if not already set (runs before kubeconfig check so LB endpoint
+	// is set as soon as LoadBalancer has an IP, enabling SSH retrieval and Machine controller)
 	needsSpecUpdate := false
 	currentHost := clusterToPatch.Spec.ControlPlaneEndpoint.Host
 	currentPort := clusterToPatch.Spec.ControlPlaneEndpoint.Port
@@ -1763,13 +1769,7 @@ func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, 
 			} else {
 				log.V(4).Info("controlPlaneEndpoint already set to LoadBalancer", "currentHost", currentHost, "currentPort", currentPort)
 			}
-
-			updated, err := r.ensureKubeconfigServer(ctx, log, secret, lbHost, lbPort)
-			if err != nil {
-				log.Error(err, "Failed to ensure kubeconfig server", "cluster", clusterToPatch.Name)
-			} else if updated {
-				log.Info("Updated kubeconfig server to match LoadBalancer endpoint", "cluster", clusterToPatch.Name, "host", lbHost, "port", lbPort)
-			}
+			// ensureKubeconfigServer runs below, only when secret exists
 		} else {
 			log.Info("LoadBalancer endpoint not ready yet", "cluster", clusterToPatch.Name)
 		}
@@ -1832,6 +1832,45 @@ func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, 
 				} else {
 					log.V(4).Info("No IP or hostname found for machine", "machine", machine.Name)
 				}
+			}
+		}
+	}
+
+	// Check if kubeconfig secret exists - early exit if not, but controlPlaneEndpoint already updated above
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, secretKey, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.V(4).Info("Kubeconfig secret not found, skipping cluster status update", "secret", secretName)
+			// Still update spec if controlPlaneEndpoint was set (e.g. from LB)
+			if needsSpecUpdate {
+				log.Info("Updating cluster spec with controlPlaneEndpoint", "cluster", clusterToPatch.Name, "host", clusterToPatch.Spec.ControlPlaneEndpoint.Host, "port", clusterToPatch.Spec.ControlPlaneEndpoint.Port)
+				if err := r.Update(ctx, clusterToPatch); err != nil {
+					if apierrors.IsConflict(err) {
+						log.V(4).Info("Conflict updating cluster spec, will retry on next reconcile", "cluster", clusterToPatch.Name, "error", err)
+						return nil
+					}
+					return fmt.Errorf("failed to update cluster spec: %w", err)
+				}
+				log.Info("Successfully updated cluster spec with controlPlaneEndpoint", "cluster", clusterToPatch.Name)
+			}
+			return nil
+		}
+		return err
+	}
+
+	log.Info("updateClusterStatus called", "cluster", cluster.Name, "kubeconfigExists", true)
+
+	// For KubeVirt, ensure kubeconfig server URL matches LoadBalancer endpoint (only when secret exists)
+	if isKubevirtControlPlane(kcp) {
+		lbHost, lbPort, err := r.getControlPlaneLBEndpoint(ctx, log, clusterToPatch)
+		if err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to get control plane LoadBalancer endpoint for kubeconfig", "cluster", clusterToPatch.Name)
+		} else if lbHost != "" && lbPort != 0 {
+			updated, err := r.ensureKubeconfigServer(ctx, log, secret, lbHost, lbPort)
+			if err != nil {
+				log.Error(err, "Failed to ensure kubeconfig server", "cluster", clusterToPatch.Name)
+			} else if updated {
+				log.Info("Updated kubeconfig server to match LoadBalancer endpoint", "cluster", clusterToPatch.Name, "host", lbHost, "port", lbPort)
 			}
 		}
 	}

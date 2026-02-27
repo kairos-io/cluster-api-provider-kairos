@@ -6,7 +6,7 @@ metadata:
 spec:
   role: control-plane
   distribution: k0s
-  kubernetesVersion: "1.30.0"
+  kubernetesVersion: "v1.30.0+k0s.0"
   preCommands:
     - echo "Pre-install commands"
   postCommands:
@@ -21,10 +21,11 @@ metadata:
 spec:
   role: worker
   distribution: k0s
-  kubernetesVersion: "1.30.0"
+  kubernetesVersion: "v1.30.0+k0s.0"
   serverAddress: "https://control-plane.example.com:6443"
-  tokenSecretRef:
+  workerTokenSecretRef:
     name: k0s-token
+    key: token
     namespace: default
 
 ---
@@ -38,5 +39,8 @@ spec:
     spec:
       role: worker
       distribution: k0s
-      kubernetesVersion: "1.30.0"
+      kubernetesVersion: "v1.30.0+k0s.0"
+      workerTokenSecretRef:
+        name: k0s-token
+        key: token
 

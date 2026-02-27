@@ -901,3 +901,85 @@ func TestGenerateK3sCloudConfig_WorkerTokenSecretMissing(t *testing.T) {
 
 	g.Expect(err).To(Equal(errK3sTokenNotReady))
 }
+
+func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	lbService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-control-plane-lb",
+			Namespace: "default",
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{
+					{IP: "192.0.2.10"},
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lbService).Build()
+	reconciler := &KairosConfigReconciler{
+		Client: client,
+		Scheme: scheme,
+		// RESTConfig nil: ensureKubeconfigPushConfig returns nil, but LB + CAPK template still used
+	}
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "control-plane",
+			Distribution:      "k3s",
+			KubernetesVersion: "v1.30.0+k3s.0",
+			SingleNode:        true,
+			UserName:          "kairos",
+			UserPassword:      "kairos",
+			UserGroups:        []string{"admin"},
+		},
+	}
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-machine",
+			Namespace: "default",
+		},
+		Spec: clusterv1.MachineSpec{
+			InfrastructureRef: corev1.ObjectReference{
+				Kind:      "KubevirtMachine",
+				Name:      "test-kubevirt-machine",
+				Namespace: "default",
+			},
+		},
+	}
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+	}
+
+	cloudConfig, err := reconciler.generateK3sCloudConfig(
+		context.Background(),
+		log.Log,
+		kairosConfig,
+		machine,
+		cluster,
+		"control-plane",
+		"",
+	)
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cloudConfig).To(ContainSubstring("CAPK: always mark bootstrap success on script exit"))
+	g.Expect(cloudConfig).To(ContainSubstring("--tls-san=192.0.2.10"))
+	g.Expect(cloudConfig).To(ContainSubstring("k3s:"))
+}
