@@ -4,6 +4,7 @@ This guide describes how to install the Kairos CAPI provider. All steps use `mak
 
 ## Prerequisites
 
+- Go 1.25+ toolchain
 - A Kubernetes cluster as your management cluster (e.g. kind, minikube)
 - CAPI and an infrastructure provider (CAPD, CAPV, or CAPK) already installed
 - `kubectl` configured to use the management cluster
