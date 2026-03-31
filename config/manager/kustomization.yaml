@@ -7,7 +7,7 @@ patches:
     name: kairos-capi-controller-manager
 images:
 - name: controller
-  newName: ghcr.io/kairos-io/kairos-capi
+  newName: ghcr.io/kairos-io/cluster-api-provider-kairos
   newTag: latest
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

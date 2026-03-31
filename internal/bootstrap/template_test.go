@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	bootstrapv1beta2 "github.com/kairos-io/kairos-capi/api/bootstrap/v1beta2"
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
 func TestRenderK0sCloudConfig_ControlPlaneSingleNode(t *testing.T) {

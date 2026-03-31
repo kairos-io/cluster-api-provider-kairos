@@ -32,11 +32,11 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 
-	bootstrapv1beta2 "github.com/kairos-io/kairos-capi/api/bootstrap/v1beta2"
-	controlplanev1beta2 "github.com/kairos-io/kairos-capi/api/controlplane/v1beta2"
-	"github.com/kairos-io/kairos-capi/internal/config"
-	"github.com/kairos-io/kairos-capi/internal/controllers/bootstrap"
-	"github.com/kairos-io/kairos-capi/internal/controllers/controlplane"
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/config"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/bootstrap"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/controlplane"
 	//+kubebuilder:scaffold:imports
 )
 

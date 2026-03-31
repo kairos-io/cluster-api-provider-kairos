@@ -15,10 +15,10 @@ This guide describes how to install the Kairos CAPI provider. All steps use `mak
 make deploy
 ```
 
-This installs CRDs, RBAC, webhooks, and the controller to the `kairos-capi-system` namespace. The controller uses the image from `IMG` (default: `ghcr.io/kairos-io/kairos-capi:latest`). To use a different image:
+This installs CRDs, RBAC, webhooks, and the controller to the `kairos-capi-system` namespace. The controller uses the image from `IMG` (default: `ghcr.io/kairos-io/cluster-api-provider-kairos:latest`). To use a different image:
 
 ```bash
-IMG=MY_REGISTRY/kairos-capi:v1.0 make deploy
+IMG=MY_REGISTRY/cluster-api-provider-kairos:v1.0 make deploy
 ```
 
 ## Verify

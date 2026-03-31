@@ -14,7 +14,7 @@ namespace: kairos-capi-system
 # Set the image name and tag
 images:
   - name: controller
-    newName: ghcr.io/kairos-io/kairos-capi
+    newName: ghcr.io/kairos-io/cluster-api-provider-kairos
     newTag: latest
 
 # Common labels for all resources

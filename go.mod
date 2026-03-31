@@ -1,4 +1,4 @@
-module github.com/kairos-io/kairos-capi
+module github.com/kairos-io/cluster-api-provider-kairos
 
 go 1.25
 

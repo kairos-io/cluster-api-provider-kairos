@@ -10,11 +10,11 @@ releaseSeries:
     patches:
       - version: v0.1.0
         releaseDate: "2024-11-21"
-        url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/components.yaml
+        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
         contract: v1beta2
         files:
-          - url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/components.yaml
+          - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
             sha256: "" # TODO: Add SHA256 checksum
-          - url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/metadata.yaml
+          - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/metadata.yaml
             sha256: "" # TODO: Add SHA256 checksum
 
