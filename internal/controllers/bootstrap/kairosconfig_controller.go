@@ -1170,10 +1170,6 @@ func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.L
 	return ctrl.Result{}, r.Update(ctx, kairosConfig)
 }
 
-func splitLines(s string) []string {
-	return strings.Split(s, "\n")
-}
-
 // randomString generates a random lowercase alphanumeric string of the given length
 // This ensures the string is RFC 1123 compliant for Kubernetes resource names
 func randomString(length int) (string, error) {

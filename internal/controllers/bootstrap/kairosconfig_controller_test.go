@@ -25,7 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -477,7 +477,7 @@ users:
 			Namespace: "default",
 		},
 		Status: bootstrapv1beta2.KairosConfigStatus{
-			DataSecretName: pointer.String("status-secret"),
+			DataSecretName: ptr.To("status-secret"),
 		},
 	}
 
@@ -488,7 +488,7 @@ users:
 		},
 		Spec: clusterv1.MachineSpec{
 			Bootstrap: clusterv1.Bootstrap{
-				DataSecretName: pointer.String("machine-secret"),
+				DataSecretName: ptr.To("machine-secret"),
 			},
 		},
 	}

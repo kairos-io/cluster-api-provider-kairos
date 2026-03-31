@@ -5,11 +5,10 @@ This guide sets up a local KubeVirt environment and provisions a single-node Kai
 ## Prerequisites
 
 - `docker`
-- `kind`
-- `kubectl`
-- `helm`
-- `virtctl` (from KubeVirt releases)
 - Go toolchain (for building `kubevirt-env`)
+- Network access to `github.com` (remote `kubectl apply -k` for the Kairos operator)
+
+Pinned `kubectl`, `kind`, `clusterctl`, and `virtctl` are downloaded into `.work-kubevirt-<cluster-name>/bin` on first run.
 
 ## Build the local helper
 
@@ -24,22 +23,17 @@ go build -o bin/kubevirt-env ./cmd/kubevirt-env
 ```
 
 ## Create the local KubeVirt environment
-```
-./bin/kubevirt-env setup
+
+```bash
+./bin/kubevirt-env
 ```
 
 Notes:
-- `kubevirt-env setup` creates a kind cluster, installs a default StorageClass, Calico, CDI, KubeVirt, CAPI, CAPK, osbuilder, cert-manager, and Kairos CAPI.
+- The root command creates a kind cluster (name from `--cluster-name` or `CLUSTER_NAME`), installs Calico (required first: default CNI is off), then local-path, CDI, KubeVirt, CAPI, CAPK, the [Kairos operator](https://kairos.io/docs/operator-docs/installation/) plus its nginx artifact sink, builds and uploads the Kairos cloud image, cert-manager, and the Kairos CAPI provider (release image).
 - KubeVirt emulation is enabled by default (set `KUBEVIRT_USE_EMULATION=false` to disable).
 - To pin CAPK to a specific version, set `CAPK_VERSION` (e.g., `CAPK_VERSION=v0.1.x`).
 - The control-plane API is exposed via a mandatory LoadBalancer Service named `<cluster>-control-plane-lb`. Ensure a LoadBalancer implementation is available (for example, MetalLB in kind environments).
 - The controller expects the kubeconfig secret to be created in the management cluster as `<cluster>-kubeconfig`.
-
-## Build and upload a Kairos image
-```
-./bin/kubevirt-env build-kairos-image
-./bin/kubevirt-env upload-kairos-image
-```
 
 ## Create a test cluster
 
@@ -54,9 +48,6 @@ kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_single_node.yaml
 ```
 
 ## Check status
-```
-./bin/kubevirt-env test-cluster-status
-```
 
 Optional checks (cluster name from sample is `kairos-cluster-kv`):
 
@@ -73,12 +64,14 @@ make test-kubevirt
 ```
 
 ## Cleanup
-```
-./bin/kubevirt-env delete-test-cluster
+
+Delete workload resources with `kubectl` as needed, then remove the management kind cluster and work directory:
+
+```bash
 ./bin/kubevirt-env cleanup
 ```
 
 ## Troubleshooting
 - If VMs do not start, confirm KubeVirt is `Available` and that `local-path` is the default StorageClass.
-- If you have `/dev/kvm` available and want hardware acceleration, set `KUBEVIRT_USE_EMULATION=false` before `kubevirt-env setup`.
+- If you have `/dev/kvm` available and want hardware acceleration, set `KUBEVIRT_USE_EMULATION=false` before running `kubevirt-env`.
 - If you use bridged/multus networking and the management cluster stays NotReady, ensure `spec.controlPlaneEndpoint.host` is reachable from the CAPI controllers; KubevirtMachine status may not report VM IPs in this mode.

@@ -14,9 +14,10 @@ if [[ ! -x bin/kubevirt-env ]]; then
   go build -o bin/kubevirt-env ./cmd/kubevirt-env
 fi
 
-bin/kubevirt-env setup
-bin/kubevirt-env test-control-plane
-bin/kubevirt-env test-cluster-status
+bin/kubevirt-env
+
+kubectl --kubeconfig "$KUBECONFIG_PATH" --context "$KUBECTL_CONTEXT" \
+  apply -f config/samples/capk/kubevirt_cluster_k0s_single_node.yaml
 
 echo "Waiting for control plane machine to be Ready..."
 kubectl --kubeconfig "$KUBECONFIG_PATH" --context "$KUBECTL_CONTEXT" \
