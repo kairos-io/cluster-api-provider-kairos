@@ -2,6 +2,12 @@
 
 **Cluster API providers for Kairos OS.**
 
+**Repository:** [github.com/kairos-io/cluster-api-provider-kairos](https://github.com/kairos-io/cluster-api-provider-kairos)
+
+```bash
+git clone https://github.com/kairos-io/cluster-api-provider-kairos.git
+```
+
 ## Overview
 
 This project provides two Cluster API (CAPI) providers for managing Kubernetes clusters on Kairos:

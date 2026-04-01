@@ -20,9 +20,9 @@ spec:
       type: Components
       # Path to the kustomization file relative to this metadata file
       files:
-        - url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/components.yaml
+        - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
           sha256: "" # TODO: Add SHA256 checksum for release
-        - url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/metadata.yaml
+        - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/metadata.yaml
           sha256: "" # TODO: Add SHA256 checksum for release
   # Additional metadata
   metadata:
@@ -42,9 +42,9 @@ spec:
     - name: kairos-control-plane
       type: Components
       files:
-        - url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/components.yaml
+        - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
           sha256: "" # TODO: Add SHA256 checksum for release
-        - url: https://github.com/kairos-io/kairos-capi/releases/download/v0.1.0/metadata.yaml
+        - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/metadata.yaml
           sha256: "" # TODO: Add SHA256 checksum for release
   metadata:
     releaseSeries: v0.1
