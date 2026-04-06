@@ -19,6 +19,9 @@ func InstallBaseStackThroughCAPK(ctx context.Context, env *Environment) error {
 	if err := env.InstallCalico(ctx); err != nil {
 		return fmt.Errorf("calico: %w", err)
 	}
+	if err := env.InstallMetalLB(ctx); err != nil {
+		return fmt.Errorf("metallb: %w", err)
+	}
 	if err := env.InstallLocalPath(ctx); err != nil {
 		return fmt.Errorf("local-path: %w", err)
 	}

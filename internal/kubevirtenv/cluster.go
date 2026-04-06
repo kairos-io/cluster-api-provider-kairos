@@ -31,7 +31,8 @@ func EnsureDockerConfigJSON() (string, error) {
 	return p, nil
 }
 
-// WriteKindClusterConfig writes a kind v1alpha4 config: no default CNI, docker config mount (cluster name from kind create --name).
+// WriteKindClusterConfig writes a kind v1alpha4 config: no default CNI, docker config mount,
+// and /dev/kvm passthrough for hardware-accelerated KubeVirt VMs (cluster name from kind create --name).
 func WriteKindClusterConfig(destPath, hostDockerConfig string) error {
 	content := fmt.Sprintf(`kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -42,6 +43,8 @@ nodes:
   extraMounts:
   - containerPath: /var/lib/kubelet/config.json
     hostPath: %s
+  - containerPath: /dev/kvm
+    hostPath: /dev/kvm
 `, hostDockerConfig)
 	return os.WriteFile(destPath, []byte(content), 0o644)
 }
@@ -254,6 +257,7 @@ func (e *Environment) CreateTestCluster(ctx context.Context) error {
 	if err := e.kubectlClusterSanity(ctx, kubeconfigAbs); err != nil {
 		return err
 	}
+	e.fixKVMPermissions(ctx)
 	log.Step("Kind cluster created ✓")
 	log.Infof("Note: default CNI is disabled; install Calico before local-path and other pod workloads.")
 	return nil
@@ -270,6 +274,23 @@ func (e *Environment) kubectlClusterSanity(ctx context.Context, kubeconfigPath s
 		return fmt.Errorf("kubectl cluster-info: %w", err)
 	}
 	return nil
+}
+
+// fixKVMPermissions makes /dev/kvm world-accessible inside the kind node container
+// so that KubeVirt virt-launcher pods (which run as non-root) can use hardware acceleration.
+func (e *Environment) fixKVMPermissions(ctx context.Context) {
+	log := e.log()
+	dockerExe := e.DockerExe
+	if dockerExe == "" {
+		dockerExe = "docker"
+	}
+	nodeName := fmt.Sprintf("%s-control-plane", e.ClusterName)
+	cmd := exec.CommandContext(ctx, dockerExe, "exec", nodeName, "chmod", "666", "/dev/kvm")
+	if err := cmd.Run(); err != nil {
+		log.Infof("/dev/kvm not available in kind node (KubeVirt will use software emulation)")
+		return
+	}
+	log.Infof("/dev/kvm permissions fixed in kind node (hardware acceleration enabled)")
 }
 
 // DeleteKindCluster deletes the kind cluster (best-effort logging on failure).

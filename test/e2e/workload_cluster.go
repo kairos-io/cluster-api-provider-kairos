@@ -38,27 +38,9 @@ var (
 	machineGVR = schema.GroupVersionResource{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machines"}
 )
 
-// createBlankInstallDisk creates a blank CDI DataVolume used as the Kairos install target disk.
-func createBlankInstallDisk(env *kubevirtenv.Environment, dc dynamic.Interface, cfg *rest.Config) {
-	yaml := `apiVersion: cdi.kubevirt.io/v1beta1
-kind: DataVolume
-metadata:
-  name: kairos-install-disk
-  namespace: default
-spec:
-  source:
-    blank: {}
-  pvc:
-    accessModes: ["ReadWriteOnce"]
-    resources:
-      requests:
-        storage: 40Gi
-    storageClassName: local-path
-`
-	Expect(env.ApplyManifestContent(dc, cfg, []byte(yaml))).To(Succeed())
-}
-
 // applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt.
+// The VM boots directly from the Kairos cloud image (kairos-kubevirt DataVolume) — no ISO
+// install step is needed since the cloud image is a pre-built bootable disk.
 func applyWorkloadClusterManifests(env *kubevirtenv.Environment, dc dynamic.Interface, cfg *rest.Config, clusterName, namespace string) {
 	yaml := fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta2
 kind: Cluster
@@ -130,10 +112,6 @@ spec:
                     disk:
                       bus: virtio
                     bootOrder: 1
-                  - name: installeriso
-                    cdrom:
-                      bus: sata
-                    bootOrder: 2
                   interfaces:
                   - name: default
                     masquerade: {}
@@ -152,9 +130,6 @@ spec:
               volumes:
               - name: rootdisk
                 dataVolume:
-                  name: kairos-install-disk
-              - name: installeriso
-                dataVolume:
                   name: kairos-kubevirt
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
@@ -168,10 +143,6 @@ spec:
       role: control-plane
       distribution: k3s
       kubernetesVersion: "v1.30.0+k3s.0"
-      install:
-        auto: true
-        device: "/dev/vda"
-        reboot: true
       dnsServers:
         - "8.8.8.8"
       userName: kairos

@@ -160,9 +160,6 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		dc, err := stackEnv.DynamicClient()
 		Expect(err).NotTo(HaveOccurred())
 
-		By("creating blank install disk DataVolume")
-		createBlankInstallDisk(stackEnv, dc, cfg)
-
 		By("applying workload cluster manifests (single-node k3s on KubeVirt)")
 		applyWorkloadClusterManifests(stackEnv, dc, cfg, wlClusterName, wlNamespace)
 

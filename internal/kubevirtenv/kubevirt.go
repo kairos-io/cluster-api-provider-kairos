@@ -136,12 +136,16 @@ func getKubeVirtCR(ctx context.Context, dynamicClient dynamic.Interface) (*unstr
 	return dynamicClient.Resource(gvr).Namespace("kubevirt").Get(ctx, "kubevirt", metav1.GetOptions{})
 }
 
+// shouldUseEmulation returns true when KVM is not available on the host.
+// When useEmulation is set on the KubeVirt CR, virt-launcher pods do not
+// request /dev/kvm and fall back to software emulation (QEMU TCG).
+// Set KUBEVIRT_USE_EMULATION=true/false to override the auto-detection.
 func shouldUseEmulation() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv("KUBEVIRT_USE_EMULATION")))
-	if value == "" {
-		return true
+	if value := strings.ToLower(strings.TrimSpace(os.Getenv("KUBEVIRT_USE_EMULATION"))); value != "" {
+		return value != "false" && value != "0" && value != "no"
 	}
-	return value != "false" && value != "0" && value != "no"
+	_, err := os.Stat("/dev/kvm")
+	return err != nil
 }
 
 func ensureKubeVirtEmulation(ctx context.Context, dynamicClient dynamic.Interface) error {
