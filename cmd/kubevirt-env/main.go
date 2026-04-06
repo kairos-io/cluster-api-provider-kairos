@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/kairos-io/kairos-capi/internal/kubevirtenv"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )

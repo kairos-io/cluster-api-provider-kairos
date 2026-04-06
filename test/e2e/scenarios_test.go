@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/kairos-io/kairos-capi/internal/kubevirtenv"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
