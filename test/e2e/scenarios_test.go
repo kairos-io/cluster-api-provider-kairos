@@ -72,7 +72,16 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		repoRoot, err = RepoRoot()
 		Expect(err).NotTo(HaveOccurred())
 
-		workDir = GinkgoT().TempDir()
+		// E2E_WORK_DIR overrides the default temp directory. This is important because
+		// /tmp is often tmpfs (RAM-backed) and the Kairos cloud image build downloads
+		// a ~32GB raw disk image which won't fit.
+		if d := os.Getenv("E2E_WORK_DIR"); d != "" {
+			workDir = filepath.Join(d, fmt.Sprintf("e2e-%d", GinkgoRandomSeed()))
+			Expect(os.MkdirAll(workDir, 0o755)).To(Succeed())
+			DeferCleanup(func() { _ = os.RemoveAll(workDir) })
+		} else {
+			workDir = GinkgoT().TempDir()
+		}
 		clusterName = fmt.Sprintf("kcapk-%d", GinkgoRandomSeed())
 		kubeconfig = filepath.Join(workDir, "kubeconfig")
 		dockerExe = DockerExeFromEnvOrInput("")
@@ -128,10 +137,42 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 	It("deploys the Kairos provider on the management cluster and creates a single-node workload cluster on KubeVirt", func(ctx context.Context) {
 		Expect(mgmtCluster).NotTo(BeNil())
 
+		const (
+			wlClusterName = "e2e-workload"
+			wlNamespace   = "default"
+			wlTimeout     = 45 * time.Minute
+		)
+
 		By(fmt.Sprintf("kubectl rollout status deployment/%s -n %s", kairosControllerDeployName, kairosProviderNamespace))
 		Expect(stackEnv.KubectlRolloutDeployment(ctx, mgmtCluster.Kubeconfig, kairosProviderNamespace, kairosControllerDeployName, kairosManagerRolloutTimeout)).To(Succeed())
 
-		By("creating a single-node workload cluster on KubeVirt")
-		Skip("KubeVirt workload cluster not implemented yet (needs DataVolume/Kairos image pipeline like kubevirt-env full setup)")
+		By("installing Kairos operator (OSArtifact builds)")
+		Expect(stackEnv.InstallKairosOperator(ctx)).To(Succeed())
+
+		By("building Kairos cloud image via OSArtifact")
+		Expect(stackEnv.BuildKairosCloudImage(ctx)).To(Succeed())
+
+		By("uploading Kairos image to CDI as DataVolume")
+		Expect(stackEnv.UploadKairosDataVolume(ctx)).To(Succeed())
+
+		cfg, err := stackEnv.RESTConfig()
+		Expect(err).NotTo(HaveOccurred())
+		dc, err := stackEnv.DynamicClient()
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating blank install disk DataVolume")
+		createBlankInstallDisk(stackEnv, dc, cfg)
+
+		By("applying workload cluster manifests (single-node k3s on KubeVirt)")
+		applyWorkloadClusterManifests(stackEnv, dc, cfg, wlClusterName, wlNamespace)
+
+		By("waiting for CAPI Cluster to become Provisioned")
+		waitForClusterProvisioned(ctx, dc, wlNamespace, wlClusterName, wlTimeout)
+
+		By("waiting for KairosControlPlane to be initialized with ready replicas")
+		waitForControlPlaneReady(ctx, dc, wlNamespace, wlClusterName+"-cp", wlTimeout)
+
+		By("verifying CAPI Machines are in Running phase")
+		expectMachinesRunning(ctx, dc, wlNamespace, wlClusterName)
 	})
 })

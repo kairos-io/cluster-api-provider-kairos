@@ -362,6 +362,7 @@ func (e *Environment) waitForOSArtifactReady(ctx context.Context, dynamicClient 
 			if b, err := obj.MarshalJSON(); err == nil {
 				log.WriteString(string(b) + "\n")
 			}
+			e.dumpOSArtifactPodLogs(ctx, log)
 			return false, fmt.Errorf("OSArtifact build failed (phase: %s)", phase)
 		}
 		log.WriteString(".")
@@ -453,4 +454,58 @@ func (e *Environment) downloadImageFromNginx(ctx context.Context, clientset kube
 		log.Infof("No image files found.")
 	}
 	return nil
+}
+
+// dumpOSArtifactPodLogs finds Pods related to the OSArtifact build and prints their logs for debugging.
+func (e *Environment) dumpOSArtifactPodLogs(ctx context.Context, log Logger) {
+	clientset, err := e.Clientset()
+	if err != nil {
+		log.Warnf("cannot get clientset for pod log dump: %v", err)
+		return
+	}
+	pods, err := clientset.CoreV1().Pods("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Warnf("cannot list pods: %v", err)
+		return
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !strings.Contains(pod.Name, kairosCloudImageName) {
+			continue
+		}
+		log.Warnf("--- Pod %s (phase: %s) ---", pod.Name, pod.Status.Phase)
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.State.Waiting != nil {
+				log.Warnf("  container %s: waiting (%s: %s)", cs.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
+			}
+			if cs.State.Terminated != nil {
+				log.Warnf("  container %s: terminated (exit %d, reason: %s, message: %s)",
+					cs.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Reason, cs.State.Terminated.Message)
+			}
+		}
+		for _, c := range pod.Spec.Containers {
+			logOpts := &corev1.PodLogOptions{Container: c.Name}
+			req := clientset.CoreV1().Pods("default").GetLogs(pod.Name, logOpts)
+			stream, err := req.Stream(ctx)
+			if err != nil {
+				log.Warnf("  cannot get logs for container %s: %v", c.Name, err)
+				continue
+			}
+			body, _ := io.ReadAll(stream)
+			_ = stream.Close()
+			log.Warnf("  logs [%s/%s]:\n%s", pod.Name, c.Name, string(body))
+		}
+		for _, c := range pod.Spec.InitContainers {
+			logOpts := &corev1.PodLogOptions{Container: c.Name}
+			req := clientset.CoreV1().Pods("default").GetLogs(pod.Name, logOpts)
+			stream, err := req.Stream(ctx)
+			if err != nil {
+				log.Warnf("  cannot get logs for init container %s: %v", c.Name, err)
+				continue
+			}
+			body, _ := io.ReadAll(stream)
+			_ = stream.Close()
+			log.Warnf("  logs [%s/init:%s]:\n%s", pod.Name, c.Name, string(body))
+		}
+	}
 }

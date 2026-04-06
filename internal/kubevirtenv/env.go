@@ -10,8 +10,10 @@ import (
 )
 
 const (
-	// DefaultCAPIVersion is a last-resort cluster-api version if the tool catalog cannot be read.
-	DefaultCAPIVersion = "v1.12.4"
+	// DefaultCAPIVersion must match the sigs.k8s.io/cluster-api version in go.mod.
+	// If these diverge, the controller will fail with API version mismatch errors
+	// (e.g. "unable to decode an event" on Machine watches).
+	DefaultCAPIVersion = "v1.8.0"
 )
 
 // Environment holds paths and options shared by install steps (kind cluster, kubeconfig, tool binaries, logging).
@@ -200,9 +202,6 @@ func ValidateClusterctlInstalled(e *Environment) error {
 func (e *Environment) capiVersionOrDefault() string {
 	if e.CAPIVersion != "" {
 		return e.CAPIVersion
-	}
-	if v, err := ClusterctlPinnedVersion(); err == nil {
-		return v
 	}
 	return DefaultCAPIVersion
 }
