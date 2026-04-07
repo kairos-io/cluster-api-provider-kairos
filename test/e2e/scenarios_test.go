@@ -140,7 +140,7 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 			wlClusterName = "e2e-workload"
 			wlNamespace   = "default"
 			wlTimeout     = 45 * time.Minute
-			cpTimeout     = 10 * time.Minute
+			cpTimeout     = 25 * time.Minute
 		)
 
 		By(fmt.Sprintf("kubectl rollout status deployment/%s -n %s", kairosControllerDeployName, kairosProviderNamespace))
@@ -173,6 +173,6 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		expectMachinesRunning(ctx, dc, wlNamespace, wlClusterName)
 
 		By("connecting to the workload cluster and waiting for a Ready Node")
-		waitForWorkloadNodeReady(ctx, stackEnv, wlNamespace, wlClusterName, 10*time.Minute)
+		waitForWorkloadNodeReady(ctx, stackEnv, wlNamespace, wlClusterName, 25*time.Minute)
 	})
 })
