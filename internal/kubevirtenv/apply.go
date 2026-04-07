@@ -51,13 +51,15 @@ func (e *Environment) ApplyManifestContent(dynamicClient dynamic.Interface, conf
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(yamlContent)), 4096)
 	dec := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
+	// Iterate over each `---`-separated document in the multi-doc YAML stream.
+	// The decoder is streaming and doesn't expose a length, so we Decode until io.EOF.
 	for {
 		var rawObj runtime.RawExtension
 		if err := decoder.Decode(&rawObj); err != nil {
 			if err == io.EOF {
 				break
 			}
-			continue
+			return fmt.Errorf("decode YAML document: %w", err)
 		}
 		if len(rawObj.Raw) == 0 {
 			continue
@@ -142,13 +144,15 @@ func (e *Environment) deleteResourcesFromYAML(dynamicClient dynamic.Interface, c
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(yamlContent)), 4096)
 	dec := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
+	// Iterate over each `---`-separated document in the multi-doc YAML stream.
+	// The decoder is streaming and doesn't expose a length, so we Decode until io.EOF.
 	for {
 		var rawObj runtime.RawExtension
 		if err := decoder.Decode(&rawObj); err != nil {
 			if err == io.EOF {
 				break
 			}
-			continue
+			return fmt.Errorf("decode YAML document: %w", err)
 		}
 		if len(rawObj.Raw) == 0 {
 			continue

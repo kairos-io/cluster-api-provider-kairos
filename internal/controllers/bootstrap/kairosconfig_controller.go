@@ -1443,9 +1443,6 @@ func (r *KairosConfigReconciler) machineToKairosConfig(ctx context.Context, o cl
 	}
 }
 
-// vsphereMachineToKairosConfig maps a VSphereMachine to its KairosConfig
-// This allows us to watch for VSphereMachine changes (especially when providerID is set)
-// and trigger KairosConfig reconciliation to regenerate bootstrap secret with providerID
 // infraMachineToKairosConfig maps any infrastructure machine (VSphereMachine, KubevirtMachine, etc.)
 // to its owning KairosConfig. This triggers re-reconciliation when the infra machine changes
 // (e.g. providerID is set), so the bootstrap secret can be regenerated.
