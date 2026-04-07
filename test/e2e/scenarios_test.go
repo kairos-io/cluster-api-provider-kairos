@@ -92,15 +92,14 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		}
 
 		stackEnv = &kubevirtenv.Environment{
-			ClusterName:         clusterName,
-			WorkDir:             workDir,
-			RepoRoot:            repoRoot,
-			DockerExe:           dockerExe,
-			Logger:              ginkgoKubevirtLogger{},
-			ClusterctlExtraPath: filepath.Join(repoRoot, "bin"),
-			KindCreateWait:      kindWait,
-			Stdout:              GinkgoWriter,
-			Stderr:              GinkgoWriter,
+			ClusterName:    clusterName,
+			WorkDir:        workDir,
+			RepoRoot:       repoRoot,
+			DockerExe:      dockerExe,
+			Logger:         ginkgoKubevirtLogger{},
+			KindCreateWait: kindWait,
+			Stdout:         GinkgoWriter,
+			Stderr:         GinkgoWriter,
 		}
 
 		Expect(os.MkdirAll(workDir, 0o755)).To(Succeed())

@@ -43,9 +43,14 @@ manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition o
 	@if [ -f config/webhook/manifests.yaml ]; then \
 		sed -i 's/namespace: system/namespace: kairos-capi-system/g' config/webhook/manifests.yaml; \
 	fi
-	@# Add contract version labels to all CRDs (required for Cluster API contract compliance)
-	@# Note: Labels must be added AFTER annotations to match controller-gen output order
-	@# Use sed to insert labels without reformatting (preserves controller-gen formatting)
+	@# Add contract version labels to all CRDs (required for Cluster API contract compliance).
+	@# CAPI looks at the cluster.x-k8s.io/<contract> label to map a CRD to the contract version
+	@# its served storage version implements. We serve v1beta2 only, but advertise it under both
+	@# the v1beta1 and v1beta2 contract labels so older CAPI controllers (still keying off
+	@# /v1beta1) and newer ones (/v1beta2) both resolve our CRDs to v1beta2 — hence both labels
+	@# point at "v1beta2", which looks like a typo but isn't.
+	@# Labels must be added AFTER annotations to match controller-gen output order; sed inserts
+	@# them in place to preserve the rest of the generated formatting.
 	@for crd in config/crd/bases/bootstrap.cluster.x-k8s.io_kairosconfigs.yaml \
 		config/crd/bases/bootstrap.cluster.x-k8s.io_kairosconfigtemplates.yaml \
 		config/crd/bases/controlplane.cluster.x-k8s.io_kairoscontrolplanes.yaml \

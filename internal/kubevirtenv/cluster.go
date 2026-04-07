@@ -85,14 +85,6 @@ func (e *Environment) kindClusterListed() bool {
 	return false
 }
 
-func (e *Environment) absKubeconfigPath() (string, error) {
-	workDirAbs, err := filepath.Abs(e.WorkDir)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(workDirAbs, "kubeconfig"), nil
-}
-
 // FetchKindKubeconfig writes `kind get kubeconfig` for this cluster to dest (parent dirs created).
 func (e *Environment) FetchKindKubeconfig(ctx context.Context, dest string) error {
 	getCfg := exec.CommandContext(ctx, e.kindBin(), "get", "kubeconfig", "--name", e.ClusterName)
@@ -176,25 +168,16 @@ func (e *Environment) IsClusterReady() bool {
 	if !e.kindClusterListed() {
 		return false
 	}
-	kc, err := e.absKubeconfigPath()
-	if err != nil {
-		return false
-	}
-	return kubeconfigFileUsable(kc)
+	return kubeconfigFileUsable(e.KubeconfigPath())
 }
 
 // CreateTestCluster creates a kind cluster with Calico-ready networking and writes kubeconfig to WorkDir.
 func (e *Environment) CreateTestCluster(ctx context.Context) error {
 	log := e.log()
-	workDirAbs, err := filepath.Abs(e.WorkDir)
-	if err != nil {
-		return fmt.Errorf("work directory: %w", err)
+	if err := e.normalizeWorkDir(); err != nil {
+		return err
 	}
-	e.WorkDir = workDirAbs
-	if err := os.MkdirAll(e.WorkDir, 0o755); err != nil {
-		return fmt.Errorf("work directory: %w", err)
-	}
-	kubeconfigAbs := filepath.Join(e.WorkDir, "kubeconfig")
+	kubeconfigAbs := e.KubeconfigPath()
 
 	listed := e.kindClusterListed()
 	usable := kubeconfigFileUsable(kubeconfigAbs)

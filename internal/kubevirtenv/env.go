@@ -59,9 +59,9 @@ func (e *Environment) BinDir() string {
 	return filepath.Join(e.WorkDir, "bin")
 }
 
-// EnsurePinnedCLIs downloads kubectl, kind, clusterctl, and virtctl into a persistent
-// per-repo cache (<RepoRoot>/.e2e-bin) so binaries are reused across runs, and sets *Path fields.
-func (e *Environment) EnsurePinnedCLIs(ctx context.Context) error {
+// normalizeWorkDir resolves WorkDir to an absolute path and creates it (idempotent).
+// Safe to call multiple times.
+func (e *Environment) normalizeWorkDir() error {
 	if e.WorkDir == "" {
 		return fmt.Errorf("kubevirtenv.Environment: WorkDir is required")
 	}
@@ -72,6 +72,15 @@ func (e *Environment) EnsurePinnedCLIs(ctx context.Context) error {
 	e.WorkDir = abs
 	if err := os.MkdirAll(e.WorkDir, 0o755); err != nil {
 		return fmt.Errorf("workdir: %w", err)
+	}
+	return nil
+}
+
+// EnsurePinnedCLIs downloads kubectl, kind, clusterctl, and virtctl into a persistent
+// per-repo cache (<RepoRoot>/.e2e-bin) so binaries are reused across runs, and sets *Path fields.
+func (e *Environment) EnsurePinnedCLIs(ctx context.Context) error {
+	if err := e.normalizeWorkDir(); err != nil {
+		return err
 	}
 	if e.RepoRoot == "" {
 		r, err := FindRepoRoot(e.WorkDir)

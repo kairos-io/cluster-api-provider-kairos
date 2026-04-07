@@ -14,7 +14,10 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-const kairosCAPIControllerDeployment = "kairos-capi-controller-manager"
+const (
+	kairosCAPINamespace            = "kairos-capi-system"
+	kairosCAPIControllerDeployment = "kairos-capi-controller-manager"
+)
 
 // IsKairosCAPIProviderInstalled reports whether the kairos-capi controller deployment is available.
 func (e *Environment) IsKairosCAPIProviderInstalled() bool {
@@ -24,7 +27,7 @@ func (e *Environment) IsKairosCAPIProviderInstalled() bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	deployment, err := clientset.AppsV1().Deployments("kairos-capi-system").Get(ctx, kairosCAPIControllerDeployment, metav1.GetOptions{})
+	deployment, err := clientset.AppsV1().Deployments(kairosCAPINamespace).Get(ctx, kairosCAPIControllerDeployment, metav1.GetOptions{})
 	if err != nil {
 		return false
 	}
@@ -86,7 +89,7 @@ func (e *Environment) InstallKairosCAPIProviderRelease(ctx context.Context) erro
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
-	if err := WaitForDeployment(waitCtx, clientset, "kairos-capi-system", kairosCAPIControllerDeployment); err != nil {
+	if err := WaitForDeployment(waitCtx, clientset, kairosCAPINamespace, kairosCAPIControllerDeployment); err != nil {
 		log.Warnf("deployment may not be ready: %v", err)
 	}
 	log.Step("Kairos CAPI provider installed ✓")
@@ -111,13 +114,13 @@ func (e *Environment) waitForKairosWebhookCertificate(ctx context.Context) error
 		if err != nil {
 			return false, nil
 		}
-		_, err = clientset.CoreV1().Secrets("kairos-capi-system").Get(ctx, "kairos-capi-webhook-server-cert", metav1.GetOptions{})
+		_, err = clientset.CoreV1().Secrets(kairosCAPINamespace).Get(ctx, "kairos-capi-webhook-server-cert", metav1.GetOptions{})
 		if err != nil {
 			log.WriteString(".")
 			return false, nil
 		}
 		certGVR := schema.GroupVersionResource{Group: "cert-manager.io", Version: "v1", Resource: "certificates"}
-		cert, err := dynamicClient.Resource(certGVR).Namespace("kairos-capi-system").Get(ctx, "kairos-capi-webhook-server-cert", metav1.GetOptions{})
+		cert, err := dynamicClient.Resource(certGVR).Namespace(kairosCAPINamespace).Get(ctx, "kairos-capi-webhook-server-cert", metav1.GetOptions{})
 		if err != nil {
 			log.WriteString(".")
 			return false, nil
