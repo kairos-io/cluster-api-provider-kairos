@@ -59,7 +59,7 @@ func (e *Environment) InstallCalico(ctx context.Context) error {
 	}
 	calicoURL := fmt.Sprintf(CalicoManifestURL, CalicoVersion)
 	log.Infof("Installing Calico CNI %s...", CalicoVersion)
-	if err := e.ApplyManifestFromURL(dynamicClient, config, calicoURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, calicoURL); err != nil {
 		return fmt.Errorf("apply Calico manifest: %w", err)
 	}
 	log.Step("Waiting for Calico to be ready...")

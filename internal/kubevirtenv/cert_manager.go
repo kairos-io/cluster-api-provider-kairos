@@ -74,7 +74,7 @@ func (e *Environment) InstallCertManager(ctx context.Context) error {
 	}
 	log.Infof("Installing cert-manager %s...", CertManagerVersion)
 	u := fmt.Sprintf(CertManagerURL, CertManagerVersion)
-	if err := e.ApplyManifestFromURL(dynamicClient, config, u); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, u); err != nil {
 		log.Warnf("cert-manager apply: %v (may already be installed)", err)
 	}
 	log.Step("Waiting for cert-manager to be ready...")
@@ -110,7 +110,7 @@ func (e *Environment) UninstallCertManager(ctx context.Context) error {
 	}
 	u := fmt.Sprintf(CertManagerURL, CertManagerVersion)
 	log.Step("Uninstalling cert-manager...")
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, u); err != nil {
+	if err := e.DeleteResourcesFromManifestURL(ctx, dynamicClient, config, u); err != nil {
 		return fmt.Errorf("delete cert-manager manifest: %w", err)
 	}
 	clientset, err := e.Clientset()

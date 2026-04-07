@@ -43,7 +43,7 @@ func (e *Environment) InstallLocalPath(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
-	if err := e.ApplyManifestFromURL(dynamicClient, config, LocalPathManifestURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, LocalPathManifestURL); err != nil {
 		return fmt.Errorf("apply local-path manifest: %w", err)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
@@ -106,7 +106,7 @@ func (e *Environment) UninstallLocalPath(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, LocalPathManifestURL); err != nil {
+	if err := e.DeleteResourcesFromManifestURL(ctx, dynamicClient, config, LocalPathManifestURL); err != nil {
 		return fmt.Errorf("delete local-path: %w", err)
 	}
 	clientset, err := e.Clientset()

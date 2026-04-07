@@ -64,10 +64,10 @@ func (e *Environment) InstallCDI(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
-	if err := e.ApplyManifestFromURL(dynamicClient, config, CDIOperatorURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, CDIOperatorURL); err != nil {
 		return fmt.Errorf("apply CDI operator: %w", err)
 	}
-	if err := e.ApplyManifestFromURL(dynamicClient, config, CDICRURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, CDICRURL); err != nil {
 		return fmt.Errorf("apply CDI CR: %w", err)
 	}
 	log.Step("Waiting for CDI to be ready...")
@@ -157,10 +157,10 @@ func (e *Environment) UninstallCDI(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, CDICRURL); err != nil {
+	if err := e.DeleteResourcesFromManifestURL(ctx, dynamicClient, config, CDICRURL); err != nil {
 		return fmt.Errorf("delete CDI CR: %w", err)
 	}
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, CDIOperatorURL); err != nil {
+	if err := e.DeleteResourcesFromManifestURL(ctx, dynamicClient, config, CDIOperatorURL); err != nil {
 		return fmt.Errorf("delete CDI operator: %w", err)
 	}
 	clientset, err := e.Clientset()

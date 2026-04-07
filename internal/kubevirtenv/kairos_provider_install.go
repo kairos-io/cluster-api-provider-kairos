@@ -161,15 +161,31 @@ func (e *Environment) waitForKairosCABundleInjection(ctx context.Context) error 
 			return false, nil
 		}
 		webhooks, found, err := unstructured.NestedSlice(mwh.Object, "webhooks")
-		if found && err == nil && len(webhooks) > 0 {
-			if webhook, ok := webhooks[0].(map[string]interface{}); ok {
-				if clientConfig, ok := webhook["clientConfig"].(map[string]interface{}); ok {
-					if caBundle, ok := clientConfig["caBundle"].(string); ok && caBundle != "" && caBundle != "null" {
-						log.Infof("✓ CA bundle injected")
-						return true, nil
-					}
-				}
+		if !found || err != nil || len(webhooks) == 0 {
+			log.WriteString(".")
+			return false, nil
+		}
+		allInjected := true
+		for _, w := range webhooks {
+			webhook, ok := w.(map[string]interface{})
+			if !ok {
+				allInjected = false
+				break
 			}
+			clientConfig, ok := webhook["clientConfig"].(map[string]interface{})
+			if !ok {
+				allInjected = false
+				break
+			}
+			caBundle, ok := clientConfig["caBundle"].(string)
+			if !ok || caBundle == "" || caBundle == "null" {
+				allInjected = false
+				break
+			}
+		}
+		if allInjected {
+			log.Infof("✓ CA bundle injected (%d webhooks)", len(webhooks))
+			return true, nil
 		}
 		log.WriteString(".")
 		return false, nil

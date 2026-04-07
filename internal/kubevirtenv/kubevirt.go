@@ -67,11 +67,11 @@ func (e *Environment) InstallKubeVirt(ctx context.Context) error {
 	}
 	log.Infof("Installing KubeVirt %s...", KubeVirtVersion)
 	operatorURL := fmt.Sprintf(KubeVirtOperatorURL, KubeVirtVersion)
-	if err := e.ApplyManifestFromURL(dynamicClient, config, operatorURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, operatorURL); err != nil {
 		return fmt.Errorf("apply KubeVirt operator: %w", err)
 	}
 	crURL := fmt.Sprintf(KubeVirtCRURL, KubeVirtVersion)
-	if err := e.ApplyManifestFromURL(dynamicClient, config, crURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, crURL); err != nil {
 		return fmt.Errorf("apply KubeVirt CR: %w", err)
 	}
 	if shouldUseEmulation() {
@@ -181,11 +181,11 @@ func (e *Environment) UninstallKubeVirt(ctx context.Context) error {
 	}
 	log.Step("Uninstalling KubeVirt...")
 	crURL := fmt.Sprintf(KubeVirtCRURL, KubeVirtVersion)
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, crURL); err != nil {
+	if err := e.DeleteResourcesFromManifestURL(ctx, dynamicClient, config, crURL); err != nil {
 		log.Warnf("delete KubeVirt CR: %v", err)
 	}
 	operatorURL := fmt.Sprintf(KubeVirtOperatorURL, KubeVirtVersion)
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, operatorURL); err != nil {
+	if err := e.DeleteResourcesFromManifestURL(ctx, dynamicClient, config, operatorURL); err != nil {
 		return fmt.Errorf("delete KubeVirt operator: %w", err)
 	}
 	log.Step("KubeVirt uninstalled ✓")

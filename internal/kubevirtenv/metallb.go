@@ -64,7 +64,7 @@ func (e *Environment) InstallMetalLB(ctx context.Context) error {
 
 	manifestURL := fmt.Sprintf(MetalLBManifestURL, MetalLBVersion)
 	log.Infof("Installing MetalLB %s...", MetalLBVersion)
-	if err := e.ApplyManifestFromURL(dynamicClient, config, manifestURL); err != nil {
+	if err := e.ApplyManifestFromURL(ctx, dynamicClient, config, manifestURL); err != nil {
 		return fmt.Errorf("apply MetalLB manifest: %w", err)
 	}
 
@@ -105,7 +105,7 @@ spec:
   - kind-pool
 `, MetalLBNamespace, ipRange, MetalLBNamespace)
 
-	if err := e.ApplyManifestContent(dynamicClient, config, []byte(poolYAML)); err != nil {
+	if err := e.ApplyManifestContent(ctx, dynamicClient, config, []byte(poolYAML)); err != nil {
 		return fmt.Errorf("apply MetalLB pool config: %w", err)
 	}
 

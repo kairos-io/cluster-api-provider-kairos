@@ -1,16 +1,19 @@
 package kubevirtenv
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	yamlserializer "k8s.io/apimachinery/pkg/runtime/serializer/yaml"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
@@ -20,118 +23,74 @@ import (
 )
 
 // ApplyManifestFromURL downloads YAML and applies it with server-side apply.
-func (e *Environment) ApplyManifestFromURL(dynamicClient dynamic.Interface, config *rest.Config, url string) error {
-	resp, err := http.Get(url)
+func (e *Environment) ApplyManifestFromURL(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, url string) error {
+	body, err := httpGetBody(ctx, url)
 	if err != nil {
-		return fmt.Errorf("download manifest: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download manifest: HTTP %d", resp.StatusCode)
-	}
-	yamlContent, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read manifest: %w", err)
-	}
-	return e.ApplyManifestContent(dynamicClient, config, yamlContent)
+	return e.ApplyManifestContent(ctx, dynamicClient, config, body)
 }
 
 // ApplyManifestContent applies multi-document YAML with server-side apply.
-func (e *Environment) ApplyManifestContent(dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
+func (e *Environment) ApplyManifestContent(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		return fmt.Errorf("discovery client: %w", err)
-	}
-	gr, err := restmapper.GetAPIGroupResources(discoveryClient)
-	if err != nil {
-		return fmt.Errorf("API group resources: %w", err)
-	}
-	mapper := restmapper.NewDiscoveryRESTMapper(gr)
-	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(yamlContent)), 4096)
-	dec := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
-
-	// Iterate over each `---`-separated document in the multi-doc YAML stream.
-	// The decoder is streaming and doesn't expose a length, so we Decode until io.EOF.
-	for {
-		var rawObj runtime.RawExtension
-		if err := decoder.Decode(&rawObj); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("decode YAML document: %w", err)
-		}
-		if len(rawObj.Raw) == 0 {
-			continue
-		}
-		obj := &unstructured.Unstructured{}
-		_, gvk, err := dec.Decode(rawObj.Raw, nil, obj)
-		if err != nil {
-			log.Warnf("decode resource: %v", err)
-			continue
-		}
-		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-		if err != nil {
-			log.Warnf("REST mapping for %s: %v", gvk, err)
-			continue
-		}
-		var dr dynamic.ResourceInterface
-		if mapping.Scope.Name() == "namespace" && obj.GetNamespace() != "" {
-			dr = dynamicClient.Resource(mapping.Resource).Namespace(obj.GetNamespace())
-		} else {
-			dr = dynamicClient.Resource(mapping.Resource)
-		}
+	return forEachManifestObject(config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
+		dr := resourceClient(dynamicClient, mapping, obj)
 		obj.SetManagedFields(nil)
-		_, err = dr.Apply(context.Background(), obj.GetName(), obj, metav1.ApplyOptions{
-			FieldManager: applyFieldManager,
-		})
-		if err != nil {
-			_, createErr := dr.Create(context.Background(), obj, metav1.CreateOptions{})
-			if createErr != nil && !strings.Contains(createErr.Error(), "already exists") {
-				log.Warnf("apply %s/%s: %v", gvk.Kind, obj.GetName(), err)
-			}
+		if _, err := dr.Apply(ctx, obj.GetName(), obj, metav1.ApplyOptions{FieldManager: applyFieldManager}); err != nil {
+			log.Warnf("apply %s/%s: %v", mapping.gvk.Kind, obj.GetName(), err)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // ApplyManifestFromFile reads a YAML file and applies it.
-func (e *Environment) ApplyManifestFromFile(dynamicClient dynamic.Interface, config *rest.Config, filePath string) error {
+func (e *Environment) ApplyManifestFromFile(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, filePath string) error {
 	yamlContent, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("read manifest file: %w", err)
 	}
-	return e.ApplyManifestContent(dynamicClient, config, yamlContent)
+	return e.ApplyManifestContent(ctx, dynamicClient, config, yamlContent)
 }
 
 // DeleteResourcesFromManifestFile deletes resources described in a local YAML file.
-func (e *Environment) DeleteResourcesFromManifestFile(dynamicClient dynamic.Interface, config *rest.Config, filePath string) error {
+func (e *Environment) DeleteResourcesFromManifestFile(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, filePath string) error {
 	yamlContent, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("read manifest file: %w", err)
 	}
-	return e.deleteResourcesFromYAML(dynamicClient, config, yamlContent)
+	return e.deleteResourcesFromYAML(ctx, dynamicClient, config, yamlContent)
 }
 
 // DeleteResourcesFromManifestURL deletes resources described in a remote YAML manifest.
-func (e *Environment) DeleteResourcesFromManifestURL(dynamicClient dynamic.Interface, config *rest.Config, url string) error {
-	resp, err := http.Get(url)
+func (e *Environment) DeleteResourcesFromManifestURL(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, url string) error {
+	body, err := httpGetBody(ctx, url)
 	if err != nil {
-		return fmt.Errorf("download manifest: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download manifest: HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read manifest: %w", err)
-	}
-	return e.deleteResourcesFromYAML(dynamicClient, config, body)
+	return e.deleteResourcesFromYAML(ctx, dynamicClient, config, body)
 }
 
-func (e *Environment) deleteResourcesFromYAML(dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
+func (e *Environment) deleteResourcesFromYAML(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
+	return forEachManifestObject(config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
+		dr := resourceClient(dynamicClient, mapping, obj)
+		if err := dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			log.Warnf("delete %s/%s: %v", mapping.gvk.Kind, obj.GetName(), err)
+		}
+		return nil
+	})
+}
+
+// manifestMapping pairs a parsed object's GVK with its REST mapping.
+type manifestMapping struct {
+	gvk     schema.GroupVersionKind
+	mapping *meta.RESTMapping
+}
+
+// forEachManifestObject decodes a multi-doc YAML stream and invokes fn for each object that
+// resolves through discovery. Decode/mapping errors are logged via the environment logger and skipped.
+func forEachManifestObject(config *rest.Config, yamlContent []byte, fn func(*manifestMapping, *unstructured.Unstructured) error) error {
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return fmt.Errorf("discovery client: %w", err)
@@ -141,11 +100,9 @@ func (e *Environment) deleteResourcesFromYAML(dynamicClient dynamic.Interface, c
 		return fmt.Errorf("API group resources: %w", err)
 	}
 	mapper := restmapper.NewDiscoveryRESTMapper(gr)
-	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(yamlContent)), 4096)
+	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(yamlContent), 4096)
 	dec := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
-	// Iterate over each `---`-separated document in the multi-doc YAML stream.
-	// The decoder is streaming and doesn't expose a length, so we Decode until io.EOF.
 	for {
 		var rawObj runtime.RawExtension
 		if err := decoder.Decode(&rawObj); err != nil {
@@ -166,16 +123,38 @@ func (e *Environment) deleteResourcesFromYAML(dynamicClient dynamic.Interface, c
 		if err != nil {
 			continue
 		}
-		var dr dynamic.ResourceInterface
-		if mapping.Scope.Name() == "namespace" && obj.GetNamespace() != "" {
-			dr = dynamicClient.Resource(mapping.Resource).Namespace(obj.GetNamespace())
-		} else {
-			dr = dynamicClient.Resource(mapping.Resource)
-		}
-		err = dr.Delete(context.Background(), obj.GetName(), metav1.DeleteOptions{})
-		if err != nil && !strings.Contains(err.Error(), "not found") {
-			log.Warnf("delete %s/%s: %v", gvk.Kind, obj.GetName(), err)
+		mm := &manifestMapping{gvk: *gvk, mapping: mapping}
+		if err := fn(mm, obj); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func resourceClient(dynamicClient dynamic.Interface, mm *manifestMapping, obj *unstructured.Unstructured) dynamic.ResourceInterface {
+	if mm.mapping.Scope.Name() == "namespace" && obj.GetNamespace() != "" {
+		return dynamicClient.Resource(mm.mapping.Resource).Namespace(obj.GetNamespace())
+	}
+	return dynamicClient.Resource(mm.mapping.Resource)
+}
+
+// httpGetBody downloads url with the given context and returns the body bytes.
+func httpGetBody(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download manifest: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download manifest: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest: %w", err)
+	}
+	return body, nil
 }

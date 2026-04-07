@@ -159,11 +159,11 @@ spec:
         - admin
 `, clusterName, namespace)
 
-	Expect(env.ApplyManifestContent(dc, cfg, []byte(yaml))).To(Succeed())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	Expect(env.ApplyManifestContent(ctx, dc, cfg, []byte(yaml))).To(Succeed())
 
 	// Apply is silent on unknown GVKs / partial failures — verify each top-level object actually exists.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	checks := []struct {
 		gvr  schema.GroupVersionResource
 		name string

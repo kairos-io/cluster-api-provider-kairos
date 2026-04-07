@@ -336,7 +336,7 @@ spec:
 	if err != nil {
 		return err
 	}
-	return e.ApplyManifestContent(dynamicClient, rc, []byte(yaml))
+	return e.ApplyManifestContent(ctx, dynamicClient, rc, []byte(yaml))
 }
 
 func (e *Environment) waitForOSArtifactReady(ctx context.Context, dynamicClient dynamic.Interface) error {

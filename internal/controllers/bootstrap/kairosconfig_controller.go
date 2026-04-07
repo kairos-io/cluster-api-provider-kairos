@@ -1450,6 +1450,7 @@ func (r *KairosConfigReconciler) infraMachineToKairosConfig(ctx context.Context,
 	if _, ok := o.(*unstructured.Unstructured); !ok {
 		return nil
 	}
+	infraKind := o.GetObjectKind().GroupVersionKind().Kind
 
 	machineList := &clusterv1.MachineList{}
 	if err := r.List(ctx, machineList, client.InNamespace(o.GetNamespace())); err != nil {
@@ -1459,7 +1460,8 @@ func (r *KairosConfigReconciler) infraMachineToKairosConfig(ctx context.Context,
 	var requests []reconcile.Request
 	for _, machine := range machineList.Items {
 		ref := machine.Spec.InfrastructureRef
-		if ref.Name == o.GetName() && ref.Namespace == o.GetNamespace() &&
+		if ref.Kind == infraKind &&
+			ref.Name == o.GetName() && ref.Namespace == o.GetNamespace() &&
 			machine.Spec.Bootstrap.ConfigRef != nil &&
 			machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group == bootstrapv1beta2.GroupVersion.Group &&
 			machine.Spec.Bootstrap.ConfigRef.Kind == "KairosConfig" {
