@@ -189,6 +189,43 @@ func (e *Environment) UploadKairosDataVolume(ctx context.Context) error {
 	if err := virtctlCmd.Run(); err != nil {
 		return fmt.Errorf("virtctl image-upload: %w", err)
 	}
+
+	// Wait for DataVolume to be ready before returning
+	log.Step("Waiting for DataVolume to be ready...")
+	waitCtx, cancel := context.WithTimeout(ctx, 300*time.Second) // 5 minute timeout
+	defer cancel()
+
+	err = wait.PollUntilContextCancel(waitCtx, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		dv, err := dynamicClient.Resource(dvGVR).Namespace("default").Get(ctx, kairosCloudImageName, metav1.GetOptions{})
+		if err != nil {
+			log.WriteString(".")
+			return false, nil
+		}
+
+		// Check if DataVolume is ready
+		phase, found, err := unstructured.NestedString(dv.Object, "status", "phase")
+		if !found || err != nil {
+			log.WriteString(".")
+			return false, nil
+		}
+
+		if phase == "Succeeded" {
+			log.Infof("✓ DataVolume %s is ready (phase: %s)", kairosCloudImageName, phase)
+			return true, nil
+		}
+
+		if phase == "Failed" {
+			return false, fmt.Errorf("DataVolume %s failed (phase: %s)", kairosCloudImageName, phase)
+		}
+
+		log.WriteString(".")
+		return false, nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("wait for DataVolume readiness: %w", err)
+	}
+
 	log.Step("Image upload completed ✓")
 	return nil
 }
