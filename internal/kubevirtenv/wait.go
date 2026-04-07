@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -47,8 +48,11 @@ func WaitForDaemonset(ctx context.Context, log Logger, clientset kubernetes.Inte
 func WaitForNamespaceDeleted(ctx context.Context, clientset kubernetes.Interface, namespace string) error {
 	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
 		_, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-		if err != nil {
+		if apierrors.IsNotFound(err) {
 			return true, nil
+		}
+		if err != nil {
+			return false, err
 		}
 		return false, nil
 	})

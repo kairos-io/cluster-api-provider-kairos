@@ -239,7 +239,6 @@ func FindRepoRoot(start string) (string, error) {
 // If want is nil or empty, downloads kubectl, kind, clusterctl, and virtctl.
 // If log is non-nil, emits progress (already present vs download/install per tool).
 func EnsureBinariesInDir(ctx context.Context, dir string, want []string, client *http.Client, log Logger) error {
-	_ = ctx
 	all, err := DefaultToolSpecs()
 	if err != nil {
 		return err
@@ -257,10 +256,10 @@ func EnsureBinariesInDir(ctx context.Context, dir string, want []string, client 
 			specs[n] = s
 		}
 	}
-	return ensureBinaries(dir, specs, client, log)
+	return ensureBinaries(ctx, dir, specs, client, log)
 }
 
-func ensureBinaries(dir string, deps map[string]BinarySpec, client *http.Client, log Logger) error {
+func ensureBinaries(ctx context.Context, dir string, deps map[string]BinarySpec, client *http.Client, log Logger) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir tools dir: %w", err)
 	}
@@ -273,14 +272,14 @@ func ensureBinaries(dir string, deps map[string]BinarySpec, client *http.Client,
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if err := ensureOneBinary(dir, name, deps[name], client, log); err != nil {
+		if err := ensureOneBinary(ctx, dir, name, deps[name], client, log); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	return nil
 }
 
-func ensureOneBinary(dir, name string, spec BinarySpec, client *http.Client, log Logger) error {
+func ensureOneBinary(ctx context.Context, dir, name string, spec BinarySpec, client *http.Client, log Logger) error {
 	dest := filepath.Join(dir, name)
 	if ok, err := fileMatchesSHA256(dest, spec.SHA256); err != nil {
 		return err
@@ -295,7 +294,7 @@ func ensureOneBinary(dir, name string, spec BinarySpec, client *http.Client, log
 		log.Infof("Installing %s: downloading pinned release (this may take a while)...", name)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, spec.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.URL, nil)
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}

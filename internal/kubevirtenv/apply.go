@@ -34,7 +34,7 @@ func (e *Environment) ApplyManifestFromURL(ctx context.Context, dynamicClient dy
 // ApplyManifestContent applies multi-document YAML with server-side apply.
 func (e *Environment) ApplyManifestContent(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
-	return forEachManifestObject(config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
+	return forEachManifestObject(log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
 		dr := resourceClient(dynamicClient, mapping, obj)
 		obj.SetManagedFields(nil)
 		if _, err := dr.Apply(ctx, obj.GetName(), obj, metav1.ApplyOptions{FieldManager: applyFieldManager}); err != nil {
@@ -73,7 +73,7 @@ func (e *Environment) DeleteResourcesFromManifestURL(ctx context.Context, dynami
 
 func (e *Environment) deleteResourcesFromYAML(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
-	return forEachManifestObject(config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
+	return forEachManifestObject(log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
 		dr := resourceClient(dynamicClient, mapping, obj)
 		if err := dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			log.Warnf("delete %s/%s: %v", mapping.gvk.Kind, obj.GetName(), err)
@@ -90,7 +90,7 @@ type manifestMapping struct {
 
 // forEachManifestObject decodes a multi-doc YAML stream and invokes fn for each object that
 // resolves through discovery. Decode/mapping errors are logged via the environment logger and skipped.
-func forEachManifestObject(config *rest.Config, yamlContent []byte, fn func(*manifestMapping, *unstructured.Unstructured) error) error {
+func forEachManifestObject(log Logger, config *rest.Config, yamlContent []byte, fn func(*manifestMapping, *unstructured.Unstructured) error) error {
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return fmt.Errorf("discovery client: %w", err)
@@ -117,10 +117,13 @@ func forEachManifestObject(config *rest.Config, yamlContent []byte, fn func(*man
 		obj := &unstructured.Unstructured{}
 		_, gvk, err := dec.Decode(rawObj.Raw, nil, obj)
 		if err != nil {
-			continue
+			return fmt.Errorf("decode object: %w", err)
 		}
 		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
+			if log != nil {
+				log.Warnf("skip %s/%s: REST mapping unavailable: %v", gvk.Kind, obj.GetName(), err)
+			}
 			continue
 		}
 		mm := &manifestMapping{gvk: *gvk, mapping: mapping}

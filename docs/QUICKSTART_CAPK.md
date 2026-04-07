@@ -8,7 +8,7 @@ This guide sets up a local KubeVirt environment and provisions a single-node Kai
 - Go toolchain (for building `kubevirt-env`)
 - Network access to `github.com` (remote `kubectl apply -k` for the Kairos operator)
 
-Pinned `kubectl`, `kind`, `clusterctl`, and `virtctl` are downloaded into `.work-kubevirt-<cluster-name>/bin` on first run.
+Pinned `kubectl`, `kind`, `clusterctl`, and `virtctl` are cached under `<RepoRoot>/.e2e-bin` on first run.
 
 ## Build the local helper
 

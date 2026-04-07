@@ -19,7 +19,7 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "kubevirt-env",
 		Short: "Provision a local kind + KubeVirt management cluster and install the full demo stack",
-		Long:  "Creates the work directory (.work-kubevirt-<cluster-name>/), downloads pinned CLIs into <workdir>/bin, creates the kind cluster, and installs components in order (same flow as library RunFullDemoSetup).",
+		Long:  "Creates the work directory (.work-kubevirt-<cluster-name>/), caches pinned CLIs under <RepoRoot>/.e2e-bin, creates the kind cluster, and installs components in order (same flow as library RunFullDemoSetup).",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			env, err := kubevirtEnv()
 			if err != nil {

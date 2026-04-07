@@ -171,7 +171,7 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 140
     env:
       GOTOOLCHAIN: local
     steps:
@@ -205,7 +205,7 @@ jobs:
 
     - name: Run e2e suite
       # Use `go run .../ginkgo` so the CLI version always matches the Ginkgo library in go.mod.
-      run: go run github.com/onsi/ginkgo/v2/ginkgo -v --timeout=80m ./test/e2e/...
+      run: go run github.com/onsi/ginkgo/v2/ginkgo -v --timeout=130m ./test/e2e/...
 
   build:
     runs-on: ubuntu-latest

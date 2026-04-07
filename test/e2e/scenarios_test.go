@@ -65,7 +65,7 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 	)
 
 	BeforeAll(func(ctx context.Context) {
-		By("provisioning management kind cluster (shared kubevirtenv.RunDevManagementStack — CLIs in workDir/bin)")
+		By("provisioning management kind cluster (shared kubevirtenv.RunDevManagementStack — CLIs cached under <RepoRoot>/.e2e-bin)")
 		var err error
 
 		By("resolving repository root (directory containing go.mod)")
