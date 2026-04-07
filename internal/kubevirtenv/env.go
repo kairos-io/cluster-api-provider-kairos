@@ -5,15 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-)
-
-const (
-	// DefaultCAPIVersion must match the sigs.k8s.io/cluster-api version in go.mod.
-	// If these diverge, the controller will fail with API version mismatch errors
-	// (e.g. "unable to decode an event" on Machine watches).
-	DefaultCAPIVersion = "v1.8.0"
 )
 
 // Environment holds paths and options shared by install steps (kind cluster, kubeconfig, tool binaries, logging).
@@ -40,7 +32,8 @@ type Environment struct {
 	// ClusterctlExtraPath is prepended to PATH for clusterctl (e.g. repo ./bin for provider plugins).
 	ClusterctlExtraPath string
 
-	// CAPIVersion is used for clusterctl init core/bootstrap/control-plane (filled from catalog by EnsurePinnedCLIs if empty).
+	// CAPIVersion is used for clusterctl init core/bootstrap/control-plane. Filled from the pinned
+	// clusterctl version by EnsurePinnedCLIs if empty.
 	CAPIVersion string
 
 	// CAPKInfra is the --infrastructure argument (e.g. "kubevirt", "kubevirt:v1.2.3"). Empty defaults to kubevirt / CAPK_VERSION env in InstallCAPK.
@@ -120,18 +113,6 @@ func (e *Environment) RequireKubeconfig() error {
 	return nil
 }
 
-// HelmEnviron returns os.Environ with KUBECONFIG set to this environment's kubeconfig path.
-func (e *Environment) HelmEnviron() []string {
-	return append(os.Environ(), "KUBECONFIG="+e.KubeconfigPath())
-}
-
-// HelmCommand builds a helm subprocess using HelmEnviron (targets the same cluster as client-go).
-func (e *Environment) HelmCommand(args ...string) *exec.Cmd {
-	c := exec.Command("helm", args...)
-	c.Env = e.HelmEnviron()
-	return c
-}
-
 func (e *Environment) kindBin() string {
 	if e.KindPath != "" {
 		return e.KindPath
@@ -192,27 +173,3 @@ func (e *Environment) log() Logger {
 	return StdLogger{}
 }
 
-// ValidateKindInstalled returns an error if kind is not available (empty KindPath uses PATH).
-func ValidateKindInstalled(e *Environment) error {
-	bin := e.kindBin()
-	if _, err := exec.LookPath(bin); err != nil {
-		return fmt.Errorf("required command %q not found in PATH", bin)
-	}
-	return nil
-}
-
-// ValidateClusterctlInstalled returns an error if clusterctl is not available.
-func ValidateClusterctlInstalled(e *Environment) error {
-	bin := e.clusterctlBin()
-	if _, err := exec.LookPath(bin); err != nil {
-		return fmt.Errorf("required command %q not found in PATH", bin)
-	}
-	return nil
-}
-
-func (e *Environment) capiVersionOrDefault() string {
-	if e.CAPIVersion != "" {
-		return e.CAPIVersion
-	}
-	return DefaultCAPIVersion
-}

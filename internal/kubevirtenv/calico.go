@@ -80,31 +80,3 @@ func (e *Environment) InstallCalico(ctx context.Context) error {
 	return nil
 }
 
-// UninstallCalico removes Calico (best-effort).
-func (e *Environment) UninstallCalico(ctx context.Context) error {
-	log := e.log()
-	if !e.IsCalicoInstalled() {
-		log.Infof("Calico CNI is not installed")
-		return nil
-	}
-	config, err := e.RESTConfig()
-	if err != nil {
-		return err
-	}
-	dynamicClient, err := dynamic.NewForConfig(config)
-	if err != nil {
-		return fmt.Errorf("dynamic client: %w", err)
-	}
-	calicoURL := fmt.Sprintf(CalicoManifestURL, CalicoVersion)
-	log.Step("Uninstalling Calico CNI...")
-	if err := e.DeleteResourcesFromManifestURL(dynamicClient, config, calicoURL); err != nil {
-		return fmt.Errorf("delete Calico manifest: %w", err)
-	}
-	time.Sleep(5 * time.Second)
-	if e.IsCalicoInstalled() {
-		log.Warnf("Some Calico resources may still be present")
-	} else {
-		log.Step("Calico CNI uninstalled ✓")
-	}
-	return nil
-}

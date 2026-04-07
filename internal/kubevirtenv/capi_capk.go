@@ -60,7 +60,10 @@ func (e *Environment) InstallCAPIKubeadmCore(ctx context.Context) error {
 		log.Step("Cluster API (CAPI) is already installed ✓")
 		return nil
 	}
-	ver := e.capiVersionOrDefault()
+	if e.CAPIVersion == "" {
+		return fmt.Errorf("Environment.CAPIVersion is empty (call EnsurePinnedCLIs first)")
+	}
+	ver := e.CAPIVersion
 	log.Infof("Installing Cluster API %s (kubeadm bootstrap + control-plane)...", ver)
 	args := []string{
 		"init",

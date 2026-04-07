@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
 	"github.com/spf13/cobra"
@@ -22,7 +21,11 @@ func main() {
 		Short: "Provision a local kind + KubeVirt management cluster and install the full demo stack",
 		Long:  "Creates the work directory (.work-kubevirt-<cluster-name>/), downloads pinned CLIs into <workdir>/bin, creates the kind cluster, and installs components in order (same flow as library RunFullDemoSetup).",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return kubevirtenv.RunFullDemoSetup(context.Background(), kubevirtEnv())
+			env, err := kubevirtEnv()
+			if err != nil {
+				return err
+			}
+			return kubevirtenv.RunFullDemoSetup(context.Background(), env)
 		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			return initializeConfig()
@@ -37,7 +40,11 @@ func main() {
 		Use:   "cleanup",
 		Short: "Delete the kind cluster and remove the work directory",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCleanup()
+			env, err := kubevirtEnv()
+			if err != nil {
+				return err
+			}
+			return runCleanup(env)
 		},
 	})
 
@@ -58,26 +65,29 @@ func getClusterName() string {
 }
 
 func getWorkDir() string {
-	return filepath.Join(".work-kubevirt-" + getClusterName())
+	return ".work-kubevirt-" + getClusterName()
 }
 
-func kubevirtEnv() *kubevirtenv.Environment {
-	wd, _ := os.Getwd()
-	repoRoot, _ := kubevirtenv.FindRepoRoot(wd)
-	return &kubevirtenv.Environment{
-		ClusterName:         getClusterName(),
-		WorkDir:             getWorkDir(),
-		RepoRoot:            repoRoot,
-		Logger:              kubevirtenv.StdLogger{},
-		ClusterctlExtraPath: filepath.Join(wd, "bin"),
-		Stdout:              os.Stdout,
-		Stderr:              os.Stderr,
-		CAPIVersion:         kubevirtenv.DefaultCAPIVersion,
+func kubevirtEnv() (*kubevirtenv.Environment, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("getwd: %w", err)
 	}
+	repoRoot, err := kubevirtenv.FindRepoRoot(wd)
+	if err != nil {
+		return nil, fmt.Errorf("repo root: %w", err)
+	}
+	return &kubevirtenv.Environment{
+		ClusterName: getClusterName(),
+		WorkDir:     getWorkDir(),
+		RepoRoot:    repoRoot,
+		Logger:      kubevirtenv.StdLogger{},
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+	}, nil
 }
 
-func runCleanup() error {
-	env := kubevirtEnv()
+func runCleanup(env *kubevirtenv.Environment) error {
 	log := env.Logger
 	ctx := context.Background()
 	log.Step("=== Cleaning up ===")

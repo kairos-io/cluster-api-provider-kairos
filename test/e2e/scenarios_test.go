@@ -111,7 +111,7 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		mgmtCluster = &PreparedKindCluster{
 			ClusterName: clusterName,
 			Kubeconfig:  kubeconfig,
-			ImageRef:    DevControllerImageRef,
+			ImageRef:    kubevirtenv.DevControllerImageRef,
 		}
 
 		By("kubectl sanity check against management API")

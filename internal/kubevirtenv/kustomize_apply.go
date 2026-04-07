@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,6 +120,3 @@ func (e *Environment) KubectlAPIHealth(ctx context.Context, kubeconfig string) e
 	}
 	return nil
 }
-
-// DiscardWriter is an io.Writer that discards input (for tests).
-var DiscardWriter io.Writer = io.Discard
