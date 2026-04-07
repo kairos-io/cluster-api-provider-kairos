@@ -30,7 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 var (
@@ -330,6 +332,64 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 			_, _ = fmt.Fprintln(w)
 		}
 	}
+}
+
+// waitForWorkloadNodeReady fetches the workload cluster kubeconfig from the CAPI-managed
+// "<clusterName>-kubeconfig" Secret on the management cluster, then polls the workload API
+// until at least one Node reports Ready=True.
+func waitForWorkloadNodeReady(ctx context.Context, env *kubevirtenv.Environment, namespace, clusterName string, timeout time.Duration) {
+	mgmtCS, err := env.Clientset()
+	Expect(err).NotTo(HaveOccurred())
+
+	secretName := clusterName + "-kubeconfig"
+	var kubeconfigBytes []byte
+	{
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		err := wait.PollUntilContextCancel(fetchCtx, 5*time.Second, true, func(c context.Context) (bool, error) {
+			s, gerr := mgmtCS.CoreV1().Secrets(namespace).Get(c, secretName, metav1.GetOptions{})
+			if gerr != nil {
+				return false, nil
+			}
+			kubeconfigBytes = s.Data["value"]
+			return len(kubeconfigBytes) > 0, nil
+		})
+		Expect(err).NotTo(HaveOccurred(), "kubeconfig secret %s/%s not available", namespace, secretName)
+	}
+
+	cfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
+	Expect(err).NotTo(HaveOccurred())
+	wlCS, err := kubernetes.NewForConfig(cfg)
+	Expect(err).NotTo(HaveOccurred())
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err = wait.PollUntilContextCancel(waitCtx, 10*time.Second, true, func(c context.Context) (bool, error) {
+		nodes, lerr := wlCS.CoreV1().Nodes().List(c, metav1.ListOptions{})
+		if lerr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "  workload nodes: list error: %v\n", lerr)
+			return false, nil
+		}
+		if len(nodes.Items) == 0 {
+			_, _ = fmt.Fprintf(GinkgoWriter, "  workload nodes: none yet\n")
+			return false, nil
+		}
+		for _, n := range nodes.Items {
+			ready := corev1.ConditionUnknown
+			for _, c := range n.Status.Conditions {
+				if c.Type == corev1.NodeReady {
+					ready = c.Status
+					break
+				}
+			}
+			_, _ = fmt.Fprintf(GinkgoWriter, "  workload node %s Ready=%s\n", n.Name, ready)
+			if ready == corev1.ConditionTrue {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	Expect(err).NotTo(HaveOccurred(), "no workload Node became Ready within %s", timeout)
 }
 
 // expectMachinesRunning asserts that all CAPI Machines for the given cluster are in the "Running" phase.

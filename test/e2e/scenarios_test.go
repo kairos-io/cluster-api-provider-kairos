@@ -172,5 +172,8 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 
 		By("verifying CAPI Machines are in Running phase")
 		expectMachinesRunning(ctx, dc, wlNamespace, wlClusterName)
+
+		By("connecting to the workload cluster and waiting for a Ready Node")
+		waitForWorkloadNodeReady(ctx, stackEnv, wlNamespace, wlClusterName, 10*time.Minute)
 	})
 })
