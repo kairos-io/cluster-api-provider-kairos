@@ -66,7 +66,8 @@ func (e *Environment) BinDir() string {
 	return filepath.Join(e.WorkDir, "bin")
 }
 
-// EnsurePinnedCLIs downloads kubectl, kind, clusterctl, and virtctl into WorkDir/bin and sets *Path fields.
+// EnsurePinnedCLIs downloads kubectl, kind, clusterctl, and virtctl into a persistent
+// per-repo cache (<RepoRoot>/.e2e-bin) so binaries are reused across runs, and sets *Path fields.
 func (e *Environment) EnsurePinnedCLIs(ctx context.Context) error {
 	if e.WorkDir == "" {
 		return fmt.Errorf("kubevirtenv.Environment: WorkDir is required")
@@ -79,7 +80,17 @@ func (e *Environment) EnsurePinnedCLIs(ctx context.Context) error {
 	if err := os.MkdirAll(e.WorkDir, 0o755); err != nil {
 		return fmt.Errorf("workdir: %w", err)
 	}
-	bin := e.BinDir()
+	if e.RepoRoot == "" {
+		r, err := FindRepoRoot(e.WorkDir)
+		if err != nil {
+			return fmt.Errorf("repo root for CLI cache: %w", err)
+		}
+		e.RepoRoot = r
+	}
+	bin := filepath.Join(e.RepoRoot, ".e2e-bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		return fmt.Errorf("cli cache dir: %w", err)
+	}
 	if err := EnsureBinariesInDir(ctx, bin, nil, nil, e.log()); err != nil {
 		return fmt.Errorf("ensure CLIs: %w", err)
 	}

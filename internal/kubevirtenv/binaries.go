@@ -123,14 +123,15 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 		Name: "clusterctl",
 		Arches: map[string]BinaryArchArtifact{
 			"amd64": {
-				Version:     "v1.12.4",
+				// must match DefaultCAPIVersion (and the sigs.k8s.io/cluster-api version in go.mod)
+				Version:     "v1.8.0",
 				URLTemplate: "https://github.com/kubernetes-sigs/cluster-api/releases/download/%[1]s/clusterctl-linux-%[2]s",
-				SHA256:      "ec758f8355b8ee92a5a4463a43d374516d611dd41029fd5e5315eb6f167643e7",
+				SHA256:      "9489713e4306300d5915fe8a301dd3f641764177dd3be51bf10e16e995b97092",
 			},
 			"arm64": {
-				Version:     "v1.12.4",
+				Version:     "v1.8.0",
 				URLTemplate: "https://github.com/kubernetes-sigs/cluster-api/releases/download/%[1]s/clusterctl-linux-%[2]s",
-				SHA256:      "1260f75a3e936057b94a561c8b21ac6cba2ae75d9f1c2c25ea3ecc876017fbd6",
+				SHA256:      "cc594a67672a08e60cefd7e01d1cc487156dc3c224ac433a1a8685d0309b8fcc",
 			},
 		},
 	},

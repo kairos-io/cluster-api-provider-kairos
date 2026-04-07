@@ -141,6 +141,7 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 			wlClusterName = "e2e-workload"
 			wlNamespace   = "default"
 			wlTimeout     = 45 * time.Minute
+			cpTimeout     = 10 * time.Minute
 		)
 
 		By(fmt.Sprintf("kubectl rollout status deployment/%s -n %s", kairosControllerDeployName, kairosProviderNamespace))
@@ -167,7 +168,7 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		waitForClusterProvisioned(ctx, dc, wlNamespace, wlClusterName, wlTimeout)
 
 		By("waiting for KairosControlPlane to be initialized with ready replicas")
-		waitForControlPlaneReady(ctx, dc, wlNamespace, wlClusterName+"-cp", wlTimeout)
+		waitForControlPlaneReady(ctx, stackEnv, dc, wlNamespace, wlClusterName, wlClusterName+"-cp", cpTimeout)
 
 		By("verifying CAPI Machines are in Running phase")
 		expectMachinesRunning(ctx, dc, wlNamespace, wlClusterName)

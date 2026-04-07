@@ -24,6 +24,7 @@ import (
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -33,27 +34,32 @@ import (
 )
 
 var (
-	clusterGVR = schema.GroupVersionResource{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "clusters"}
-	kcpGVR     = schema.GroupVersionResource{Group: "controlplane.cluster.x-k8s.io", Version: "v1beta2", Resource: "kairoscontrolplanes"}
-	machineGVR = schema.GroupVersionResource{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machines"}
+	clusterGVR        = schema.GroupVersionResource{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "clusters"}
+	kcpGVR            = schema.GroupVersionResource{Group: "controlplane.cluster.x-k8s.io", Version: "v1beta2", Resource: "kairoscontrolplanes"}
+	machineGVR        = schema.GroupVersionResource{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machines"}
+	kvMachineGVR            = schema.GroupVersionResource{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Resource: "kubevirtmachines"}
+	kvMachineTemplateGVR    = schema.GroupVersionResource{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Resource: "kubevirtmachinetemplates"}
+	kubevirtClusterGVR      = schema.GroupVersionResource{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Resource: "kubevirtclusters"}
+	kairosConfigTemplateGVR = schema.GroupVersionResource{Group: "bootstrap.cluster.x-k8s.io", Version: "v1beta2", Resource: "kairosconfigtemplates"}
+	vmiGVR                  = schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances"}
 )
 
 // applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt.
 // The VM boots directly from the Kairos cloud image (kairos-kubevirt DataVolume) — no ISO
 // install step is needed since the cloud image is a pre-built bootable disk.
 func applyWorkloadClusterManifests(env *kubevirtenv.Environment, dc dynamic.Interface, cfg *rest.Config, clusterName, namespace string) {
-	yaml := fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta2
+	yaml := fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
 metadata:
   name: %[1]s
   namespace: %[2]s
 spec:
   infrastructureRef:
-    apiGroup: infrastructure.cluster.x-k8s.io
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
     kind: KubevirtCluster
     name: %[1]s
   controlPlaneRef:
-    apiGroup: controlplane.cluster.x-k8s.io
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta2
     kind: KairosControlPlane
     name: %[1]s-cp
 ---
@@ -71,7 +77,7 @@ metadata:
   namespace: %[2]s
 spec:
   replicas: 1
-  version: "v1.30.0+k3s.0"
+  version: "v1.35.2+k3s1"
   distribution: k3s
   machineTemplate:
     infrastructureRef:
@@ -142,7 +148,7 @@ spec:
     spec:
       role: control-plane
       distribution: k3s
-      kubernetesVersion: "v1.30.0+k3s.0"
+      kubernetesVersion: "v1.35.2+k3s1"
       dnsServers:
         - "8.8.8.8"
       userName: kairos
@@ -152,6 +158,24 @@ spec:
 `, clusterName, namespace)
 
 	Expect(env.ApplyManifestContent(dc, cfg, []byte(yaml))).To(Succeed())
+
+	// Apply is silent on unknown GVKs / partial failures — verify each top-level object actually exists.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	checks := []struct {
+		gvr  schema.GroupVersionResource
+		name string
+	}{
+		{clusterGVR, clusterName},
+		{kcpGVR, clusterName + "-cp"},
+		{kvMachineTemplateGVR, clusterName + "-mt"},
+		{kubevirtClusterGVR, clusterName},
+		{kairosConfigTemplateGVR, clusterName + "-config"},
+	}
+	for _, c := range checks {
+		_, err := dc.Resource(c.gvr).Namespace(namespace).Get(ctx, c.name, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), "expected %s %s/%s to exist after apply", c.gvr.Resource, namespace, c.name)
+	}
 }
 
 // waitForClusterProvisioned polls until the CAPI Cluster reaches the "Provisioned" phase.
@@ -171,20 +195,141 @@ func waitForClusterProvisioned(ctx context.Context, dc dynamic.Interface, namesp
 }
 
 // waitForControlPlaneReady polls until the KairosControlPlane is initialized with at least one ready replica.
-func waitForControlPlaneReady(ctx context.Context, dc dynamic.Interface, namespace, name string, timeout time.Duration) {
+// On failure (timeout, fatal pod state, or context cancel) it dumps diagnostics from the workload namespace
+// (KCP, KubevirtMachine, VMI, virt-launcher pod logs) before failing the spec.
+func waitForControlPlaneReady(ctx context.Context, env *kubevirtenv.Environment, dc dynamic.Interface, namespace, clusterName, name string, timeout time.Duration) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	var fatalReason string
 	err := wait.PollUntilContextCancel(waitCtx, 15*time.Second, true, func(ctx context.Context) (bool, error) {
 		obj, getErr := dc.Resource(kcpGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-		if getErr != nil {
-			return false, nil
+		if getErr == nil {
+			initialized, _, _ := unstructured.NestedBool(obj.Object, "status", "initialized")
+			readyReplicas, _, _ := unstructured.NestedInt64(obj.Object, "status", "readyReplicas")
+			_, _ = fmt.Fprintf(GinkgoWriter, "  KairosControlPlane initialized=%v readyReplicas=%d\n", initialized, readyReplicas)
+			if initialized && readyReplicas >= 1 {
+				return true, nil
+			}
 		}
-		initialized, _, _ := unstructured.NestedBool(obj.Object, "status", "initialized")
-		readyReplicas, _, _ := unstructured.NestedInt64(obj.Object, "status", "readyReplicas")
-		_, _ = fmt.Fprintf(GinkgoWriter, "  KairosControlPlane initialized=%v readyReplicas=%d\n", initialized, readyReplicas)
-		return initialized && readyReplicas >= 1, nil
+		if reason := detectFatalVirtLauncherState(ctx, env, namespace); reason != "" {
+			fatalReason = reason
+			return false, fmt.Errorf("fatal virt-launcher state: %s", reason)
+		}
+		return false, nil
 	})
-	Expect(err).NotTo(HaveOccurred(), "KairosControlPlane %s/%s did not become ready within %s", namespace, name, timeout)
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "\n=== KairosControlPlane did not become ready (%v) ===\n", err)
+		if fatalReason != "" {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Fatal: %s\n", fatalReason)
+		}
+		dumpWorkloadDiagnostics(env, dc, namespace, clusterName, name)
+		Fail(fmt.Sprintf("KairosControlPlane %s/%s did not become ready within %s: %v", namespace, name, timeout, err))
+	}
+}
+
+// detectFatalVirtLauncherState returns a non-empty reason if any virt-launcher pod in the namespace is
+// in a clearly terminal/broken state (Failed phase, CrashLoopBackOff, or container restartCount >= 3).
+func detectFatalVirtLauncherState(ctx context.Context, env *kubevirtenv.Environment, namespace string) string {
+	cs, err := env.Clientset()
+	if err != nil {
+		return ""
+	}
+	pods, err := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "kubevirt.io=virt-launcher"})
+	if err != nil {
+		return ""
+	}
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodFailed {
+			return fmt.Sprintf("pod %s phase=Failed", p.Name)
+		}
+		for _, cs := range p.Status.ContainerStatuses {
+			if cs.RestartCount >= 3 {
+				return fmt.Sprintf("pod %s container %s restartCount=%d", p.Name, cs.Name, cs.RestartCount)
+			}
+			if w := cs.State.Waiting; w != nil && (w.Reason == "CrashLoopBackOff" || w.Reason == "ImagePullBackOff" || w.Reason == "ErrImagePull") {
+				return fmt.Sprintf("pod %s container %s waiting: %s", p.Name, cs.Name, w.Reason)
+			}
+		}
+	}
+	return ""
+}
+
+// dumpWorkloadDiagnostics prints status of KCP, KubevirtMachines, VMIs and tail of virt-launcher container logs.
+func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface, namespace, clusterName, kcpName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := GinkgoWriter
+
+	_, _ = fmt.Fprintf(w, "\n--- KairosControlPlane %s/%s status ---\n", namespace, kcpName)
+	if obj, err := dc.Resource(kcpGVR).Namespace(namespace).Get(ctx, kcpName, metav1.GetOptions{}); err == nil {
+		if status, found, _ := unstructured.NestedMap(obj.Object, "status"); found {
+			_, _ = fmt.Fprintf(w, "%v\n", status)
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "get error: %v\n", err)
+	}
+
+	_, _ = fmt.Fprintf(w, "\n--- KubevirtMachines in %s ---\n", namespace)
+	if list, err := dc.Resource(kvMachineGVR).Namespace(namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, m := range list.Items {
+			ready, _, _ := unstructured.NestedBool(m.Object, "status", "ready")
+			conds, _, _ := unstructured.NestedSlice(m.Object, "status", "conditions")
+			_, _ = fmt.Fprintf(w, "  %s ready=%v conditions=%v\n", m.GetName(), ready, conds)
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
+	}
+
+	_, _ = fmt.Fprintf(w, "\n--- VirtualMachineInstances in %s ---\n", namespace)
+	if list, err := dc.Resource(vmiGVR).Namespace(namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, vmi := range list.Items {
+			phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase")
+			conds, _, _ := unstructured.NestedSlice(vmi.Object, "status", "conditions")
+			_, _ = fmt.Fprintf(w, "  %s phase=%s conditions=%v\n", vmi.GetName(), phase, conds)
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
+	}
+
+	_, _ = fmt.Fprintf(w, "\n--- virt-launcher pods in %s ---\n", namespace)
+	cs, err := env.Clientset()
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "clientset error: %v\n", err)
+		return
+	}
+	pods, err := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "kubevirt.io=virt-launcher"})
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
+		return
+	}
+	for _, p := range pods.Items {
+		_, _ = fmt.Fprintf(w, "\nPod %s phase=%s\n", p.Name, p.Status.Phase)
+		for _, cstat := range p.Status.ContainerStatuses {
+			_, _ = fmt.Fprintf(w, "  container %s ready=%v restarts=%d state=%+v\n", cstat.Name, cstat.Ready, cstat.RestartCount, cstat.State)
+		}
+		for _, c := range p.Spec.Containers {
+			tail := int64(120)
+			req := cs.CoreV1().Pods(namespace).GetLogs(p.Name, &corev1.PodLogOptions{Container: c.Name, TailLines: &tail})
+			rc, err := req.Stream(ctx)
+			if err != nil {
+				_, _ = fmt.Fprintf(w, "  logs(%s) error: %v\n", c.Name, err)
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "  --- logs %s (tail %d) ---\n", c.Name, tail)
+			buf := make([]byte, 8192)
+			for {
+				n, rerr := rc.Read(buf)
+				if n > 0 {
+					_, _ = w.Write(buf[:n])
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			_ = rc.Close()
+			_, _ = fmt.Fprintln(w)
+		}
+	}
 }
 
 // expectMachinesRunning asserts that all CAPI Machines for the given cluster are in the "Running" phase.

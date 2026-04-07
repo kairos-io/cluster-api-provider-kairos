@@ -52,7 +52,7 @@ manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition o
 		config/crd/bases/controlplane.cluster.x-k8s.io_kairoscontrolplanetemplates.yaml; do \
 		if [ -f "$$crd" ]; then \
 			if ! grep -q "cluster.x-k8s.io/provider: kairos" "$$crd" 2>/dev/null; then \
-				sed -i '/^  name: /i\  labels:\n    cluster.x-k8s.io/provider: kairos\n    cluster.x-k8s.io/v1beta2: v1beta2' "$$crd"; \
+				sed -i '/^  name: /i\  labels:\n    cluster.x-k8s.io/provider: kairos\n    cluster.x-k8s.io/v1beta1: v1beta2\n    cluster.x-k8s.io/v1beta2: v1beta2' "$$crd"; \
 			fi; \
 		fi; \
 	done

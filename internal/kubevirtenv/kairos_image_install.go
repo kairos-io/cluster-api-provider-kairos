@@ -27,23 +27,25 @@ const (
 	kairosCloudImageName = "kairos-kubevirt"
 	cdiUploadDefaultPort = 18443
 	// kairosOSArtifactDiskMiB is spec.artifacts.diskSize (MiB); the built .raw virtual size matches this.
-	kairosOSArtifactDiskMiB = 32000
-	// kairosCDIUploadExtraMiB is added to the CDI DataVolume virtctl --size so the PVC exceeds the raw image
-	// (provisioner rounding and upload checks compare against available capacity; 25Gi was too small for 32000MiB disk).
-	kairosCDIUploadExtraMiB = 2048
+	// hadron-standard-k3s fits comfortably in 8 GiB; bumping this only slows down the build/upload.
+	kairosOSArtifactDiskMiB = 8000
+	// kairosCDIUploadExtraMiB is added to the CDI DataVolume virtctl --size so the PVC exceeds the raw image.
+	kairosCDIUploadExtraMiB = 1024
 )
 
 func (e *Environment) kairosImageBuildDir() string {
 	return filepath.Join(e.WorkDir, "kairos-image", "build")
 }
 
-// kairosOSArtifactBaseImage is a published Kairos core image matching the host GOARCH (operator Stage 1 ref).
+// kairosOSArtifactBaseImage is a published Kairos hadron image with k3s preinstalled, matching the host GOARCH.
+// The "core" family ships without a Kubernetes distro and is unusable for CAPI workload nodes; "hadron-standard-k3s"
+// is also significantly smaller, which speeds up build + CDI upload.
 func kairosOSArtifactBaseImage(goarch string) string {
 	switch goarch {
 	case "arm64":
-		return "quay.io/kairos/opensuse:leap-15.6-core-arm64-generic-v3.6.0"
+		return "quay.io/kairos/hadron:v0.0.4-standard-arm64-generic-v4.0.3-k3s-v1.35.2-k3s1"
 	default:
-		return "quay.io/kairos/opensuse:leap-15.6-core-amd64-generic-v3.6.0"
+		return "quay.io/kairos/hadron:v0.0.4-standard-amd64-generic-v4.0.3-k3s-v1.35.2-k3s1"
 	}
 }
 
