@@ -1,43 +1,52 @@
+// Kubevirt-env CLI. Run e.g.:
+//
+//	go run ./cmd/kubevirt-env/
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
-const (
-	defaultClusterName = "kairos-capi-test"
-)
+const defaultClusterName = "kairos-capi-test"
 
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "kubevirt-env",
-		Short: "KubeVirt Local Testing Environment CLI",
-		Long:  "A CLI tool for managing local KubeVirt testing environments",
+		Short: "Provision a local kind + KubeVirt management cluster and install the full demo stack",
+		Long:  "Creates the work directory (.work-kubevirt-<cluster-name>/), caches pinned CLIs under <RepoRoot>/.e2e-bin, creates the kind cluster, and installs components in order (same flow as library RunFullDemoSetup).",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			env, err := kubevirtEnv()
+			if err != nil {
+				return err
+			}
+			return kubevirtenv.RunFullDemoSetup(context.Background(), env)
+		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			return initializeConfig()
 		},
 	}
 
 	rootCmd.PersistentFlags().String("cluster-name", defaultClusterName, "Cluster name (can also be set via CLUSTER_NAME env var)")
-	viper.BindPFlag("cluster-name", rootCmd.PersistentFlags().Lookup("cluster-name"))
-	viper.BindEnv("cluster-name", "CLUSTER_NAME")
+	_ = viper.BindPFlag("cluster-name", rootCmd.PersistentFlags().Lookup("cluster-name"))
+	_ = viper.BindEnv("cluster-name", "CLUSTER_NAME")
 
-	rootCmd.AddCommand(newCreateTestClusterCmd())
-	rootCmd.AddCommand(newSetupCmd())
-	rootCmd.AddCommand(newCleanupCmd())
-	rootCmd.AddCommand(newInstallCmd())
-	rootCmd.AddCommand(newUninstallCmd())
-	rootCmd.AddCommand(newReinstallCmd())
-	rootCmd.AddCommand(newBuildKairosImageCmd())
-	rootCmd.AddCommand(newUploadKairosImageCmd())
-	rootCmd.AddCommand(newTestControlPlaneCmd())
-	rootCmd.AddCommand(newTestClusterStatusCmd())
-	rootCmd.AddCommand(newDeleteTestClusterCmd())
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "cleanup",
+		Short: "Delete the kind cluster and remove the work directory",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			env, err := kubevirtEnv()
+			if err != nil {
+				return err
+			}
+			return runCleanup(env)
+		},
+	})
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -56,15 +65,41 @@ func getClusterName() string {
 }
 
 func getWorkDir() string {
-	clusterName := getClusterName()
-	return filepath.Join(".work-kubevirt-" + clusterName)
+	return ".work-kubevirt-" + getClusterName()
 }
 
-func getKubeconfigPath() string {
-	return filepath.Join(getWorkDir(), "kubeconfig")
+func kubevirtEnv() (*kubevirtenv.Environment, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("getwd: %w", err)
+	}
+	repoRoot, err := kubevirtenv.FindRepoRoot(wd)
+	if err != nil {
+		return nil, fmt.Errorf("repo root: %w", err)
+	}
+	return &kubevirtenv.Environment{
+		ClusterName: getClusterName(),
+		WorkDir:     getWorkDir(),
+		RepoRoot:    repoRoot,
+		Logger:      kubevirtenv.StdLogger{},
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+	}, nil
 }
 
-func getKubectlContext() string {
-	clusterName := getClusterName()
-	return fmt.Sprintf("kind-%s", clusterName)
+func runCleanup(env *kubevirtenv.Environment) error {
+	log := env.Logger
+	ctx := context.Background()
+	log.Step("=== Cleaning up ===")
+	log.Infof("Cluster name: %s", env.ClusterName)
+	log.Step("Deleting kind cluster...")
+	if err := env.DeleteKindCluster(ctx); err != nil {
+		log.Warnf("delete kind cluster: %v", err)
+	}
+	log.Step("Removing work directory...")
+	if err := env.RemoveWorkDir(); err != nil {
+		log.Warnf("remove work dir: %v", err)
+	}
+	log.Step("Cleanup complete ✓")
+	return nil
 }

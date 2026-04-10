@@ -4,18 +4,16 @@
 #
 # SETUP INSTRUCTIONS:
 #
-# 1. Ensure KubeVirt local env is ready (see docs/QUICKSTART_CAPK.md)
-# 2. Upload the Kairos image to CDI:
-#    - kubevirt-env upload-kairos-image
+# 1. Run ./bin/kubevirt-env (see docs/QUICKSTART_CAPK.md) — creates the env and uploads the Kairos image to CDI.
 #
-# 3. Update the KubeVirtMachineTemplate below:
+# 2. Update the KubeVirtMachineTemplate below:
 #    - Adjust CPU/memory/disk sizes
 #    - nodeSelector and DataVolume names are environment-specific; customize for your cluster
 #    - If using a cloud disk image, set the rootdisk DataVolume name to that image
 #    - If using an ISO, set installeriso to the ISO DataVolume and
 #      create a blank install disk DataVolume (kairos-install-disk)
 #
-# 4. Apply the manifest:
+# 3. Apply the manifest:
 #    - kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_single_node.yaml
 #
 # ============================================================================

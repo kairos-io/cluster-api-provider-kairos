@@ -1170,10 +1170,6 @@ func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.L
 	return ctrl.Result{}, r.Update(ctx, kairosConfig)
 }
 
-func splitLines(s string) []string {
-	return strings.Split(s, "\n")
-}
-
 // randomString generates a random lowercase alphanumeric string of the given length
 // This ensures the string is RFC 1123 compliant for Kubernetes resource names
 func randomString(length int) (string, error) {
@@ -1328,34 +1324,17 @@ func kubeconfigWriterName(clusterName string) string {
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// optionalInfraWatches lists infrastructure machine CRDs that the controller watches
+// when present. Each entry is tried at startup; missing CRDs are silently skipped.
+// When an infrastructure machine changes (e.g. providerID is set), the controller
+// re-reconciles the owning KairosConfig to regenerate the bootstrap secret.
+var optionalInfraWatches = []schema.GroupVersionKind{
+	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta1", Kind: "VSphereMachine"},
+	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "KubevirtMachine"},
+}
+
 func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	log := ctrl.Log.WithName("KairosConfig")
-
-	// Create unstructured VSphereMachine object for watching
-	vsphereMachineGVK := schema.GroupVersionKind{
-		Group:   "infrastructure.cluster.x-k8s.io",
-		Version: "v1beta1",
-		Kind:    "VSphereMachine",
-	}
-	vsphereMachine := &unstructured.Unstructured{}
-	vsphereMachine.SetGroupVersionKind(vsphereMachineGVK)
-
-	// Create unstructured KubevirtMachine objects for watching (v1alpha1 and v1alpha4)
-	kubevirtMachineGVKAlpha1 := schema.GroupVersionKind{
-		Group:   "infrastructure.cluster.x-k8s.io",
-		Version: "v1alpha1",
-		Kind:    "KubevirtMachine",
-	}
-	kubevirtMachineAlpha1 := &unstructured.Unstructured{}
-	kubevirtMachineAlpha1.SetGroupVersionKind(kubevirtMachineGVKAlpha1)
-
-	kubevirtMachineGVKAlpha4 := schema.GroupVersionKind{
-		Group:   "infrastructure.cluster.x-k8s.io",
-		Version: "v1alpha4",
-		Kind:    "KubevirtMachine",
-	}
-	kubevirtMachineAlpha4 := &unstructured.Unstructured{}
-	kubevirtMachineAlpha4.SetGroupVersionKind(kubevirtMachineGVKAlpha4)
 
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&bootstrapv1beta2.KairosConfig{}).
@@ -1366,23 +1345,16 @@ func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.machineToKairosConfig),
-		).
-		Watches(
-			vsphereMachine,
-			handler.EnqueueRequestsFromMapFunc(r.vsphereMachineToKairosConfig),
-		).
-		Watches(
-			kubevirtMachineAlpha1,
-			handler.EnqueueRequestsFromMapFunc(r.kubevirtMachineToKairosConfig),
 		)
 
-	if r.gvkExists(mgr, kubevirtMachineGVKAlpha4) {
-		builder = builder.Watches(
-			kubevirtMachineAlpha4,
-			handler.EnqueueRequestsFromMapFunc(r.kubevirtMachineToKairosConfig),
-		)
-	} else {
-		log.V(2).Info("Skipping watch: KubevirtMachine v1alpha4 CRD not installed")
+	for _, gvk := range optionalInfraWatches {
+		if !r.gvkExists(mgr, gvk) {
+			log.V(2).Info("Skipping watch: CRD not installed", "kind", gvk.Kind, "version", gvk.Version)
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		builder = builder.Watches(obj, handler.EnqueueRequestsFromMapFunc(r.infraMachineToKairosConfig))
 	}
 
 	return builder.Complete(r)
@@ -1471,53 +1443,14 @@ func (r *KairosConfigReconciler) machineToKairosConfig(ctx context.Context, o cl
 	}
 }
 
-// vsphereMachineToKairosConfig maps a VSphereMachine to its KairosConfig
-// This allows us to watch for VSphereMachine changes (especially when providerID is set)
-// and trigger KairosConfig reconciliation to regenerate bootstrap secret with providerID
-func (r *KairosConfigReconciler) vsphereMachineToKairosConfig(ctx context.Context, o client.Object) []reconcile.Request {
-	// Verify this is an unstructured object (VSphereMachine)
+// infraMachineToKairosConfig maps any infrastructure machine (VSphereMachine, KubevirtMachine, etc.)
+// to its owning KairosConfig. This triggers re-reconciliation when the infra machine changes
+// (e.g. providerID is set), so the bootstrap secret can be regenerated.
+func (r *KairosConfigReconciler) infraMachineToKairosConfig(ctx context.Context, o client.Object) []reconcile.Request {
 	if _, ok := o.(*unstructured.Unstructured); !ok {
 		return nil
 	}
-
-	// Get the Machine that owns this VSphereMachine
-	// VSphereMachine is typically owned by a Machine
-	machineList := &clusterv1.MachineList{}
-	if err := r.List(ctx, machineList, client.InNamespace(o.GetNamespace())); err != nil {
-		return nil
-	}
-
-	var requests []reconcile.Request
-	for _, machine := range machineList.Items {
-		// Check if this Machine references the VSphereMachine
-		if machine.Spec.InfrastructureRef.Kind == "VSphereMachine" &&
-			machine.Spec.InfrastructureRef.Name == o.GetName() &&
-			machine.Spec.InfrastructureRef.Namespace == o.GetNamespace() {
-			// Check if Machine has a bootstrap config reference to KairosConfig
-			if machine.Spec.Bootstrap.ConfigRef != nil &&
-				machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group == bootstrapv1beta2.GroupVersion.Group &&
-				machine.Spec.Bootstrap.ConfigRef.Kind == "KairosConfig" {
-				requests = append(requests, reconcile.Request{
-					NamespacedName: types.NamespacedName{
-						Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-						Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
-					},
-				})
-			}
-		}
-	}
-
-	return requests
-}
-
-// kubevirtMachineToKairosConfig maps a KubevirtMachine to its KairosConfig
-// This allows us to watch for KubevirtMachine changes (especially when providerID is set)
-// and trigger KairosConfig reconciliation to regenerate bootstrap secret with providerID
-func (r *KairosConfigReconciler) kubevirtMachineToKairosConfig(ctx context.Context, o client.Object) []reconcile.Request {
-	// Verify this is an unstructured object (KubevirtMachine)
-	if _, ok := o.(*unstructured.Unstructured); !ok {
-		return nil
-	}
+	infraKind := o.GetObjectKind().GroupVersionKind().Kind
 
 	machineList := &clusterv1.MachineList{}
 	if err := r.List(ctx, machineList, client.InNamespace(o.GetNamespace())); err != nil {
@@ -1526,19 +1459,18 @@ func (r *KairosConfigReconciler) kubevirtMachineToKairosConfig(ctx context.Conte
 
 	var requests []reconcile.Request
 	for _, machine := range machineList.Items {
-		if (machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine") &&
-			machine.Spec.InfrastructureRef.Name == o.GetName() &&
-			machine.Spec.InfrastructureRef.Namespace == o.GetNamespace() {
-			if machine.Spec.Bootstrap.ConfigRef != nil &&
-				machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group == bootstrapv1beta2.GroupVersion.Group &&
-				machine.Spec.Bootstrap.ConfigRef.Kind == "KairosConfig" {
-				requests = append(requests, reconcile.Request{
-					NamespacedName: types.NamespacedName{
-						Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-						Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
-					},
-				})
-			}
+		ref := machine.Spec.InfrastructureRef
+		if ref.Kind == infraKind &&
+			ref.Name == o.GetName() && ref.Namespace == o.GetNamespace() &&
+			machine.Spec.Bootstrap.ConfigRef != nil &&
+			machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group == bootstrapv1beta2.GroupVersion.Group &&
+			machine.Spec.Bootstrap.ConfigRef.Kind == "KairosConfig" {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      machine.Spec.Bootstrap.ConfigRef.Name,
+					Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
+				},
+			})
 		}
 	}
 

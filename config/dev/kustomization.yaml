@@ -1,0 +1,20 @@
+# Local / e2e overlay: deploy the controller using a pre-loaded image (e.g. controller:latest in kind).
+# The patch pins both image and pullPolicy on the manager Deployment so the cluster never tries
+# to pull from a remote registry.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../default
+
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/image
+      value: controller:latest
+    - op: replace
+      path: /spec/template/spec/containers/0/imagePullPolicy
+      value: IfNotPresent
+  target:
+    kind: Deployment
+    name: kairos-capi-controller-manager
+    namespace: kairos-capi-system

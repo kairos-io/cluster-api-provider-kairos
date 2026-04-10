@@ -8,6 +8,9 @@
 # Test artifacts
 test/crd/capi/
 
+# E2E tool binaries (kubectl, kind, clusterctl, …)
+.e2e-bin/
+
 # Test binary, built with `go test -c`
 *.test
 
