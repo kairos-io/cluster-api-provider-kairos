@@ -1,0 +1,84 @@
+#cloud-config
+{{- /* 
+Template inputs (from Go):
+
+  .Role              string   // "control-plane" or "worker"
+  .SingleNode        bool     // true for single-node kubeadm (controller-only)
+  .Hostname          string   // explicit hostname (optional)
+  .UserName          string   // e.g. "kairos"
+  .UserPassword      string   // e.g. "kairos"
+  .UserGroups        []string // e.g. ["admin"]
+  .GitHubUser        string   // e.g. "YOUR_GITHUB_USER" (optional)
+  .SSHPublicKey      string   // alternative to GitHubUser (optional)
+  .WorkerToken       string   // used only for workers
+  .Manifests         []Manifest // optional manifests
+  .HostnamePrefix    string   // e.g. "metal-"
+  .DNSServers        []string // optional DNS resolvers
+  .Install           *InstallConfig // install configuration (optional)
+  .ProviderID        string   // providerID for Node (e.g., "vsphere://<vm-uuid>")
+  .ControlPlaneLBEndpoint string // LoadBalancer endpoint for control plane (used as server address for workers)
+*/ -}}
+{{/* Hostname: prefer explicit name, else use hostname prefix with Kairos templating for machine ID */}}
+{{/* The {{ trunc 4 .MachineID }} is Kairos templating syntax, output literally */}}
+hostname: {{ .Hostname }}
+
+{{- if .Install }}
+install:
+  auto: {{ .Install.Auto }}
+  device: "{{ .Install.Device }}"
+  reboot: {{ .Install.Reboot }}
+{{- end }}
+
+users:
+  - name: {{ .UserName }}
+    passwd: {{ .UserPassword }}
+    groups:
+{{- range .UserGroups }}
+      - {{ . }}
+{{- end }}
+{{- if or .GitHubUser .SSHPublicKey }}
+    ssh_authorized_keys:
+  {{- if .GitHubUser }}
+      - github:{{ .GitHubUser }}
+  {{- end }}
+  {{- if .SSHPublicKey }}
+      - {{ .SSHPublicKey }}
+  {{- end }}
+{{- end }}
+{{/*{{- /* DNS overrides and post-bootstrap service */}}
+stages:
+  initramfs:
+    - sysctl:
+        net.ipv4.ip_forward: "1"
+        kernel.panic: "10"
+        kernel.panic_on_oops: "1"
+        vm.overcommit_memory: "1"
+      name: pre-kubeadm
+  boot:
+{{- if .DNSServers }}
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+        {{- range .DNSServers }}
+          - {{ . }}
+        {{- end }}
+        path: "/etc/resolv.conf"
+{{- end }}
+
+cluster:
+  role: worker
+  config: |
+    joinConfiguration:
+      discovery:
+        bootstrapToken:
+          apiServerEndpoint: {{ .ControlPlaneLBEndpoint }}
+          unsafeSkipCAVerification: true
+          token: {{ .WorkerToken }}
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+{{- if .Hostname }}
+          provider-id: kubevirt://{{ .Hostname }}
+{{- else }}
+          provider-id: {{ .ProviderID }}
+{{- end }}

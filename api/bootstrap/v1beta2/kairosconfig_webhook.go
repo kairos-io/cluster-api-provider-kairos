@@ -191,11 +191,11 @@ func (r *KairosConfig) validate() error {
 	}
 
 	// Validate distribution
-	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" && r.Spec.Distribution != "k3s" {
+	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" && r.Spec.Distribution != "k3s" && r.Spec.Distribution != "kubeadm" {
 		allErrs = append(allErrs, field.Invalid(
 			field.NewPath("spec", "distribution"),
 			r.Spec.Distribution,
-			"spec.distribution must be one of [k0s, k3s]",
+			"spec.distribution must be one of [k0s, k3s, kubeadm]",
 		))
 	}
 

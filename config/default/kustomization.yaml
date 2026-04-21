@@ -10,12 +10,12 @@ resources:
   - ../manager
 
 namePrefix: kairos-capi-
-namespace: kairos-capi-system
+namespace: kmetal-capi-providers
 
 # Set the image name and tag
 images:
   - name: controller
-    newName: ghcr.io/kairos-io/cluster-api-provider-kairos
+    newName: ghcr.io/clastix/cluster-api-provider-kairos
     newTag: latest
 
 # Common labels for all resources

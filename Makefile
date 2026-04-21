@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= ghcr.io/kairos-io/cluster-api-provider-kairos:latest
+IMG ?= ghcr.io/clastix/cluster-api-provider-kairos:latest
 # Image registry (no tag) — used by the release-manifests target with VERSION below.
 IMG_REGISTRY ?= ghcr.io/kairos-io/cluster-api-provider-kairos
 # Version used by release-manifests / docker-buildx-release. Default derives from git;

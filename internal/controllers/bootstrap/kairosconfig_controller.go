@@ -592,16 +592,16 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		// Verify providerID is included in the cloud-config
 		// cloudConfig is plain text, no need to decode
 		hasProviderIDInSecret := strings.Contains(cloudConfig, currentProviderID)
-		distribution := kairosConfig.Spec.Distribution
-		if distribution == "" {
-			distribution = "k0s"
-		}
 		// Check for the systemd service that sets providerID (runs after k3s/k0s service starts)
-		hasPostBootstrapService := strings.Contains(cloudConfig, "kairos-k0s-post-bootstrap.service")
-		if distribution == "k3s" {
+		var hasPostBootstrapService bool
+		switch kairosConfig.Spec.Distribution {
+		case "k3s":
 			hasPostBootstrapService = strings.Contains(cloudConfig, "kairos-k3s-post-bootstrap.service")
+		case "k0s":
+			hasPostBootstrapService = strings.Contains(cloudConfig, "kairos-k0s-post-bootstrap.service")
+		case "kubeadm":
+			hasPostBootstrapService = true
 		}
-
 		if hasProviderIDInSecret && hasPostBootstrapService {
 			kairosConfig.Status.Ready = true
 			log.Info("Bootstrap data secret created with providerID", "secret", secretName, "providerID", currentProviderID)
@@ -949,6 +949,8 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 
 	// Generate cloud-config based on distribution
 	switch distribution {
+	case "kubeadm":
+		return r.generateKubeadmCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
 	case "k0s":
 		return r.generateK0sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
 	case "k3s":

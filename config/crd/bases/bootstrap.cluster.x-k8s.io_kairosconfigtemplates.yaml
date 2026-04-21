@@ -225,6 +225,7 @@ spec:
                         enum:
                         - k0s
                         - k3s
+                        - kubeadm
                         type: string
                       dnsServers:
                         description: |-

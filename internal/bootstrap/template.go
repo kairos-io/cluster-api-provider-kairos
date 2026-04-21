@@ -265,6 +265,11 @@ func (d TemplateData) RenderKubeVIP() bool {
 	return d.IsHAControlPlane() && d.VIP != nil && !d.IsKubeVirt
 }
 
+// RenderKubeadmCloudConfig renders the kubeadm Kairos cloud-config template.
+func RenderKubeadmCloudConfig(data TemplateData) (string, error) {
+	return renderTemplate("kubeadm_kairos_cloud_config", "templates/kubeadm_kairos_cloud_config.yaml.tmpl", data)
+}
+
 // RenderK0sCloudConfig renders the k0s Kairos cloud-config template.
 //
 // Kairos fleet (AuroraBoot) providerID self-discovery is implemented on the CAPV

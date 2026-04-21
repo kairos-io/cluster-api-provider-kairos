@@ -105,7 +105,7 @@ type KairosConfigSpec struct {
 	Role string `json:"role,omitempty"`
 
 	// Distribution specifies the Kubernetes distribution to install
-	// +kubebuilder:validation:Enum=k0s;k3s
+	// +kubebuilder:validation:Enum=k0s;k3s;kubeadm
 	// +kubebuilder:default=k0s
 	Distribution string `json:"distribution,omitempty"`
 
