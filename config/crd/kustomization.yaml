@@ -4,3 +4,12 @@ resources:
 - bases/controlplane.cluster.x-k8s.io_kairoscontrolplanes.yaml
 - bases/controlplane.cluster.x-k8s.io_kairoscontrolplanetemplates.yaml
 
+# CAPI contract labels: advertise that our served storage version (v1beta2)
+# satisfies both the v1beta1 and v1beta2 contract — older CAPI controllers
+# key off /v1beta1, newer ones off /v1beta2, so both labels point at v1beta2.
+# includeSelectors:false keeps these off any selector fields.
+labels:
+  - includeSelectors: false
+    pairs:
+      cluster.x-k8s.io/v1beta1: v1beta2
+      cluster.x-k8s.io/v1beta2: v1beta2

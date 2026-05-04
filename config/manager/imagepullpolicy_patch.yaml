@@ -1,8 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kairos-capi-controller-manager
-  namespace: kairos-capi-system
+  name: controller-manager
 spec:
   template:
     spec:

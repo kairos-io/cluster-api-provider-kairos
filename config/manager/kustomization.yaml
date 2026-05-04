@@ -4,7 +4,7 @@ patches:
 - path: imagepullpolicy_patch.yaml
   target:
     kind: Deployment
-    name: kairos-capi-controller-manager
+    name: controller-manager
 images:
 - name: controller
   newName: ghcr.io/kairos-io/cluster-api-provider-kairos

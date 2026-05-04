@@ -1,8 +1,8 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kairos-capi-controller-manager
-  namespace: kairos-capi-system
+  name: controller-manager
+  namespace: system
 spec:
   replicas: 1
   selector:
@@ -51,11 +51,10 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
-      serviceAccountName: kairos-capi-manager
+      serviceAccountName: manager
       terminationGracePeriodSeconds: 10
       volumes:
       - name: cert
         secret:
           defaultMode: 420
-          secretName: kairos-capi-webhook-server-cert
-
+          secretName: webhook-server-cert

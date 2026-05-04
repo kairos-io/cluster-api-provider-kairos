@@ -9,6 +9,7 @@ resources:
   - ../webhook
   - ../manager
 
+namePrefix: kairos-capi-
 namespace: kairos-capi-system
 
 # Set the image name and tag
@@ -26,4 +27,154 @@ commonLabels:
 # Common annotations
 commonAnnotations:
   cluster.x-k8s.io/provider: kairos
+
+# Wire CRD-typed cross-references that Kustomize's built-in nameReference
+# transformer doesn't know about: Certificate.spec.issuerRef.name (cert-manager
+# CRD field) and the cert-manager.io/inject-ca-from annotation on webhook
+# configurations. This way namePrefix and namespace can be changed in one place
+# and every downstream reference is recomputed.
+replacements:
+  - source:
+      kind: Issuer
+      group: cert-manager.io
+      version: v1
+      name: selfsigned-issuer
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.issuerRef.name
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: webhook-server-cert
+      fieldPath: .metadata.namespace
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: webhook-server-cert
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.dnsNames.0
+          - .spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 0
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.namespace
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.dnsNames.0
+          - .spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 1
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: webhook-server-cert
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.secretName
+      - select:
+          kind: Deployment
+          group: apps
+          version: v1
+          name: controller-manager
+        fieldPaths:
+          - .spec.template.spec.volumes.[name=cert].secret.secretName
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.name
+          - .webhooks.1.clientConfig.service.name
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.name
+          - .webhooks.1.clientConfig.service.name
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.namespace
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.namespace
+          - .webhooks.1.clientConfig.service.namespace
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.namespace
+          - .webhooks.1.clientConfig.service.namespace
 

@@ -1,27 +1,25 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kairos-capi-manager-rolebinding
+  name: manager-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: manager-role
 subjects:
 - kind: ServiceAccount
-  name: kairos-capi-manager
-  namespace: kairos-capi-system
+  name: manager
+  namespace: system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: kairos-capi-manager-rolebinding
-  namespace: kairos-capi-system
+  name: manager-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: manager-role
 subjects:
 - kind: ServiceAccount
-  name: kairos-capi-manager
-  namespace: kairos-capi-system
-
+  name: manager
+  namespace: system
