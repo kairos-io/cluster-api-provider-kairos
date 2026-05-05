@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: kairos-capi-system
+  name: system
   labels:
     cluster.x-k8s.io/provider: kairos
     app.kubernetes.io/name: kairos-capi
