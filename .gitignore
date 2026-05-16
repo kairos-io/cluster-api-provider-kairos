@@ -48,3 +48,10 @@ ideas/*
 .cursor/*
 !ideas/CAPK_PARITY_GAP_ANALYSIS.md
 CODEBASE_KNOWLEDGE.md
+
+# Local Claude Code tooling — agents, skills, grounding, settings.
+# These files are intentionally project-local and never pushed.
+# See .claude/PROJECT_CONTEXT.md (after creation) for what lives here.
+.claude/
+CLAUDE.md
+**/CLAUDE.md

@@ -14,14 +14,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.25']  # go.mod requires go 1.25; 1.24 removed to avoid covdata/toolchain issues
+        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.7'
+        go-version: '1.26.0'
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -29,9 +29,9 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.25.7-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.25.7-
+          ${{ runner.os }}-go-1.26.0-
 
     - name: Download dependencies
       run: go mod download
@@ -57,14 +57,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.25']  # go.mod requires go 1.25; 1.24 removed to avoid covdata/toolchain issues
+        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.7'
+        go-version: '1.26.0'
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -72,9 +72,9 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.25.7-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.25.7-
+          ${{ runner.os }}-go-1.26.0-
 
     - name: Install controller-gen
       run: |
@@ -94,14 +94,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.25']  # go.mod requires go 1.25; 1.24 removed to avoid covdata/toolchain issues
+        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.7'
+        go-version: '1.26.0'
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -109,9 +109,9 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.25.7-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.25.7-
+          ${{ runner.os }}-go-1.26.0-
 
     - name: Install controller-gen
       run: |
@@ -136,14 +136,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.25']  # go.mod requires go 1.25; 1.24 removed to avoid covdata/toolchain issues
+        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.7'
+        go-version: '1.26.0'
 
     - name: Install envtest tools
       run: |
@@ -157,9 +157,9 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.25.7-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.25.7-
+          ${{ runner.os }}-go-1.26.0-
 
     - name: Download dependencies
       run: go mod download
@@ -180,7 +180,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.7'
+        go-version: '1.26.0'
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -188,9 +188,9 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.25.7-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.25.7-
+          ${{ runner.os }}-go-1.26.0-
 
     - name: Cache pinned e2e CLIs (kubectl, kind, clusterctl, virtctl)
       uses: actions/cache@v4
@@ -215,14 +215,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.25']  # go.mod requires go 1.25; 1.24 removed to avoid covdata/toolchain issues
+        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.7'
+        go-version: '1.26.0'
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -230,9 +230,9 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.25.7-${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.25.7-
+          ${{ runner.os }}-go-1.26.0-
 
     - name: Download dependencies
       run: go mod download
