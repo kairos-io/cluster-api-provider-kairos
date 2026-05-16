@@ -48,12 +48,20 @@ func (e *Environment) ApplyManifestFromURL(ctx context.Context, dynamicClient dy
 // log.Warnf and the function returned nil — which silently masked CRD-ordering
 // bugs (e.g. applying a CR before its CRD was Established) and made install
 // failures look like flaky waits downstream.
+//
+// ApplyOptions.Force is set so we resolve field-manager conflicts in our
+// favor: this is an installer tool whose job is to enforce a known-good state
+// of the manifests. The typical conflict surface is kind-bundled resources
+// (e.g. local-path-provisioner) that ship with `kubectl-client-side-apply` as
+// their field manager. SSA documents Force as the standard mechanism for
+// adopting fields owned by another manager.
 func (e *Environment) ApplyManifestContent(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
 	return forEachManifestObject(ctx, log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
 		dr := resourceClient(dynamicClient, mapping, obj)
 		obj.SetManagedFields(nil)
-		if _, err := dr.Apply(ctx, obj.GetName(), obj, metav1.ApplyOptions{FieldManager: applyFieldManager}); err != nil {
+		opts := metav1.ApplyOptions{FieldManager: applyFieldManager, Force: true}
+		if _, err := dr.Apply(ctx, obj.GetName(), obj, opts); err != nil {
 			return fmt.Errorf("apply %s/%s: %w", mapping.gvk.Kind, obj.GetName(), err)
 		}
 		return nil
