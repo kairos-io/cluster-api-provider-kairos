@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -15,11 +16,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	yamlserializer "k8s.io/apimachinery/pkg/runtime/serializer/yaml"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+)
+
+// restMappingRetry* bound how long we wait for a just-installed CRD to be
+// served by the API server's discovery endpoint. CRDs go through Established
+// before kube-apiserver serves their kind; without retry we race the CRD and
+// silently skip the dependent CR.
+const (
+	restMappingRetryTimeout  = 30 * time.Second
+	restMappingRetryInterval = 1 * time.Second
 )
 
 // ApplyManifestFromURL downloads YAML and applies it with server-side apply.
@@ -32,13 +43,18 @@ func (e *Environment) ApplyManifestFromURL(ctx context.Context, dynamicClient dy
 }
 
 // ApplyManifestContent applies multi-document YAML with server-side apply.
+//
+// Apply errors are returned to the caller. Previously they were downgraded to
+// log.Warnf and the function returned nil — which silently masked CRD-ordering
+// bugs (e.g. applying a CR before its CRD was Established) and made install
+// failures look like flaky waits downstream.
 func (e *Environment) ApplyManifestContent(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
-	return forEachManifestObject(log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
+	return forEachManifestObject(ctx, log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
 		dr := resourceClient(dynamicClient, mapping, obj)
 		obj.SetManagedFields(nil)
 		if _, err := dr.Apply(ctx, obj.GetName(), obj, metav1.ApplyOptions{FieldManager: applyFieldManager}); err != nil {
-			log.Warnf("apply %s/%s: %v", mapping.gvk.Kind, obj.GetName(), err)
+			return fmt.Errorf("apply %s/%s: %w", mapping.gvk.Kind, obj.GetName(), err)
 		}
 		return nil
 	})
@@ -71,9 +87,13 @@ func (e *Environment) DeleteResourcesFromManifestURL(ctx context.Context, dynami
 	return e.deleteResourcesFromYAML(ctx, dynamicClient, config, body)
 }
 
+// deleteResourcesFromYAML issues Delete for each object in the manifest stream.
+// Per-object errors other than NotFound are downgraded to warnings: callers
+// (e.g. UninstallKubeVirt) want best-effort cleanup and should not abort on
+// the first stale object.
 func (e *Environment) deleteResourcesFromYAML(ctx context.Context, dynamicClient dynamic.Interface, config *rest.Config, yamlContent []byte) error {
 	log := e.log()
-	return forEachManifestObject(log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
+	return forEachManifestObject(ctx, log, config, yamlContent, func(mapping *manifestMapping, obj *unstructured.Unstructured) error {
 		dr := resourceClient(dynamicClient, mapping, obj)
 		if err := dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			log.Warnf("delete %s/%s: %v", mapping.gvk.Kind, obj.GetName(), err)
@@ -88,18 +108,15 @@ type manifestMapping struct {
 	mapping *meta.RESTMapping
 }
 
-// forEachManifestObject decodes a multi-doc YAML stream and invokes fn for each object that
-// resolves through discovery. Decode/mapping errors are logged via the environment logger and skipped.
-func forEachManifestObject(log Logger, config *rest.Config, yamlContent []byte, fn func(*manifestMapping, *unstructured.Unstructured) error) error {
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+// forEachManifestObject decodes a multi-doc YAML stream and invokes fn for
+// each object. Decode failures abort. REST-mapping NoMatch errors trigger a
+// bounded retry against a refreshed discovery cache, since a CRD applied
+// earlier in the same operation may not be served by kube-apiserver yet.
+func forEachManifestObject(ctx context.Context, log Logger, config *rest.Config, yamlContent []byte, fn func(*manifestMapping, *unstructured.Unstructured) error) error {
+	mapper, err := buildRESTMapper(config)
 	if err != nil {
-		return fmt.Errorf("discovery client: %w", err)
+		return err
 	}
-	gr, err := restmapper.GetAPIGroupResources(discoveryClient)
-	if err != nil {
-		return fmt.Errorf("API group resources: %w", err)
-	}
-	mapper := restmapper.NewDiscoveryRESTMapper(gr)
 	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(yamlContent), 4096)
 	dec := yamlserializer.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
 
@@ -119,12 +136,9 @@ func forEachManifestObject(log Logger, config *rest.Config, yamlContent []byte, 
 		if err != nil {
 			return fmt.Errorf("decode object: %w", err)
 		}
-		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		mapping, err := resolveMapping(ctx, log, config, mapper, *gvk)
 		if err != nil {
-			if log != nil {
-				log.Warnf("skip %s/%s: REST mapping unavailable: %v", gvk.Kind, obj.GetName(), err)
-			}
-			continue
+			return fmt.Errorf("REST mapping for %s/%s: %w", gvk.Kind, obj.GetName(), err)
 		}
 		mm := &manifestMapping{gvk: *gvk, mapping: mapping}
 		if err := fn(mm, obj); err != nil {
@@ -132,6 +146,54 @@ func forEachManifestObject(log Logger, config *rest.Config, yamlContent []byte, 
 		}
 	}
 	return nil
+}
+
+// resolveMapping returns the REST mapping for gvk, refreshing discovery if the
+// initial lookup reports NoMatch (typical right after a CRD apply).
+func resolveMapping(ctx context.Context, log Logger, config *rest.Config, mapper meta.RESTMapper, gvk schema.GroupVersionKind) (*meta.RESTMapping, error) {
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err == nil {
+		return mapping, nil
+	}
+	if !meta.IsNoMatchError(err) {
+		return nil, err
+	}
+	if log != nil {
+		log.Infof("REST mapping for %s/%s not yet served by API server; refreshing discovery (up to %s)", gvk.GroupKind().String(), gvk.Version, restMappingRetryTimeout)
+	}
+	waitErr := wait.PollUntilContextTimeout(ctx, restMappingRetryInterval, restMappingRetryTimeout, false, func(ctx context.Context) (bool, error) {
+		rm, berr := buildRESTMapper(config)
+		if berr != nil {
+			return false, berr
+		}
+		m, mErr := rm.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if mErr == nil {
+			mapping = m
+			return true, nil
+		}
+		if !meta.IsNoMatchError(mErr) {
+			return false, mErr
+		}
+		return false, nil
+	})
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	return mapping, nil
+}
+
+// buildRESTMapper returns a fresh discovery-backed RESTMapper. Callers rebuild
+// after operations that may have changed the set of registered CRDs.
+func buildRESTMapper(config *rest.Config) (meta.RESTMapper, error) {
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("discovery client: %w", err)
+	}
+	gr, err := restmapper.GetAPIGroupResources(discoveryClient)
+	if err != nil {
+		return nil, fmt.Errorf("API group resources: %w", err)
+	}
+	return restmapper.NewDiscoveryRESTMapper(gr), nil
 }
 
 func resourceClient(dynamicClient dynamic.Interface, mm *manifestMapping, obj *unstructured.Unstructured) dynamic.ResourceInterface {

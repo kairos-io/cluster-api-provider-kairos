@@ -88,15 +88,15 @@ func (e *Environment) InstallKubeVirt(ctx context.Context) error {
 	defer cancel()
 	log.Infof("Waiting for virt-operator deployment...")
 	if err := WaitForDeployment(waitCtx, clientset, "kubevirt", "virt-operator"); err != nil {
-		log.Warnf("virt-operator may not be fully ready: %v", err)
+		return fmt.Errorf("virt-operator did not become ready: %w", err)
 	}
 	log.Infof("Waiting for KubeVirt CR...")
 	if err := waitForKubeVirtCR(waitCtx, log, dynamicClient); err != nil {
-		log.Warnf("KubeVirt CR may not be fully ready: %v", err)
 		if kubevirt, gerr := getKubeVirtCR(waitCtx, dynamicClient); gerr == nil && kubevirt != nil {
 			phase, _, _ := unstructured.NestedString(kubevirt.Object, "status", "phase")
-			log.Infof("KubeVirt phase: %s", phase)
+			log.Infof("KubeVirt phase at failure: %s", phase)
 		}
+		return fmt.Errorf("KubeVirt CR did not become ready: %w", err)
 	}
 	log.Step("KubeVirt installed ✓")
 	return nil
