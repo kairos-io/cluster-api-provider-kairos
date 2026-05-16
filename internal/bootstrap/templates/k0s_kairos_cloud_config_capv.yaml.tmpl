@@ -22,32 +22,32 @@ Template inputs (from Go):
 {{/* Hostname: prefer explicit name, else use hostname prefix with Kairos templating for machine ID */}}
 {{/* The {{ trunc 4 .MachineID }} is Kairos templating syntax, output literally */}}
 {{- if .Hostname }}
-hostname: {{ .Hostname }}
+hostname: {{ .Hostname | quote }}
 {{- else if .HostnamePrefix }}
-hostname: {{ .HostnamePrefix }}{{ "{{ trunc 4 .MachineID }}" }}
+hostname: {{ printf "%s{{ trunc 4 .MachineID }}" .HostnamePrefix | quote }}
 {{- end }}
 
 {{- if .Install }}
 install:
   auto: {{ .Install.Auto }}
-  device: "{{ .Install.Device }}"
+  device: {{ .Install.Device | quote }}
   reboot: {{ .Install.Reboot }}
 {{- end }}
 
 users:
-- name: {{ .UserName }}
-  passwd: {{ .UserPassword }}
+- name: {{ .UserName | quote }}
+  passwd: {{ .UserPassword | quote }}
   groups:
   {{- range .UserGroups }}
-    - {{ . }}
+    - {{ . | quote }}
   {{- end }}
   {{- if or .GitHubUser .SSHPublicKey }}
   ssh_authorized_keys:
   {{- if .GitHubUser }}
-    - github:{{ .GitHubUser }}
+    - {{ printf "github:%s" .GitHubUser | quote }}
   {{- end }}
   {{- if .SSHPublicKey }}
-    - {{ .SSHPublicKey }}
+    - {{ .SSHPublicKey | quote }}
   {{- end }}
   {{- end }}
 - name: capk
@@ -92,10 +92,10 @@ write_files:
       spec:
         network:
       {{ if .PodCIDR }}
-          podCIDR: {{ .PodCIDR }}
+          podCIDR: {{ .PodCIDR | quote }}
       {{ end }}
       {{ if .ServiceCIDR }}
-          serviceCIDR: {{ .ServiceCIDR }}
+          serviceCIDR: {{ .ServiceCIDR | quote }}
       {{ end }}
       {{- else }}
       spec: {}
@@ -132,7 +132,7 @@ stages:
       dns:
         nameservers:
         {{- range .DNSServers }}
-          - {{ . }}
+          - {{ . | quote }}
         {{- end }}
         path: "/etc/resolv.conf"
     {{- end }}

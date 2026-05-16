@@ -537,9 +537,10 @@ func TestRenderK0sCloudConfig_WithInstallConfig(t *testing.T) {
 		t.Error("Missing install.auto: true")
 	}
 
-	// Check for install.device
-	if !strings.Contains(result, "device: \"auto\"") {
-		t.Error("Missing install.device: \"auto\"")
+	// Check for install.device — YAML emits unquoted for safe values like "auto".
+	// The semantic invariant is that install.device == "auto" after parsing.
+	if !strings.Contains(result, "device: auto") {
+		t.Error("Missing install.device: auto")
 	}
 
 	// Check for install.reboot
