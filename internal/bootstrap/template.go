@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
-	"strings"
 	"text/template"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -29,7 +28,12 @@ import (
 //go:embed templates/*.tmpl
 var templateFS embed.FS
 
-// TemplateData holds data for rendering the Kairos cloud-config template
+// TemplateData holds data for rendering the Kairos cloud-config template.
+//
+// Most string fields originate from KairosConfig spec (user-controlled). They
+// MUST be emitted through the `quote` template func — never as raw `{{ .X }}`
+// interpolation. See internal/bootstrap/funcs.go and the
+// cloudconfig-rendering-safety skill for the rules.
 type TemplateData struct {
 	Role                           string
 	SingleNode                     bool
@@ -50,7 +54,7 @@ type TemplateData struct {
 	ClusterNS                      string
 	IsKubeVirt                     bool
 	Install                        *InstallConfig
-	ProviderID                     string // ProviderID for the Node (e.g., "vsphere://<vm-uuid>")
+	ProviderID                     string // ProviderID for the Node (e.g., "vsphere://<vm-uuid>"). Validated against providerIDPattern at render time.
 	K3sServerURL                   string
 	K3sToken                       string
 	ControlPlaneLBServiceName      string
@@ -70,102 +74,47 @@ type InstallConfig struct {
 	Reboot bool
 }
 
-// RenderK0sCloudConfig renders the k0s Kairos cloud-config template
+// RenderK0sCloudConfig renders the k0s Kairos cloud-config template.
 func RenderK0sCloudConfig(data TemplateData) (string, error) {
-	// Load template (split per provider)
 	templatePath := "templates/k0s_kairos_cloud_config_capv.yaml.tmpl"
 	if data.IsKubeVirt {
 		templatePath = "templates/k0s_kairos_cloud_config_capk.yaml.tmpl"
 	}
-	tmplContent, err := templateFS.ReadFile(templatePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read template: %w", err)
-	}
-
-	// Create template with custom functions
-	tmpl := template.New("k0s_kairos_cloud_config").Funcs(template.FuncMap{
-		"indent": func(spaces int, s string) string {
-			if s == "" {
-				return ""
-			}
-			indent := strings.Repeat(" ", spaces)
-			lines := strings.Split(s, "\n")
-			var result []string
-			for _, line := range lines {
-				if line != "" {
-					result = append(result, indent+line)
-				} else {
-					result = append(result, "")
-				}
-			}
-			return strings.Join(result, "\n")
-		},
-		"trimSuffix": func(suffix, s string) string {
-			return strings.TrimSuffix(s, suffix)
-		},
-	})
-
-	// Parse template
-	tmpl, err = tmpl.Parse(string(tmplContent))
-	if err != nil {
-		return "", fmt.Errorf("failed to parse template: %w", err)
-	}
-
-	// Render template
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", fmt.Errorf("failed to execute template: %w", err)
-	}
-
-	return buf.String(), nil
+	return renderTemplate("k0s_kairos_cloud_config", templatePath, data)
 }
 
-// RenderK3sCloudConfig renders the k3s Kairos cloud-config template
+// RenderK3sCloudConfig renders the k3s Kairos cloud-config template.
 func RenderK3sCloudConfig(data TemplateData) (string, error) {
-	// Load template (split per provider)
 	templatePath := "templates/k3s_kairos_cloud_config_capv.yaml.tmpl"
 	if data.IsKubeVirt {
 		templatePath = "templates/k3s_kairos_cloud_config_capk.yaml.tmpl"
 	}
+	return renderTemplate("k3s_kairos_cloud_config", templatePath, data)
+}
+
+// renderTemplate is the shared entry point for both distribution renderers.
+// It validates TemplateData, loads the template from the embedded FS, attaches
+// the shared FuncMap, executes, and returns the rendered cloud-config.
+//
+// Centralizing this prevents the FuncMap from drifting between the k0s and
+// k3s paths — a real risk in the previous two-function layout, since adding
+// `quote` to one and forgetting the other would silently leave half the
+// renders unsafe.
+func renderTemplate(name, templatePath string, data TemplateData) (string, error) {
+	if err := validateTemplateData(&data); err != nil {
+		return "", fmt.Errorf("invalid template data: %w", err)
+	}
 	tmplContent, err := templateFS.ReadFile(templatePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read template: %w", err)
+		return "", fmt.Errorf("failed to read template %s: %w", templatePath, err)
 	}
-
-	// Create template with custom functions
-	tmpl := template.New("k3s_kairos_cloud_config").Funcs(template.FuncMap{
-		"indent": func(spaces int, s string) string {
-			if s == "" {
-				return ""
-			}
-			indent := strings.Repeat(" ", spaces)
-			lines := strings.Split(s, "\n")
-			var result []string
-			for _, line := range lines {
-				if line != "" {
-					result = append(result, indent+line)
-				} else {
-					result = append(result, "")
-				}
-			}
-			return strings.Join(result, "\n")
-		},
-		"trimSuffix": func(suffix, s string) string {
-			return strings.TrimSuffix(s, suffix)
-		},
-	})
-
-	// Parse template
-	tmpl, err = tmpl.Parse(string(tmplContent))
+	tmpl, err := template.New(name).Funcs(newFuncMap()).Parse(string(tmplContent))
 	if err != nil {
-		return "", fmt.Errorf("failed to parse template: %w", err)
+		return "", fmt.Errorf("failed to parse template %s: %w", templatePath, err)
 	}
-
-	// Render template
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", fmt.Errorf("failed to execute template: %w", err)
+		return "", fmt.Errorf("failed to execute template %s: %w", templatePath, err)
 	}
-
 	return buf.String(), nil
 }
