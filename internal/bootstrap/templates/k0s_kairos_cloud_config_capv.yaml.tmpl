@@ -140,7 +140,7 @@ stages:
     - name: "Create k0s post-bootstrap service and script"
       files:
         {{- if or .Hostname .HostnamePrefix }}
-        - path: /sysroot/usr/local/etc/hostname
+        - path: /usr/local/etc/hostname
           permissions: "0644"
           owner: 0
           group: 0
@@ -151,7 +151,7 @@ stages:
             {{ .HostnamePrefix }}{{ "{{ trunc 4 .MachineID }}" }}
             {{- end }}
         {{- end }}
-        - path: /sysroot/etc/systemd/system/kairos-k0s-post-bootstrap.service
+        - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
           permissions: "0644"
           owner: 0
           group: 0
@@ -173,7 +173,7 @@ stages:
             
             [Install]
             WantedBy=multi-user.target
-        - path: /sysroot/etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
+        - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
           permissions: "0644"
           owner: 0
           group: 0
@@ -191,7 +191,7 @@ stages:
             
             [Install]
             WantedBy=multi-user.target
-        - path: /sysroot/usr/local/bin/kairos-k0s-post-bootstrap.sh
+        - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
           permissions: "0755"
           owner: 0
           group: 0
@@ -270,5 +270,5 @@ MANIFEST_EOF
             echo "k0s post-bootstrap tasks completed successfully"
       commands:
         # Create symlink to enable the helper service that enables the main service
-        - mkdir -p /sysroot/etc/systemd/system/multi-user.target.wants
-        - ln -sf /sysroot/etc/systemd/system/kairos-k0s-post-bootstrap-enable.service /sysroot/etc/systemd/system/multi-user.target.wants/kairos-k0s-post-bootstrap-enable.service || true
+        - mkdir -p /etc/systemd/system/multi-user.target.wants
+        - ln -sf /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service /etc/systemd/system/multi-user.target.wants/kairos-k0s-post-bootstrap-enable.service || true
