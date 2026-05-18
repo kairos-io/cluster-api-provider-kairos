@@ -1,5 +1,12 @@
 # Image URL to use all building/pushing image targets
 IMG ?= ghcr.io/kairos-io/cluster-api-provider-kairos:latest
+# Image registry (no tag) — used by the release-manifests target with VERSION below.
+IMG_REGISTRY ?= ghcr.io/kairos-io/cluster-api-provider-kairos
+# Version used by release-manifests / docker-buildx-release. Default derives from git;
+# CI overrides it with the tag name when triggered by a `v*` tag push.
+VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo "dev")
+# Directory where release-manifests writes its artifacts.
+RELEASE_DIR ?= dist
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:generateEmbeddedObjectMeta=true"
 
@@ -143,6 +150,27 @@ deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/c
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
 	kustomize build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+
+##@ Release
+
+.PHONY: release-manifests
+release-manifests: manifests kustomize ## Render the all-in-one provider manifest into $(RELEASE_DIR)/kairos-capi-provider.yaml.
+	@mkdir -p $(RELEASE_DIR)
+	@# Render against a temporary copy of config/ so the source tree stays clean
+	@# (kustomize edit set image mutates config/manager/kustomization.yaml in place,
+	@# which would leave the working directory dirty after a local dry-run).
+	@tmp=$$(mktemp -d) && \
+	  cp -r config "$$tmp/config" && \
+	  (cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=$(IMG_REGISTRY):$(VERSION)) && \
+	  $(KUSTOMIZE) build "$$tmp/config/default" > $(RELEASE_DIR)/kairos-capi-provider.yaml && \
+	  rm -rf "$$tmp"
+	@cd $(RELEASE_DIR) && sha256sum kairos-capi-provider.yaml > sha256sums.txt
+	@echo "Release artifacts in $(RELEASE_DIR):"
+	@ls -la $(RELEASE_DIR)
+
+.PHONY: docker-buildx-release
+docker-buildx-release: generate fmt vet ## Build and push the multi-arch image tagged with VERSION for a release.
+	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG_REGISTRY):$(VERSION) --push .
 
 ##@ Build Dependencies
 
