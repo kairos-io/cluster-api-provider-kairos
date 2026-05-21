@@ -79,17 +79,38 @@ func (r *KairosControlPlane) ValidateDelete() (admission.Warnings, error) {
 	return nil, nil
 }
 
-// validate performs validation on the KairosControlPlane spec
+// validate performs validation on the KairosControlPlane spec.
+//
+// The replicas bounds check is duplicated declaratively via
+// kubebuilder:validation:Minimum=1 / Maximum=1 markers on the type. The webhook
+// remains as a second line of defense and to surface a clearer message when
+// users hit the upper bound — the CRD-level message ("spec.replicas in body
+// should be less than or equal to 1") tells them WHAT is wrong but not WHY.
 func (r *KairosControlPlane) validate() error {
 	var allErrs field.ErrorList
 
-	// Validate replicas
-	if r.Spec.Replicas != nil && *r.Spec.Replicas < 1 {
-		allErrs = append(allErrs, field.Invalid(
-			field.NewPath("spec", "replicas"),
-			*r.Spec.Replicas,
-			"spec.replicas must be greater than or equal to 1",
-		))
+	// Validate replicas. Lower bound: must be >= 1 (control plane with zero
+	// machines is nonsensical). Upper bound: must be <= 1 in this release —
+	// see the field doc-comment and foundational-review item KD-5 for context.
+	if r.Spec.Replicas != nil {
+		switch {
+		case *r.Spec.Replicas < 1:
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec", "replicas"),
+				*r.Spec.Replicas,
+				"spec.replicas must be greater than or equal to 1",
+			))
+		case *r.Spec.Replicas > 1:
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec", "replicas"),
+				*r.Spec.Replicas,
+				"spec.replicas > 1 is not supported in this release: the current "+
+					"control-plane implementation would produce N independent "+
+					"single-node clusters instead of an HA cluster. HA support "+
+					"(both classic and P2P/decentralized) is planned for a "+
+					"future release. Use spec.replicas: 1 for now.",
+			))
+		}
 	}
 
 	// Validate distribution

@@ -30,11 +30,18 @@ const (
 
 // KairosControlPlaneSpec defines the desired state of KairosControlPlane
 type KairosControlPlaneSpec struct {
-	// Replicas is the number of control plane machines
-	// Contract: ControlPlane MUST expose replicas
-	// When replicas == 1, the control plane operates in single-node mode and k0s will be
-	// configured with --single flag. For HA setups, set replicas > 1 (full HA support is planned).
+	// Replicas is the number of control plane machines.
+	// Contract: ControlPlane MUST expose replicas.
+	//
+	// Only `replicas: 1` is supported in this release. With `replicas: 1`,
+	// k0s/k3s is configured with `--single` and the control plane operates in
+	// single-node mode. HA control planes (both classic and P2P/decentralized)
+	// are planned for a future release; until then, the validating webhook
+	// rejects values greater than 1 because the current bootstrap logic would
+	// otherwise produce N independent single-node clusters instead of an HA
+	// cluster (see foundational-review item KD-5).
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1
 	// +kubebuilder:default=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
