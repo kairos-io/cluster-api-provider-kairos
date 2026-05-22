@@ -342,7 +342,7 @@ The provider declares the following paths as persistent across reboots and A/B u
 
 **Second-boot-onward semantic.** The first install boot consumes the cloud-config directly (the bootstrap Secret is rendered into userdata and applied by `kairos-agent`). From the second reboot onward, the on-disk `/system/oem/12_kairos-capi-persistency.yaml` is what immucore reads at every boot to assemble the persistent overlay.
 
-**Adding your own persistent paths.** Users who need application-specific persistent paths can layer their own cloud-config snippet by writing a file via `Spec.Files` to `/oem/91_custom.yaml` (or any `/oem/9*` prefix). Lower numeric prefixes (`5x`–`8x`) are not recommended: future provider files may use those slots and silently shadow your override.
+**Adding your own persistent paths.** Users who need application-specific persistent paths can layer their own cloud-config snippet by writing a file via `Spec.Files` to `/system/oem/91_custom.yaml` (or any `/system/oem/9*` prefix). Lower numeric prefixes (`5x`–`8x`) are not recommended: future provider files may use those slots and silently shadow your override.
 
 Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence guarantees) in the punch list.
 
