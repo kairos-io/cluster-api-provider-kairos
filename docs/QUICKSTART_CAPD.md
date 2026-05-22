@@ -1,15 +1,19 @@
 # Quick Start Guide - CAPD (Docker)
 
+Last verified against: Kairos v3.6.0+, CAPI v1.8.x, provider v0.1.0-alpha.2.
+
 This guide walks you through creating a single-node k0s cluster on Kairos using Cluster API with the Docker provider (CAPD).
 
-**Note:** The CAPD sample provided uses k0s. For k3s clusters, use [CAPV](QUICKSTART_CAPV.md) or [CAPK](QUICKSTART_CAPK.md).
+**Note:** The CAPD sample uses k0s. For k3s clusters, use [CAPV](QUICKSTART_CAPV.md) or [CAPK](QUICKSTART_CAPK.md).
+
+**Note:** CAPD is a development-only infrastructure provider. Docker-based Kairos clusters do not represent a production topology.
 
 ## Prerequisites
 
-1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster)
-2. **Cluster API**: CAPI v1.11+ installed
-3. **CAPD**: Cluster API Provider Docker installed
-4. **Kairos CAPI Provider**: Installed via make (see [Install guide](INSTALL.md))
+1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster).
+2. **Cluster API**: CAPI v1.8.x installed. v1.11.x is on the roadmap (KD-13).
+3. **CAPD**: Cluster API Provider Docker installed.
+4. **Kairos CAPI Provider**: Installed (see [Install guide](INSTALL.md)).
 
 ### Installing Prerequisites
 
@@ -19,33 +23,44 @@ Install CAPI and CAPD using your preferred method. See the [Cluster API book](ht
 
 #### 2. Install Kairos CAPI Provider
 
+**Recommended (released artifact):**
+
+```bash
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+```
+
+**Developer install (from source):**
+
 ```bash
 make docker-build
 make deploy
 ```
 
-See [INSTALL.md](INSTALL.md) for full install steps.
+See [INSTALL.md](INSTALL.md) for the full developer install process, including the kustomize-CRD note for re-installs.
 
 ## Creating a Cluster
 
-### Step 1: Review the Sample Manifest
+### Step 1: Create the user-password Secret
 
-The sample manifest is located at `config/samples/capd/kairos_cluster_k0s_single_node.yaml`.
+```bash
+kubectl create secret generic kairos-user-password \
+  --from-literal=password=$(openssl rand -base64 32)
+```
+
+The sample manifest references this Secret via `userPasswordSecretRef`. Do not use `userPassword` inline for anything beyond throwaway local testing.
+
+### Step 2: Review the Sample Manifest
+
+The sample manifest is at `config/samples/capd/kairos_cluster_k0s_single_node.yaml`.
 
 Key components:
-- `Cluster` - References DockerCluster and KairosControlPlane
-- `DockerCluster` - Infrastructure cluster for Docker
-- `KairosControlPlane` - Control plane with replicas=1 (single-node)
-- `DockerMachineTemplate` - Template for Docker machines
-- `KairosConfigTemplate` - Bootstrap configuration template
 
-### Step 2: Customize the Manifest (Optional)
-
-Edit `config/samples/capd/kairos_cluster_k0s_single_node.yaml`:
-
-- Update `spec.version` in `KairosControlPlane` to your desired k0s version
-- Add `githubUser` or `sshPublicKey` in `KairosConfigTemplate` for SSH access
-- Change `userName`/`userPassword` if needed (default: kairos/kairos)
+- `Secret` — user password (referenced by `userPasswordSecretRef` in KairosConfigTemplate).
+- `Cluster` — references `DockerCluster` and `KairosControlPlane`.
+- `DockerCluster` — Docker infrastructure cluster.
+- `KairosControlPlane` — control plane with `replicas: 1` (single-node only; HA is not yet supported).
+- `DockerMachineTemplate` — template for Docker machines.
+- `KairosConfigTemplate` — bootstrap configuration with `userPasswordSecretRef`.
 
 ### Step 3: Apply the Manifest
 
@@ -53,10 +68,10 @@ Edit `config/samples/capd/kairos_cluster_k0s_single_node.yaml`:
 kubectl apply -f config/samples/capd/kairos_cluster_k0s_single_node.yaml
 ```
 
-### Step 4: Wait for Cluster to be Ready
+### Step 4: Wait for the Cluster to be Ready
 
 ```bash
-# Watch the cluster status
+# Watch cluster status
 kubectl get cluster kairos-cluster -w
 
 # Check control plane status
@@ -64,138 +79,79 @@ kubectl get kairoscontrolplane kairos-control-plane
 
 # Check machines
 kubectl get machines
-
-# Once ready, check nodes
-kubectl get nodes --kubeconfig=<path-to-kubeconfig>
 ```
 
-### Step 5: Verify k0s is Running
+### Step 5: Retrieve the Kubeconfig
 
 ```bash
-# Get kubeconfig for the cluster (from the cluster secret)
-kubectl get secret kairos-cluster-kubeconfig -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
-
-# Check nodes
+kubectl get secret kairos-cluster-kubeconfig \
+  -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
 kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
-
-# Check k0s pods (if accessible)
 kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system
 ```
-
-Notes:
-- Kubeconfig retrieval may use SSH to the control plane node depending on the infrastructure provider. Ensure SSH access is available for the Kairos user credentials in your KairosConfigTemplate.
 
 ## Troubleshooting
 
 ### Cluster Not Ready
 
 ```bash
-# Check cluster conditions
 kubectl describe cluster kairos-cluster
-
-# Check control plane conditions
 kubectl describe kairoscontrolplane kairos-control-plane
-
-# Check machine status
 kubectl describe machine <machine-name>
-
-# Check bootstrap config
 kubectl describe kairosconfig <kairosconfig-name>
-kubectl get secret <dataSecretName> -o yaml
 ```
 
 ### Bootstrap Data Not Generated
 
 ```bash
-# Check bootstrap controller logs
-kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager | grep bootstrap
-
-# Verify KairosConfig has required fields
+kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager
 kubectl get kairosconfig -o yaml
 ```
 
-### Worker Token Issues
+If `KairosConfig.status.failureMessage` is set, the last reconcile failed. The message clears automatically when the underlying condition is resolved (for example, if a missing Secret is created). This is a transient failure, not a terminal one.
 
-For worker nodes, ensure:
-- `WorkerToken` or `WorkerTokenSecretRef` is set in `KairosConfig`
-- Token secret exists and contains the correct key
-- Token is valid for joining the cluster
+### Missing User-Password Secret
 
-## Adding Worker Nodes
-
-Once your control plane is ready, you can add worker nodes using a `MachineDeployment`.
-
-### Step 1: Get Worker Token
-
-First, you need to obtain a worker join token from your k0s control plane:
+If `failureMessage` contains "secret not found" for `kairos-user-password`, create the Secret:
 
 ```bash
-# Get kubeconfig for the cluster (from the cluster secret)
-kubectl get secret kairos-cluster-kubeconfig -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
+kubectl create secret generic kairos-user-password \
+  --from-literal=password=$(openssl rand -base64 32)
+```
 
-# Option 1: If you have access to the control plane node
-# SSH into the control plane and run:
-# k0s token create --role=worker
+The controller retries automatically.
 
-# Option 2: Use kubectl to exec into k0s controller pod
+### Worker Token Issues
+
+For worker nodes, ensure `workerTokenSecretRef` references an existing Secret containing the correct key (default: `token`). Retrieve a k0s worker token from the control plane:
+
+```bash
+kubectl get secret kairos-cluster-kubeconfig \
+  -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
 kubectl --kubeconfig=kairos-kubeconfig.yaml exec -n kube-system \
-  $(kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system -l app=k0s-controller -o jsonpath='{.items[0].metadata.name}') \
+  $(kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system \
+    -l app=k0s-controller -o jsonpath='{.items[0].metadata.name}') \
   -- k0s token create --role=worker
 ```
 
-### Step 2: Create Worker Token Secret
+## Adding Worker Nodes
 
-Create a Secret with the worker token:
-
-```bash
-kubectl create secret generic kairos-worker-token \
-  --from-literal=token="<your-worker-token-here>" \
-  -n default
-```
-
-### Step 3: Apply Worker Sample
-
-Apply the worker sample manifest:
+Once your control plane is ready, apply the workers sample:
 
 ```bash
 kubectl apply -f config/samples/capd/kairos_cluster_k0s_with_workers.yaml
 ```
 
-This creates:
-- A `MachineDeployment` for worker nodes
-- A `KairosConfigTemplate` for worker bootstrap configuration
-- A `DockerMachineTemplate` for worker infrastructure
-
-### Step 4: Verify Worker Nodes
-
-```bash
-# Watch machines being created
-kubectl get machines -w
-
-# Once machines are ready, check nodes in the cluster
-kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
-
-# You should see worker nodes joining
-```
-
-### Worker Configuration Options
-
-The worker `KairosConfigTemplate` supports:
-
-- **Worker Token**: Use `workerTokenSecretRef` (recommended) or inline `workerToken`
-- **SSH Access**: Configure via `githubUser` or `sshPublicKey`
-- **Custom Manifests**: Add Kubernetes manifests via `spec.manifests`
+This adds a `MachineDeployment` for worker nodes referencing a separate `KairosConfigTemplate` that also uses `userPasswordSecretRef`. The `kairos-worker-token` Secret referenced in that template must be created first.
 
 ## Next Steps
 
-- Configure additional manifests via `spec.manifests` in `KairosConfig`
-- Explore multi-node control plane (set `spec.replicas > 1`)
-- Scale worker nodes by updating `MachineDeployment.spec.replicas`
+- Configure additional Kubernetes manifests via `spec.manifests` in `KairosConfigTemplate`.
+- Scale worker nodes by updating `MachineDeployment.spec.replicas`.
+- Multi-node control planes are tracked for a future release (KD-5b / KD-25).
 
 ## Cleanup
 
 ```bash
-# Delete the cluster
 kubectl delete -f config/samples/capd/kairos_cluster_k0s_single_node.yaml
 ```
-
