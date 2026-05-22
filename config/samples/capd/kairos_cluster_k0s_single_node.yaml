@@ -40,6 +40,8 @@ metadata:
   namespace: default
 spec:
   replicas: 1
+  # Pin a version your Kairos image bundles; the value is informational
+  # (KD-24 makes this advisory in alpha-2).
   version: "v1.30.0+k0s.0"
   machineTemplate:
     infrastructureRef:
@@ -73,6 +75,8 @@ spec:
     spec:
       role: control-plane
       distribution: k0s
+      # Pin a version your Kairos image bundles; the value is informational
+      # (KD-24 makes this advisory in alpha-2).
       kubernetesVersion: "v1.30.0+k0s.0"
       userName: kairos
       # Password comes from a Secret (defined at the top of this file).

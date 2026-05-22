@@ -61,7 +61,7 @@ spec:
   # IMPORTANT: Use only the hostname or IP address, NOT a URL with protocol/path
   # Correct: "vcenter.example.com" or "172.16.56.10"
   # Wrong: "https://vcenter.example.com" or "https://172.16.56.10/sdk"
-  server: "vcsa.lab.k8"
+  server: "TODO-YOUR-VCENTER-HOSTNAME"
   
   # Optional: SSL thumbprint for vCenter certificate validation
   # thumbprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD"
@@ -88,7 +88,8 @@ metadata:
   namespace: default
 spec:
   replicas: 1
-  version: "v1.30.0+k3s.0"
+  # Pin a version your Kairos image bundles (informational; see KD-24).
+  version: "v1.35.0+k3s1"
   distribution: k3s
   machineTemplate:
     infrastructureRef:
@@ -100,6 +101,7 @@ spec:
     name: kairos-config-template-control-plane
     # Note: namespace is NOT specified here - it defaults to the same namespace as KairosControlPlane
 ---
+# Uncomment and customize for your vSphere environment.
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: VSphereMachineTemplate
 metadata:
@@ -132,7 +134,8 @@ spec:
     spec:
       role: control-plane
       distribution: k3s
-      kubernetesVersion: "v1.30.0+k3s.0"
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.35.0+k3s1"
       install:
         auto: true
         device: "auto"
@@ -178,7 +181,7 @@ spec:
         cluster.x-k8s.io/cluster-name: kairos-cluster
         cluster.x-k8s.io/deployment-name: kairos-workers
     spec:
-      version: "v1.30.0+k3s.0"
+      version: "v1.35.0+k3s1"
       bootstrap:
         configRef:
           apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
@@ -221,7 +224,8 @@ spec:
     spec:
       role: worker
       distribution: k3s
-      kubernetesVersion: "v1.30.0+k3s.0"
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.35.0+k3s1"
       k3sTokenSecretRef:
         name: kairos-k3s-worker-token
         key: token

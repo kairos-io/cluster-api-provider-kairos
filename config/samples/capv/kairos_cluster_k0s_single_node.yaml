@@ -56,7 +56,7 @@ spec:
   # IMPORTANT: Use only the hostname or IP address, NOT a URL with protocol/path
   # Correct: "vcenter.example.com" or "172.16.56.10"
   # Wrong: "https://vcenter.example.com" or "https://172.16.56.10/sdk"
-  server: "vcsa.lab.k8"
+  server: "TODO-YOUR-VCENTER-HOSTNAME"
   
   # Optional: SSL thumbprint for vCenter certificate validation
   # thumbprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD"
@@ -83,7 +83,8 @@ metadata:
   namespace: default
 spec:
   replicas: 1
-  version: "v1.30.0+k0s.0"
+  # Pin a version your Kairos image bundles (informational; see KD-24).
+  version: "v1.34.1+k0s.1"
   machineTemplate:
     infrastructureRef:
       apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
@@ -94,6 +95,7 @@ spec:
     name: kairos-config-template-control-plane
     # Note: namespace is NOT specified here - it defaults to the same namespace as KairosControlPlane
 ---
+# Uncomment and customize for your vSphere environment.
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: VSphereMachineTemplate
 metadata:
@@ -126,7 +128,8 @@ spec:
     spec:
       role: control-plane
       distribution: k0s
-      kubernetesVersion: "v1.30.0+k0s.0"
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.34.1+k0s.1"
       userName: kairos
       # Password comes from a Secret (defined at the top of this file).
       # Alternative: set `sshPublicKey:` and omit `userPasswordSecretRef`.
@@ -141,6 +144,7 @@ spec:
 ---
 # ============================================================================
 # VSphere Credentials Setup (REQUIRED - apply this BEFORE the cluster manifest)
+# See Step 1 in the SETUP INSTRUCTIONS at the top of this file.
 # ============================================================================
 # 
 # Step 1: Create a Secret with your vSphere credentials

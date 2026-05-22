@@ -1,12 +1,51 @@
+# ============================================================================
+# Control Plane Sample: KairosControlPlane + KairosConfigTemplate
+# ============================================================================
+#
+# INTENTIONALLY INCOMPLETE: this sample shows the KairosControlPlane and its
+# companion KairosConfigTemplate in isolation. The infrastructureRef below
+# points at a VSphereMachineTemplate that is not defined in this file.
+# To deploy a real cluster, combine this with the matching CAPV sample:
+#   config/samples/capv/kairos_cluster_k0s_single_node.yaml
+#
+# PREREQUISITES:
+#   - Kairos CAPI provider installed (see docs/INSTALL.md)
+#   - CAPV (or substitute infra provider) installed and configured
+#   - Secret 'kairos-user-password' created in the same namespace:
+#       kubectl create secret generic kairos-user-password \
+#         --from-literal=password=$(openssl rand -base64 32)
+#   - A VSphereMachineTemplate named 'control-plane-template' in namespace
+#     'default' (see config/samples/capv/kairos_cluster_k0s_single_node.yaml)
+#
+# ============================================================================
+
+# Secret providing the node user password.
+# IMPORTANT: replace the placeholder with a strong value before applying.
+# `openssl rand -base64 32` is suitable. Do not commit real passwords.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
 apiVersion: controlplane.cluster.x-k8s.io/v1beta2
 kind: KairosControlPlane
 metadata:
   name: kairos-control-plane
   namespace: default
 spec:
+  # Only replicas: 1 is supported. The webhook rejects values > 1.
+  # HA control planes are on the roadmap (KD-5b / KD-25).
   replicas: 1
-  version: "v1.30.0+k0s.0"
+  # Pin a version your Kairos image bundles (informational; see KD-24).
+  version: "v1.34.1+k0s.1"
   machineTemplate:
+    # infrastructureRef must point at a VSphereMachineTemplate (or substitute)
+    # that exists in the same namespace. See the CAPV sample for a complete
+    # definition.
     infrastructureRef:
       apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
       kind: VSphereMachineTemplate
@@ -17,7 +56,7 @@ spec:
         cluster.x-k8s.io/control-plane: ""
   kairosConfigTemplate:
     name: kairos-config-template-control-plane
-    # Note: namespace defaults to the same namespace as KairosControlPlane
+    # namespace defaults to the same namespace as KairosControlPlane
 
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
@@ -30,5 +69,12 @@ spec:
     spec:
       role: control-plane
       distribution: k0s
-      kubernetesVersion: "v1.30.0+k0s.0"
-
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.34.1+k0s.1"
+      userName: kairos
+      # Password comes from a Secret. Inline userPassword is discouraged —
+      # it is stored in the resource and visible to anyone with read access.
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin

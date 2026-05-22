@@ -4,17 +4,22 @@
 #
 # SETUP INSTRUCTIONS:
 #
-# 1. Run ./bin/kubevirt-env (see docs/QUICKSTART_CAPK.md) — creates the env and uploads the Kairos image to CDI.
+# 1. Run ./bin/kubevirt-env (see docs/QUICKSTART_CAPK.md) — creates the env and
+#    uploads the Kairos image to CDI. Non-lab users: skip kubevirt-env and apply
+#    the manifests directly against your own management cluster.
+#
+# 1.5. Apply the blank install-target DataVolume BEFORE the cluster manifest:
+#    kubectl apply -f config/samples/capk/kairos-install-disk.yaml
+#    (Kairos image DVs are live-installer images. The blank disk is the
+#    actual install target for the OS. See docs/QUICKSTART_CAPK.md.)
 #
 # 2. Update the KubeVirtMachineTemplate below:
 #    - Adjust CPU/memory/disk sizes
-#    - nodeSelector and DataVolume names are environment-specific; customize for your cluster
-#    - If using a cloud disk image, set the rootdisk DataVolume name to that image
-#    - If using an ISO, set installeriso to the ISO DataVolume and
-#      create a blank install disk DataVolume (kairos-install-disk)
+#    - nodeSelector is environment-specific; see note in the template below
+#    - DataVolume names reference the Kairos image DV and the blank install disk
 #
 # 3. Apply the manifest:
-#    - kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_single_node.yaml
+#    kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_single_node.yaml
 #
 # ============================================================================
 
@@ -90,9 +95,11 @@ spec:
               labels:
                 kubevirt.io/domain: kairos-control-plane-template
             spec:
-              # Schedule on a node with KVM. Customize for your environment (e.g., remove or set to your node name).
-              nodeSelector:
-                kubernetes.io/hostname: grogu
+              # Schedule on a KVM-capable node. Remove this selector entirely if
+              # all nodes support KVM, or replace the hostname value with one
+              # that matches a KVM-capable node in your cluster.
+              # nodeSelector:
+              #   kubernetes.io/hostname: YOUR-KVM-NODE-HOSTNAME
               domain:
                 cpu:
                   cores: 8

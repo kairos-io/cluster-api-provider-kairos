@@ -1,3 +1,38 @@
+# ============================================================================
+# Bootstrap Samples: Standalone KairosConfig and KairosConfigTemplate examples
+# ============================================================================
+#
+# These are illustrative standalone resources. In practice, KairosConfig
+# objects are created by the KairosControlPlane controller (for control-plane
+# nodes) or by a MachineDeployment using a KairosConfigTemplate (for workers).
+#
+# PREREQUISITES:
+#   - Kairos CAPI provider installed (see docs/INSTALL.md)
+#   - Secret 'kairos-user-password' created in the same namespace:
+#       kubectl create secret generic kairos-user-password \
+#         --from-literal=password=$(openssl rand -base64 32)
+#
+# NOTE: This sample is intentionally incomplete — it omits Cluster, infra, and
+# MachineDeployment resources. Combine with a provider-specific sample from
+# config/samples/capd/, config/samples/capk/, or config/samples/capv/.
+#
+# ============================================================================
+
+# Secret providing the node user password.
+# IMPORTANT: replace the placeholder with a strong value before applying.
+# `openssl rand -base64 32` is suitable. Do not commit real passwords.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
+# Control-plane KairosConfig example.
+# In a real cluster this object is created by the KairosControlPlane controller;
+# you would set these fields on the KairosConfigTemplate instead.
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfig
 metadata:
@@ -6,13 +41,27 @@ metadata:
 spec:
   role: control-plane
   distribution: k0s
-  kubernetesVersion: "v1.30.0+k0s.0"
+  # Pin a version your Kairos image bundles; the value is informational
+  # (KD-24 makes this advisory in alpha-2).
+  kubernetesVersion: "v1.34.1+k0s.1"
+  userName: kairos
+  # Password comes from a Secret. Inline userPassword is discouraged —
+  # it is stored in the resource and visible to anyone with read access.
+  userPasswordSecretRef:
+    name: kairos-user-password
+  userGroups:
+    - admin
+  # preCommands and postCommands are reserved for future use and are not
+  # yet rendered into the cloud-config.
   preCommands:
-    - echo "Pre-install commands"
+    - echo "Pre-install placeholder"
   postCommands:
-    - echo "Post-install commands"
+    - echo "Post-install placeholder"
 
 ---
+# Worker KairosConfig example.
+# For k0s workers, set workerTokenSecretRef with the join token from the
+# control-plane node.
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfig
 metadata:
@@ -21,14 +70,22 @@ metadata:
 spec:
   role: worker
   distribution: k0s
-  kubernetesVersion: "v1.30.0+k0s.0"
+  # Pin a version your Kairos image bundles (informational; see KD-24).
+  kubernetesVersion: "v1.34.1+k0s.1"
   serverAddress: "https://control-plane.example.com:6443"
+  userName: kairos
+  userPasswordSecretRef:
+    name: kairos-user-password
+  userGroups:
+    - admin
   workerTokenSecretRef:
     name: k0s-token
     key: token
     namespace: default
 
 ---
+# Worker KairosConfigTemplate example.
+# Referenced by a MachineDeployment to produce per-Machine KairosConfig objects.
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
 metadata:
@@ -39,8 +96,13 @@ spec:
     spec:
       role: worker
       distribution: k0s
-      kubernetesVersion: "v1.30.0+k0s.0"
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.34.1+k0s.1"
+      userName: kairos
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
       workerTokenSecretRef:
         name: k0s-token
         key: token
-
