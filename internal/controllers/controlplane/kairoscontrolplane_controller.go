@@ -2370,11 +2370,54 @@ func (r *KairosControlPlaneReconciler) triggerClusterReconciliation(ctx context.
 	return nil
 }
 
+// reconcileDelete drains the CAPI Machines owned by this KairosControlPlane
+// before removing the finalizer. Stripping the finalizer with live owned
+// Machines still attached causes the parent Cluster to disappear with
+// orphaned children, which is the failure mode that produced KD-4: the CAPI
+// machine.cluster.x-k8s.io finalizer never cleared because the Machine
+// controller could not find its parent Cluster, requiring a manual
+// `kubectl patch --type=json` to unblock.
+//
+// KairosConfig and the infrastructure Machine are NOT deleted directly --
+// they cascade via the CAPI Machine's OwnerReferences (KD-11 keeps the
+// Machine as the controller of both children). Deleting them here would
+// race with the CAPI Machine controller's own delete flow.
 func (r *KairosControlPlaneReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane) (ctrl.Result, error) {
-	// Remove finalizer
+	remaining, err := drainOwnedMachines(ctx, r.Client, kcp)
+	if err != nil {
+		log.Error(err, "Failed to drain owned Machines",
+			"kcp", kcp.Name, "namespace", kcp.Namespace, "uid", kcp.UID)
+		return ctrl.Result{}, err
+	}
+	if remaining > 0 {
+		log.Info("Waiting for owned Machines to be reaped before removing KCP finalizer",
+			"kcp", kcp.Name, "namespace", kcp.Namespace, "remaining", remaining)
+		return ctrl.Result{RequeueAfter: kcpDeleteRequeueAfter}, nil
+	}
+
+	// Terminal step: remove the finalizer with a bare r.Update. The patch
+	// helper is NOT used here -- once the last finalizer drops, the apiserver
+	// is free to garbage-collect the object, and a follow-up patch from the
+	// deferred closure in Reconcile would race that GC and surface as a
+	// 404. The patchOnExit guard in Reconcile is left at its default
+	// (false), so the deferred Patch is a no-op on this path.
+	// (KD-4, per maintainer-confirmed plan.)
 	controllerutil.RemoveFinalizer(kcp, controlplanev1beta2.KairosControlPlaneFinalizer)
-	return ctrl.Result{}, r.Update(ctx, kcp)
+	if err := r.Update(ctx, kcp); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Object already gone -- nothing to do.
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
+
+// kcpDeleteRequeueAfter is the polling interval while waiting for owned
+// Machines to be reaped during reconcileDelete. Short enough to be
+// responsive, long enough to avoid hammering the apiserver while the CAPI
+// Machine controller does its work.
+const kcpDeleteRequeueAfter = 10 * time.Second
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *KairosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error {
