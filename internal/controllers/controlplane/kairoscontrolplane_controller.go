@@ -1421,7 +1421,26 @@ func isValidEndpointHost(host string) bool {
 	return host != "" && host != "0.0.0.0" && host != "::"
 }
 
-// getSSHCredentials retrieves SSH credentials from KairosConfig
+// getSSHCredentials retrieves SSH credentials from KairosConfig.
+//
+// KD-3a (v0.1.0-alpha.2): UserPassword no longer silently defaults to
+// "kairos". Password resolution mirrors the bootstrap controller's
+// resolveUserPassword:
+//
+//	UserPasswordSecretRef > inline UserPassword > error.
+//
+// If neither is set, the helper returns an error so the caller surfaces it
+// as a clear reconcile failure instead of silently using a wrong password
+// and burning a 60-second SSH dial timeout.
+//
+// Note: this entire SSH path is slated for removal in KD-3b, where the
+// control-plane controller stops SSHing into nodes (the kubeconfig and
+// providerID are pushed from inside the node via the CAPK pattern,
+// extended to all infras). Until then, this resolver is the right
+// behaviour — and an SSH-key-only KairosConfig (`sshPublicKey` /
+// `gitHubUser` with no password set) cannot currently work on infras that
+// rely on controller-side SSH (CAPV today; CAPM3/Tinkerbell/etc. when
+// they land). Users who need that combination must wait for KD-3b.
 func (r *KairosControlPlaneReconciler) getSSHCredentials(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, string, error) {
 	if machine.Spec.Bootstrap.ConfigRef == nil {
 		return "", "", fmt.Errorf("machine has no bootstrap config ref")
@@ -1438,19 +1457,56 @@ func (r *KairosControlPlaneReconciler) getSSHCredentials(ctx context.Context, lo
 		return "", "", fmt.Errorf("failed to get KairosConfig: %w", err)
 	}
 
-	// Get username and password from spec
 	userName := kairosConfig.Spec.UserName
 	if userName == "" {
-		userName = "kairos" // Default
+		userName = "kairos"
 	}
 
-	userPassword := kairosConfig.Spec.UserPassword
+	userPassword, err := r.resolveUserPasswordForSSH(ctx, kairosConfig)
+	if err != nil {
+		return "", "", err
+	}
 	if userPassword == "" {
-		userPassword = "kairos" // Default
+		return "", "", fmt.Errorf("KairosConfig %s/%s has no userPassword or userPasswordSecretRef configured; "+
+			"controller-side SSH operations (kubeconfig fetch, providerID set) require a password until KD-3b lands. "+
+			"Set spec.userPassword or spec.userPasswordSecretRef.",
+			kairosConfig.Namespace, kairosConfig.Name)
 	}
 
 	log.V(4).Info("Retrieved SSH credentials", "userName", userName)
 	return userName, userPassword, nil
+}
+
+// resolveUserPasswordForSSH mirrors internal/controllers/bootstrap/
+// resolveUserPassword. The duplication is deliberate for now: the two
+// controllers live in separate packages with unexported helpers; extracting
+// a shared resolver is bigger work that belongs in a controller-split PR
+// (see internal/controllers/CLAUDE.md § "File-size policy"). When that
+// split lands, both call sites consolidate.
+func (r *KairosControlPlaneReconciler) resolveUserPasswordForSSH(ctx context.Context, kairosConfig *bootstrapv1beta2.KairosConfig) (string, error) {
+	if ref := kairosConfig.Spec.UserPasswordSecretRef; ref != nil && ref.Name != "" {
+		secretKey := types.NamespacedName{
+			Namespace: kairosConfig.Namespace,
+			Name:      ref.Name,
+		}
+		if ref.Namespace != "" {
+			secretKey.Namespace = ref.Namespace
+		}
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, secretKey, secret); err != nil {
+			return "", fmt.Errorf("get user password secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
+		}
+		key := ref.Key
+		if key == "" {
+			key = "password"
+		}
+		data, ok := secret.Data[key]
+		if !ok {
+			return "", fmt.Errorf("user password secret %s/%s does not contain key %q", secretKey.Namespace, secretKey.Name, key)
+		}
+		return string(data), nil
+	}
+	return kairosConfig.Spec.UserPassword, nil
 }
 
 // checkK0sReady checks if k0s is ready by verifying the service is running and admin.conf exists

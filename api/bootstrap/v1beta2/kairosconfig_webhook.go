@@ -45,12 +45,13 @@ var _ webhook.Defaulter = &KairosConfig{}
 func (r *KairosConfig) Default() {
 	kairosconfigLog.Info("default", "name", r.Name)
 
-	// Set defaults for user configuration
+	// Set defaults for user configuration. UserPassword is no longer defaulted
+	// here (KD-3a, v0.1.0-alpha.2): the previous "kairos" default put a known
+	// credential on every node and the validating webhook now requires the
+	// user to set at least one explicit credential (userPassword,
+	// userPasswordSecretRef, sshPublicKey, or gitHubUser).
 	if r.Spec.UserName == "" {
 		r.Spec.UserName = "kairos"
-	}
-	if r.Spec.UserPassword == "" {
-		r.Spec.UserPassword = "kairos"
 	}
 	if len(r.Spec.UserGroups) == 0 {
 		r.Spec.UserGroups = []string{"admin"}
@@ -135,6 +136,29 @@ func (r *KairosConfig) validate() error {
 				))
 			}
 		}
+	}
+
+	// KD-3a: require at least one explicit credential. Previously UserPassword
+	// silently defaulted to "kairos", which combined with PasswordAuthentication
+	// yes in the rendered cloud-config gave every node well-known SSH access.
+	// At least one of these must now be set:
+	//   - userPassword            (inline; discouraged)
+	//   - userPasswordSecretRef   (Secret reference; recommended for passwords)
+	//   - sshPublicKey            (raw SSH public key; recommended)
+	//   - gitHubUser              (fetches SSH keys from GitHub at first boot)
+	hasInlinePassword := r.Spec.UserPassword != ""
+	hasPasswordRef := r.Spec.UserPasswordSecretRef != nil && r.Spec.UserPasswordSecretRef.Name != ""
+	hasSSHKey := r.Spec.SSHPublicKey != ""
+	hasGitHubUser := r.Spec.GitHubUser != ""
+	if !hasInlinePassword && !hasPasswordRef && !hasSSHKey && !hasGitHubUser {
+		allErrs = append(allErrs, field.Required(
+			field.NewPath("spec"),
+			"at least one of spec.userPassword, spec.userPasswordSecretRef, "+
+				"spec.sshPublicKey, or spec.gitHubUser must be set so the "+
+				"node has a working authentication mechanism. The previous "+
+				"behavior of defaulting userPassword to 'kairos' was removed "+
+				"in v0.1.0-alpha.2; see release notes for details.",
+		))
 	}
 
 	if len(allErrs) > 0 {

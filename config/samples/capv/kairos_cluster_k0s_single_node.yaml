@@ -17,6 +17,18 @@
 #
 # ============================================================================
 
+# IMPORTANT: replace `password:` below with a strong value before applying.
+# `openssl rand -base64 32` is fine. Inline UserPassword in KairosConfig is
+# deprecated; this Secret pattern is the recommended way to provide it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: Cluster
 metadata:
@@ -116,7 +128,10 @@ spec:
       distribution: k0s
       kubernetesVersion: "v1.30.0+k0s.0"
       userName: kairos
-      userPassword: kairos
+      # Password comes from a Secret (defined at the top of this file).
+      # Alternative: set `sshPublicKey:` and omit `userPasswordSecretRef`.
+      userPasswordSecretRef:
+        name: kairos-user-password
       userGroups:
         - admin
       # Optional: Add GitHub user for SSH access
