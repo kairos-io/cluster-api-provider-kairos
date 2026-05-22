@@ -170,13 +170,17 @@ type KairosControlPlaneStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// FailureReason indicates the reason for control plane failure
-	// This field is set only when the control plane fails permanently.
+	// FailureReason is a short machine-readable string indicating why the
+	// control-plane controller failed on its last reconcile attempt. Cleared
+	// automatically when a subsequent reconcile succeeds, so a non-empty
+	// value indicates an ongoing failure, not a terminal one.
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
 
-	// FailureMessage indicates the message for control plane failure
-	// This field is set only when the control plane fails permanently.
+	// FailureMessage is a human-readable description of the last control-plane
+	// failure. Cleared automatically when a subsequent reconcile succeeds.
+	// If non-empty, check the KairosControlPlane events and the owned Machine
+	// events for context.
 	// +optional
 	FailureMessage string `json:"failureMessage,omitempty"`
 

@@ -18,16 +18,19 @@ package envtest
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"os"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -209,4 +212,313 @@ func TestControlPlaneIntegration(t *testing.T) {
 	// Note: Full Machine and KairosConfig creation testing requires infrastructure provider CRDs.
 	// The unit tests (TestCreateControlPlaneMachine_SingleNode) verify the SingleNode logic
 	// with mocked infrastructure. For full integration testing, use a real infrastructure provider.
+}
+
+// startKCPEnvtest spins up a fresh envtest + manager + KCP reconciler. Returns
+// a cancel-and-wait teardown closure. Each KD-4 delete-flow test sets up its
+// own envtest because envtest start/stop is slow but parallelization across
+// tests is unsafe (shared apiserver port).
+func startKCPEnvtest(t *testing.T) (context.Context, client.Client, func()) {
+	t.Helper()
+	g := NewWithT(t)
+
+	crdPaths := []string{"../../config/crd/bases"}
+	if _, err := os.Stat("../../test/crd/capi/cluster-api-components.yaml"); err == nil {
+		crdPaths = append(crdPaths, "../../test/crd/capi")
+	}
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths:     crdPaths,
+		ErrorIfCRDPathMissing: false,
+	}
+	cfg, err := testEnv.Start()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cfg).NotTo(BeNil())
+
+	scheme := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
+
+	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	bootstrapReconciler := &bootstrap.KairosConfigReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+	}
+	g.Expect(bootstrapReconciler.SetupWithManager(mgr)).To(Succeed())
+
+	cpReconciler := &controlplane.KairosControlPlaneReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+	}
+	g.Expect(cpReconciler.SetupWithManager(mgr)).To(Succeed())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgrErrCh := make(chan error, 1)
+	go func() { mgrErrCh <- mgr.Start(ctx) }()
+
+	g.Eventually(func() bool {
+		return mgr.GetCache().WaitForCacheSync(ctx)
+	}, 10*time.Second).Should(BeTrue())
+
+	teardown := func() {
+		cancel()
+		<-mgrErrCh
+		g.Expect(testEnv.Stop()).To(Succeed())
+	}
+	return ctx, mgr.GetClient(), teardown
+}
+
+// TestControlPlaneIntegration_DeleteDrainsOwnedMachine verifies KD-4:
+//
+//  1. Create a Cluster, KCP, and a CAPI Machine owned by the KCP (controller
+//     OwnerReference) with the cluster-name label.
+//  2. Delete the KCP.
+//  3. Assert the Machine is deleted, the KCP finalizer is removed, and the
+//     KCP itself is reaped.
+//
+// Prior to the fix the KCP finalizer was removed immediately, leaving the
+// Machine without a parent KCP to coordinate its delete flow.
+func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	g := NewWithT(t)
+	ctx, c, teardown := startKCPEnvtest(t)
+	defer teardown()
+
+	const (
+		nsName      = "kd4-drain"
+		clusterName = "kd4-drain-cluster"
+		kcpName     = "kd4-drain-kcp"
+		machineName = "kd4-drain-kcp-0"
+	)
+
+	g.Expect(c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}})).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: &corev1.ObjectReference{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       kcpName,
+				Namespace:  nsName,
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, cluster)).To(Succeed())
+
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kcpName,
+			Namespace: nsName,
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+		},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			Replicas: ptr.To(int32(1)),
+			Version:  "v1.30.0+k0s.0",
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+					Kind:       "DockerMachineTemplate",
+					Name:       "not-installed",
+					Namespace:  nsName,
+				},
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, kcp)).To(Succeed())
+
+	// Wait for the controller to add the finalizer.
+	g.Eventually(func() bool {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		if err := c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, got); err != nil {
+			return false
+		}
+		for _, f := range got.Finalizers {
+			if f == controlplanev1beta2.KairosControlPlaneFinalizer {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 500*time.Millisecond).Should(BeTrue(), "KCP finalizer must be added before delete")
+
+	// Pre-create a Machine owned by this KCP. Match the labels and
+	// controller OwnerReference so drainOwnedMachines picks it up.
+	gotKCP := &controlplanev1beta2.KairosControlPlane{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, gotKCP)).To(Succeed())
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      machineName,
+			Namespace: nsName,
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:         clusterName,
+				clusterv1.MachineControlPlaneLabel: "",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(gotKCP, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
+			},
+		},
+		Spec: clusterv1.MachineSpec{
+			ClusterName: clusterName,
+			Version:     ptr.To("v1.30.0+k0s.0"),
+		},
+	}
+	g.Expect(c.Create(ctx, machine)).To(Succeed())
+
+	// Delete the KCP.
+	g.Expect(c.Delete(ctx, gotKCP)).To(Succeed())
+
+	// Eventually the owned Machine is deleted.
+	g.Eventually(func() bool {
+		got := &clusterv1.Machine{}
+		err := c.Get(ctx, types.NamespacedName{Name: machineName, Namespace: nsName}, got)
+		return apierrors.IsNotFound(err)
+	}, 30*time.Second, 1*time.Second).Should(BeTrue(), "owned Machine must be deleted before KCP finalizer is removed (KD-4)")
+
+	// And then the KCP itself is reaped.
+	g.Eventually(func() bool {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		err := c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, got)
+		return apierrors.IsNotFound(err)
+	}, 30*time.Second, 1*time.Second).Should(BeTrue(), "KCP must be reaped once its owned Machine is gone")
+}
+
+// TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine verifies
+// KD-4 negative path: when an owned Machine has a foreign finalizer holding
+// it (so the Machine cannot be fully deleted), reconcileDelete must keep
+// requeuing and the KCP finalizer must stay attached. The KCP itself must
+// NOT disappear.
+//
+// This is the property that prevents the orphan-Cluster failure mode that
+// motivated KD-4: stripping the KCP finalizer prematurely leaves the parent
+// Cluster reapable while owned children still depend on it.
+func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	g := NewWithT(t)
+	ctx, c, teardown := startKCPEnvtest(t)
+	defer teardown()
+
+	const (
+		nsName            = "kd4-held"
+		clusterName       = "kd4-held-cluster"
+		kcpName           = "kd4-held-kcp"
+		machineName       = "kd4-held-kcp-0"
+		foreignFinalizer  = "foreign-controller.example.com/wait"
+	)
+
+	g.Expect(c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}})).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: &corev1.ObjectReference{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       kcpName,
+				Namespace:  nsName,
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, cluster)).To(Succeed())
+
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kcpName,
+			Namespace: nsName,
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+		},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			Replicas: ptr.To(int32(1)),
+			Version:  "v1.30.0+k0s.0",
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+					Kind:       "DockerMachineTemplate",
+					Name:       "not-installed",
+					Namespace:  nsName,
+				},
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, kcp)).To(Succeed())
+
+	g.Eventually(func() bool {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		if err := c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, got); err != nil {
+			return false
+		}
+		for _, f := range got.Finalizers {
+			if f == controlplanev1beta2.KairosControlPlaneFinalizer {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 500*time.Millisecond).Should(BeTrue())
+
+	gotKCP := &controlplanev1beta2.KairosControlPlane{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, gotKCP)).To(Succeed())
+
+	// Pre-create the Machine with a foreign finalizer. When the KCP delete
+	// flow issues Delete on this Machine the apiserver will mark its
+	// DeletionTimestamp but the finalizer prevents actual removal.
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      machineName,
+			Namespace: nsName,
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:         clusterName,
+				clusterv1.MachineControlPlaneLabel: "",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(gotKCP, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
+			},
+			Finalizers: []string{foreignFinalizer},
+		},
+		Spec: clusterv1.MachineSpec{
+			ClusterName: clusterName,
+			Version:     ptr.To("v1.30.0+k0s.0"),
+		},
+	}
+	g.Expect(c.Create(ctx, machine)).To(Succeed())
+
+	// Delete the KCP.
+	g.Expect(c.Delete(ctx, gotKCP)).To(Succeed())
+
+	// Give the controller time to attempt the delete drain a few times.
+	// The Machine must enter mid-deletion (DeletionTimestamp set) but stay
+	// present (foreign finalizer holding it).
+	g.Eventually(func() bool {
+		got := &clusterv1.Machine{}
+		if err := c.Get(ctx, types.NamespacedName{Name: machineName, Namespace: nsName}, got); err != nil {
+			return false
+		}
+		return !got.DeletionTimestamp.IsZero()
+	}, 30*time.Second, 1*time.Second).Should(BeTrue(), "Machine must be marked for deletion by drainOwnedMachines")
+
+	// Consistently: the KCP must NOT disappear while the Machine lingers.
+	// 8s is long enough for several reconciles at the 10s requeue
+	// interval to land without the test stalling CI.
+	g.Consistently(func() bool {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		err := c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, got)
+		return err == nil
+	}, 8*time.Second, 1*time.Second).Should(BeTrue(), "KCP must NOT be reaped while owned Machine has a foreign finalizer (KD-4 negative path)")
+
+	// Cleanup: drop the foreign finalizer so the Machine can be reaped and
+	// the KCP can finish its delete flow before teardown.
+	gotMachine := &clusterv1.Machine{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: machineName, Namespace: nsName}, gotMachine)).To(Succeed())
+	gotMachine.Finalizers = nil
+	g.Expect(c.Update(ctx, gotMachine)).To(Succeed())
+
+	g.Eventually(func() bool {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		err := c.Get(ctx, types.NamespacedName{Name: kcpName, Namespace: nsName}, got)
+		return apierrors.IsNotFound(err)
+	}, 30*time.Second, 1*time.Second).Should(BeTrue(), "KCP must be reaped once the foreign finalizer drops and the Machine is gone")
 }

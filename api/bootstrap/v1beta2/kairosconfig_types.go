@@ -321,13 +321,16 @@ type KairosConfigStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// FailureReason indicates the reason for bootstrap failure
-	// This field is set only when bootstrap fails permanently.
+	// FailureReason is a short machine-readable string indicating why the
+	// bootstrap controller failed on its last reconcile attempt. Cleared
+	// automatically when a subsequent reconcile succeeds, so a non-empty
+	// value indicates an ongoing failure, not a terminal one.
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
 
-	// FailureMessage indicates the message for bootstrap failure
-	// This field is set only when bootstrap fails permanently.
+	// FailureMessage is a human-readable description of the last bootstrap
+	// failure. Cleared automatically when a subsequent reconcile succeeds.
+	// If non-empty, check the owning Machine's events for context.
 	// +optional
 	FailureMessage string `json:"failureMessage,omitempty"`
 }

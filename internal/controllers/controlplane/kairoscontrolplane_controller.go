@@ -19,6 +19,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -42,6 +43,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -74,7 +76,18 @@ const controlPlaneLBServiceSuffix = "control-plane-lb"
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop
-func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+//
+// Scope-limit: this PR (KD-14) introduces a deferred patch.Helper.Patch that
+// ONLY fires on the early-exit paths (no-Cluster, delete). The hot path
+// continues to issue r.Status().Update directly because it relies on
+// Update-not-Patch semantics for zero-valued status fields (see the
+// "Status().Update() vs Patch()" comment further down). Unifying the hot path
+// behind the patch helper is tracked as KD-37 and lands on
+// refactor/kcp-patch-helper-unify post-alpha-2.
+//
+// Named returns (result, retErr) are required so the deferred Patch closure
+// can combine its error into retErr via errors.Join.
+func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Fetch the KairosControlPlane instance
@@ -86,17 +99,71 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// Handle deletion
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, log, kcp)
+	// Initialize patch helper BEFORE any early returns so paths that don't run
+	// the hot-path r.Status().Update still flush observedGeneration and
+	// condition transitions. (KD-14.)
+	patchHelper, err := patch.NewHelper(kcp, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// Add finalizer if needed
+	// Always set observedGeneration so even early-return paths reconcile it.
+	kcp.Status.ObservedGeneration = kcp.Generation
+
+	// patchOnExit controls whether the deferred Patch fires. It defaults to
+	// false because the hot path issues its own r.Status().Update and a
+	// follow-up Patch with a stale resourceVersion would conflict. Every
+	// early-exit path that wants the observedGeneration/condition changes
+	// persisted MUST set patchOnExit = true immediately before returning.
+	// reconcileDelete signals via skipPatch=true when it has already issued
+	// a bare r.Update for the terminal finalizer-remove step; in that case
+	// the deferred Patch must be bypassed to avoid racing with the
+	// apiserver removing the object after the last finalizer drops.
+	patchOnExit := false
+	defer func() {
+		if !patchOnExit {
+			return
+		}
+		if perr := patchHelper.Patch(ctx, kcp); perr != nil {
+			retErr = errors.Join(retErr, perr)
+		}
+	}()
+
+	// Handle deletion. reconcileDelete signals via skipPatch=true when it
+	// has already finalized the object via a bare r.Update; otherwise the
+	// deferred Patch should flush observedGeneration/conditions on the
+	// non-terminal drain-requeue path.
+	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+		res, skipPatch, derr := r.reconcileDelete(ctx, log, kcp)
+		if !skipPatch {
+			patchOnExit = true
+		}
+		return res, derr
+	}
+
+	// Add finalizer if needed. Kept as a bare r.Update so this spec write is
+	// flushed independently of the deferred Patch (which only runs on early
+	// exits). After the bare Update we re-anchor the patch helper against
+	// the post-Update in-memory state, then re-apply the observedGeneration
+	// mutation so the deferred Patch on early-exit paths still produces a
+	// diff. Cleanup is part of KD-37.
 	if !controllerutil.ContainsFinalizer(kcp, controlplanev1beta2.KairosControlPlaneFinalizer) {
 		controllerutil.AddFinalizer(kcp, controlplanev1beta2.KairosControlPlaneFinalizer)
+		// Snapshot the desired status before the bare Update wipes our local
+		// observedGeneration mutation from the patch-helper diff base.
+		desiredObservedGeneration := kcp.Status.ObservedGeneration
 		if err := r.Update(ctx, kcp); err != nil {
 			return ctrl.Result{}, err
 		}
+		// r.Update rewrote kcp from the server response, clobbering our
+		// in-memory Status.ObservedGeneration. Re-create the patch helper
+		// against the fresh state, then re-set the field so the deferred
+		// Patch still flushes it on early-exit paths.
+		patchHelper, err = patch.NewHelper(kcp, r.Client)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		kcp.Status.ObservedGeneration = desiredObservedGeneration
 	}
 
 	// Find the owning Cluster
@@ -126,7 +193,9 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 					return ctrl.Result{}, err
 				}
 				log.Info("Set cluster-name label on KairosControlPlane", "cluster", cluster.Name)
-				// Return to trigger a new reconcile with the label set
+				// Return to trigger a new reconcile with the label set.
+				// The r.Update above already persisted the spec change AND
+				// bumped resourceVersion; do NOT fire the deferred patch.
 				return ctrl.Result{Requeue: true}, nil
 			}
 		} else {
@@ -136,11 +205,10 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 	if cluster == nil {
 		log.Info("Cluster is not available yet")
+		// Flush observedGeneration via the deferred Patch.
+		patchOnExit = true
 		return ctrl.Result{}, nil
 	}
-
-	// Always update observedGeneration
-	kcp.Status.ObservedGeneration = kcp.Generation
 
 	// Reconcile control plane machines
 	if err := r.reconcileMachines(ctx, log, kcp, cluster); err != nil {
@@ -155,6 +223,15 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 		return ctrl.Result{}, nil
 	}
+
+	// reconcileMachines returned nil -- clear any latched failure status
+	// unconditionally. Maintainer-confirmed decision #3: gating on
+	// ReadyReplicas > 0 conflated "API server not ready yet" with "failure
+	// observed", forcing operators to manually clear failureReason/Message
+	// to unblock orchestration. API readiness is a v1beta2 condition
+	// concern, not a failure-fields concern. (KD-14.)
+	kcp.Status.FailureReason = ""
+	kcp.Status.FailureMessage = ""
 
 	// Track previous initialized state to detect transitions
 	wasInitialized := kcp.Status.Initialized
@@ -320,11 +397,9 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
 	}
 
-	// Clear failure fields if successful
-	if kcp.Status.ReadyReplicas > 0 {
-		kcp.Status.FailureReason = ""
-		kcp.Status.FailureMessage = ""
-	}
+	// Failure fields were cleared above immediately after reconcileMachines
+	// returned nil (KD-14, maintainer-confirmed decision #3). The previous
+	// `if ReadyReplicas > 0` gate at this location is intentionally removed.
 
 	// Use Status().Update() instead of Patch() to ensure all status fields are included
 	// This is important because Patch() with omitempty tags may omit zero values,
@@ -2302,11 +2377,57 @@ func (r *KairosControlPlaneReconciler) triggerClusterReconciliation(ctx context.
 	return nil
 }
 
-func (r *KairosControlPlaneReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane) (ctrl.Result, error) {
-	// Remove finalizer
+// reconcileDelete drains the CAPI Machines owned by this KairosControlPlane
+// before removing the finalizer. Stripping the finalizer with live owned
+// Machines still attached causes the parent Cluster to disappear with
+// orphaned children, which is the failure mode that produced KD-4: the CAPI
+// machine.cluster.x-k8s.io finalizer never cleared because the Machine
+// controller could not find its parent Cluster, requiring a manual
+// `kubectl patch --type=json` to unblock.
+//
+// KairosConfig and the infrastructure Machine are NOT deleted directly --
+// they cascade via the CAPI Machine's OwnerReferences (KD-11 keeps the
+// Machine as the controller of both children). Deleting them here would
+// race with the CAPI Machine controller's own delete flow.
+//
+// Returns (result, skipPatch, err). When skipPatch is true the caller MUST
+// bypass the deferred Patch -- this path has already finalized the object
+// via a bare r.Update and a follow-up Patch would race with apiserver GC.
+func (r *KairosControlPlaneReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane) (ctrl.Result, bool, error) {
+	remaining, err := drainOwnedMachines(ctx, r.Client, kcp)
+	if err != nil {
+		log.Error(err, "Failed to drain owned Machines",
+			"kcp", kcp.Name, "namespace", kcp.Namespace, "uid", kcp.UID)
+		return ctrl.Result{}, false, err
+	}
+	if remaining > 0 {
+		log.Info("Waiting for owned Machines to be reaped before removing KCP finalizer",
+			"kcp", kcp.Name, "namespace", kcp.Namespace, "remaining", remaining)
+		// Non-terminal requeue: let the deferred Patch flush
+		// observedGeneration/conditions while we wait for the drain.
+		return ctrl.Result{RequeueAfter: kcpDeleteRequeueAfter}, false, nil
+	}
+
+	// Terminal step: remove the finalizer with a bare r.Update. The patch
+	// helper is bypassed via skipPatch=true so the deferred closure in
+	// Reconcile does not race apiserver GC once the last finalizer drops.
+	// (KD-4, per maintainer-confirmed plan.)
 	controllerutil.RemoveFinalizer(kcp, controlplanev1beta2.KairosControlPlaneFinalizer)
-	return ctrl.Result{}, r.Update(ctx, kcp)
+	if err := r.Update(ctx, kcp); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Object already gone -- nothing to do.
+			return ctrl.Result{}, true, nil
+		}
+		return ctrl.Result{}, true, err
+	}
+	return ctrl.Result{}, true, nil
 }
+
+// kcpDeleteRequeueAfter is the polling interval while waiting for owned
+// Machines to be reaped during reconcileDelete. Short enough to be
+// responsive, long enough to avoid hammering the apiserver while the CAPI
+// Machine controller does its work.
+const kcpDeleteRequeueAfter = 10 * time.Second
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *KairosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error {
