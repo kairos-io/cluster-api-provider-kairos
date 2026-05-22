@@ -346,10 +346,18 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 					if distribution == "k3s" {
 						hasPostBootstrapService = strings.Contains(cloudConfigStr, "kairos-k3s-post-bootstrap.service")
 					}
-					// Ensure SSH enable stage exists (regression guard for CAPV access)
+					// Ensure SSH enable stage exists (regression guard for CAPV access).
+					//
+					// KD-3a: the `hasSSHPassAuth` check that previously looked for
+					// `PasswordAuthentication yes` is gone. That injection was
+					// deliberately removed in KD-3a; keeping the substring check
+					// caused an infinite regeneration loop (the check always fired
+					// "missing", controller rewrote the secret every reconcile).
+					// The whole substring-based regeneration heuristic is KD-9 —
+					// replacing it with a template-version annotation on the
+					// Secret is the proper long-term fix.
 					hasSSHEnableStage := strings.Contains(cloudConfigStr, "systemctl enable --now sshd") ||
 						strings.Contains(cloudConfigStr, "systemctl enable --now ssh")
-					hasSSHPassAuth := strings.Contains(cloudConfigStr, "PasswordAuthentication yes")
 
 					if currentProviderID != "" && (!hasProviderIDInSecret || !hasPostBootstrapService) {
 						log.Info("Bootstrap secret missing providerID in post-bootstrap service, regenerating to include it",
@@ -359,8 +367,8 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 							"hasPostBootstrapService", hasPostBootstrapService)
 						needsRegeneration = true
 					}
-					if !hasSSHEnableStage || !hasSSHPassAuth {
-						log.Info("Bootstrap secret missing SSH settings, regenerating",
+					if !hasSSHEnableStage {
+						log.Info("Bootstrap secret missing SSH enable stage, regenerating",
 							"secret", *kairosConfig.Status.DataSecretName)
 						needsRegeneration = true
 					}
