@@ -127,9 +127,16 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}()
 
-	// Handle deletion
+	// Handle deletion. reconcileDelete signals via skipPatch=true when it
+	// has just issued a bare r.Update for the terminal finalizer-remove
+	// step -- the deferred Patch must be skipped to avoid racing the
+	// apiserver removing the object.
 	if !kairosConfig.ObjectMeta.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, log, kairosConfig)
+		res, skipPatch, derr := r.reconcileDelete(ctx, log, kairosConfig)
+		if skipPatch {
+			patchOnExit = false
+		}
+		return res, derr
 	}
 
 	// Add finalizer if needed. The deferred patch helper flushes the change;
@@ -1235,15 +1242,54 @@ func (r *KairosConfigReconciler) getControlPlaneLBEndpoint(ctx context.Context, 
 	return "", nil
 }
 
-func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig) (ctrl.Result, error) {
-	// Remove finalizer. The deferred patch helper in Reconcile flushes the
-	// change. Commit 4 (KD-4) replaces this stub with an explicit drain of the
-	// owned bootstrap Secret before the finalizer is dropped, at which point
-	// the terminal finalizer-remove step switches to a bare r.Update with the
-	// patchOnExit guard.
+// reconcileDelete drains the owned bootstrap Secret before removing the
+// finalizer. Stripping the finalizer with the Secret still attached leaks the
+// rendered cloud-config (containing user passwords and tokens) until
+// Kubernetes garbage collection eventually reaps it -- the failure mode
+// motivating KD-4.
+//
+// Returns (result, skipPatch, err). When skipPatch is true the caller MUST
+// NOT run the deferred patch.Helper.Patch -- this happens when we just
+// issued a bare r.Update for the terminal finalizer-remove step. Once the
+// last finalizer drops, the apiserver is free to garbage-collect the
+// object, and a follow-up patch from the deferred closure would race that
+// GC and surface as a 404.
+func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig) (result ctrl.Result, skipPatch bool, err error) {
+	gone, err := deleteBootstrapSecret(ctx, r.Client, kairosConfig)
+	if err != nil {
+		log.Error(err, "Failed to delete bootstrap Secret",
+			"kairosConfig", kairosConfig.Name,
+			"namespace", kairosConfig.Namespace,
+			"uid", kairosConfig.UID)
+		return ctrl.Result{}, false, err
+	}
+	if !gone {
+		log.Info("Waiting for bootstrap Secret to be reaped before removing KairosConfig finalizer",
+			"kairosConfig", kairosConfig.Name,
+			"namespace", kairosConfig.Namespace,
+			"secret", *kairosConfig.Status.DataSecretName)
+		return ctrl.Result{RequeueAfter: bootstrapDeleteRequeueAfter}, false, nil
+	}
+
+	// Terminal step: remove the finalizer with a bare r.Update. The patch
+	// helper is bypassed via skipPatch=true so the deferred closure in
+	// Reconcile does not race the apiserver's garbage-collection of this
+	// object. (KD-4, per maintainer-confirmed plan.)
 	controllerutil.RemoveFinalizer(kairosConfig, bootstrapv1beta2.KairosConfigFinalizer)
-	return ctrl.Result{}, nil
+	if err := r.Update(ctx, kairosConfig); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Object already gone.
+			return ctrl.Result{}, true, nil
+		}
+		return ctrl.Result{}, true, err
+	}
+	return ctrl.Result{}, true, nil
 }
+
+// bootstrapDeleteRequeueAfter is the polling interval while waiting for the
+// owned bootstrap Secret to be garbage-collected. Short because Secret GC
+// is normally near-instant; long enough not to hammer the apiserver.
+const bootstrapDeleteRequeueAfter = 5 * time.Second
 
 // randomString generates a random lowercase alphanumeric string of the given length
 // This ensures the string is RFC 1123 compliant for Kubernetes resource names
