@@ -90,13 +90,27 @@ type KairosConfigSpec struct {
 	// +optional
 	UserName string `json:"userName,omitempty"`
 
-	// UserPassword is the password for the default user
-	// Defaults to "kairos" if not specified.
-	// WARNING: This default is for development only and is NOT production-safe.
-	// For production use, always set a strong password.
-	// +kubebuilder:default=kairos
+	// UserPassword is the password for the default user (inline; discouraged).
+	//
+	// Inline values are stored in the cluster as part of this resource's spec
+	// and are visible to anyone with read access to KairosConfigs. Prefer
+	// UserPasswordSecretRef for any non-lab use — the password then lives in
+	// a Kubernetes Secret which can be encrypted at rest and is subject to
+	// separate RBAC.
+	//
+	// No default is applied. A KairosConfig MUST set at least one of
+	// userPassword, userPasswordSecretRef, sshPublicKey, or gitHubUser; the
+	// validating webhook enforces this. If both UserPassword and
+	// UserPasswordSecretRef are set, UserPasswordSecretRef takes precedence.
 	// +optional
 	UserPassword string `json:"userPassword,omitempty"`
+
+	// UserPasswordSecretRef is a reference to a Secret containing the user
+	// password. The Secret must live in the same namespace as the KairosConfig
+	// unless Namespace is set explicitly. The Secret's data key defaults to
+	// "password". Recommended over inline UserPassword.
+	// +optional
+	UserPasswordSecretRef *UserPasswordSecretReference `json:"userPasswordSecretRef,omitempty"`
 
 	// UserGroups are the groups for the default user
 	// +kubebuilder:default={admin}
@@ -217,6 +231,27 @@ type WorkerTokenSecretReference struct {
 
 	// Namespace is the namespace of the Secret
 	// If not specified, defaults to the same namespace as the KairosConfig
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// UserPasswordSecretReference is a reference to a Secret containing the user
+// password. Structurally identical to WorkerTokenSecretReference except for
+// the default Key — "password" instead of "token" — so users following the
+// most common convention can omit Key entirely.
+type UserPasswordSecretReference struct {
+	// Name is the name of the Secret
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Key is the key within the Secret that contains the password.
+	// Defaults to "password" if not specified.
+	// +kubebuilder:default=password
+	// +optional
+	Key string `json:"key,omitempty"`
+
+	// Namespace is the namespace of the Secret.
+	// If not specified, defaults to the same namespace as the KairosConfig.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 }

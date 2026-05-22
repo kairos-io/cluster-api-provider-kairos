@@ -713,6 +713,43 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 	}
 }
 
+// resolveUserPassword returns the user password for the default user, in
+// precedence order: UserPasswordSecretRef > inline UserPassword > "" (empty).
+//
+// Empty is a valid return value here. The validating webhook requires the
+// KairosConfig to set at least one of userPassword/userPasswordSecretRef/
+// sshPublicKey/gitHubUser, so an empty password just means the user opted
+// for SSH-key-only auth. The cloud-config templates handle that by simply
+// not emitting a `passwd:` field for the default user.
+//
+// KD-3a, v0.1.0-alpha.2: this replaced the previous behaviour of defaulting
+// to "kairos" when no password was set.
+func (r *KairosConfigReconciler) resolveUserPassword(ctx context.Context, kairosConfig *bootstrapv1beta2.KairosConfig) (string, error) {
+	if ref := kairosConfig.Spec.UserPasswordSecretRef; ref != nil && ref.Name != "" {
+		secretKey := types.NamespacedName{
+			Namespace: kairosConfig.Namespace,
+			Name:      ref.Name,
+		}
+		if ref.Namespace != "" {
+			secretKey.Namespace = ref.Namespace
+		}
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, secretKey, secret); err != nil {
+			return "", fmt.Errorf("get user password secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
+		}
+		key := ref.Key
+		if key == "" {
+			key = "password"
+		}
+		data, ok := secret.Data[key]
+		if !ok {
+			return "", fmt.Errorf("user password secret %s/%s does not contain key %q", secretKey.Namespace, secretKey.Name, key)
+		}
+		return string(data), nil
+	}
+	return kairosConfig.Spec.UserPassword, nil
+}
+
 func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
 	// Determine single-node mode
 	// Single-node is determined by:
@@ -798,9 +835,9 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	if userName == "" {
 		userName = "kairos"
 	}
-	userPassword := kairosConfig.Spec.UserPassword
-	if userPassword == "" {
-		userPassword = "kairos"
+	userPassword, err := r.resolveUserPassword(ctx, kairosConfig)
+	if err != nil {
+		return "", err
 	}
 	userGroups := kairosConfig.Spec.UserGroups
 	if len(userGroups) == 0 {
@@ -1024,9 +1061,9 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 	if userName == "" {
 		userName = "kairos"
 	}
-	userPassword := kairosConfig.Spec.UserPassword
-	if userPassword == "" {
-		userPassword = "kairos"
+	userPassword, err := r.resolveUserPassword(ctx, kairosConfig)
+	if err != nil {
+		return "", err
 	}
 	userGroups := kairosConfig.Spec.UserGroups
 	if len(userGroups) == 0 {

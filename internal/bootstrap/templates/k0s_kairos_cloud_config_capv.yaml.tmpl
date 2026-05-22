@@ -36,7 +36,9 @@ install:
 
 users:
 - name: {{ .UserName | quote }}
+  {{- if .UserPassword }}
   passwd: {{ .UserPassword | quote }}
+  {{- end }}
   groups:
   {{- range .UserGroups }}
     - {{ . | quote }}
@@ -115,18 +117,6 @@ stages:
     - name: "Ensure SSH service is enabled"
       commands:
         - systemctl enable --now sshd || systemctl enable --now ssh || true
-    - name: "Allow SSH password authentication"
-      files:
-        - path: /etc/ssh/sshd_config.d/60-kairos-capi.conf
-          permissions: "0644"
-          owner: 0
-          group: 0
-          content: |
-            PasswordAuthentication yes
-            KbdInteractiveAuthentication yes
-      commands:
-        - mkdir -p /etc/ssh/sshd_config.d
-        - systemctl restart sshd || systemctl restart ssh || true
     {{- if .DNSServers }}
     - name: "Configure DNS resolvers for early boot"
       dns:
