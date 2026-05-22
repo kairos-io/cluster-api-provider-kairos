@@ -83,7 +83,15 @@ type KairosConfigReconciler struct {
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;patch;update
 
 // Reconcile is part of the main kubernetes reconciliation loop
-func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+//
+// The function uses a single deferred patch.Helper.Patch to flush all spec and
+// status mutations on the way out. The helper is created immediately after the
+// initial Get so that even early-return paths (paused, no owner Machine, no
+// Cluster) reconcile observedGeneration and conditions. This closes KD-14.
+//
+// Named returns (result, retErr) are required so the deferred closure can
+// combine the patch error into the returned error via errors.Join.
+func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Fetch the KairosConfig instance
@@ -95,20 +103,45 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	// Initialize patch helper BEFORE any early returns so paused/no-owner/no-Cluster
+	// paths still flush observedGeneration and condition transitions. (KD-14.)
+	patchHelper, err := patch.NewHelper(kairosConfig, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Always update observedGeneration, including on early-return paths.
+	kairosConfig.Status.ObservedGeneration = kairosConfig.Generation
+
+	// patchOnExit lets reconcileDelete signal that it has already issued a bare
+	// r.Update for the terminal finalizer-removal step and the deferred patch
+	// MUST be skipped to avoid racing with the apiserver removing the object.
+	// In commit 1 this is always true; commit 4 wires the skip path.
+	patchOnExit := true
+	defer func() {
+		if !patchOnExit {
+			return
+		}
+		if perr := patchHelper.Patch(ctx, kairosConfig); perr != nil {
+			retErr = errors.Join(retErr, perr)
+		}
+	}()
+
 	// Handle deletion
 	if !kairosConfig.ObjectMeta.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, log, kairosConfig)
 	}
 
-	// Add finalizer if needed
-	if !controllerutil.ContainsFinalizer(kairosConfig, bootstrapv1beta2.KairosConfigFinalizer) {
-		controllerutil.AddFinalizer(kairosConfig, bootstrapv1beta2.KairosConfigFinalizer)
-		if err := r.Update(ctx, kairosConfig); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
+	// Add finalizer if needed. The deferred patch helper flushes the change;
+	// no bare r.Update here. (controller-reconcile-safety skill.)
+	controllerutil.AddFinalizer(kairosConfig, bootstrapv1beta2.KairosConfigFinalizer)
 
-	// Check if paused
+	// Check if paused. observedGeneration was already set above; the deferred
+	// patch flushes it along with any condition changes a previous Reconcile
+	// left in flight. FailureReason/FailureMessage are intentionally NOT
+	// cleared on the paused path -- latched failure state still reflects the
+	// last real observation and clears on the first successful post-resume
+	// Reconcile.
 	if kairosConfig.Spec.Pause {
 		log.Info("KairosConfig is paused, skipping reconciliation")
 		return ctrl.Result{}, nil
@@ -136,17 +169,8 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Initialize patch helper
-	helper, err := patch.NewHelper(kairosConfig, r.Client)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Always update observedGeneration
-	kairosConfig.Status.ObservedGeneration = kairosConfig.Generation
-
 	// Reconcile bootstrap data
-	result, err := r.reconcileBootstrapData(ctx, log, kairosConfig, machine, cluster)
+	bootstrapResult, err := r.reconcileBootstrapData(ctx, log, kairosConfig, machine, cluster)
 	if err != nil {
 		// Mark conditions as false on error
 		// Use "%s" as format string and pass error as argument to satisfy linter
@@ -158,12 +182,12 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		kairosConfig.Status.FailureMessage = err.Error()
 		kairosConfig.Status.Ready = false
 
-		return ctrl.Result{}, helper.Patch(ctx, kairosConfig)
+		return ctrl.Result{}, nil
 	}
 
 	// If reconcileBootstrapData requested a requeue (e.g., waiting for providerID), return it
-	if result.Requeue || result.RequeueAfter > 0 {
-		return result, helper.Patch(ctx, kairosConfig)
+	if bootstrapResult.Requeue || bootstrapResult.RequeueAfter > 0 {
+		return bootstrapResult, nil
 	}
 
 	// Mark conditions as true on success
@@ -171,12 +195,14 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	conditions.MarkTrue(kairosConfig, bootstrapv1beta2.BootstrapReadyCondition)
 	conditions.MarkTrue(kairosConfig, bootstrapv1beta2.DataSecretAvailableCondition)
 
-	// Clear failure fields
+	// Clear failure fields on every successful exit so a transient missing
+	// dependency (e.g. userPasswordSecretRef target Secret) does not latch
+	// FailureReason/Message into a terminal state that blocks the CAPI Machine
+	// controller from cloning the infrastructure Machine. (KD-14.)
 	kairosConfig.Status.FailureReason = ""
 	kairosConfig.Status.FailureMessage = ""
 
-	// Update status
-	return ctrl.Result{}, helper.Patch(ctx, kairosConfig)
+	return ctrl.Result{}, nil
 }
 
 func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (ctrl.Result, error) {
@@ -1210,9 +1236,13 @@ func (r *KairosConfigReconciler) getControlPlaneLBEndpoint(ctx context.Context, 
 }
 
 func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig) (ctrl.Result, error) {
-	// Remove finalizer
+	// Remove finalizer. The deferred patch helper in Reconcile flushes the
+	// change. Commit 4 (KD-4) replaces this stub with an explicit drain of the
+	// owned bootstrap Secret before the finalizer is dropped, at which point
+	// the terminal finalizer-remove step switches to a bare r.Update with the
+	// patchOnExit guard.
 	controllerutil.RemoveFinalizer(kairosConfig, bootstrapv1beta2.KairosConfigFinalizer)
-	return ctrl.Result{}, r.Update(ctx, kairosConfig)
+	return ctrl.Result{}, nil
 }
 
 // randomString generates a random lowercase alphanumeric string of the given length

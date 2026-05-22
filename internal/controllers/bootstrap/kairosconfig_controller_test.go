@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -982,4 +983,195 @@ func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
 	g.Expect(cloudConfig).To(ContainSubstring("CAPK: always mark bootstrap success on script exit"))
 	g.Expect(cloudConfig).To(ContainSubstring("--tls-san=192.0.2.10"))
 	g.Expect(cloudConfig).To(ContainSubstring("k3s:"))
+}
+
+// newBootstrapTestScheme registers the schemes that the bootstrap Reconcile
+// flow depends on for these unit tests.
+func newBootstrapTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	return scheme
+}
+
+// TestReconcile_PausedPatchesObservedGeneration verifies KD-14: even when the
+// KairosConfig is paused, Reconcile must flush observedGeneration via the
+// deferred patch helper. Prior to the fix the patch helper was created after
+// the paused early-return and observedGeneration drifted permanently.
+func TestReconcile_PausedPatchesObservedGeneration(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "paused-config",
+			Namespace:  "default",
+			Generation: 7,
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:         "control-plane",
+			Distribution: "k0s",
+			Pause:        true,
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "paused-config", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "paused-config", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(7)))
+}
+
+// TestReconcile_NoOwnerMachinePatchesObservedGeneration verifies KD-14 for the
+// "Machine controller has not yet set OwnerRef" early return. observedGeneration
+// must still be flushed.
+func TestReconcile_NoOwnerMachinePatchesObservedGeneration(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "orphan-config",
+			Namespace:  "default",
+			Generation: 3,
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:         "control-plane",
+			Distribution: "k0s",
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "orphan-config", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "orphan-config", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(3)))
+	// Finalizer should be added even though we early-return on missing owner Machine.
+	g.Expect(got.Finalizers).To(ContainElement(bootstrapv1beta2.KairosConfigFinalizer))
+}
+
+// TestReconcile_PausedDoesNotClearFailureFields verifies the maintainer-confirmed
+// decision #2: latched FailureReason/FailureMessage must NOT be cleared on the
+// paused path. Clearing happens naturally on the first successful post-resume
+// Reconcile.
+func TestReconcile_PausedDoesNotClearFailureFields(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "paused-failed-config",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:         "control-plane",
+			Distribution: "k0s",
+			Pause:        true,
+		},
+		Status: bootstrapv1beta2.KairosConfigStatus{
+			FailureReason:  "SomePriorFailure",
+			FailureMessage: "rendered userdata before user paused us",
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "paused-failed-config", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "paused-failed-config", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Status.FailureReason).To(Equal("SomePriorFailure"))
+	g.Expect(got.Status.FailureMessage).To(Equal("rendered userdata before user paused us"))
+}
+
+// TestReconcile_SuccessClearsFailureFields verifies KD-14: when a previous
+// Reconcile latched FailureReason/FailureMessage (e.g. transient missing
+// userPasswordSecretRef target) and the next Reconcile succeeds, the failure
+// fields are cleared. Prior to the fix they latched forever and CAPI Machine
+// controller refused to clone the infra Machine.
+func TestReconcile_SuccessClearsFailureFields(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+	}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-machine",
+			Namespace: "default",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+		},
+		Spec: clusterv1.MachineSpec{
+			ClusterName: "test-cluster",
+		},
+	}
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "recovered-config",
+			Namespace:  "default",
+			Generation: 5,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(machine, clusterv1.GroupVersion.WithKind("Machine")),
+			},
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "control-plane",
+			Distribution:      "k0s",
+			KubernetesVersion: "v1.30.0+k0s.0",
+			SingleNode:        true,
+			UserName:          "kairos",
+			UserPassword:      "kairos",
+			UserGroups:        []string{"admin"},
+		},
+		Status: bootstrapv1beta2.KairosConfigStatus{
+			FailureReason:  bootstrapv1beta2.BootstrapDataSecretGenerationFailedReason,
+			FailureMessage: "user password secret default/missing not found",
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, machine, kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "recovered-config", Namespace: "default"}})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "recovered-config", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Status.FailureReason).To(BeEmpty(), "FailureReason should be cleared on success (KD-14)")
+	g.Expect(got.Status.FailureMessage).To(BeEmpty(), "FailureMessage should be cleared on success (KD-14)")
+	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(5)))
 }
