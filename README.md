@@ -15,7 +15,7 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 **Latest release**: [`v0.1.0-alpha.1`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-alpha.1) — initial alpha. Pre-release; API surface may change before v0.1.0.
 
-Supports single-node k0s and k3s clusters with CAPD, CAPV, and CAPK. HA control planes and additional infrastructure providers (Metal3, Tinkerbell, hyperscalers) are on the v0.1 roadmap.
+Supports single-node k0s and k3s clusters with CAPD, CAPV, and CAPK. `spec.replicas > 1` is currently webhook-rejected; HA control planes are on the roadmap (KD-5b / KD-25). Additional infrastructure providers (Metal3, Tinkerbell, hyperscalers) are also on the roadmap.
 
 Read the [v0.1.0-alpha.1 release notes](docs/release-notes/v0.1.0-alpha.1.md) before using — there are important security caveats and known limitations.
 
@@ -27,7 +27,11 @@ Read the [v0.1.0-alpha.1 release notes](docs/release-notes/v0.1.0-alpha.1.md) be
 kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
 ```
 
-The provider is currently distributed as a flat manifest installable via `kubectl apply -f`. [clusterctl](https://cluster-api.sigs.k8s.io/clusterctl/overview) integration is planned for a future release.
+The provider is distributed as a flat manifest installable via `kubectl apply -f`. [clusterctl](https://cluster-api.sigs.k8s.io/clusterctl/overview) integration is planned for a future release.
+
+## Credentials
+
+Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublicKey` / `githubUser`. The validating webhook rejects any `KairosConfig` that specifies no credential. Inline `userPassword` is accepted but discouraged — the value is stored in the resource spec and readable by anyone with access to KairosConfig objects.
 
 ## Target versions
 
@@ -35,7 +39,7 @@ The provider is currently distributed as a flat manifest installable via `kubect
 | --- | --- |
 | Kubernetes (workload) | bundled in your Kairos image (k3s/k0s, typically v1.30+) |
 | Kubernetes (management) | v1.30+ |
-| Cluster API | v1.8.x (v1.11.x tracking is on the roadmap) |
+| Cluster API | v1.8.x (v1.11.x tracking is on the roadmap, KD-13) |
 | Kairos | v3.6.0+ |
 | Distributions | k0s, k3s |
 
@@ -56,7 +60,9 @@ The provider is currently distributed as a flat manifest installable via `kubect
 ```bash
 git clone https://github.com/kairos-io/cluster-api-provider-kairos.git
 cd cluster-api-provider-kairos
-make test
+make test               # unit tests
+make test-envtest       # integration tests (envtest)
+make test-kubevirt      # end-to-end (requires Docker + kubevirt-env setup)
 ```
 
 See [docs/INSTALL.md](docs/INSTALL.md) for the developer install path (`make deploy` from source).
