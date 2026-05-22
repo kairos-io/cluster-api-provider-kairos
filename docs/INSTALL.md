@@ -1,5 +1,7 @@
 # Install Guide
 
+Last verified against: CAPI v1.8.x, cert-manager v1.15+, provider v0.1.0-alpha.2.
+
 Two install paths: the released artifact (recommended for users) and a developer install from source.
 
 ## Path 1 — Released artifact (`kubectl apply`)
@@ -9,16 +11,20 @@ Use this if you want to consume a tagged release.
 ### Prerequisites
 
 1. A Kubernetes cluster acting as the management cluster (kind, EKS, GKE, AKS, etc.).
-2. **cert-manager v1.15+** installed:
+2. **cert-manager v1.15+** installed. Verify it is present before continuing:
+   ```bash
+   kubectl get crd certificates.cert-manager.io
+   ```
+   If not installed:
    ```bash
    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.2/cert-manager.yaml
    kubectl wait --for=condition=Available --timeout=2m -n cert-manager deploy/cert-manager-webhook
    ```
 3. **Cluster API core** installed. Easiest path:
    ```bash
-   clusterctl init --infrastructure docker   # or vsphere, kubevirt, …
+   kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.8.0/cluster-api-components.yaml
    ```
-   `clusterctl init` installs Cluster API core as a side effect of installing the infrastructure provider.
+   Or use `clusterctl init --infrastructure docker` (or vsphere, kubevirt, ...) if you already have clusterctl configured — `clusterctl init` installs Cluster API core as a side effect of installing the infrastructure provider.
 4. `kubectl` configured to use the management cluster.
 
 ### Install
@@ -49,17 +55,25 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
 ```
 
-> **Note**: the provider's `reconcileDelete` does not yet clean up child resources (KairosConfig, owned secrets, InfraMachines) when a managed `Cluster` is deleted. Manually clean up any clusters created with this release before uninstalling the provider.
+**Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:
+
+```bash
+kubectl get mutatingwebhookconfigurations | grep kairos
+kubectl get validatingwebhookconfigurations | grep kairos
+# Delete any stale entries before re-applying
+kubectl delete mutatingwebhookconfiguration <stale-name>
+kubectl delete validatingwebhookconfiguration <stale-name>
+```
 
 ---
 
 ## Path 2 — Developer install (from source)
 
-Use this if you're hacking on the provider itself.
+Use this if you are hacking on the provider itself.
 
 ### Prerequisites
 
-- Go 1.26+ toolchain.
+- Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0` / toolchain `go1.26.0`).
 - A Kubernetes cluster acting as the management cluster.
 - cert-manager and Cluster API core installed (same as Path 1).
 - `kubectl` configured to use the management cluster.
@@ -78,12 +92,14 @@ This installs CRDs, RBAC, webhooks, and the controller to the `kairos-capi-syste
 IMG=MY_REGISTRY/cluster-api-provider-kairos:dev make deploy
 ```
 
+**CRD installation note**: `make deploy` uses `kustomize build config/crd | kubectl apply -f -`, which applies kustomize-managed labels that CAPI's conversion webhook expects (`cluster.x-k8s.io/v1beta1`, `cluster.x-k8s.io/v1beta2`). If you apply raw CRD YAML via `kubectl apply -f config/crd/bases/`, those labels are absent and CAPI core may reject the CRDs. Use `make deploy` or `bin/kustomize build config/crd | kubectl apply -f -`.
+
 ### Run the controller on your host (optional)
 
 To run the controller on your host instead of deploying to the cluster:
 
 ```bash
-make install     # installs only the CRDs
+make install     # installs only the CRDs via kustomize
 make run         # runs the controller in the foreground against your kubeconfig
 ```
 

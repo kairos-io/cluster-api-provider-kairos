@@ -1,3 +1,18 @@
+# Blank install-target DataVolume for the Kairos 2-disk installer pattern.
+#
+# Apply this BEFORE the cluster manifest:
+#   kubectl apply -f config/samples/capk/kairos-install-disk.yaml
+#
+# The Kairos image DataVolumes (kairos-rootdisk, kairos-k3s-rootdisk) are
+# live-installer images that boot to a live shell. This blank disk is the
+# actual installation target — the cloud-config's install.device points at
+# /dev/vda (the virtio disk backed by this DV).
+#
+# storageClassName: choose one that exists on your cluster.
+# - kubevirt-env default: local-path (set by local-path-provisioner)
+# - Longhorn environments: uncomment the longhorn line below
+# - Leave blank to use the cluster's default StorageClass
+#
 apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
@@ -11,4 +26,5 @@ spec:
     resources:
       requests:
         storage: 40Gi
-    storageClassName: longhorn
+    # storageClassName: longhorn
+    # storageClassName: local-path

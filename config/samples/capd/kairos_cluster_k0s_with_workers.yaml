@@ -41,6 +41,8 @@ metadata:
   namespace: default
 spec:
   replicas: 1
+  # Pin a version your Kairos image bundles; the value is informational
+  # (KD-24 makes this advisory in alpha-2).
   version: "v1.30.0+k0s.0"
   machineTemplate:
     infrastructureRef:
