@@ -31,8 +31,11 @@ func EnsureDockerConfigJSON() (string, error) {
 	return p, nil
 }
 
-// WriteKindClusterConfig writes a kind v1alpha4 config: no default CNI, docker config mount,
-// and /dev/kvm passthrough for hardware-accelerated KubeVirt VMs (cluster name from kind create --name).
+// WriteKindClusterConfig writes a kind v1alpha4 config: no default CNI, docker
+// config mount, /dev/kvm passthrough for hardware-accelerated KubeVirt VMs, and
+// an explicit `image` pin to KindNodeImage (digest-locked) so a floating-tag
+// re-push upstream cannot silently change the node image under us. The cluster
+// name is supplied separately via `kind create --name`.
 func WriteKindClusterConfig(destPath, hostDockerConfig string) error {
 	content := fmt.Sprintf(`kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -40,12 +43,13 @@ networking:
   disableDefaultCNI: true
 nodes:
 - role: control-plane
+  image: %s
   extraMounts:
   - containerPath: /var/lib/kubelet/config.json
     hostPath: %s
   - containerPath: /dev/kvm
     hostPath: /dev/kvm
-`, hostDockerConfig)
+`, KindNodeImage, hostDockerConfig)
 	return os.WriteFile(destPath, []byte(content), 0o644)
 }
 
