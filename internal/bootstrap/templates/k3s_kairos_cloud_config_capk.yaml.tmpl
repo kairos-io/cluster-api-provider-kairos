@@ -88,6 +88,12 @@ k3s-agent:
 
 {{- /* write_files: worker token + post-bootstrap service/script (like k0s CAPK) */}}
 write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+{{ persistencyOEM | indent 6 }}
   {{- if and (eq .Role "control-plane") .ProviderID }}
   - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
     permissions: "0644"

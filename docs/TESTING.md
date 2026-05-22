@@ -40,3 +40,7 @@ make test-kubevirt     # run the scripted end-to-end flow
 ```
 
 This is the highest-confidence gate but requires Docker and a host with enough memory for nested VMs (16 GiB+ recommended). See [QUICKSTART_CAPK.md](QUICKSTART_CAPK.md) for details on the lab environment.
+
+## Reboot survival test
+
+After the cluster is `Available=true`, drain a node via `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`, restart the underlying VM (`virtctl restart <vm>` for CAPK; vSphere "Restart Guest OS" for CAPV), uncordon, and verify `kubectl get nodes` shows `Ready` within 5 minutes. This validates KD-23's persistence injection — k0s/k3s state, SSH host keys, and CNI config must survive the reboot.

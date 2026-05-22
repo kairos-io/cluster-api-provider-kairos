@@ -10,6 +10,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 - [KairosConfigTemplate](#kairosconfigtemplate)
 - [KairosControlPlane](#kairoscontrolplane)
 - [KairosControlPlaneTemplate](#kairoscontrolplanetemplate)
+- [Persistence behavior](#persistence-behavior)
 - [Notes](#notes)
 
 ---
@@ -317,6 +318,33 @@ spec:
 |-------|------|----------|-------------|
 | `metadata` | `ObjectMeta` | No | Metadata to apply to created `KairosControlPlane` resources. |
 | `spec` | `KairosControlPlaneSpec` | Yes | Spec applied to created `KairosControlPlane` resources. See [KairosControlPlane Spec](#spec-fields-1). |
+
+---
+
+## Persistence behavior
+
+The provider injects `/system/oem/12_kairos-capi-persistency.yaml` into every node's cloud-config via `write_files`. The file uses immucore's `extra-layout.env` mechanism (not `cos-layout.env`), so its `PERSISTENT_STATE_PATHS` value is **unioned** with the stock image's persistent paths — never overwriting them. A custom or stock Kairos image is unaffected; the provider's persistent paths are added on top of whatever the image already persists.
+
+The provider declares the following paths as persistent across reboots and A/B upgrades:
+
+- `/etc/cni`
+- `/etc/k0s`
+- `/etc/kubernetes`
+- `/etc/rancher`
+- `/etc/ssh`
+- `/etc/systemd`
+- `/var/lib/cni`
+- `/var/lib/containerd`
+- `/var/lib/k0s`
+- `/var/lib/kubelet`
+- `/var/lib/rancher`
+- `/var/log`
+
+**Second-boot-onward semantic.** The first install boot consumes the cloud-config directly (the bootstrap Secret is rendered into userdata and applied by `kairos-agent`). From the second reboot onward, the on-disk `/system/oem/12_kairos-capi-persistency.yaml` is what immucore reads at every boot to assemble the persistent overlay.
+
+**Adding your own persistent paths.** Users who need application-specific persistent paths can layer their own cloud-config snippet by writing a file via `Spec.Files` to `/system/oem/91_custom.yaml` (or any `/system/oem/9*` prefix). Lower numeric prefixes (`5x`–`8x`) are not recommended: future provider files may use those slots and silently shadow your override.
+
+Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence guarantees) in the punch list.
 
 ---
 

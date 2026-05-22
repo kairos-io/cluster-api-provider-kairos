@@ -80,8 +80,13 @@ k0s-worker:
 
 {{- end }}
 
-{{- if or .IsKubeVirt (and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR)) (and (ne .Role "control-plane") .WorkerToken) }}
 write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+{{ persistencyOEM | indent 6 }}
   {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR .IsKubeVirt) }}
   - path: /etc/k0s/k0s.yaml
     permissions: "0644"
@@ -531,7 +536,6 @@ MANIFEST_EOF
       exit 1
   {{- end }}
   {{- end }}
-{{- end }}
 
 {{- /* DNS overrides and post-bootstrap service */}}
 stages:
