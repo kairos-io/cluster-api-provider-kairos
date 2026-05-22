@@ -40,11 +40,12 @@ import (
 //   - quotes scalars containing YAML metacharacters (`:`, `#`, `---`, etc.).
 func newFuncMap() template.FuncMap {
 	return template.FuncMap{
-		"quote":      quote,
-		"toYaml":     toYaml,
-		"indent":     safeIndent,
-		"nindent":    nindent,
-		"trimSuffix": trimSuffix,
+		"quote":          quote,
+		"toYaml":         toYaml,
+		"indent":         safeIndent,
+		"nindent":        nindent,
+		"trimSuffix":     trimSuffix,
+		"persistencyOEM": persistencyOEM,
 	}
 }
 

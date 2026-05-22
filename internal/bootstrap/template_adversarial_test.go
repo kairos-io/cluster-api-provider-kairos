@@ -296,6 +296,149 @@ func TestRender_RejectsControlChars(t *testing.T) {
 	}
 }
 
+// TestPersistencyBlockDoesNotLeakUserInput asserts the persistency
+// write_files entry (KD-23) is content-static — no user-controlled string
+// from TemplateData can appear inside the persistency subtree of the
+// rendered cloud-config.
+//
+// The block is supposed to be a compile-time constant (see persistency.go's
+// SECURITY notes) and its template-func is zero-arg, but the safety story
+// breaks if a future template edit accidentally interpolates a user field
+// into the wrong YAML scope and yip then expands PERSISTENT_STATE_PATHS to
+// include a user-controlled directory. This test renders with adversarial
+// markers in every user-controlled string field and then asserts none of
+// those markers appear anywhere inside the persistency entry's `content`.
+func TestPersistencyBlockDoesNotLeakUserInput(t *testing.T) {
+	// Distinct sentinel strings so a leak names the exact field that bled
+	// through. The values are chosen to be plain ASCII (no `\n`/`\r`/NUL
+	// which validateTemplateData rejects) yet implausible as accidental
+	// matches against any path in expectedPersistentStatePaths.
+	const (
+		hostnameMark        = "ADV-HOSTNAME-LEAK"
+		userNameMark        = "ADV-USERNAME-LEAK"
+		userPasswordMark    = "ADV-USERPASSWORD-LEAK"
+		workerTokenMark     = "ADV-WORKERTOKEN-LEAK"
+		k3sTokenMark        = "ADV-K3STOKEN-LEAK"
+		k3sServerURLMark    = "https://ADV-K3SSERVER-LEAK:6443"
+		sshKeyMark          = "ssh-rsa ADV-SSHKEY-LEAK"
+		gitHubUserMark      = "ADV-GITHUBUSER-LEAK"
+		hostnamePrefixMark  = "ADV-HOSTPREFIX-LEAK"
+		groupMark           = "ADV-GROUP-LEAK"
+		dnsMark             = "203.0.113.7"
+		podCIDRMark         = "203.0.113.8/24"
+		serviceCIDRMark     = "203.0.113.16/28"
+		primaryIPMark       = "203.0.113.9"
+		machineNameMark     = "ADV-MACHINE-LEAK"
+		clusterNSMark       = "ADV-CLUSTERNS-LEAK"
+		lbServiceNameMark   = "ADV-LBNAME-LEAK"
+		lbServiceNSMark     = "ADV-LBNS-LEAK"
+		lbEndpointMark      = "203.0.113.10"
+		mgmtTokenMark       = "ADV-MGMTTOKEN-LEAK"
+		mgmtSecretNameMark  = "ADV-MGMTSECRET-LEAK"
+		mgmtSecretNSMark    = "ADV-MGMTNS-LEAK"
+		mgmtAPIServerMark   = "https://ADV-MGMTAPI-LEAK:6443"
+	)
+
+	allMarks := []string{
+		hostnameMark, userNameMark, userPasswordMark, workerTokenMark,
+		k3sTokenMark, k3sServerURLMark, sshKeyMark, gitHubUserMark,
+		hostnamePrefixMark, groupMark, dnsMark, podCIDRMark, serviceCIDRMark,
+		primaryIPMark, machineNameMark, clusterNSMark, lbServiceNameMark,
+		lbServiceNSMark, lbEndpointMark, mgmtTokenMark, mgmtSecretNameMark,
+		mgmtSecretNSMark, mgmtAPIServerMark,
+	}
+
+	mkData := func(isKV bool, dist string) TemplateData {
+		d := TemplateData{
+			Role:                                "control-plane",
+			SingleNode:                          true,
+			Hostname:                            hostnameMark,
+			UserName:                            userNameMark,
+			UserPassword:                        userPasswordMark,
+			UserGroups:                          []string{groupMark},
+			GitHubUser:                          gitHubUserMark,
+			SSHPublicKey:                        sshKeyMark,
+			HostnamePrefix:                      hostnamePrefixMark,
+			DNSServers:                          []string{dnsMark},
+			PodCIDR:                             podCIDRMark,
+			ServiceCIDR:                         serviceCIDRMark,
+			PrimaryIP:                           primaryIPMark,
+			MachineName:                         machineNameMark,
+			ClusterNS:                           clusterNSMark,
+			IsKubeVirt:                          isKV,
+			ControlPlaneLBServiceName:           lbServiceNameMark,
+			ControlPlaneLBServiceNamespace:      lbServiceNSMark,
+			ControlPlaneLBEndpoint:              lbEndpointMark,
+			ManagementKubeconfigToken:           mgmtTokenMark,
+			ManagementKubeconfigSecretName:      mgmtSecretNameMark,
+			ManagementKubeconfigSecretNamespace: mgmtSecretNSMark,
+			ManagementAPIServer:                 mgmtAPIServerMark,
+		}
+		if dist == "k3s" {
+			// k3s control-plane templates don't read WorkerToken (workers
+			// only); set K3sToken so the field is still exercised on the
+			// worker-template-share path. Use a control-plane role here so
+			// the persistency block renders; set K3sToken anyway as a
+			// belt-and-braces check that even an unused-in-this-role field
+			// doesn't leak.
+			d.K3sToken = k3sTokenMark
+			d.K3sServerURL = k3sServerURLMark
+		} else {
+			d.WorkerToken = workerTokenMark
+		}
+		return d
+	}
+
+	for _, dist := range []string{"k0s", "k3s"} {
+		for _, isKV := range []bool{false, true} {
+			tag := dist
+			if isKV {
+				tag += "/capk"
+			} else {
+				tag += "/capv"
+			}
+			t.Run(tag, func(t *testing.T) {
+				out, err := renderForDist(dist, mkData(isKV, dist))
+				if err != nil {
+					t.Fatalf("render failed: %v", err)
+				}
+
+				// Walk the rendered YAML to the persistency entry's inner content.
+				doc := parseRendered(t, out)
+				rawWF, ok := doc["write_files"].([]any)
+				if !ok {
+					t.Fatalf("write_files missing or not a list")
+				}
+				const wantPath = "/system/oem/12_kairos-capi-persistency.yaml"
+				var content string
+				for _, raw := range rawWF {
+					e, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					if p, _ := e["path"].(string); p == wantPath {
+						content, _ = e["content"].(string)
+						break
+					}
+				}
+				if content == "" {
+					t.Fatalf("persistency entry with path=%q not found or content empty", wantPath)
+				}
+
+				// None of the adversarial markers may appear inside the
+				// persistency content. (We assert on the raw content string
+				// rather than the parsed inner doc to catch leaks even into
+				// YAML comments or structurally-broken regions.)
+				for _, mark := range allMarks {
+					if strings.Contains(content, mark) {
+						t.Errorf("user-controlled value %q leaked into persistency block content", mark)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestSafeIndent_CRLF asserts the indent function strips \r so Windows-authored
 // Manifest.Content doesn't leak \r into the YAML block scalar (which would
 // then propagate into files written on the node).
