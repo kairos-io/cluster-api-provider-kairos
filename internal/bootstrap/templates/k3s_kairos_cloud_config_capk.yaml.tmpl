@@ -71,7 +71,7 @@ k3s:
     - --kubelet-arg=provider-id={{ .ProviderID }}
   {{- end }}
   {{- if .ControlPlaneLBEndpoint }}
-    - --tls-san={{ .ControlPlaneLBEndpoint }}
+    - {{ printf "--tls-san=%s" .ControlPlaneLBEndpoint | quote }}
   {{- end }}
   {{- end }}
 
@@ -172,8 +172,12 @@ write_files:
       set -e
       PROVIDER_ID=""
       # Prefer hostname: CAPK uses kubevirt://<vm-name> and hostname matches KubevirtMachine/VM name
+      # Hostname is shquote'd into POSIX single quotes to prevent shell injection
+      # (KD-43): the static "kubevirt://" prefix is in double quotes (safe — no
+      # template expansion), and the user-controlled .Hostname is concatenated as
+      # a single-quoted literal that bash cannot reinterpret.
       {{- if .Hostname }}
-      PROVIDER_ID="kubevirt://{{ .Hostname }}"
+      PROVIDER_ID="kubevirt://"{{ .Hostname | shquote }}
       echo "Discovered providerID: $PROVIDER_ID (hostname)"
       {{- end }}
       # Fallback: DMI product_uuid (KubeVirt VMs may expose UUID; only if hostname not available)
@@ -291,16 +295,17 @@ MANIFEST_EOF
         {{- if .ControlPlaneLBEndpoint }}
         local tmp_kubeconfig
         tmp_kubeconfig=$(mktemp)
-        sed "s|https://[^[:space:]]*:6443|https://{{ .ControlPlaneLBEndpoint }}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
+        local lb_endpoint={{ .ControlPlaneLBEndpoint | shquote }}
+        sed "s|https://[^[:space:]]*:6443|https://${lb_endpoint}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
         kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
         rm -f "${tmp_kubeconfig}"
         {{- else }}
         kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
         {{- end }}
-        local api="{{ .ManagementAPIServer }}"
+        local api={{ .ManagementAPIServer | shquote }}
         local ns="{{ .ManagementKubeconfigSecretNamespace }}"
         local name="{{ .ManagementKubeconfigSecretName }}"
-        local token="{{ .ManagementKubeconfigToken }}"
+        local token={{ .ManagementKubeconfigToken | shquote }}
         local payload
         payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"

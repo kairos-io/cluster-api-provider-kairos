@@ -42,6 +42,7 @@ func newFuncMap() template.FuncMap {
 	return template.FuncMap{
 		"quote":          quote,
 		"toYaml":         toYaml,
+		"shquote":        shquote,
 		"indent":         safeIndent,
 		"nindent":        nindent,
 		"trimSuffix":     trimSuffix,
@@ -80,6 +81,45 @@ func quote(v any) (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(string(b), "\n"), nil
+}
+
+// shquote returns a POSIX-shell-safe single-quoted representation of s,
+// INCLUDING the surrounding single quotes. Callers therefore write
+//
+//	local var={{ .Field | shquote }}
+//
+// and NOT
+//
+//	local var='{{ .Field | shquote }}'   // wrong: double-quotes the quotes
+//
+// Use shquote for any user-influenced value that lands inside a shell
+// command in a rendered template (e.g. systemd ExecStart= lines, runcmd:
+// entries, the bash script bodies emitted under write_files: / stages:
+// initramfs.files:). The `quote` filter is YAML-aware but not shell-aware:
+// yaml.v3 emits double-quoted scalars for values that need disambiguation
+// from booleans/ints/null, and bash double-quoted strings evaluate `$()`,
+// backticks, `${VAR}`, and `\`, so handing a `quote`-rendered scalar to
+// bash through a double-quoted assignment is unsafe. shquote sidesteps the
+// problem by emitting a POSIX single-quoted literal, which bash NEVER
+// interprets (no escapes, no expansions). The only character that cannot
+// appear inside a POSIX single-quoted string is the single quote itself;
+// shquote escapes embedded ones with the standard '\” close-open-quote
+// sequence.
+//
+// Threat model: a CAPI infrastructure provider (CAPK in particular) could,
+// in principle, populate a TemplateData field with a value containing
+// shell metacharacters. The fields that pass through shquote today are
+// .ManagementAPIServer, .ManagementKubeconfigToken, .PrimaryIP,
+// .MachineName, .ClusterNS, and .ControlPlaneLBEndpoint — the
+// management-endpoint set introduced for the CAPK kubeconfig-push and
+// post-bootstrap SAN-patch flows. None of these are intended to carry
+// shell-active input today, but the renderer is the LAST line of defense
+// between user/provider input and root-privileged userdata.
+//
+// See internal/bootstrap/CLAUDE.md §2 and the cloudconfig-rendering-safety
+// skill for the broader rules.
+func shquote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // toYaml marshals any value (typically a slice or map) and trims the trailing
