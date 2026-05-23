@@ -109,10 +109,11 @@ func quote(v any) (string, error) {
 // Threat model: a CAPI infrastructure provider (CAPK in particular) could,
 // in principle, populate a TemplateData field with a value containing
 // shell metacharacters. The fields that pass through shquote today are
-// .ManagementAPIServer, .ManagementKubeconfigToken, .PrimaryIP,
-// .MachineName, .ClusterNS, and .ControlPlaneLBEndpoint — the
-// management-endpoint set introduced for the CAPK kubeconfig-push and
-// post-bootstrap SAN-patch flows. None of these are intended to carry
+// .ManagementEndpoint.APIServer, .ManagementEndpoint.Token,
+// .ManagementEndpoint.KubeconfigSecretName,
+// .ManagementEndpoint.KubeconfigSecretNamespace (all four rendered only
+// when ManagementEndpoint is non-nil), .PrimaryIP, .MachineName, .ClusterNS,
+// and .ControlPlaneLBEndpoint. None of these are intended to carry
 // shell-active input today, but the renderer is the LAST line of defense
 // between user/provider input and root-privileged userdata.
 //
