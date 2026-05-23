@@ -172,8 +172,12 @@ write_files:
       set -e
       PROVIDER_ID=""
       # Prefer hostname: CAPK uses kubevirt://<vm-name> and hostname matches KubevirtMachine/VM name
+      # Hostname is shquote'd into POSIX single quotes to prevent shell injection
+      # (KD-43): the static "kubevirt://" prefix is in double quotes (safe — no
+      # template expansion), and the user-controlled .Hostname is concatenated as
+      # a single-quoted literal that bash cannot reinterpret.
       {{- if .Hostname }}
-      PROVIDER_ID="kubevirt://{{ .Hostname }}"
+      PROVIDER_ID="kubevirt://"{{ .Hostname | shquote }}
       echo "Discovered providerID: $PROVIDER_ID (hostname)"
       {{- end }}
       # Fallback: DMI product_uuid (KubeVirt VMs may expose UUID; only if hostname not available)

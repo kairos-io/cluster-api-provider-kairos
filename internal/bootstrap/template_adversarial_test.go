@@ -439,6 +439,132 @@ func TestPersistencyBlockDoesNotLeakUserInput(t *testing.T) {
 	}
 }
 
+// TestHostnameShellInjection_K3sCAPK_ProviderID is the regression guard for
+// KD-43. The k3s CAPK template's VM self-discovery script interpolates the
+// user-controlled .Hostname into a PROVIDER_ID shell assignment. Before the
+// fix, the line was:
+//
+//	PROVIDER_ID="kubevirt://{{ .Hostname }}"
+//
+// which is a double-quoted shell-string-literal context. An attacker who can
+// create or update a KairosConfig could set Hostname to (e.g.)
+//
+//	foo"; rm -rf /; echo "
+//
+// and obtain RCE as root at first boot — validateTemplateData only rejects
+// `\n\r\x00`, not shell metacharacters. The fix concatenates a static
+// double-quoted prefix with the shquote'd Hostname so any embedded `"` or
+// shell metas are literally quoted by POSIX single quotes.
+//
+// This test renders the k3s CAPK template with adversarial Hostname payloads
+// that DO inject shell metas (but do NOT contain `\n`/`\r`/NUL, which
+// validateTemplateData rejects before render) and asserts:
+//
+//  1. The rendered YAML still parses.
+//  2. The PROVIDER_ID line in /usr/local/bin/kairos-k3s-discover-provider-id.sh
+//     contains the payload bracketed by `'...'` (the shquote envelope),
+//     never unescaped.
+//  3. Dangerous fragments inside the payload never appear unquoted.
+//
+// The k3s CAPV, k0s CAPV, and k0s CAPK templates do NOT embed Hostname in a
+// shell context (the only other appearances are YAML block-scalar file
+// contents written to /usr/local/etc/hostname, which is `cat`'d at runtime —
+// the validator's `\n`/`\r`/NUL reject keeps that contract intact), so this
+// test is intentionally scoped to k3s CAPK.
+func TestHostnameShellInjection_K3sCAPK_ProviderID(t *testing.T) {
+	payloads := map[string]string{
+		"double_quote_break": `foo"; rm -rf /; echo "`,
+		"command_subst":      `host$(rm -rf /)`,
+		"backtick":           "host`rm -rf /`",
+		"semicolon_and_and":  `host'; rm -rf /; && echo '`,
+		"single_quote_break": `host'; rm -rf /; echo '`,
+	}
+
+	for name, payload := range payloads {
+		t.Run(name, func(t *testing.T) {
+			data := TemplateData{
+				Role:       "control-plane",
+				SingleNode: true,
+				Hostname:   payload,
+				UserName:   "kairos",
+				IsKubeVirt: true,
+				// Leave ProviderID empty so the self-discovery script
+				// (which is where the Hostname interpolation lives) renders.
+			}
+			out, err := RenderK3sCloudConfig(data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			// (1) YAML must still parse.
+			var doc map[string]any
+			if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+				t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+			}
+
+			// (2) The PROVIDER_ID assignment line must appear, and the
+			// payload must appear wrapped in the shquote envelope. The
+			// expected line shape is:
+			//   PROVIDER_ID="kubevirt://"'<shquoted-payload>'
+			envelope := shquote(payload)
+			wantLine := `PROVIDER_ID="kubevirt://"` + envelope
+			if !strings.Contains(out, wantLine) {
+				t.Fatalf("PROVIDER_ID assignment not found in expected shquoted form\nwant substring: %q\n---OUTPUT---\n%s", wantLine, out)
+			}
+
+			// (3) On the PROVIDER_ID line specifically, dangerous fragments
+			// must only appear within the shquote envelope. We restrict to
+			// the line because the payload also appears (safely) in the YAML
+			// hostname scalar at the top of the document, where the
+			// surrounding context is YAML-double-quoted rather than
+			// shell-single-quoted; that's a different escape contract and
+			// is not the regression site KD-43 covers.
+			//
+			// Locate the line beginning `PROVIDER_ID="kubevirt://"` and
+			// extract just that line to perform the walk on.
+			marker := `PROVIDER_ID="kubevirt://"`
+			lineStart := strings.Index(out, marker)
+			if lineStart < 0 {
+				t.Fatalf("PROVIDER_ID assignment line not found in output\n---OUTPUT---\n%s", out)
+			}
+			lineEnd := strings.Index(out[lineStart:], "\n")
+			if lineEnd < 0 {
+				lineEnd = len(out) - lineStart
+			}
+			providerIDLine := out[lineStart : lineStart+lineEnd]
+
+			for _, dangerous := range []string{
+				"; rm -rf /",
+				"$(rm -rf /)",
+				"`rm -rf /`",
+			} {
+				if !strings.Contains(payload, dangerous) {
+					continue
+				}
+				idx := 0
+				for {
+					pos := strings.Index(providerIDLine[idx:], dangerous)
+					if pos < 0 {
+						break
+					}
+					absPos := idx + pos
+					before := providerIDLine[:absPos]
+					lastOpen := strings.LastIndex(before, "'")
+					if lastOpen < 0 {
+						t.Fatalf("dangerous fragment %q at PROVIDER_ID-line offset %d has no preceding `'` — not inside shquote envelope\nLINE: %s", dangerous, absPos, providerIDLine)
+					}
+					after := providerIDLine[absPos+len(dangerous):]
+					nextClose := strings.Index(after, "'")
+					if nextClose < 0 {
+						t.Fatalf("dangerous fragment %q at PROVIDER_ID-line offset %d has no closing `'` after it — not inside shquote envelope\nLINE: %s", dangerous, absPos, providerIDLine)
+					}
+					idx = absPos + len(dangerous)
+				}
+			}
+		})
+	}
+}
+
 // TestSafeIndent_CRLF asserts the indent function strips \r so Windows-authored
 // Manifest.Content doesn't leak \r into the YAML block scalar (which would
 // then propagate into files written on the node).
