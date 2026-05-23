@@ -603,6 +603,30 @@ func isKubevirtMachine(machine *clusterv1.Machine) bool {
 	return machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine"
 }
 
+// supportsManagementEndpoint returns true for infrastructure kinds whose
+// control-plane Machines run the in-node kubeconfig-push block (KD-3b).
+//
+// Today: KubeVirt (CAPK) and vSphere (CAPV). When CAPM3 / Tinkerbell / etc.
+// gain Kairos support, they're added here once the rendered templates support
+// the push block on their cloud-config layout.
+//
+// KD-46 (post-alpha-2): the resolver's RBAC currently grants
+// `kubevirt.io/virtualmachineinstances:get` on every cluster that uses this
+// gate — including CAPV-only clusters that never read VMI status. The
+// over-broad permission is acceptable for alpha-2 (single VM-per-Role, no
+// blast-radius expansion) but should be narrowed to per-infrastructure
+// Role rules in a follow-up.
+func supportsManagementEndpoint(machine *clusterv1.Machine) bool {
+	if machine == nil {
+		return false
+	}
+	switch machine.Spec.InfrastructureRef.Kind {
+	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine":
+		return true
+	}
+	return false
+}
+
 func (r *KairosConfigReconciler) sanitizeCapkUserdataSecret(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) (bool, bool, error) {
 	secretName := ""
 	if machine != nil && machine.Spec.Bootstrap.DataSecretName != nil && *machine.Spec.Bootstrap.DataSecretName != "" {
@@ -933,15 +957,15 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	// This is needed to set the Node's providerID so the Machine controller can match Nodes to Machines
 	providerID := r.getProviderID(ctx, log, machine)
 
-	// CAPK control-plane: ask the resolver for the management-endpoint bundle
-	// the node needs to push its kubeconfig back without SSH. The gating
-	// (CAPK + control-plane only) stays here in the reconciler — it's
-	// routing, not a resolver concern. The resolver itself is allowed to
-	// return (nil, nil) as a "disabled" signal (e.g. envtest without a
-	// management REST config); we treat that the same as "no push block",
-	// per the contract in management_endpoint.go.
+	// Control-plane: ask the resolver for the management-endpoint bundle
+	// the node needs to push its kubeconfig back without SSH. KD-3b broadened
+	// the gate from CAPK-only to any infrastructure kind whose templates
+	// support the push block (see supportsManagementEndpoint). The resolver
+	// itself is allowed to return (nil, nil) as a "disabled" signal (e.g.
+	// envtest without a management REST config); we treat that the same as
+	// "no push block", per the contract in management_endpoint.go.
 	var mgmtEndpoint *ManagementEndpoint
-	if isKubevirtMachine(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
+	if supportsManagementEndpoint(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
 		var err error
 		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
 		if err != nil {
@@ -1176,9 +1200,10 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 	// Get providerID from Machine's infrastructure reference
 	providerID := r.getProviderID(ctx, log, machine)
 
-	// CAPK control-plane: same routing as the k0s path above.
+	// Control-plane: same routing as the k0s path above. KD-3b broadened
+	// the gate from CAPK-only to any supported infrastructure kind.
 	var mgmtEndpoint *ManagementEndpoint
-	if isKubevirtMachine(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
+	if supportsManagementEndpoint(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
 		var err error
 		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
 		if err != nil {
