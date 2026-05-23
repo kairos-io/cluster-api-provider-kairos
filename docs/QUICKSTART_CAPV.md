@@ -190,7 +190,14 @@ kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
 kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system
 ```
 
-**Note:** The kubeconfig retrieval currently uses SSH to reach the control plane node (KD-3b tracks removing SSH from the normal flow in a future release). Ensure the Kairos user credentials allow SSH access until that work lands (PR-7 in the alpha-2 sequence will eliminate SSH from the control plane path).
+**Note (alpha-2+):** As of v0.1.0-alpha.2, the control-plane controller no
+longer SSHes into nodes to retrieve the kubeconfig. The node pushes its
+kubeconfig to a Secret in the management cluster at bootstrap time. The
+workload VM must have network reachability to the management cluster's API
+server (`<mgmt-api-server-host>:6443`). See
+[docs/INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure)
+for verification steps. If the VM has no network path to the API server, see
+the planned `SSHFallback` opt-in (post-alpha-2, PR-9).
 
 ## Field Reference
 
@@ -263,7 +270,7 @@ If `KairosConfig.status.failureMessage` is set, the issue is transient — it cl
 - Configure additional worker nodes via `MachineDeployment`.
 - Add custom Kubernetes manifests via `spec.manifests` in `KairosConfigTemplate`.
 - Multi-node control planes are tracked for a future release (KD-5b / KD-25).
-- SSH will be removed from the normal control-plane flow in a future PR (KD-3b).
+- SSH opt-in fallback for air-gapped scenarios is tracked for a future PR (KD-3b / PR-9).
 
 ## Cleanup
 

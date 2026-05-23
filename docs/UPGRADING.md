@@ -9,11 +9,11 @@
 ### KD-3b: SSH eliminated from controller normal operation
 
 The alpha-2 release removes synchronous SSH from the controller's hot path.
-The bootstrap controller now writes a `push_kubeconfig()` function into every
-control-plane node's cloud-config. After k0s/k3s starts, the **node** POSTs
-its workload kubeconfig back to a Secret in the management cluster using a
-short-lived Bearer token. The controller waits for that Secret via a label-
-filtered watch.
+The bootstrap controller now writes a `push_kubeconfig()` shell function into
+every control-plane node's cloud-config. After k0s/k3s starts, the **node**
+POSTs its workload kubeconfig back to a Secret in the management cluster using
+a short-lived Bearer token. The control-plane controller waits for that Secret
+via a label-filtered watch.
 
 | State at upgrade | What happens | User action |
 |---|---|---|
@@ -26,7 +26,11 @@ filtered watch.
 ### Network reachability requirement
 
 CAPV (and future non-CAPK infrastructure) VMs must reach the management
-cluster's API server URL (`mgr.GetConfig().Host`). Verify with `curl -k
-https://<api-server>/api` from a workload node before deploying. For
-air-gapped or strictly-segmented network environments, see the planned
-`SSHFallback` opt-in mechanism (post-alpha-2).
+cluster's API server URL. Verify from a workload node before deploying:
+
+```bash
+curl -k https://<mgmt-api-server-host>:6443/api
+```
+
+For air-gapped or strictly-segmented network environments, see the planned
+`SSHFallback` opt-in mechanism (post-alpha-2, PR-9).
