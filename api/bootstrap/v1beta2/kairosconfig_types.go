@@ -256,16 +256,25 @@ type UserPasswordSecretReference struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// Manifest represents a Kubernetes manifest file to be deployed by k0s
-// The manifest will be placed at /var/lib/k0s/manifests/{Name}/{File} and automatically
-// applied by k0s when the cluster starts.
+// Manifest represents a Kubernetes manifest file to be deployed by the
+// workload distribution. The manifest is placed at:
+//   - k0s: /var/lib/k0s/manifests/{Name}/{File}
+//   - k3s: /var/lib/rancher/k3s/server/manifests/{Name}/{File}
+//
+// and is auto-applied by the distribution at server start. Manifests are
+// applied on control-plane nodes only.
 type Manifest struct {
-	// Name is the directory name under /var/lib/k0s/manifests/
-	// This creates a directory structure: /var/lib/k0s/manifests/{Name}/{File}
+	// Name is the directory name under the distribution's manifests directory.
+	// This creates a directory structure:
+	//   - k0s: /var/lib/k0s/manifests/{Name}/{File}
+	//   - k3s: /var/lib/rancher/k3s/server/manifests/{Name}/{File}
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 
-	// File is the filename within the Name directory
+	// File is the filename within the Name directory. The distribution's
+	// manifest loader auto-applies it from:
+	//   - k0s: /var/lib/k0s/manifests/{Name}/{File}
+	//   - k3s: /var/lib/rancher/k3s/server/manifests/{Name}/{File}
 	// +kubebuilder:validation:Required
 	File string `json:"file"`
 
