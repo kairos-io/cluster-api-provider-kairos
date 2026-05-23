@@ -110,10 +110,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Wire the production management-endpoint resolver. Pulling the API
+	// server URL from mgr.GetConfig().Host preserves the pre-KD-33 behavior
+	// (the legacy ensureKubeconfigPushConfig used the same source). The
+	// resolver itself short-circuits to (nil, nil) when ManagementAPIServer
+	// is empty — the documented disabled signal — so an empty Host stays a
+	// graceful "render without push block" rather than a startup error.
+	mgmtResolver := bootstrap.NewKubeVirtTokenResolver(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		mgr.GetConfig().Host,
+	)
 	if err = (&bootstrap.KairosConfigReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		RESTConfig: mgr.GetConfig(),
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		MgmtEndpointResolver: mgmtResolver,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KairosConfig")
 		os.Exit(1)
