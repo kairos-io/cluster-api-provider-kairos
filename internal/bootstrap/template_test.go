@@ -435,6 +435,15 @@ func TestRenderK3sCloudConfig_CapkTlsSan(t *testing.T) {
 	}
 }
 
+// TestRenderK0sCloudConfig_CapvTemplateExcludesCapkBlocks asserts the
+// CAPV-template invariants that hold REGARDLESS of whether the kubeconfig-push
+// block is rendered:
+//   - The CAPK-only LB SAN service / endpoint wiring never appears (CAPV has
+//     no LB Service).
+//   - With ManagementEndpoint == nil, no push block renders. KD-3b extends
+//     the CAPV templates with a push block gated on a non-nil
+//     ManagementEndpoint; the assertions below cover the nil case. The
+//     non-nil case has its own test (TestRenderK0sCloudConfig_CapvKubeconfigPush).
 func TestRenderK0sCloudConfig_CapvTemplateExcludesCapkBlocks(t *testing.T) {
 	data := TemplateData{
 		Role:         "control-plane",
@@ -455,8 +464,8 @@ func TestRenderK0sCloudConfig_CapvTemplateExcludesCapkBlocks(t *testing.T) {
 	if strings.Contains(result, "KAIROS_LB_ENDPOINT") {
 		t.Error("CAPV template should not include KubeVirt LB endpoint handling")
 	}
-	if strings.Contains(result, "Push kubeconfig to management cluster without SSH") {
-		t.Error("CAPV template should not include KubeVirt kubeconfig push")
+	if strings.Contains(result, "push_kubeconfig") {
+		t.Error("CAPV template should not include push_kubeconfig block when ManagementEndpoint is nil")
 	}
 }
 
@@ -638,6 +647,195 @@ func TestRenderK3sCloudConfig_CapkNoManagementEndpoint(t *testing.T) {
 	}
 	// k3s template doesn't have the KAIROS_MGMT_API SAN-detection block (only
 	// the push block), so the push_kubeconfig check above is sufficient.
+}
+
+// TestRenderK0sCloudConfig_CapvKubeconfigPush asserts the KD-3b extension:
+// when a CAPV control plane has a non-nil ManagementEndpoint, the CAPV k0s
+// template renders the push_kubeconfig() block with the cluster-name label
+// and the node-push provenance annotation in the curl payload. The
+// ControlPlaneEndpointHost field drives the `server:` URL rewrite (CAPV has
+// no LB Service, so the cluster's controlPlaneEndpoint host is the canonical
+// reachable address from the management cluster).
+func TestRenderK0sCloudConfig_CapvKubeconfigPush(t *testing.T) {
+	data := TemplateData{
+		Role:       "control-plane",
+		SingleNode: true,
+		UserName:   "kairos",
+		IsKubeVirt: false, // CAPV path
+		ManagementEndpoint: &ManagementEndpoint{
+			Token:                     "test-token",
+			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+			APIServer:                 "https://mgmt.example.com:6443",
+			ClusterName:               "test-cluster",
+			ControlPlaneEndpointHost:  "10.0.0.42",
+		},
+	}
+
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "push_kubeconfig()") {
+		t.Error("Missing push_kubeconfig function for CAPV k0s control plane")
+	}
+	if !strings.Contains(result, "/var/lib/k0s/pki/admin.conf") {
+		t.Error("Missing k0s kubeconfig path in push block")
+	}
+	if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
+		t.Error("Push block must stamp cluster-name label on the Secret payload")
+	}
+	if !strings.Contains(result, `\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"`) {
+		t.Error("Push block must stamp node-push provenance annotation")
+	}
+	// ControlPlaneEndpointHost is shquote'd into a local shell var, then
+	// referenced via ${cp_endpoint_host} in the sed substitution.
+	if !strings.Contains(result, "local cp_endpoint_host='10.0.0.42'") {
+		t.Error("Missing shquote'd cp_endpoint_host local var")
+	}
+	if !strings.Contains(result, "https://${cp_endpoint_host}:6443") {
+		t.Error("Missing ${cp_endpoint_host} reference in sed URL rewrite")
+	}
+	// cluster_name shquote envelope must be present.
+	if !strings.Contains(result, "local cluster_name='test-cluster'") {
+		t.Error("Missing shquote'd cluster_name local var")
+	}
+}
+
+// TestRenderK3sCloudConfig_CapvKubeconfigPush is the k3s twin of the CAPV
+// push test above. The kubeconfig path differs (/etc/rancher/k3s/k3s.yaml)
+// but otherwise the assertions are the same.
+func TestRenderK3sCloudConfig_CapvKubeconfigPush(t *testing.T) {
+	data := TemplateData{
+		Role:       "control-plane",
+		SingleNode: true,
+		UserName:   "kairos",
+		IsKubeVirt: false, // CAPV path
+		ManagementEndpoint: &ManagementEndpoint{
+			Token:                     "test-token",
+			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+			APIServer:                 "https://mgmt.example.com:6443",
+			ClusterName:               "test-cluster",
+			ControlPlaneEndpointHost:  "10.0.0.42",
+		},
+	}
+
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "push_kubeconfig()") {
+		t.Error("Missing push_kubeconfig function for CAPV k3s control plane")
+	}
+	if !strings.Contains(result, "/etc/rancher/k3s/k3s.yaml") {
+		t.Error("Missing k3s kubeconfig path in push block")
+	}
+	if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
+		t.Error("Push block must stamp cluster-name label on the Secret payload")
+	}
+	if !strings.Contains(result, `\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"`) {
+		t.Error("Push block must stamp node-push provenance annotation")
+	}
+	if !strings.Contains(result, "local cp_endpoint_host='10.0.0.42'") {
+		t.Error("Missing shquote'd cp_endpoint_host local var")
+	}
+	if !strings.Contains(result, "https://${cp_endpoint_host}:6443") {
+		t.Error("Missing ${cp_endpoint_host} reference in sed URL rewrite")
+	}
+}
+
+// TestRenderK0sCloudConfig_CapvNoManagementEndpoint guards the gate: with a
+// nil ManagementEndpoint the CAPV k0s template MUST NOT render the push
+// block. This is the byte-identical preservation check the architect called
+// out as the CRITICAL invariant for KD-3b commit 1.
+func TestRenderK0sCloudConfig_CapvNoManagementEndpoint(t *testing.T) {
+	data := TemplateData{
+		Role:               "control-plane",
+		SingleNode:         true,
+		UserName:           "kairos",
+		IsKubeVirt:         false,
+		ManagementEndpoint: nil,
+	}
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+	if strings.Contains(result, "push_kubeconfig") {
+		t.Errorf("push_kubeconfig must not appear when ManagementEndpoint is nil on CAPV k0s template")
+	}
+	if strings.Contains(result, "controllers.cluster.x-k8s.io/kubeconfig-source") {
+		t.Errorf("node-push annotation must not appear when ManagementEndpoint is nil")
+	}
+}
+
+// TestRenderK3sCloudConfig_CapvNoManagementEndpoint is the k3s twin.
+func TestRenderK3sCloudConfig_CapvNoManagementEndpoint(t *testing.T) {
+	data := TemplateData{
+		Role:               "control-plane",
+		SingleNode:         true,
+		UserName:           "kairos",
+		IsKubeVirt:         false,
+		ManagementEndpoint: nil,
+	}
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+	if strings.Contains(result, "push_kubeconfig") {
+		t.Errorf("push_kubeconfig must not appear when ManagementEndpoint is nil on CAPV k3s template")
+	}
+	if strings.Contains(result, "controllers.cluster.x-k8s.io/kubeconfig-source") {
+		t.Errorf("node-push annotation must not appear when ManagementEndpoint is nil")
+	}
+}
+
+// TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation asserts the
+// CAPK templates also gained the cluster-name label and node-push annotation
+// (so the controlplane controller's label-based watch predicate works
+// uniformly across CAPK and CAPV).
+func TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation(t *testing.T) {
+	for _, dist := range []string{"k0s", "k3s"} {
+		t.Run(dist, func(t *testing.T) {
+			data := TemplateData{
+				Role:       "control-plane",
+				SingleNode: true,
+				UserName:   "kairos",
+				IsKubeVirt: true,
+				ManagementEndpoint: &ManagementEndpoint{
+					Token:                     "test-token",
+					KubeconfigSecretName:      "cluster-kubeconfig",
+					KubeconfigSecretNamespace: "default",
+					APIServer:                 "https://1.2.3.4:6443",
+					ClusterName:               "capk-cluster",
+				},
+				ControlPlaneLBEndpoint: "10.0.0.1",
+			}
+			var (
+				result string
+				err    error
+			)
+			if dist == "k0s" {
+				result, err = RenderK0sCloudConfig(data)
+			} else {
+				result, err = RenderK3sCloudConfig(data)
+			}
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
+				t.Errorf("CAPK %s push payload missing cluster-name label", dist)
+			}
+			if !strings.Contains(result, `\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"`) {
+				t.Errorf("CAPK %s push payload missing node-push annotation", dist)
+			}
+			if !strings.Contains(result, "local cluster_name='capk-cluster'") {
+				t.Errorf("CAPK %s push block missing shquote'd cluster_name var", dist)
+			}
+		})
+	}
 }
 
 func TestRenderK0sCloudConfig_WithoutInstallConfig(t *testing.T) {

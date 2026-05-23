@@ -250,12 +250,77 @@ MANIFEST_EOF
         done
       fi
       {{- end }}
-      
+
+      {{- if .ManagementEndpoint }}
+      # Push kubeconfig to management cluster without SSH (KD-3b).
+      # CAPV has no LB Service: rewrite k3s.yaml's `server:` URL to use the
+      # cluster's controlPlaneEndpoint host (CAPV-controlled, set on the
+      # Cluster's spec by the infrastructure provider).
+      push_kubeconfig() {
+        local kubeconfig_file="/etc/rancher/k3s/k3s.yaml"
+        if [ ! -f "${kubeconfig_file}" ]; then
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file}"
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push kubeconfig"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push kubeconfig"
+          return 1
+        fi
+        local kubeconfig_b64
+        {{- if .ManagementEndpoint.ControlPlaneEndpointHost }}
+        local tmp_kubeconfig
+        tmp_kubeconfig=$(mktemp)
+        local cp_endpoint_host={{ .ManagementEndpoint.ControlPlaneEndpointHost | shquote }}
+        sed "s|https://[^[:space:]]*:6443|https://${cp_endpoint_host}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
+        kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
+        rm -f "${tmp_kubeconfig}"
+        {{- else }}
+        kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
+        {{- end }}
+        local api={{ .ManagementEndpoint.APIServer | shquote }}
+        local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
+        local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
+        local token={{ .ManagementEndpoint.Token | shquote }}
+        local cluster_name={{ .ManagementEndpoint.ClusterName | shquote }}
+        local payload
+        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" \
+          -X PUT \
+          --data "${payload}" \
+          "${url}" || true)
+        if [ "${status}" = "404" ]; then
+          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "${payload}" \
+            "${api}/api/v1/namespaces/${ns}/secrets" || true)
+        fi
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed kubeconfig to management secret ${ns}/${name}"
+          return 0
+        fi
+        echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
+        return 1
+      }
+      if ! push_kubeconfig; then
+        echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+      {{- end }}
+
       # Mark bootstrap success for CAPI/CAPK consumers
       mkdir -p /run/cluster-api
       echo "success" > /run/cluster-api/bootstrap-success.complete
       chmod 0644 /run/cluster-api/bootstrap-success.complete
-      
+
       echo "k3s post-bootstrap tasks completed successfully"
 
 {{- /* DNS overrides and bootstrap stages */}}

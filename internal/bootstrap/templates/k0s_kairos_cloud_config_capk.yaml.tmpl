@@ -539,8 +539,12 @@ MANIFEST_EOF
               local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
               local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
               local token={{ .ManagementEndpoint.Token | shquote }}
+              local cluster_name={{ .ManagementEndpoint.ClusterName | shquote }}
               local payload
-              payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+              # cluster.x-k8s.io/cluster-name label and node-push provenance
+              # annotation are required by the KCP controller's Secret-watch
+              # predicate (KD-15) and KD-3b observability respectively.
+              payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
               local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
               local status
               status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \

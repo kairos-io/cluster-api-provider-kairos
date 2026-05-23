@@ -979,11 +979,21 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		// One-line conversion preserves the rule that internal/bootstrap is
 		// API-server-unaware: the renderer's ManagementEndpoint is a flat
 		// data struct, identical in shape but distinct in type.
+		//
+		// ClusterName and ControlPlaneEndpointHost are stamped from the live
+		// Cluster object rather than the resolver output because they're pure
+		// CAPI metadata (not resolver-specific): the cluster-name label keeps
+		// the controlplane controller's Secret-watch predicate sharp, and the
+		// CP endpoint host is what CAPV's `server:` URL rewrite uses. Keeping
+		// these in the call site means the resolver doesn't need to be aware
+		// of the rewrite semantics.
 		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
 			APIServer:                 mgmtEndpoint.APIServer,
 			Token:                     mgmtEndpoint.Token,
 			KubeconfigSecretName:      mgmtEndpoint.KubeconfigSecretName,
 			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
+			ClusterName:               cluster.Name,
+			ControlPlaneEndpointHost:  cluster.Spec.ControlPlaneEndpoint.Host,
 		}
 	}
 	if machine != nil {
@@ -1202,11 +1212,15 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		ControlPlaneLBEndpoint:         "",
 	}
 	if mgmtEndpoint != nil {
+		// See k0s twin above for the rationale behind stamping ClusterName /
+		// ControlPlaneEndpointHost from the live Cluster (not the resolver).
 		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
 			APIServer:                 mgmtEndpoint.APIServer,
 			Token:                     mgmtEndpoint.Token,
 			KubeconfigSecretName:      mgmtEndpoint.KubeconfigSecretName,
 			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
+			ClusterName:               cluster.Name,
+			ControlPlaneEndpointHost:  cluster.Spec.ControlPlaneEndpoint.Host,
 		}
 	}
 	if machine != nil {

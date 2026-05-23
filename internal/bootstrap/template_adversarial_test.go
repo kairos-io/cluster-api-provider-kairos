@@ -1053,3 +1053,144 @@ func TestRender_ManagementEndpoint_AdversarialFields(t *testing.T) {
 		}
 	}
 }
+
+// TestRender_ManagementEndpoint_KD3bAdversarialFields covers the two new
+// shell-context fields added in KD-3b — ClusterName (rendered into both CAPK
+// and CAPV push blocks) and ControlPlaneEndpointHost (rendered only into the
+// CAPV templates' `server:` URL rewrite). The matrix is per-field × per-template
+// (CAPK+CAPV × k0s+k3s, plus the CAPV-only ControlPlaneEndpointHost).
+//
+// Assertions per case:
+//
+//  1. Rendered YAML still parses.
+//  2. The payload appears wrapped in the shquote envelope.
+//  3. Dangerous shell fragments inside the payload only appear inside that
+//     envelope — never as bare shell tokens.
+//
+// Pattern mirrors TestRender_ManagementEndpoint_AdversarialFields so a
+// future field added to ManagementEndpoint without a matching case fails
+// code review at the subtest-count check.
+func TestRender_ManagementEndpoint_KD3bAdversarialFields(t *testing.T) {
+	const (
+		clusterNameInj      = `evil$(rm -rf /)`
+		controlPlaneHostInj = `evil-host'; rm -rf /; echo '`
+		dangerousSemi       = "; rm -rf /"
+		dangerousSubsh      = "$(rm -rf /)"
+	)
+
+	type kind string
+	const (
+		kindCAPK kind = "capk"
+		kindCAPV kind = "capv"
+	)
+
+	type fieldCase struct {
+		name    string
+		payload string
+		apply   func(ep *ManagementEndpoint)
+		// Some fields are only rendered into CAPV templates. CAPK runs are
+		// skipped when applicableCAPK is false.
+		applicableCAPK bool
+	}
+
+	cases := []fieldCase{
+		{
+			name:           "ClusterName",
+			payload:        clusterNameInj,
+			apply:          func(ep *ManagementEndpoint) { ep.ClusterName = clusterNameInj },
+			applicableCAPK: true,
+		},
+		{
+			name:    "ControlPlaneEndpointHost",
+			payload: controlPlaneHostInj,
+			apply: func(ep *ManagementEndpoint) {
+				ep.ControlPlaneEndpointHost = controlPlaneHostInj
+			},
+			// CAPK uses ControlPlaneLBEndpoint for the same purpose; the
+			// CAPK templates don't reference ControlPlaneEndpointHost.
+			applicableCAPK: false,
+		},
+	}
+
+	baseEndpoint := func() *ManagementEndpoint {
+		return &ManagementEndpoint{
+			APIServer:                 "https://1.2.3.4:6443",
+			Token:                     "good-token",
+			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+			ClusterName:               "good-cluster",
+			ControlPlaneEndpointHost:  "10.0.0.42",
+		}
+	}
+
+	baseData := func(ep *ManagementEndpoint, k kind) TemplateData {
+		return TemplateData{
+			Role:               "control-plane",
+			SingleNode:         true,
+			UserName:           "kairos",
+			UserPassword:       "kairos",
+			UserGroups:         []string{"admin"},
+			IsKubeVirt:         k == kindCAPK,
+			ManagementEndpoint: ep,
+		}
+	}
+
+	for _, tc := range cases {
+		kinds := []kind{kindCAPV}
+		if tc.applicableCAPK {
+			kinds = append(kinds, kindCAPK)
+		}
+		for _, k := range kinds {
+			for _, dist := range []string{"k0s", "k3s"} {
+				t.Run(tc.name+"/"+string(k)+"/"+dist, func(t *testing.T) {
+					ep := baseEndpoint()
+					tc.apply(ep)
+					data := baseData(ep, k)
+
+					out, err := renderForDist(dist, data)
+					if err != nil {
+						t.Fatalf("render: %v", err)
+					}
+
+					// (1) YAML must still parse.
+					var doc map[string]any
+					if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+						t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+					}
+
+					// (2) Payload appears inside shquote envelope.
+					envelope := shquote(tc.payload)
+					if !strings.Contains(out, envelope) {
+						t.Fatalf("payload not wrapped in shquote envelope:\nenvelope=%q\n---OUTPUT---\n%s", envelope, out)
+					}
+
+					// (3) Dangerous fragments only inside the envelope.
+					for _, dangerous := range []string{dangerousSemi, dangerousSubsh} {
+						if !strings.Contains(tc.payload, dangerous) {
+							continue
+						}
+						idx := 0
+						for {
+							pos := strings.Index(out[idx:], dangerous)
+							if pos < 0 {
+								break
+							}
+							absPos := idx + pos
+							before := out[:absPos]
+							lastOpen := strings.LastIndex(before, "'")
+							if lastOpen < 0 {
+								t.Fatalf("dangerous fragment %q at offset %d has no preceding `'` — not inside shquote envelope\n---OUTPUT---\n%s", dangerous, absPos, out)
+							}
+							after := out[absPos+len(dangerous):]
+							nextClose := strings.Index(after, "'")
+							if nextClose < 0 {
+								t.Fatalf("dangerous fragment %q at offset %d has no closing `'` after it\n---OUTPUT---\n%s", dangerous, absPos, out)
+							}
+							idx = absPos + len(dangerous)
+						}
+					}
+				})
+			}
+		}
+	}
+}
