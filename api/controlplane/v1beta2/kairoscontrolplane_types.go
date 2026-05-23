@@ -188,6 +188,17 @@ type KairosControlPlaneStatus struct {
 	// This is used to identify machines belonging to this control plane.
 	// +optional
 	Selector string `json:"selector,omitempty"`
+
+	// LastNodePushObserved is the timestamp at which the controlplane
+	// reconciler first observed that the workload-cluster kubeconfig Secret
+	// was missing for this KairosControlPlane on the node-push path (KD-3b).
+	// Cleared once the Secret is observed and KubeconfigReadyCondition
+	// transitions to True. Used to escalate the condition severity from
+	// Info to Warning once the elapsed exceeds kubeconfigReadyTimeout —
+	// not a terminal state. The PR-9 SSHFallback option provides
+	// operator-triggered recovery if a node never manages to push.
+	// +optional
+	LastNodePushObserved *metav1.Time `json:"lastNodePushObserved,omitempty"`
 }
 
 // KairosControlPlaneInitializationStatus provides observations of the control plane initialization process.

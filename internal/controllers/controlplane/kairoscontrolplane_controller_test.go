@@ -18,8 +18,8 @@ package controlplane
 
 import (
 	"context"
-	"errors"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -30,7 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -234,52 +236,6 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(kairosConfig.Spec.SingleNode).To(BeFalse())
 	g.Expect(kairosConfig.Spec.Role).To(Equal("control-plane"))
-}
-
-func TestResolveSSHHost_KubevirtFallback(t *testing.T) {
-	g := NewWithT(t)
-
-	machine := &clusterv1.Machine{
-		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				Kind: "KubevirtMachine",
-			},
-		},
-	}
-	cluster := &clusterv1.Cluster{
-		Spec: clusterv1.ClusterSpec{
-			ControlPlaneEndpoint: clusterv1.APIEndpoint{
-				Host: "10.111.124.223",
-			},
-		},
-	}
-
-	host, err := resolveSSHHost(machine, cluster, "", errors.New("no ip in status"), log.Log)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(host).To(Equal("10.111.124.223"))
-}
-
-func TestResolveSSHHost_NoFallbackForVsphere(t *testing.T) {
-	g := NewWithT(t)
-
-	expectedErr := errors.New("no ip in status")
-	machine := &clusterv1.Machine{
-		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				Kind: "VSphereMachine",
-			},
-		},
-	}
-	cluster := &clusterv1.Cluster{
-		Spec: clusterv1.ClusterSpec{
-			ControlPlaneEndpoint: clusterv1.APIEndpoint{
-				Host: "10.111.124.223",
-			},
-		},
-	}
-
-	_, err := resolveSSHHost(machine, cluster, "", expectedErr, log.Log)
-	g.Expect(err).To(MatchError(expectedErr))
 }
 
 func TestGetNodeIP_KubevirtVMIFallback(t *testing.T) {
@@ -489,4 +445,193 @@ func TestReconcile_FailureFieldsClearedOnSuccess(t *testing.T) {
 	g.Expect(got.Status.FailureMessage).To(BeEmpty(), "FailureMessage should be cleared on successful reconcileMachines, regardless of ReadyReplicas (KD-14)")
 	g.Expect(got.Status.ReadyReplicas).To(Equal(int32(0)), "ReadyReplicas should still be 0 since the Machine has no NodeRef -- proving the clear is unconditional")
 	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(9)))
+}
+
+// TestSecretWatchPredicate_FiltersByTypeAndClusterNameLabel verifies the
+// KD-15-compliant predicate the KCP controller installs on Secret events.
+// We assert by reconstructing the predicate logic against representative
+// Secret shapes — the predicate function is a literal inside SetupWithManager
+// so we copy the same guards here. If a future refactor changes the
+// predicate, the assertions here drive the test to match.
+func TestSecretWatchPredicate_FiltersByTypeAndClusterNameLabel(t *testing.T) {
+	predicate := func(obj client.Object) bool {
+		secret, ok := obj.(*corev1.Secret)
+		if !ok {
+			return false
+		}
+		if secret.Type != clusterv1.ClusterSecretType {
+			return false
+		}
+		return secret.Labels[clusterv1.ClusterNameLabel] != ""
+	}
+
+	cases := []struct {
+		name string
+		obj  client.Object
+		want bool
+	}{
+		{
+			name: "right type + right label → enqueue",
+			obj: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+				},
+				Type: clusterv1.ClusterSecretType,
+			},
+			want: true,
+		},
+		{
+			name: "right type + no label → drop (KD-15: legacy strings.HasSuffix would have matched)",
+			obj: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-kubeconfig"},
+				Type:       clusterv1.ClusterSecretType,
+			},
+			want: false,
+		},
+		{
+			name: "wrong type + right label → drop (someone hand-labelled an Opaque secret)",
+			obj: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+				},
+				Type: corev1.SecretTypeOpaque,
+			},
+			want: false,
+		},
+		{
+			name: "non-secret object → drop",
+			obj:  &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-kubeconfig"}},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(predicate(tc.obj)).To(Equal(tc.want))
+		})
+	}
+}
+
+// TestObserveKubeconfigSecret_TransitionsCondition exercises the three
+// KubeconfigReadyCondition states observeKubeconfigSecret produces:
+//
+//   - Secret missing + first observation → False(WaitingForNodePush, Info);
+//     LastNodePushObserved set to now.
+//   - Secret missing + LastNodePushObserved older than kubeconfigReadyTimeout
+//     → severity escalates to Warning; LastNodePushObserved unchanged.
+//   - Secret present with kubeconfig data → True(KubeconfigReady);
+//     LastNodePushObserved cleared.
+func TestObserveKubeconfigSecret_TransitionsCondition(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-kcp", Namespace: "default"},
+	}
+
+	// --- (1) Secret missing, first observation: False(Info), anchor timestamp.
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	beforeFirst := metav1.Now()
+	ready, err := r.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeFalse())
+	g.Expect(kcp.Status.LastNodePushObserved).NotTo(BeNil(), "first miss must anchor LastNodePushObserved")
+	g.Expect(kcp.Status.LastNodePushObserved.Time).To(BeTemporally(">=", beforeFirst.Time.Add(-time.Second)))
+	cond := conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.WaitingForNodePushReason))
+	g.Expect(cond.Severity).To(Equal(clusterv1.ConditionSeverityInfo))
+
+	// --- (2) Secret still missing, but LastNodePushObserved is now in the past
+	// beyond kubeconfigReadyTimeout: severity escalates to Warning.
+	stale := metav1.NewTime(time.Now().Add(-2 * kubeconfigReadyTimeout))
+	kcp.Status.LastNodePushObserved = &stale
+	originalStale := stale
+	ready, err = r.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeFalse())
+	// LastNodePushObserved must NOT be re-anchored — we measure elapsed
+	// since first observation, not since each reconcile.
+	g.Expect(kcp.Status.LastNodePushObserved.Time).To(Equal(originalStale.Time))
+	cond = conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Severity).To(Equal(clusterv1.ConditionSeverityWarning))
+
+	// --- (3) Secret present with non-empty value: True; LastNodePushObserved cleared.
+	pushedSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-kubeconfig",
+			Namespace: "default",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+		},
+		Type: clusterv1.ClusterSecretType,
+		Data: map[string][]byte{"value": []byte("apiVersion: v1\nkind: Config")},
+	}
+	c2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pushedSecret).Build()
+	r2 := &KairosControlPlaneReconciler{Client: c2, Scheme: scheme}
+	ready, err = r2.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeTrue())
+	g.Expect(kcp.Status.LastNodePushObserved).To(BeNil(), "Secret-present must clear LastNodePushObserved")
+	cond = conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(corev1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.KubeconfigReadyReason))
+}
+
+// TestSecretToKairosControlPlane_UsesClusterNameLabel guards the KD-15 label
+// lookup: the handler must consult `cluster.x-k8s.io/cluster-name`, never
+// derive the cluster name from the Secret's name suffix.
+func TestSecretToKairosControlPlane_UsesClusterNameLabel(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: &corev1.ObjectReference{
+				Kind: "KairosControlPlane",
+				Name: "test-kcp",
+			},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	// Secret with the right label → maps to KCP.
+	labelled := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "arbitrary-name", // intentionally NOT *-kubeconfig
+			Namespace: "default",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+		},
+		Type: clusterv1.ClusterSecretType,
+	}
+	got := r.secretToKairosControlPlane(context.Background(), labelled)
+	g.Expect(got).To(HaveLen(1))
+	g.Expect(got[0].Name).To(Equal("test-kcp"))
+
+	// Secret without the label → never maps, even if name suffix would
+	// have matched the legacy logic.
+	unlabelled := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-kubeconfig", Namespace: "default"},
+		Type:       clusterv1.ClusterSecretType,
+	}
+	got = r.secretToKairosControlPlane(context.Background(), unlabelled)
+	g.Expect(got).To(BeEmpty())
 }

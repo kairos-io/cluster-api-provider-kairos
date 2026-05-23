@@ -304,6 +304,18 @@ spec:
                   This field MUST be set to true when the first control plane machine is ready
                   and the control plane is functional.
                 type: boolean
+              lastNodePushObserved:
+                description: |-
+                  LastNodePushObserved is the timestamp at which the controlplane
+                  reconciler first observed that the workload-cluster kubeconfig Secret
+                  was missing for this KairosControlPlane on the node-push path (KD-3b).
+                  Cleared once the Secret is observed and KubeconfigReadyCondition
+                  transitions to True. Used to escalate the condition severity from
+                  Info to Warning once the elapsed exceeds kubeconfigReadyTimeout —
+                  not a terminal state. The PR-9 SSHFallback option provides
+                  operator-triggered recovery if a node never manages to push.
+                format: date-time
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the most recent generation observed
                   by the controller

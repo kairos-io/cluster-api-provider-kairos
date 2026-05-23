@@ -20,6 +20,23 @@ package v1beta2
 const (
 	// AvailableCondition indicates that the control plane is available
 	AvailableCondition = "Available"
+
+	// KubeconfigReadyCondition indicates whether the workload-cluster
+	// kubeconfig Secret has been observed in the management cluster. Under
+	// KD-3b the control-plane controller no longer SSHes into nodes to fetch
+	// the kubeconfig; instead, the node pushes its kubeconfig via curl using
+	// a per-cluster ServiceAccount token and the controller waits for the
+	// Secret to appear (watch-driven, no polling).
+	//
+	// Reasons:
+	//   - KubeconfigReadyReason (True) — Secret exists, parses as a valid
+	//     kubeconfig, has the expected cluster-name label.
+	//   - WaitingForNodePushReason (False) — Secret is not present (or has
+	//     no kubeconfig payload). Severity is Info while the elapsed
+	//     since-first-observation is under kubeconfigReadyTimeout; escalates
+	//     to Warning past that threshold so operators see the stall in the
+	//     condition surface.
+	KubeconfigReadyCondition = "KubeconfigReady"
 )
 
 // Condition reasons
@@ -41,4 +58,15 @@ const (
 
 	// ScalingDownReason indicates that the control plane is scaling down
 	ScalingDownReason = "ScalingDown"
+
+	// WaitingForNodePushReason is the False reason for KubeconfigReadyCondition
+	// while the workload-cluster kubeconfig Secret has not yet been observed
+	// in the management cluster. Severity transitions from Info to Warning
+	// once Status.LastNodePushObserved is older than kubeconfigReadyTimeout.
+	WaitingForNodePushReason = "WaitingForNodePush"
+
+	// KubeconfigReadyReason is the True reason for KubeconfigReadyCondition
+	// once the workload-cluster kubeconfig Secret has been observed and
+	// parses successfully.
+	KubeconfigReadyReason = "KubeconfigReady"
 )
