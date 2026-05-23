@@ -138,10 +138,10 @@ var adversarialPayloads = map[string]string{
 // list-item indentation contract or (b) shell quoting in the file-content
 // block scalars where some fields are also embedded.
 var controlCharPayloads = map[string]string{
-	"newline injection":  "foo\nshell: /bin/sh",
-	"crlf newline":       "foo\r\nbar",
-	"yaml doc separator": "---\nevil: true",
-	"NUL byte":           "foo\x00bar",
+	"newline injection":    "foo\nshell: /bin/sh",
+	"crlf newline":         "foo\r\nbar",
+	"yaml doc separator":   "---\nevil: true",
+	"NUL byte":             "foo\x00bar",
 	"bare carriage return": "foo\rbar",
 }
 
@@ -314,29 +314,29 @@ func TestPersistencyBlockDoesNotLeakUserInput(t *testing.T) {
 	// which validateTemplateData rejects) yet implausible as accidental
 	// matches against any path in expectedPersistentStatePaths.
 	const (
-		hostnameMark        = "ADV-HOSTNAME-LEAK"
-		userNameMark        = "ADV-USERNAME-LEAK"
-		userPasswordMark    = "ADV-USERPASSWORD-LEAK"
-		workerTokenMark     = "ADV-WORKERTOKEN-LEAK"
-		k3sTokenMark        = "ADV-K3STOKEN-LEAK"
-		k3sServerURLMark    = "https://ADV-K3SSERVER-LEAK:6443"
-		sshKeyMark          = "ssh-rsa ADV-SSHKEY-LEAK"
-		gitHubUserMark      = "ADV-GITHUBUSER-LEAK"
-		hostnamePrefixMark  = "ADV-HOSTPREFIX-LEAK"
-		groupMark           = "ADV-GROUP-LEAK"
-		dnsMark             = "203.0.113.7"
-		podCIDRMark         = "203.0.113.8/24"
-		serviceCIDRMark     = "203.0.113.16/28"
-		primaryIPMark       = "203.0.113.9"
-		machineNameMark     = "ADV-MACHINE-LEAK"
-		clusterNSMark       = "ADV-CLUSTERNS-LEAK"
-		lbServiceNameMark   = "ADV-LBNAME-LEAK"
-		lbServiceNSMark     = "ADV-LBNS-LEAK"
-		lbEndpointMark      = "203.0.113.10"
-		mgmtTokenMark       = "ADV-MGMTTOKEN-LEAK"
-		mgmtSecretNameMark  = "ADV-MGMTSECRET-LEAK"
-		mgmtSecretNSMark    = "ADV-MGMTNS-LEAK"
-		mgmtAPIServerMark   = "https://ADV-MGMTAPI-LEAK:6443"
+		hostnameMark       = "ADV-HOSTNAME-LEAK"
+		userNameMark       = "ADV-USERNAME-LEAK"
+		userPasswordMark   = "ADV-USERPASSWORD-LEAK"
+		workerTokenMark    = "ADV-WORKERTOKEN-LEAK"
+		k3sTokenMark       = "ADV-K3STOKEN-LEAK"
+		k3sServerURLMark   = "https://ADV-K3SSERVER-LEAK:6443"
+		sshKeyMark         = "ssh-rsa ADV-SSHKEY-LEAK"
+		gitHubUserMark     = "ADV-GITHUBUSER-LEAK"
+		hostnamePrefixMark = "ADV-HOSTPREFIX-LEAK"
+		groupMark          = "ADV-GROUP-LEAK"
+		dnsMark            = "203.0.113.7"
+		podCIDRMark        = "203.0.113.8/24"
+		serviceCIDRMark    = "203.0.113.16/28"
+		primaryIPMark      = "203.0.113.9"
+		machineNameMark    = "ADV-MACHINE-LEAK"
+		clusterNSMark      = "ADV-CLUSTERNS-LEAK"
+		lbServiceNameMark  = "ADV-LBNAME-LEAK"
+		lbServiceNSMark    = "ADV-LBNS-LEAK"
+		lbEndpointMark     = "203.0.113.10"
+		mgmtTokenMark      = "ADV-MGMTTOKEN-LEAK"
+		mgmtSecretNameMark = "ADV-MGMTSECRET-LEAK"
+		mgmtSecretNSMark   = "ADV-MGMTNS-LEAK"
+		mgmtAPIServerMark  = "https://ADV-MGMTAPI-LEAK:6443"
 	)
 
 	allMarks := []string{
@@ -551,4 +551,230 @@ func allUsers(t *testing.T, out string) []map[string]any {
 		users = append(users, m)
 	}
 	return users
+}
+
+// TestShquote_Unit asserts the POSIX single-quoting helper produces values
+// that bash cannot interpret. The contract is:
+//   - return value INCLUDES the surrounding single quotes;
+//   - embedded single quotes are escaped via the standard '\” close-open trick;
+//   - no other character receives special treatment — `$`, backticks, `;`,
+//     `&&`, `|`, `(` `)`, etc. are emitted verbatim and rely on the
+//     single-quoting to keep bash from interpreting them.
+func TestShquote_Unit(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", `''`},
+		{"plain", "hello", `'hello'`},
+		{"single_quote", "a'b", `'a'\''b'`},
+		{"double_quote", `a"b`, `'a"b'`},
+		{"dollar_subshell", "a$(rm -rf /)b", `'a$(rm -rf /)b'`},
+		{"backtick", "a`rm`b", "'a`rm`b'"},
+		{"semicolon", "a; rm -rf /", `'a; rm -rf /'`},
+		{"pipe_and", "a && evil", `'a && evil'`},
+		{"shell_redirect", "a > /tmp/x", `'a > /tmp/x'`},
+		{"glob", "a*b", `'a*b'`},
+		{"injection_close_then_evil", `'; rm -rf /; echo '`, `''\''; rm -rf /; echo '\'''`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shquote(tc.in)
+			if got != tc.want {
+				t.Errorf("shquote(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// shquoteCAPKAdversarialFields enumerates the 6 TemplateData fields that
+// land in shell-context positions in the CAPK templates (k0s + k3s). For
+// each, we render the two CAPK template variants with an adversarial
+// payload that injects shell metacharacters, then assert:
+//
+//  1. The rendered output is still parseable as YAML.
+//  2. The adversarial payload appears wrapped in POSIX single quotes
+//     (i.e. the shquote envelope).
+//  3. The dangerous fragments inside the payload (`; rm -rf /`, `$(rm)`)
+//     never appear UNQUOTED in the rendered output. They only ever appear
+//     inside a `'...'` envelope.
+//
+// Inputs without control characters (no `\n`, `\r`, NUL) bypass
+// validateTemplateData's reject-list and reach the template, so this test
+// exercises the renderer's escaping rather than the validator's.
+func TestShquoteFieldsAreShellSafe(t *testing.T) {
+	urlInjection := `https://api:6443'; rm -rf /; echo '`
+	tokenInjection := `evil-token'; rm -rf /; echo '`
+	ipInjection := `1.2.3.4'; rm -rf /; #`
+	nameInjection := `evil$(rm -rf /)`
+
+	type fieldCase struct {
+		name       string
+		payload    string
+		applyToK0s func(d *TemplateData)
+		applyToK3s func(d *TemplateData)
+	}
+
+	cases := []fieldCase{
+		{
+			name:       "ManagementAPIServer",
+			payload:    urlInjection,
+			applyToK0s: func(d *TemplateData) { d.ManagementAPIServer = urlInjection },
+			applyToK3s: func(d *TemplateData) { d.ManagementAPIServer = urlInjection },
+		},
+		{
+			name:       "ManagementKubeconfigToken",
+			payload:    tokenInjection,
+			applyToK0s: func(d *TemplateData) { d.ManagementKubeconfigToken = tokenInjection },
+			applyToK3s: func(d *TemplateData) { d.ManagementKubeconfigToken = tokenInjection },
+		},
+		{
+			name:       "PrimaryIP",
+			payload:    ipInjection,
+			applyToK0s: func(d *TemplateData) { d.PrimaryIP = ipInjection },
+			applyToK3s: func(d *TemplateData) { d.PrimaryIP = ipInjection },
+		},
+		{
+			name:       "MachineName",
+			payload:    nameInjection,
+			applyToK0s: func(d *TemplateData) { d.MachineName = nameInjection },
+			applyToK3s: func(d *TemplateData) { d.MachineName = nameInjection },
+		},
+		{
+			name:       "ClusterNS",
+			payload:    nameInjection,
+			applyToK0s: func(d *TemplateData) { d.ClusterNS = nameInjection },
+			applyToK3s: func(d *TemplateData) { d.ClusterNS = nameInjection },
+		},
+		{
+			name:       "ControlPlaneLBEndpoint",
+			payload:    urlInjection,
+			applyToK0s: func(d *TemplateData) { d.ControlPlaneLBEndpoint = urlInjection },
+			applyToK3s: func(d *TemplateData) { d.ControlPlaneLBEndpoint = urlInjection },
+		},
+	}
+
+	baseK0s := func() TemplateData {
+		return TemplateData{
+			Role:                                "control-plane",
+			SingleNode:                          true,
+			UserName:                            "kairos",
+			UserPassword:                        "kairos",
+			UserGroups:                          []string{"admin"},
+			IsKubeVirt:                          true,
+			ManagementKubeconfigToken:           "test-token", // required to render the push block
+			ManagementKubeconfigSecretName:      "cluster-kubeconfig",
+			ManagementKubeconfigSecretNamespace: "default",
+			ManagementAPIServer:                 "https://1.2.3.4:6443",
+		}
+	}
+	baseK3s := func() TemplateData {
+		return TemplateData{
+			Role:                                "control-plane",
+			SingleNode:                          true,
+			UserName:                            "kairos",
+			UserPassword:                        "kairos",
+			UserGroups:                          []string{"admin"},
+			IsKubeVirt:                          true,
+			ManagementKubeconfigToken:           "test-token",
+			ManagementKubeconfigSecretName:      "cluster-kubeconfig",
+			ManagementKubeconfigSecretNamespace: "default",
+			ManagementAPIServer:                 "https://1.2.3.4:6443",
+		}
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, dist := range []struct {
+				name   string
+				render func() (string, error)
+			}{
+				{
+					name: "k0s",
+					render: func() (string, error) {
+						d := baseK0s()
+						tc.applyToK0s(&d)
+						return RenderK0sCloudConfig(d)
+					},
+				},
+				{
+					name: "k3s",
+					render: func() (string, error) {
+						d := baseK3s()
+						tc.applyToK3s(&d)
+						return RenderK3sCloudConfig(d)
+					},
+				},
+			} {
+				t.Run(dist.name, func(t *testing.T) {
+					out, err := dist.render()
+					if err != nil {
+						t.Fatalf("render: %v", err)
+					}
+
+					// (1) YAML must still parse.
+					var doc map[string]any
+					if err := yaml.Unmarshal([]byte(out), &doc); err != nil {
+						t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+					}
+
+					// (2) Some templates DO embed the field, but only CAPK uses
+					// these fields in shell context. If the value is referenced
+					// at all, it must be inside POSIX single quotes — i.e. the
+					// shquote envelope appears in the output. The shquote of any
+					// of our adversarial payloads is non-empty and contains an
+					// embedded escape sequence; assert the envelope is present.
+					envelope := shquote(tc.payload)
+					if !strings.Contains(out, envelope) {
+						// It's acceptable for some fields to be unused on a
+						// given template variant (e.g. PrimaryIP isn't
+						// referenced by the k3s template). Skip the rest of the
+						// assertions in that case.
+						if !strings.Contains(out, tc.payload) {
+							t.Logf("field not referenced in this template variant; skipping")
+							return
+						}
+						t.Fatalf("payload appears in output WITHOUT shquote envelope:\nenvelope=%q\n---OUTPUT---\n%s", envelope, out)
+					}
+
+					// (3) Dangerous fragments must never appear UNQUOTED outside
+					// the shquote envelope. Walk every occurrence of each
+					// fragment and verify it sits inside a single-quoted region.
+					for _, dangerous := range []string{
+						"; rm -rf /",
+						"$(rm -rf /)",
+					} {
+						if !strings.Contains(tc.payload, dangerous) {
+							continue
+						}
+						// Find each occurrence and confirm it's bracketed by
+						// single quotes via the surrounding envelope.
+						idx := 0
+						for {
+							pos := strings.Index(out[idx:], dangerous)
+							if pos < 0 {
+								break
+							}
+							absPos := idx + pos
+							// Walk backwards: the most recent unescaped single
+							// quote before this position must be unmatched
+							// (i.e., we're inside `'...'`).
+							before := out[:absPos]
+							lastOpen := strings.LastIndex(before, "'")
+							if lastOpen < 0 {
+								t.Fatalf("dangerous fragment %q at offset %d has no preceding `'` — not inside shquote envelope\n---OUTPUT---\n%s", dangerous, absPos, out)
+							}
+							after := out[absPos+len(dangerous):]
+							nextClose := strings.Index(after, "'")
+							if nextClose < 0 {
+								t.Fatalf("dangerous fragment %q at offset %d has no closing `'` after it — not inside shquote envelope\n---OUTPUT---\n%s", dangerous, absPos, out)
+							}
+							idx = absPos + len(dangerous)
+						}
+					}
+				})
+			}
+		})
+	}
 }

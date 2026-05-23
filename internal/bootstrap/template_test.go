@@ -398,8 +398,16 @@ func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
 	if !strings.Contains(result, "/etc/rancher/k3s/k3s.yaml") {
 		t.Error("Missing k3s kubeconfig path in push block")
 	}
-	if !strings.Contains(result, "https://10.0.0.1:6443") {
-		t.Error("Missing ControlPlaneLBEndpoint in kubeconfig server URL replacement")
+	// ControlPlaneLBEndpoint is routed through a shquote'd shell variable
+	// (`local lb_endpoint='10.0.0.1'`) and then referenced as
+	// `https://${lb_endpoint}:6443` in the sed substitution, so the literal
+	// "https://10.0.0.1:6443" no longer appears verbatim in the rendered
+	// output. Assert on the safe-routing observable shape instead.
+	if !strings.Contains(result, "local lb_endpoint='10.0.0.1'") {
+		t.Error("Missing shquote'd lb_endpoint local var for ControlPlaneLBEndpoint")
+	}
+	if !strings.Contains(result, "https://${lb_endpoint}:6443") {
+		t.Error("Missing ${lb_endpoint} reference in sed URL substitution")
 	}
 	if !strings.Contains(result, "systemctl enable kairos-k3s-post-bootstrap.service") {
 		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
