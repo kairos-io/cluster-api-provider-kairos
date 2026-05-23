@@ -274,7 +274,7 @@ MANIFEST_EOF
       fi
       {{- end }}
       
-      {{- if .ManagementKubeconfigToken }}
+      {{- if .ManagementEndpoint }}
       # Push kubeconfig to management cluster without SSH (KubeVirt/CAPK)
       # Update server URL to LB endpoint so management cluster can connect
       push_kubeconfig() {
@@ -302,10 +302,10 @@ MANIFEST_EOF
         {{- else }}
         kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
         {{- end }}
-        local api={{ .ManagementAPIServer | shquote }}
-        local ns="{{ .ManagementKubeconfigSecretNamespace }}"
-        local name="{{ .ManagementKubeconfigSecretName }}"
-        local token={{ .ManagementKubeconfigToken | shquote }}
+        local api={{ .ManagementEndpoint.APIServer | shquote }}
+        local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
+        local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
+        local token={{ .ManagementEndpoint.Token | shquote }}
         local payload
         payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"

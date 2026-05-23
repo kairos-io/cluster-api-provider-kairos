@@ -929,7 +929,9 @@ func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
 	reconciler := &KairosConfigReconciler{
 		Client: client,
 		Scheme: scheme,
-		// RESTConfig nil: ensureKubeconfigPushConfig returns nil, but LB + CAPK template still used
+		// MgmtEndpointResolver nil: the CAPK gate in generate*CloudConfig
+		// short-circuits to "no push block" but the LB endpoint + CAPK
+		// template selection still apply.
 	}
 
 	kairosConfig := &bootstrapv1beta2.KairosConfig{

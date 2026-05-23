@@ -332,9 +332,9 @@ stages:
             {{- if .ClusterNS }}
             KAIROS_VMI_NAMESPACE={{ .ClusterNS | shquote }}
             {{- end }}
-            {{- if .ManagementKubeconfigToken }}
-            KAIROS_MGMT_API={{ .ManagementAPIServer | shquote }}
-            KAIROS_MGMT_TOKEN={{ .ManagementKubeconfigToken | shquote }}
+            {{- if .ManagementEndpoint }}
+            KAIROS_MGMT_API={{ .ManagementEndpoint.APIServer | shquote }}
+            KAIROS_MGMT_TOKEN={{ .ManagementEndpoint.Token | shquote }}
             {{- end }}
             fetch_vmi_ip_from_management() {
               if [ -z "${KAIROS_MGMT_API}" ] || [ -z "${KAIROS_MGMT_TOKEN}" ] || [ -z "${KAIROS_VMI_NAME}" ] || [ -z "${KAIROS_VMI_NAMESPACE}" ]; then
@@ -517,7 +517,7 @@ MANIFEST_EOF
             echo "No providerID to set"
             {{- end }}
             
-            {{- if .ManagementKubeconfigToken }}
+            {{- if .ManagementEndpoint }}
             # Push kubeconfig to management cluster without SSH (KubeVirt)
             push_kubeconfig() {
               local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
@@ -535,10 +535,10 @@ MANIFEST_EOF
               fi
               local kubeconfig_b64
               kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
-              local api={{ .ManagementAPIServer | shquote }}
-              local ns="{{ .ManagementKubeconfigSecretNamespace }}"
-              local name="{{ .ManagementKubeconfigSecretName }}"
-              local token={{ .ManagementKubeconfigToken | shquote }}
+              local api={{ .ManagementEndpoint.APIServer | shquote }}
+              local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
+              local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
+              local token={{ .ManagementEndpoint.Token | shquote }}
               local payload
               payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
               local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"

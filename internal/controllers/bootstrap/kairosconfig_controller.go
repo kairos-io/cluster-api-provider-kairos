@@ -27,16 +27,13 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -56,11 +53,21 @@ const controlPlaneLBServiceSuffix = "control-plane-lb"
 var errLBEndpointNotReady = errors.New("control plane load balancer endpoint not ready")
 var errK3sTokenNotReady = errors.New("k3s token secret not ready")
 
-// KairosConfigReconciler reconciles a KairosConfig object
+// KairosConfigReconciler reconciles a KairosConfig object.
+//
+// MgmtEndpointResolver is the seam introduced by KD-33: the reconciler holds
+// an adapter that turns a (KairosConfig, Cluster) tuple into the four-field
+// management-endpoint bundle the renderer needs to emit the in-node
+// kubeconfig-push block on CAPK control-plane Machines. In production
+// (main.go) this is a kubeVirtTokenResolver wired off mgr.GetConfig().Host.
+// In tests it can be a fake. The reconciler MUST tolerate the resolver
+// returning (nil, nil) — that is the documented "disabled" signal, used by
+// envtest setups and the out-of-cluster `go run` flow where the manager has
+// no usable REST config to point nodes back at.
 type KairosConfigReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	RESTConfig *rest.Config
+	Scheme               *runtime.Scheme
+	MgmtEndpointResolver ManagementEndpointResolver
 }
 
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -926,10 +933,17 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	// This is needed to set the Node's providerID so the Machine controller can match Nodes to Machines
 	providerID := r.getProviderID(ctx, log, machine)
 
-	var kubeconfigPush *kubeconfigPushConfig
-	if isKubevirtMachine(machine) && role == "control-plane" {
+	// CAPK control-plane: ask the resolver for the management-endpoint bundle
+	// the node needs to push its kubeconfig back without SSH. The gating
+	// (CAPK + control-plane only) stays here in the reconciler — it's
+	// routing, not a resolver concern. The resolver itself is allowed to
+	// return (nil, nil) as a "disabled" signal (e.g. envtest without a
+	// management REST config); we treat that the same as "no push block",
+	// per the contract in management_endpoint.go.
+	var mgmtEndpoint *ManagementEndpoint
+	if isKubevirtMachine(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
 		var err error
-		kubeconfigPush, err = r.ensureKubeconfigPushConfig(ctx, log, kairosConfig, cluster)
+		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
 		if err != nil {
 			return "", err
 		}
@@ -937,39 +951,40 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 
 	// Build template data
 	templateData := bootstrap.TemplateData{
-		Role:                                role,
-		SingleNode:                          singleNode,
-		Hostname:                            hostname,
-		UserName:                            userName,
-		UserPassword:                        userPassword,
-		UserGroups:                          userGroups,
-		GitHubUser:                          kairosConfig.Spec.GitHubUser,
-		SSHPublicKey:                        kairosConfig.Spec.SSHPublicKey,
-		WorkerToken:                         workerToken,
-		Manifests:                           kairosConfig.Spec.Manifests,
-		HostnamePrefix:                      hostnamePrefix,
-		DNSServers:                          kairosConfig.Spec.DNSServers,
-		PodCIDR:                             kairosConfig.Spec.PodCIDR,
-		ServiceCIDR:                         kairosConfig.Spec.ServiceCIDR,
-		PrimaryIP:                           kairosConfig.Spec.PrimaryIP,
-		MachineName:                         "",
-		ClusterNS:                           "",
-		IsKubeVirt:                          isKubevirtMachine(machine),
-		Install:                             installConfig,
-		ProviderID:                          providerID,
-		ControlPlaneLBServiceName:           "",
-		ControlPlaneLBServiceNamespace:      "",
-		ControlPlaneLBEndpoint:              "",
-		ManagementKubeconfigToken:           "",
-		ManagementKubeconfigSecretName:      "",
-		ManagementKubeconfigSecretNamespace: "",
-		ManagementAPIServer:                 "",
+		Role:                           role,
+		SingleNode:                     singleNode,
+		Hostname:                       hostname,
+		UserName:                       userName,
+		UserPassword:                   userPassword,
+		UserGroups:                     userGroups,
+		GitHubUser:                     kairosConfig.Spec.GitHubUser,
+		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
+		WorkerToken:                    workerToken,
+		Manifests:                      kairosConfig.Spec.Manifests,
+		HostnamePrefix:                 hostnamePrefix,
+		DNSServers:                     kairosConfig.Spec.DNSServers,
+		PodCIDR:                        kairosConfig.Spec.PodCIDR,
+		ServiceCIDR:                    kairosConfig.Spec.ServiceCIDR,
+		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
+		MachineName:                    "",
+		ClusterNS:                      "",
+		IsKubeVirt:                     isKubevirtMachine(machine),
+		Install:                        installConfig,
+		ProviderID:                     providerID,
+		ControlPlaneLBServiceName:      "",
+		ControlPlaneLBServiceNamespace: "",
+		ControlPlaneLBEndpoint:         "",
 	}
-	if kubeconfigPush != nil {
-		templateData.ManagementKubeconfigToken = kubeconfigPush.Token
-		templateData.ManagementKubeconfigSecretName = kubeconfigPush.SecretName
-		templateData.ManagementKubeconfigSecretNamespace = kubeconfigPush.SecretNamespace
-		templateData.ManagementAPIServer = kubeconfigPush.APIServer
+	if mgmtEndpoint != nil {
+		// One-line conversion preserves the rule that internal/bootstrap is
+		// API-server-unaware: the renderer's ManagementEndpoint is a flat
+		// data struct, identical in shape but distinct in type.
+		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
+			APIServer:                 mgmtEndpoint.APIServer,
+			Token:                     mgmtEndpoint.Token,
+			KubeconfigSecretName:      mgmtEndpoint.KubeconfigSecretName,
+			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
+		}
 	}
 	if machine != nil {
 		templateData.MachineName = machine.Name
@@ -1151,11 +1166,11 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 	// Get providerID from Machine's infrastructure reference
 	providerID := r.getProviderID(ctx, log, machine)
 
-	// CAPK: ensure kubeconfig push config and LB endpoint for KubeVirt control-plane (same as k0s)
-	var kubeconfigPush *kubeconfigPushConfig
-	if isKubevirtMachine(machine) && role == "control-plane" {
+	// CAPK control-plane: same routing as the k0s path above.
+	var mgmtEndpoint *ManagementEndpoint
+	if isKubevirtMachine(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
 		var err error
-		kubeconfigPush, err = r.ensureKubeconfigPushConfig(ctx, log, kairosConfig, cluster)
+		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
 		if err != nil {
 			return "", err
 		}
@@ -1163,38 +1178,36 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 
 	// Build template data
 	templateData := bootstrap.TemplateData{
-		Role:                                role,
-		SingleNode:                          singleNode,
-		Hostname:                            hostname,
-		UserName:                            userName,
-		UserPassword:                        userPassword,
-		UserGroups:                          userGroups,
-		GitHubUser:                          kairosConfig.Spec.GitHubUser,
-		SSHPublicKey:                        kairosConfig.Spec.SSHPublicKey,
-		Manifests:                           kairosConfig.Spec.Manifests,
-		HostnamePrefix:                      hostnamePrefix,
-		DNSServers:                          kairosConfig.Spec.DNSServers,
-		PrimaryIP:                           kairosConfig.Spec.PrimaryIP,
-		MachineName:                         "",
-		ClusterNS:                           "",
-		IsKubeVirt:                          isKubevirtMachine(machine),
-		Install:                             installConfig,
-		ProviderID:                          providerID,
-		K3sServerURL:                        serverAddress,
-		K3sToken:                            k3sToken,
-		ControlPlaneLBServiceName:           "",
-		ControlPlaneLBServiceNamespace:      "",
-		ControlPlaneLBEndpoint:              "",
-		ManagementKubeconfigToken:           "",
-		ManagementKubeconfigSecretName:      "",
-		ManagementKubeconfigSecretNamespace: "",
-		ManagementAPIServer:                 "",
+		Role:                           role,
+		SingleNode:                     singleNode,
+		Hostname:                       hostname,
+		UserName:                       userName,
+		UserPassword:                   userPassword,
+		UserGroups:                     userGroups,
+		GitHubUser:                     kairosConfig.Spec.GitHubUser,
+		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
+		Manifests:                      kairosConfig.Spec.Manifests,
+		HostnamePrefix:                 hostnamePrefix,
+		DNSServers:                     kairosConfig.Spec.DNSServers,
+		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
+		MachineName:                    "",
+		ClusterNS:                      "",
+		IsKubeVirt:                     isKubevirtMachine(machine),
+		Install:                        installConfig,
+		ProviderID:                     providerID,
+		K3sServerURL:                   serverAddress,
+		K3sToken:                       k3sToken,
+		ControlPlaneLBServiceName:      "",
+		ControlPlaneLBServiceNamespace: "",
+		ControlPlaneLBEndpoint:         "",
 	}
-	if kubeconfigPush != nil {
-		templateData.ManagementKubeconfigToken = kubeconfigPush.Token
-		templateData.ManagementKubeconfigSecretName = kubeconfigPush.SecretName
-		templateData.ManagementKubeconfigSecretNamespace = kubeconfigPush.SecretNamespace
-		templateData.ManagementAPIServer = kubeconfigPush.APIServer
+	if mgmtEndpoint != nil {
+		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
+			APIServer:                 mgmtEndpoint.APIServer,
+			Token:                     mgmtEndpoint.Token,
+			KubeconfigSecretName:      mgmtEndpoint.KubeconfigSecretName,
+			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
+		}
 	}
 	if machine != nil {
 		templateData.MachineName = machine.Name
@@ -1306,124 +1319,11 @@ func randomString(length int) (string, error) {
 	return string(b), nil
 }
 
-type kubeconfigPushConfig struct {
-	Token           string
-	APIServer       string
-	SecretName      string
-	SecretNamespace string
-}
-
-func (r *KairosConfigReconciler) ensureKubeconfigPushConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster) (*kubeconfigPushConfig, error) {
-	if r.RESTConfig == nil || r.RESTConfig.Host == "" {
-		log.Info("Skipping kubeconfig push config; REST config not available")
-		return nil, nil
-	}
-
-	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
-	saName := kubeconfigWriterName(cluster.Name)
-
-	serviceAccount := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      saName,
-			Namespace: cluster.Namespace,
-		},
-	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, serviceAccount, func() error {
-		if serviceAccount.Labels == nil {
-			serviceAccount.Labels = map[string]string{}
-		}
-		serviceAccount.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-		return controllerutil.SetControllerReference(kairosConfig, serviceAccount, r.Scheme)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to ensure kubeconfig writer serviceaccount: %w", err)
-	}
-
-	role := &rbacv1.Role{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      saName,
-			Namespace: cluster.Namespace,
-		},
-	}
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, role, func() error {
-		role.Rules = []rbacv1.PolicyRule{
-			{
-				APIGroups:     []string{""},
-				Resources:     []string{"secrets"},
-				ResourceNames: []string{secretName},
-				Verbs:         []string{"get", "create", "update", "patch"},
-			},
-			{
-				APIGroups: []string{"kubevirt.io"},
-				Resources: []string{"virtualmachineinstances"},
-				Verbs:     []string{"get"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"services"},
-				Verbs:     []string{"get"},
-			},
-		}
-		if role.Labels == nil {
-			role.Labels = map[string]string{}
-		}
-		role.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-		return controllerutil.SetControllerReference(kairosConfig, role, r.Scheme)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to ensure kubeconfig writer role: %w", err)
-	}
-
-	roleBinding := &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      saName,
-			Namespace: cluster.Namespace,
-		},
-	}
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, roleBinding, func() error {
-		roleBinding.RoleRef = rbacv1.RoleRef{
-			APIGroup: rbacv1.GroupName,
-			Kind:     "Role",
-			Name:     role.Name,
-		}
-		roleBinding.Subjects = []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      serviceAccount.Name,
-				Namespace: serviceAccount.Namespace,
-			},
-		}
-		if roleBinding.Labels == nil {
-			roleBinding.Labels = map[string]string{}
-		}
-		roleBinding.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-		return controllerutil.SetControllerReference(kairosConfig, roleBinding, r.Scheme)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to ensure kubeconfig writer rolebinding: %w", err)
-	}
-
-	expirationSeconds := int64(24 * 60 * 60)
-	tokenRequest := &authenticationv1.TokenRequest{
-		Spec: authenticationv1.TokenRequestSpec{
-			Audiences:         []string{"https://kubernetes.default.svc"},
-			ExpirationSeconds: &expirationSeconds,
-		},
-	}
-	if err := r.SubResource("token").Create(ctx, serviceAccount, tokenRequest); err != nil {
-		return nil, fmt.Errorf("failed to create serviceaccount token: %w", err)
-	}
-	if tokenRequest.Status.Token == "" {
-		return nil, fmt.Errorf("serviceaccount token request returned empty token")
-	}
-
-	return &kubeconfigPushConfig{
-		Token:           tokenRequest.Status.Token,
-		APIServer:       r.RESTConfig.Host,
-		SecretName:      secretName,
-		SecretNamespace: cluster.Namespace,
-	}, nil
-}
+// kubeconfigPushConfig + ensureKubeconfigPushConfig were moved out to
+// management_endpoint_resolver.go's kubeVirtTokenResolver implementation as
+// part of KD-33. The reconciler now holds an interface-typed
+// MgmtEndpointResolver field and routes through it; main.go wires the
+// production kubeVirtTokenResolver, tests wire fakes.
 
 func kubeconfigWriterName(clusterName string) string {
 	base := "kairos-kubeconfig-writer"
