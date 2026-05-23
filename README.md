@@ -17,6 +17,8 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 Supports single-node k0s and k3s clusters with CAPD, CAPV, and CAPK. `spec.replicas > 1` is currently webhook-rejected; HA control planes are on the roadmap (KD-5b / KD-25). Additional infrastructure providers (Metal3, Tinkerbell, hyperscalers) are also on the roadmap.
 
+- v0.1.0-alpha.2 ships KD-3b — SSH no longer in the controller's hot path. SSH credentials in `KairosConfig` are only consumed by the planned `SSHFallback` opt-in mechanism (post-alpha-2). See [docs/UPGRADING.md](docs/UPGRADING.md) for the alpha-1 → alpha-2 impact.
+
 Read the [v0.1.0-alpha.1 release notes](docs/release-notes/v0.1.0-alpha.1.md) before using — there are important security caveats and known limitations.
 
 ## Install (released version)
