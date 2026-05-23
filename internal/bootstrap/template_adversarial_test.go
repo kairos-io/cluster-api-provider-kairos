@@ -910,3 +910,146 @@ func TestShquoteFieldsAreShellSafe(t *testing.T) {
 		})
 	}
 }
+
+// TestRender_ManagementEndpoint_AdversarialFields is the per-field adversarial
+// coverage matrix for the four ManagementEndpoint nested fields × the two
+// CAPK templates (k0s and k3s) = 8 subcases.
+//
+// Why this and not the existing TestShquoteFieldsAreShellSafe:
+//   - TestShquoteFieldsAreShellSafe predates KD-33's struct refactor and
+//     covers the two endpoint fields that already had shquote treatment
+//     (APIServer + Token). It does NOT cover the two namespace/name fields,
+//     which got shquote'd as the residual KD-2 follow-up in commit (a).
+//   - The naming and structure of THIS test enumerate
+//     ManagementEndpoint.{APIServer,Token,KubeconfigSecretName,
+//     KubeconfigSecretNamespace} explicitly so a future field added to
+//     ManagementEndpoint without the corresponding adversarial case fails
+//     code review at the subtest-count check.
+//
+// Per field, the test asserts:
+//
+//  1. Rendered YAML still parses (`yaml.Unmarshal`).
+//  2. The payload appears inside `'...'` (POSIX single-quoted) — the
+//     shquote envelope.
+//  3. Known shell metacharacters in the payload (`;`, `$()`, backticks,
+//     `&&`) appear only inside the single-quoted envelope, never as a
+//     bare token in the rendered output.
+func TestRender_ManagementEndpoint_AdversarialFields(t *testing.T) {
+	// Payloads chosen to surface the most dangerous metacharacter classes
+	// per field type. None contain `\n`/`\r`/NUL so they bypass
+	// validateTemplateData and reach the template — exercising the
+	// shquote envelope, not the validator.
+	const (
+		apiServerInj         = `https://api:6443'; rm -rf /; echo '`
+		tokenInj             = `evil-token'; rm -rf /; echo '`
+		secretNameInj        = `evil$(rm -rf /)`
+		secretNamespaceInj   = `evil$(rm -rf /)`
+		dangerousSemi        = "; rm -rf /"
+		dangerousDollarSubsh = "$(rm -rf /)"
+	)
+
+	type fieldCase struct {
+		name    string
+		payload string
+		// apply mutates the ManagementEndpoint inside a base TemplateData.
+		apply func(ep *ManagementEndpoint)
+	}
+
+	cases := []fieldCase{
+		{
+			name:    "APIServer",
+			payload: apiServerInj,
+			apply:   func(ep *ManagementEndpoint) { ep.APIServer = apiServerInj },
+		},
+		{
+			name:    "Token",
+			payload: tokenInj,
+			apply:   func(ep *ManagementEndpoint) { ep.Token = tokenInj },
+		},
+		{
+			name:    "KubeconfigSecretName",
+			payload: secretNameInj,
+			apply:   func(ep *ManagementEndpoint) { ep.KubeconfigSecretName = secretNameInj },
+		},
+		{
+			name:    "KubeconfigSecretNamespace",
+			payload: secretNamespaceInj,
+			apply:   func(ep *ManagementEndpoint) { ep.KubeconfigSecretNamespace = secretNamespaceInj },
+		},
+	}
+
+	baseEndpoint := func() *ManagementEndpoint {
+		return &ManagementEndpoint{
+			APIServer:                 "https://1.2.3.4:6443",
+			Token:                     "good-token",
+			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+		}
+	}
+
+	baseData := func(ep *ManagementEndpoint) TemplateData {
+		return TemplateData{
+			Role:               "control-plane",
+			SingleNode:         true,
+			UserName:           "kairos",
+			UserPassword:       "kairos",
+			UserGroups:         []string{"admin"},
+			IsKubeVirt:         true,
+			ManagementEndpoint: ep,
+		}
+	}
+
+	for _, tc := range cases {
+		for _, dist := range []string{"k0s", "k3s"} {
+			t.Run(tc.name+"/"+dist, func(t *testing.T) {
+				ep := baseEndpoint()
+				tc.apply(ep)
+				data := baseData(ep)
+
+				out, err := renderForDist(dist, data)
+				if err != nil {
+					t.Fatalf("render: %v", err)
+				}
+
+				// (1) YAML must still parse.
+				var doc map[string]any
+				if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+					t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+				}
+
+				// (2) The payload must appear wrapped in the shquote envelope.
+				envelope := shquote(tc.payload)
+				if !strings.Contains(out, envelope) {
+					t.Fatalf("payload appears in output WITHOUT shquote envelope:\nenvelope=%q\n---OUTPUT---\n%s", envelope, out)
+				}
+
+				// (3) Dangerous fragments inside the payload must only appear
+				// inside the shquote envelope — never as bare shell tokens.
+				for _, dangerous := range []string{dangerousSemi, dangerousDollarSubsh} {
+					if !strings.Contains(tc.payload, dangerous) {
+						continue
+					}
+					idx := 0
+					for {
+						pos := strings.Index(out[idx:], dangerous)
+						if pos < 0 {
+							break
+						}
+						absPos := idx + pos
+						before := out[:absPos]
+						lastOpen := strings.LastIndex(before, "'")
+						if lastOpen < 0 {
+							t.Fatalf("dangerous fragment %q at offset %d has no preceding `'` — not inside shquote envelope\n---OUTPUT---\n%s", dangerous, absPos, out)
+						}
+						after := out[absPos+len(dangerous):]
+						nextClose := strings.Index(after, "'")
+						if nextClose < 0 {
+							t.Fatalf("dangerous fragment %q at offset %d has no closing `'` after it — not inside shquote envelope\n---OUTPUT---\n%s", dangerous, absPos, out)
+						}
+						idx = absPos + len(dangerous)
+					}
+				}
+			})
+		}
+	}
+}
