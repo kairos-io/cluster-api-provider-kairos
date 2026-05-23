@@ -350,29 +350,31 @@ func TestPersistencyBlockDoesNotLeakUserInput(t *testing.T) {
 
 	mkData := func(isKV bool, dist string) TemplateData {
 		d := TemplateData{
-			Role:                                "control-plane",
-			SingleNode:                          true,
-			Hostname:                            hostnameMark,
-			UserName:                            userNameMark,
-			UserPassword:                        userPasswordMark,
-			UserGroups:                          []string{groupMark},
-			GitHubUser:                          gitHubUserMark,
-			SSHPublicKey:                        sshKeyMark,
-			HostnamePrefix:                      hostnamePrefixMark,
-			DNSServers:                          []string{dnsMark},
-			PodCIDR:                             podCIDRMark,
-			ServiceCIDR:                         serviceCIDRMark,
-			PrimaryIP:                           primaryIPMark,
-			MachineName:                         machineNameMark,
-			ClusterNS:                           clusterNSMark,
-			IsKubeVirt:                          isKV,
-			ControlPlaneLBServiceName:           lbServiceNameMark,
-			ControlPlaneLBServiceNamespace:      lbServiceNSMark,
-			ControlPlaneLBEndpoint:              lbEndpointMark,
-			ManagementKubeconfigToken:           mgmtTokenMark,
-			ManagementKubeconfigSecretName:      mgmtSecretNameMark,
-			ManagementKubeconfigSecretNamespace: mgmtSecretNSMark,
-			ManagementAPIServer:                 mgmtAPIServerMark,
+			Role:                           "control-plane",
+			SingleNode:                     true,
+			Hostname:                       hostnameMark,
+			UserName:                       userNameMark,
+			UserPassword:                   userPasswordMark,
+			UserGroups:                     []string{groupMark},
+			GitHubUser:                     gitHubUserMark,
+			SSHPublicKey:                   sshKeyMark,
+			HostnamePrefix:                 hostnamePrefixMark,
+			DNSServers:                     []string{dnsMark},
+			PodCIDR:                        podCIDRMark,
+			ServiceCIDR:                    serviceCIDRMark,
+			PrimaryIP:                      primaryIPMark,
+			MachineName:                    machineNameMark,
+			ClusterNS:                      clusterNSMark,
+			IsKubeVirt:                     isKV,
+			ControlPlaneLBServiceName:      lbServiceNameMark,
+			ControlPlaneLBServiceNamespace: lbServiceNSMark,
+			ControlPlaneLBEndpoint:         lbEndpointMark,
+			ManagementEndpoint: &ManagementEndpoint{
+				Token:                     mgmtTokenMark,
+				KubeconfigSecretName:      mgmtSecretNameMark,
+				KubeconfigSecretNamespace: mgmtSecretNSMark,
+				APIServer:                 mgmtAPIServerMark,
+			},
 		}
 		if dist == "k3s" {
 			// k3s control-plane templates don't read WorkerToken (workers
@@ -746,14 +748,14 @@ func TestShquoteFieldsAreShellSafe(t *testing.T) {
 		{
 			name:       "ManagementAPIServer",
 			payload:    urlInjection,
-			applyToK0s: func(d *TemplateData) { d.ManagementAPIServer = urlInjection },
-			applyToK3s: func(d *TemplateData) { d.ManagementAPIServer = urlInjection },
+			applyToK0s: func(d *TemplateData) { d.ManagementEndpoint.APIServer = urlInjection },
+			applyToK3s: func(d *TemplateData) { d.ManagementEndpoint.APIServer = urlInjection },
 		},
 		{
 			name:       "ManagementKubeconfigToken",
 			payload:    tokenInjection,
-			applyToK0s: func(d *TemplateData) { d.ManagementKubeconfigToken = tokenInjection },
-			applyToK3s: func(d *TemplateData) { d.ManagementKubeconfigToken = tokenInjection },
+			applyToK0s: func(d *TemplateData) { d.ManagementEndpoint.Token = tokenInjection },
+			applyToK3s: func(d *TemplateData) { d.ManagementEndpoint.Token = tokenInjection },
 		},
 		{
 			name:       "PrimaryIP",
@@ -783,30 +785,34 @@ func TestShquoteFieldsAreShellSafe(t *testing.T) {
 
 	baseK0s := func() TemplateData {
 		return TemplateData{
-			Role:                                "control-plane",
-			SingleNode:                          true,
-			UserName:                            "kairos",
-			UserPassword:                        "kairos",
-			UserGroups:                          []string{"admin"},
-			IsKubeVirt:                          true,
-			ManagementKubeconfigToken:           "test-token", // required to render the push block
-			ManagementKubeconfigSecretName:      "cluster-kubeconfig",
-			ManagementKubeconfigSecretNamespace: "default",
-			ManagementAPIServer:                 "https://1.2.3.4:6443",
+			Role:         "control-plane",
+			SingleNode:   true,
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+			IsKubeVirt:   true,
+			ManagementEndpoint: &ManagementEndpoint{ // non-nil → push block renders
+				Token:                     "test-token",
+				KubeconfigSecretName:      "cluster-kubeconfig",
+				KubeconfigSecretNamespace: "default",
+				APIServer:                 "https://1.2.3.4:6443",
+			},
 		}
 	}
 	baseK3s := func() TemplateData {
 		return TemplateData{
-			Role:                                "control-plane",
-			SingleNode:                          true,
-			UserName:                            "kairos",
-			UserPassword:                        "kairos",
-			UserGroups:                          []string{"admin"},
-			IsKubeVirt:                          true,
-			ManagementKubeconfigToken:           "test-token",
-			ManagementKubeconfigSecretName:      "cluster-kubeconfig",
-			ManagementKubeconfigSecretNamespace: "default",
-			ManagementAPIServer:                 "https://1.2.3.4:6443",
+			Role:         "control-plane",
+			SingleNode:   true,
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+			IsKubeVirt:   true,
+			ManagementEndpoint: &ManagementEndpoint{
+				Token:                     "test-token",
+				KubeconfigSecretName:      "cluster-kubeconfig",
+				KubeconfigSecretNamespace: "default",
+				APIServer:                 "https://1.2.3.4:6443",
+			},
 		}
 	}
 

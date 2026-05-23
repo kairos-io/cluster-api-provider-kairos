@@ -60,11 +60,26 @@ type TemplateData struct {
 	ControlPlaneLBServiceName      string
 	ControlPlaneLBServiceNamespace string
 	ControlPlaneLBEndpoint         string
-	// Management cluster push config for KubeVirt (non-SSH kubeconfig retrieval)
-	ManagementKubeconfigToken           string
-	ManagementKubeconfigSecretName      string
-	ManagementKubeconfigSecretNamespace string
-	ManagementAPIServer                 string
+	// ManagementEndpoint, if non-nil, enables the in-node kubeconfig-push path
+	// (CAPK today; other infra providers under KD-3b). The renderer treats the
+	// pointer as the single gate for emitting the push block — when nil, no
+	// management-cluster contact is rendered. Resolved by the controller from a
+	// ManagementEndpointResolver; see internal/controllers/bootstrap/CLAUDE.md.
+	ManagementEndpoint *ManagementEndpoint
+}
+
+// ManagementEndpoint bundles the four values the rendered cloud-config needs
+// to push the workload kubeconfig back to the management cluster without SSH:
+// the management API URL, an authenticated bearer token, and the
+// (namespace, name) of the kubeconfig Secret to write. All four fields are
+// rendered into shell command positions via the shquote template func — any
+// new field added here that lands in a shell context MUST be routed through
+// shquote per the rules in internal/bootstrap/CLAUDE.md § "Shell contexts".
+type ManagementEndpoint struct {
+	APIServer                 string
+	Token                     string
+	KubeconfigSecretName      string
+	KubeconfigSecretNamespace string
 }
 
 // InstallConfig holds installation configuration for the template

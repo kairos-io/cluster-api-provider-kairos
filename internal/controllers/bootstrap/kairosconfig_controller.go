@@ -937,39 +937,37 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 
 	// Build template data
 	templateData := bootstrap.TemplateData{
-		Role:                                role,
-		SingleNode:                          singleNode,
-		Hostname:                            hostname,
-		UserName:                            userName,
-		UserPassword:                        userPassword,
-		UserGroups:                          userGroups,
-		GitHubUser:                          kairosConfig.Spec.GitHubUser,
-		SSHPublicKey:                        kairosConfig.Spec.SSHPublicKey,
-		WorkerToken:                         workerToken,
-		Manifests:                           kairosConfig.Spec.Manifests,
-		HostnamePrefix:                      hostnamePrefix,
-		DNSServers:                          kairosConfig.Spec.DNSServers,
-		PodCIDR:                             kairosConfig.Spec.PodCIDR,
-		ServiceCIDR:                         kairosConfig.Spec.ServiceCIDR,
-		PrimaryIP:                           kairosConfig.Spec.PrimaryIP,
-		MachineName:                         "",
-		ClusterNS:                           "",
-		IsKubeVirt:                          isKubevirtMachine(machine),
-		Install:                             installConfig,
-		ProviderID:                          providerID,
-		ControlPlaneLBServiceName:           "",
-		ControlPlaneLBServiceNamespace:      "",
-		ControlPlaneLBEndpoint:              "",
-		ManagementKubeconfigToken:           "",
-		ManagementKubeconfigSecretName:      "",
-		ManagementKubeconfigSecretNamespace: "",
-		ManagementAPIServer:                 "",
+		Role:                           role,
+		SingleNode:                     singleNode,
+		Hostname:                       hostname,
+		UserName:                       userName,
+		UserPassword:                   userPassword,
+		UserGroups:                     userGroups,
+		GitHubUser:                     kairosConfig.Spec.GitHubUser,
+		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
+		WorkerToken:                    workerToken,
+		Manifests:                      kairosConfig.Spec.Manifests,
+		HostnamePrefix:                 hostnamePrefix,
+		DNSServers:                     kairosConfig.Spec.DNSServers,
+		PodCIDR:                        kairosConfig.Spec.PodCIDR,
+		ServiceCIDR:                    kairosConfig.Spec.ServiceCIDR,
+		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
+		MachineName:                    "",
+		ClusterNS:                      "",
+		IsKubeVirt:                     isKubevirtMachine(machine),
+		Install:                        installConfig,
+		ProviderID:                     providerID,
+		ControlPlaneLBServiceName:      "",
+		ControlPlaneLBServiceNamespace: "",
+		ControlPlaneLBEndpoint:         "",
 	}
 	if kubeconfigPush != nil {
-		templateData.ManagementKubeconfigToken = kubeconfigPush.Token
-		templateData.ManagementKubeconfigSecretName = kubeconfigPush.SecretName
-		templateData.ManagementKubeconfigSecretNamespace = kubeconfigPush.SecretNamespace
-		templateData.ManagementAPIServer = kubeconfigPush.APIServer
+		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
+			APIServer:                 kubeconfigPush.APIServer,
+			Token:                     kubeconfigPush.Token,
+			KubeconfigSecretName:      kubeconfigPush.SecretName,
+			KubeconfigSecretNamespace: kubeconfigPush.SecretNamespace,
+		}
 	}
 	if machine != nil {
 		templateData.MachineName = machine.Name
@@ -1163,38 +1161,36 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 
 	// Build template data
 	templateData := bootstrap.TemplateData{
-		Role:                                role,
-		SingleNode:                          singleNode,
-		Hostname:                            hostname,
-		UserName:                            userName,
-		UserPassword:                        userPassword,
-		UserGroups:                          userGroups,
-		GitHubUser:                          kairosConfig.Spec.GitHubUser,
-		SSHPublicKey:                        kairosConfig.Spec.SSHPublicKey,
-		Manifests:                           kairosConfig.Spec.Manifests,
-		HostnamePrefix:                      hostnamePrefix,
-		DNSServers:                          kairosConfig.Spec.DNSServers,
-		PrimaryIP:                           kairosConfig.Spec.PrimaryIP,
-		MachineName:                         "",
-		ClusterNS:                           "",
-		IsKubeVirt:                          isKubevirtMachine(machine),
-		Install:                             installConfig,
-		ProviderID:                          providerID,
-		K3sServerURL:                        serverAddress,
-		K3sToken:                            k3sToken,
-		ControlPlaneLBServiceName:           "",
-		ControlPlaneLBServiceNamespace:      "",
-		ControlPlaneLBEndpoint:              "",
-		ManagementKubeconfigToken:           "",
-		ManagementKubeconfigSecretName:      "",
-		ManagementKubeconfigSecretNamespace: "",
-		ManagementAPIServer:                 "",
+		Role:                           role,
+		SingleNode:                     singleNode,
+		Hostname:                       hostname,
+		UserName:                       userName,
+		UserPassword:                   userPassword,
+		UserGroups:                     userGroups,
+		GitHubUser:                     kairosConfig.Spec.GitHubUser,
+		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
+		Manifests:                      kairosConfig.Spec.Manifests,
+		HostnamePrefix:                 hostnamePrefix,
+		DNSServers:                     kairosConfig.Spec.DNSServers,
+		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
+		MachineName:                    "",
+		ClusterNS:                      "",
+		IsKubeVirt:                     isKubevirtMachine(machine),
+		Install:                        installConfig,
+		ProviderID:                     providerID,
+		K3sServerURL:                   serverAddress,
+		K3sToken:                       k3sToken,
+		ControlPlaneLBServiceName:      "",
+		ControlPlaneLBServiceNamespace: "",
+		ControlPlaneLBEndpoint:         "",
 	}
 	if kubeconfigPush != nil {
-		templateData.ManagementKubeconfigToken = kubeconfigPush.Token
-		templateData.ManagementKubeconfigSecretName = kubeconfigPush.SecretName
-		templateData.ManagementKubeconfigSecretNamespace = kubeconfigPush.SecretNamespace
-		templateData.ManagementAPIServer = kubeconfigPush.APIServer
+		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
+			APIServer:                 kubeconfigPush.APIServer,
+			Token:                     kubeconfigPush.Token,
+			KubeconfigSecretName:      kubeconfigPush.SecretName,
+			KubeconfigSecretNamespace: kubeconfigPush.SecretNamespace,
+		}
 	}
 	if machine != nil {
 		templateData.MachineName = machine.Name

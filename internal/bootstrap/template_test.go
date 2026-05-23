@@ -376,15 +376,17 @@ func TestRenderK3sCloudConfig_CapkBootstrapTrap(t *testing.T) {
 
 func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
 	data := TemplateData{
-		Role:                                "control-plane",
-		SingleNode:                          true,
-		UserName:                            "kairos",
-		IsKubeVirt:                          true,
-		ManagementKubeconfigToken:           "test-token",
-		ManagementKubeconfigSecretName:      "cluster-kubeconfig",
-		ManagementKubeconfigSecretNamespace: "default",
-		ManagementAPIServer:                 "https://1.2.3.4:6443",
-		ControlPlaneLBEndpoint:              "10.0.0.1",
+		Role:       "control-plane",
+		SingleNode: true,
+		UserName:   "kairos",
+		IsKubeVirt: true,
+		ManagementEndpoint: &ManagementEndpoint{
+			Token:                     "test-token",
+			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+			APIServer:                 "https://1.2.3.4:6443",
+		},
+		ControlPlaneLBEndpoint: "10.0.0.1",
 	}
 
 	result, err := RenderK3sCloudConfig(data)
@@ -576,6 +578,66 @@ func TestRenderK0sCloudConfig_WithDNSServers(t *testing.T) {
 	if !strings.Contains(result, "dns:\n        nameservers:\n          - 1.1.1.1\n          - 8.8.8.8") {
 		t.Error("Missing DNS servers initramfs block")
 	}
+}
+
+// TestRenderK0sCloudConfig_CapkNoManagementEndpoint asserts that when
+// ManagementEndpoint is nil on the CAPK k0s control-plane template, the
+// in-node kubeconfig-push block is omitted entirely. The pointer-nil check on
+// .ManagementEndpoint is the single gate the renderer uses; this guards
+// against accidentally re-introducing a flat-field-only check that would
+// silently render an unauthenticated push attempt.
+//
+// Two gate sites in the k0s CAPK template close on ManagementEndpoint:
+//
+//  1. The KAIROS_MGMT_API / KAIROS_MGMT_TOKEN assignment lines in the
+//     fetch_vmi_ip_from_management() helper (the rest of the helper body
+//     always renders, so we assert on the ASSIGNMENT lines, not on the
+//     identifier itself which is referenced in `[ -z "${KAIROS_MGMT_API}" ]`).
+//  2. The push_kubeconfig() function and its call sites.
+func TestRenderK0sCloudConfig_CapkNoManagementEndpoint(t *testing.T) {
+	data := TemplateData{
+		Role:               "control-plane",
+		SingleNode:         true,
+		UserName:           "kairos",
+		IsKubeVirt:         true,
+		ManagementEndpoint: nil,
+	}
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+	// Assignment lines must be omitted (they only render under .ManagementEndpoint).
+	if strings.Contains(result, "KAIROS_MGMT_API=") {
+		t.Errorf("KAIROS_MGMT_API assignment must not appear when ManagementEndpoint is nil")
+	}
+	if strings.Contains(result, "KAIROS_MGMT_TOKEN=") {
+		t.Errorf("KAIROS_MGMT_TOKEN assignment must not appear when ManagementEndpoint is nil")
+	}
+	// Entire push block must be omitted.
+	if strings.Contains(result, "push_kubeconfig") {
+		t.Errorf("push_kubeconfig must not appear when ManagementEndpoint is nil")
+	}
+}
+
+// TestRenderK3sCloudConfig_CapkNoManagementEndpoint is the k3s twin of
+// TestRenderK0sCloudConfig_CapkNoManagementEndpoint.
+func TestRenderK3sCloudConfig_CapkNoManagementEndpoint(t *testing.T) {
+	data := TemplateData{
+		Role:               "control-plane",
+		SingleNode:         true,
+		UserName:           "kairos",
+		IsKubeVirt:         true,
+		ManagementEndpoint: nil,
+	}
+	result, err := RenderK3sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+	if strings.Contains(result, "push_kubeconfig") {
+		t.Errorf("push_kubeconfig must not appear when ManagementEndpoint is nil")
+	}
+	// k3s template doesn't have the KAIROS_MGMT_API SAN-detection block (only
+	// the push block), so the push_kubeconfig check above is sufficient.
 }
 
 func TestRenderK0sCloudConfig_WithoutInstallConfig(t *testing.T) {

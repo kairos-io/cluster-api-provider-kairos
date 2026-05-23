@@ -95,14 +95,27 @@ func validateTemplateData(d *TemplateData) error {
 		{"controlPlaneLBServiceName", d.ControlPlaneLBServiceName},
 		{"controlPlaneLBServiceNamespace", d.ControlPlaneLBServiceNamespace},
 		{"controlPlaneLBEndpoint", d.ControlPlaneLBEndpoint},
-		{"managementKubeconfigToken", d.ManagementKubeconfigToken},
-		{"managementKubeconfigSecretName", d.ManagementKubeconfigSecretName},
-		{"managementKubeconfigSecretNamespace", d.ManagementKubeconfigSecretNamespace},
-		{"managementAPIServer", d.ManagementAPIServer},
 	}
 	for _, f := range stringFields {
 		if err := rejectControlChars(f.name, f.value); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	// ManagementEndpoint is an optional nested struct; only when set do we
+	// check its fields. The nested-field names below mirror the JSON-style
+	// dotted form so the error message points the user back to the resolver
+	// output that produced it.
+	if d.ManagementEndpoint != nil {
+		nested := []struct{ name, value string }{
+			{"managementEndpoint.apiServer", d.ManagementEndpoint.APIServer},
+			{"managementEndpoint.token", d.ManagementEndpoint.Token},
+			{"managementEndpoint.kubeconfigSecretName", d.ManagementEndpoint.KubeconfigSecretName},
+			{"managementEndpoint.kubeconfigSecretNamespace", d.ManagementEndpoint.KubeconfigSecretNamespace},
+		}
+		for _, f := range nested {
+			if err := rejectControlChars(f.name, f.value); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	for i, g := range d.UserGroups {
