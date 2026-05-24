@@ -88,6 +88,16 @@ write_files:
     group: 0
     content: |
 {{ persistencyOEM | indent 6 }}
+  # systemd drop-in: skip k3s.service on the Kairos live installer.
+  # See the same drop-in in k3s_kairos_cloud_config_capk.yaml.tmpl for
+  # rationale. KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
+  - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      [Unit]
+      ConditionKernelCommandLine=!cdroot
   {{- if and (eq .Role "control-plane") .ProviderID }}
   - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
     permissions: "0644"
