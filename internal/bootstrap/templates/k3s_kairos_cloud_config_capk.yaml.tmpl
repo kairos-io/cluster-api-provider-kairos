@@ -123,6 +123,28 @@ write_files:
       kubelet-arg:
         - provider-id={{ .ProviderID }}
   {{- end }}
+  {{- if and (eq .Role "control-plane") .ControlPlaneLBEndpoint }}
+  # tls-san for the apiserver serving cert. Provider-kairos's `k3s.args:`
+  # integration was observed during KD-3b lab validation to NOT write
+  # /etc/rancher/k3s/config.yaml on Hadron, so k3s generated its serving
+  # cert with default SANs only (127.0.0.1, ::1, kubernetes.default.svc,
+  # 10.43.0.1, 10.0.2.2) — missing the LB IP. CAPI's clustercache then
+  # fails to verify the cert when connecting via the LB Service IP from
+  # the management cluster, leaving the Machine in
+  # `NodeHealthy: ConnectionDown` forever. Writing tls-san directly to
+  # config.yaml.d (the same pattern we already use for kubelet-arg above)
+  # ensures k3s reads it on every start and regenerates the cert with
+  # the correct SANs included.
+  - path: /etc/rancher/k3s/config.yaml.d/91-tls-san.yaml
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      # tls-san for apiserver serving cert; LB IP must be reachable from
+      # the management cluster (KD-3b push pattern).
+      tls-san:
+        - {{ .ControlPlaneLBEndpoint | quote }}
+  {{- end }}
   {{- if and (ne .Role "control-plane") .K3sToken }}
   - path: /etc/rancher/k3s/token
     permissions: "0644"
