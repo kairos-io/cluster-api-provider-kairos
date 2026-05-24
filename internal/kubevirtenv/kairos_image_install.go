@@ -27,8 +27,17 @@ const (
 	kairosCloudImageName = "kairos-kubevirt"
 	cdiUploadDefaultPort = 18443
 	// kairosOSArtifactDiskMiB is spec.artifacts.diskSize (MiB); the built .raw virtual size matches this.
-	// hadron-standard-k3s fits comfortably in 8 GiB; bumping this only slows down the build/upload.
-	kairosOSArtifactDiskMiB = 8000
+	// hadron-standard-k3s itself fits in ~5 GiB, but with hadron's A/B partition layout this leaves
+	// only ~3.3 GiB for the persistent partition on an 8 GiB disk. That was enough for the alpha-1
+	// SSH-poll path (the controller fetched the kubeconfig early in boot, before k3s finished its
+	// image pulls). After KD-3b (PR #55) the controller waits for the node to POST its kubeconfig
+	// via push_kubeconfig() inside kairos-k3s-post-bootstrap.service — which only runs after k3s is
+	// fully up. By that time, k3s's containerd has pulled pause/coredns/traefik/metrics-server etc.
+	// (~2 GiB extracted) and the persistent partition fills, producing virt-launcher "No disk
+	// capacity" → 25 min e2e timeout. 16 GiB virtual disk leaves ~11 GiB persistent, enough for
+	// k3s + workload pods + logs over the e2e lifetime. Bumping only slows build/upload; the
+	// alternative is aligning CI on the user's lab Ubuntu-Kairos images, tracked as KD-50.
+	kairosOSArtifactDiskMiB = 16000
 	// kairosCDIUploadExtraMiB is added to the CDI DataVolume virtctl --size so the PVC exceeds the raw image.
 	kairosCDIUploadExtraMiB = 1024
 )
