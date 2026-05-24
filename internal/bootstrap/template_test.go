@@ -248,7 +248,7 @@ func TestRenderK3sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
 	if !strings.Contains(result, "path: /usr/local/bin/kairos-k3s-post-bootstrap.sh") {
 		t.Error("Missing kairos-k3s-post-bootstrap.sh in write_files")
 	}
-	if !strings.Contains(result, "systemctl enable kairos-k3s-post-bootstrap.service") {
+	if !strings.Contains(result, "systemctl enable --now kairos-k3s-post-bootstrap.service") {
 		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
 	}
 }
@@ -411,7 +411,7 @@ func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
 	if !strings.Contains(result, "https://${lb_endpoint}:6443") {
 		t.Error("Missing ${lb_endpoint} reference in sed URL substitution")
 	}
-	if !strings.Contains(result, "systemctl enable kairos-k3s-post-bootstrap.service") {
+	if !strings.Contains(result, "systemctl enable --now kairos-k3s-post-bootstrap.service") {
 		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
 	}
 }
