@@ -19,6 +19,8 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
@@ -79,7 +81,7 @@ metadata:
   namespace: %[2]s
 spec:
   replicas: 1
-  version: "v1.35.2+k3s1"
+  version: "v1.35.4+k3s1"
   distribution: k3s
   machineTemplate:
     infrastructureRef:
@@ -150,7 +152,7 @@ spec:
     spec:
       role: control-plane
       distribution: k3s
-      kubernetesVersion: "v1.35.2+k3s1"
+      kubernetesVersion: "v1.35.4+k3s1"
       dnsServers:
         - "8.8.8.8"
       userName: kairos
@@ -331,6 +333,79 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 			_ = rc.Close()
 			_, _ = fmt.Fprintln(w)
 		}
+	}
+
+	// Bootstrap-data Secret structural check (KD-3b lab finding: when push doesn't fire,
+	// confirm the template actually rendered the unit + wait-loop into the Secret, instead
+	// of having to guess. We deliberately do NOT dump the Secret payload — it contains the
+	// bearer token and user password. We only assert markers are present.)
+	_, _ = fmt.Fprintf(w, "\n--- Bootstrap data Secret structural check ---\n")
+	if list, err := cs.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "cluster.x-k8s.io/cluster-name=" + clusterName,
+	}); err == nil {
+		for _, s := range list.Items {
+			if t := s.Type; t != "cluster.x-k8s.io/secret" && string(t) != "Opaque" {
+				continue
+			}
+			payload, ok := s.Data["value"]
+			if !ok || len(payload) == 0 {
+				continue
+			}
+			body := string(payload)
+			markers := []string{
+				"kairos-k0s-post-bootstrap.service",
+				"kairos-k3s-post-bootstrap.service",
+				"push_kubeconfig()",
+				"_wait_budget=300",
+				"ConditionKernelCommandLine=!cdroot",
+				"systemctl enable --now",
+				"bootstrap-success.complete",
+			}
+			_, _ = fmt.Fprintf(w, "  Secret %s (type=%s, %d bytes):\n", s.Name, s.Type, len(payload))
+			for _, m := range markers {
+				_, _ = fmt.Fprintf(w, "    %-44s present=%v\n", m, strings.Contains(body, m))
+			}
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
+	}
+
+	// Guest serial-log tail — KubeVirt writes virtio-serial output to
+	// /var/run/kubevirt-private/<vmi-uid>/virt-serial0-log inside the virt-launcher
+	// compute container. This is the only way to see what cloud-init / systemd /
+	// the kairos-*-post-bootstrap unit actually did inside the guest after CI fails.
+	_, _ = fmt.Fprintf(w, "\n--- VMI guest serial log (tail) ---\n")
+	if list, err := dc.Resource(vmiGVR).Namespace(namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, vmi := range list.Items {
+			uid := string(vmi.GetUID())
+			vmiName := vmi.GetName()
+			podName := ""
+			if pods, perr := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: "kubevirt.io=virt-launcher,vm.kubevirt.io/name=" + vmiName,
+			}); perr == nil && len(pods.Items) > 0 {
+				podName = pods.Items[0].Name
+			}
+			if podName == "" {
+				_, _ = fmt.Fprintf(w, "  vmi=%s no virt-launcher pod found\n", vmiName)
+				continue
+			}
+			serialPath := fmt.Sprintf("/var/run/kubevirt-private/%s/virt-serial0-log", uid)
+			cmd := exec.CommandContext(ctx, "kubectl",
+				"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
+				"-n", namespace, "exec", podName, "-c", "compute", "--",
+				"tail", "-c", "32768", serialPath,
+			)
+			out, runErr := cmd.CombinedOutput()
+			_, _ = fmt.Fprintf(w, "  vmi=%s pod=%s path=%s\n", vmiName, podName, serialPath)
+			if runErr != nil {
+				_, _ = fmt.Fprintf(w, "  exec error: %v\n  output:\n%s\n", runErr, string(out))
+			} else {
+				_, _ = w.Write(out)
+				_, _ = fmt.Fprintln(w)
+			}
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
 	}
 }
 
