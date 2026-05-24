@@ -142,6 +142,12 @@ write_files:
     content: |
       [Unit]
       Description=Kairos k0s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k0s
+      # node registration that never happens on the installer, holding
+      # up cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
       {{- if eq .Role "control-plane" }}
       After=k0s.service
       Wants=k0s.service
@@ -164,6 +170,9 @@ write_files:
     content: |
       [Unit]
       Description=Enable kairos-k0s-post-bootstrap service
+      # Skip on live installer; pairs with the same gate on the main
+      # post-bootstrap service. (KD-3b.)
+      ConditionKernelCommandLine=!cdroot
       After=systemd-udev-settle.service
       Before=multi-user.target
 

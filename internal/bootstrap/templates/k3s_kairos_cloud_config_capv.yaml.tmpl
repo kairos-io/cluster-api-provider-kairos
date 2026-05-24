@@ -123,6 +123,13 @@ write_files:
     content: |
       [Unit]
       Description=Kairos k3s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k3s
+      # node registration that never happens on the installer (overlayfs
+      # snapshotter cannot nest on the live tmpfs overlay), holding up
+      # cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
       {{- if eq .Role "control-plane" }}
       After=k3s.service
       Wants=k3s.service
