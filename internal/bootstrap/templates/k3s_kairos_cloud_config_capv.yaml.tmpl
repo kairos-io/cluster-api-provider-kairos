@@ -349,5 +349,10 @@ stages:
     {{- end }}
 
 runcmd:
+  # `enable --now`: create the multi-user.target.wants/ symlink AND start
+  # the unit on this boot. Plain `enable` only creates the symlink; the
+  # service would only auto-start on the NEXT boot — too late for the
+  # KD-3b push pattern, which needs to fire on the first installed-system
+  # boot. Same fix the k0s templates use via the helper service.
   - /bin/systemctl daemon-reload || true
-  - /bin/systemctl enable kairos-k3s-post-bootstrap.service || true
+  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true
