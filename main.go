@@ -116,10 +116,26 @@ func main() {
 	// resolver itself short-circuits to (nil, nil) when ManagementAPIServer
 	// is empty — the documented disabled signal — so an empty Host stays a
 	// graceful "render without push block" rather than a startup error.
+	//
+	// KAIROS_MANAGEMENT_API_OVERRIDE: when set, overrides mgr.GetConfig().Host
+	// as the URL nodes dial back to. Required for non-CAPK infrastructure
+	// (CAPV, CAPM3, Tinkerbell) where workload VMs live on a different network
+	// than the management cluster's service IP — the in-cluster service URL
+	// (typically https://10.96.0.1:443 or kubernetes.default.svc) is not
+	// routable from workload VMs on a LAN. Set this env var to a
+	// LAN-reachable URL (e.g., https://<mgmt-cp-node-ip>:6443) on the
+	// controller Deployment. PR-9's Spec.SSHFallback is the air-gapped
+	// alternative for environments where no such reachability exists.
+	mgmtAPIServer := mgr.GetConfig().Host
+	if override := os.Getenv("KAIROS_MANAGEMENT_API_OVERRIDE"); override != "" {
+		setupLog.Info("Overriding management API server URL from environment",
+			"original", mgmtAPIServer, "override", override)
+		mgmtAPIServer = override
+	}
 	mgmtResolver := bootstrap.NewKubeVirtTokenResolver(
 		mgr.GetClient(),
 		mgr.GetScheme(),
-		mgr.GetConfig().Host,
+		mgmtAPIServer,
 	)
 	if err = (&bootstrap.KairosConfigReconciler{
 		Client:               mgr.GetClient(),
