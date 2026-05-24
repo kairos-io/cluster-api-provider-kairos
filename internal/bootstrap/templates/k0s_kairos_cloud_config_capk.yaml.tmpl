@@ -598,23 +598,25 @@ stages:
 
 {{- /*
   Post-bootstrap service enablement: kairos-k0s-post-bootstrap.service is
-  enabled by kairos-k0s-post-bootstrap-enable.service, which is itself
-  symlinked into multi-user.target.wants by the runcmd entries below. The
-  symlink-creation lines previously lived in stages.initramfs.commands; they
-  moved to runcmd alongside the unit + script writes when KD-3b lab
-  validation showed stages.initramfs writes don't persist on Hadron images.
-
-  The kairos-k0s-lb-sans.path watcher does still need to be enabled
-  explicitly on control-plane nodes; there is no equivalent enabler
-  service for it, so we enable + start it here once after first boot has
-  written the unit file.
+  enabled by kairos-k0s-post-bootstrap-enable.service. The previous
+  symlink-via-`ln -sf` approach worked when the unit file was written by
+  stages.initramfs.files (early boot, before multi-user.target was active).
+  After moving the unit writes to top-level write_files for Hadron compat
+  (KD-3b), runcmd executes too late in boot for systemd to re-scan
+  multi-user.target.wants/, so the helper service never starts. Replace
+  the manual symlink with `systemctl enable --now` (same pattern the
+  kairos-k0s-lb-sans block uses below): enable creates the multi-user
+  symlink AND starts the helper service immediately on this boot.
 */}}
 runcmd:
-  # Create symlink to enable the helper service that enables the main service
-  - mkdir -p /etc/systemd/system/multi-user.target.wants
-  - ln -sf /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service /etc/systemd/system/multi-user.target.wants/kairos-k0s-post-bootstrap-enable.service || true
-{{- if and .IsKubeVirt (eq .Role "control-plane") }}
+  # Enable + start the helper service explicitly. `enable --now` both
+  # creates the multi-user.target.wants/ symlink for next boot AND starts
+  # the unit on this boot. Required after KD-3b moved unit writes from
+  # stages.initramfs.files to top-level write_files (runcmd is now too
+  # late in boot for ln-only symlink creation to be honored by systemd).
   - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k0s-post-bootstrap-enable.service || true
+{{- if and .IsKubeVirt (eq .Role "control-plane") }}
   - /bin/systemctl enable kairos-k0s-lb-sans.path || true
   - /bin/systemctl start kairos-k0s-lb-sans.path || true
 {{- end }}
