@@ -390,13 +390,25 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 				continue
 			}
 			serialPath := fmt.Sprintf("/var/run/kubevirt-private/%s/virt-serial0-log", uid)
+			// Capture file size first so we know whether we're hitting tail-truncation
+			// or whether the VM actually stopped writing serial output.
+			sizeCmd := exec.CommandContext(ctx, "kubectl",
+				"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
+				"-n", namespace, "exec", podName, "-c", "compute", "--",
+				"sh", "-c", fmt.Sprintf("wc -c %s 2>&1 || true", serialPath),
+			)
+			sizeOut, _ := sizeCmd.CombinedOutput()
+			_, _ = fmt.Fprintf(w, "  vmi=%s pod=%s path=%s\n", vmiName, podName, serialPath)
+			_, _ = fmt.Fprintf(w, "  size: %s", string(sizeOut))
+			// Dump up to ~2 MiB tail. For a hung early-boot VM this is the whole file;
+			// for a long-running VM it's enough to capture the last few minutes of
+			// cloud-init / systemd / k0s|k3s / kairos-*-post-bootstrap output.
 			cmd := exec.CommandContext(ctx, "kubectl",
 				"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
 				"-n", namespace, "exec", podName, "-c", "compute", "--",
-				"tail", "-c", "32768", serialPath,
+				"tail", "-c", "2097152", serialPath,
 			)
 			out, runErr := cmd.CombinedOutput()
-			_, _ = fmt.Fprintf(w, "  vmi=%s pod=%s path=%s\n", vmiName, podName, serialPath)
 			if runErr != nil {
 				_, _ = fmt.Fprintf(w, "  exec error: %v\n  output:\n%s\n", runErr, string(out))
 			} else {
