@@ -482,27 +482,51 @@ func (e *Environment) downloadImageFromNginx(ctx context.Context, clientset kube
 	if nodeIP == "" {
 		return fmt.Errorf("node internal IP not found")
 	}
-	fn := fmt.Sprintf("%s.raw", kairosCloudImageName)
-	url := fmt.Sprintf("http://%s:%d/%s", nodeIP, nodePort, fn)
-	outPath := filepath.Join(buildDir, fn)
-	log.Infof("Downloading %s from %s", fn, url)
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
+	// OSArtifact iso:true publishes <name>.iso through the nginx exporter; older
+	// cloudImage:true paths publish <name>.raw. Try the current build's expected
+	// filename first, then fall back to the legacy extension so a local exporter
+	// configured differently still works.
+	exts := []string{"iso", "raw"}
+	var (
+		fn      string
+		outPath string
+		fetched bool
+	)
+	for _, ext := range exts {
+		candidate := fmt.Sprintf("%s.%s", kairosCloudImageName, ext)
+		candidateURL := fmt.Sprintf("http://%s:%d/%s", nodeIP, nodePort, candidate)
+		log.Infof("Trying %s ...", candidateURL)
+		resp, err := http.Get(candidateURL)
+		if err != nil {
+			log.Infof("  GET error: %v", err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			log.Infof("  HTTP %d", resp.StatusCode)
+			continue
+		}
+		fn = candidate
+		outPath = filepath.Join(buildDir, fn)
+		out, err := os.Create(outPath)
+		if err != nil {
+			_ = resp.Body.Close()
+			return err
+		}
+		if _, copyErr := io.Copy(out, resp.Body); copyErr != nil {
+			_ = out.Close()
+			_ = resp.Body.Close()
+			return copyErr
+		}
+		_ = out.Close()
+		_ = resp.Body.Close()
+		fetched = true
+		log.Infof("Downloaded %s -> %s", fn, outPath)
+		break
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
+	if !fetched {
+		return fmt.Errorf("download: no %s.iso or %s.raw served from exporter on %s:%d", kairosCloudImageName, kairosCloudImageName, nodeIP, nodePort)
 	}
-	out, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
-	}
-	log.Infof("Downloaded to: %s", outPath)
 	log.Infof("Checking for built image...")
 	matches, err := filepath.Glob(filepath.Join(buildDir, fmt.Sprintf("%s*", kairosCloudImageName)))
 	if err == nil && len(matches) > 0 {
