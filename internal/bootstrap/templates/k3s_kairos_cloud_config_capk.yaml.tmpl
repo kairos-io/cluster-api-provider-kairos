@@ -327,8 +327,19 @@ MANIFEST_EOF
       # Update server URL to LB endpoint so management cluster can connect
       push_kubeconfig() {
         local kubeconfig_file="/etc/rancher/k3s/k3s.yaml"
+        # Wait up to 5min for k3s to write k3s.yaml. After=k3s.service only
+        # orders against service activation, not bootstrap completion, so on
+        # slower hosts (Hadron+CAPV lab finding) the file is not yet present
+        # when this unit fires. Without this wait the unit silently abandons
+        # the push and KCP stays in WaitingForNodePush forever (KD-3b).
+        local _wait_budget=300
+        local _wait_elapsed=0
+        while [ ! -f "${kubeconfig_file}" ] && [ ${_wait_elapsed} -lt ${_wait_budget} ]; do
+          sleep 5
+          _wait_elapsed=$((_wait_elapsed + 5))
+        done
         if [ ! -f "${kubeconfig_file}" ]; then
-          echo "WARN: kubeconfig file not found at ${kubeconfig_file}"
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file} after ${_wait_budget}s"
           return 1
         fi
         if ! command -v curl >/dev/null 2>&1; then

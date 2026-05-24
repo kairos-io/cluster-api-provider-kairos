@@ -683,6 +683,14 @@ func TestRenderK0sCloudConfig_CapvKubeconfigPush(t *testing.T) {
 	if !strings.Contains(result, "/var/lib/k0s/pki/admin.conf") {
 		t.Error("Missing k0s kubeconfig path in push block")
 	}
+	// KD-3b race fix: post-bootstrap must wait for admin.conf to appear, not
+	// silently abandon the push if k0s hasn't finished bootstrapping yet.
+	if !strings.Contains(result, "_wait_budget=300") {
+		t.Error("Missing 5min wait-loop for admin.conf in push block (KD-3b race)")
+	}
+	if !strings.Contains(result, "while [ ! -f \"${kubeconfig_file}\" ]") {
+		t.Error("Missing wait-loop guard on kubeconfig_file existence")
+	}
 	if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
 		t.Error("Push block must stamp cluster-name label on the Secret payload")
 	}
@@ -732,6 +740,14 @@ func TestRenderK3sCloudConfig_CapvKubeconfigPush(t *testing.T) {
 	}
 	if !strings.Contains(result, "/etc/rancher/k3s/k3s.yaml") {
 		t.Error("Missing k3s kubeconfig path in push block")
+	}
+	// KD-3b race fix: post-bootstrap must wait for k3s.yaml to appear, not
+	// silently abandon the push if k3s hasn't finished bootstrapping yet.
+	if !strings.Contains(result, "_wait_budget=300") {
+		t.Error("Missing 5min wait-loop for k3s.yaml in push block (KD-3b race)")
+	}
+	if !strings.Contains(result, "while [ ! -f \"${kubeconfig_file}\" ]") {
+		t.Error("Missing wait-loop guard on kubeconfig_file existence")
 	}
 	if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
 		t.Error("Push block must stamp cluster-name label on the Secret payload")
@@ -833,6 +849,12 @@ func TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation(t *testing.T) 
 			}
 			if !strings.Contains(result, "local cluster_name='capk-cluster'") {
 				t.Errorf("CAPK %s push block missing shquote'd cluster_name var", dist)
+			}
+			// KD-3b race fix: wait-loop must be rendered in CAPK too — the race
+			// exists for any distribution whose service starts faster than its
+			// kubeconfig is written.
+			if !strings.Contains(result, "_wait_budget=300") {
+				t.Errorf("CAPK %s push block missing wait-loop for kubeconfig file", dist)
 			}
 		})
 	}
