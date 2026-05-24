@@ -139,7 +139,11 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	g.Expect(sa.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, "test-cluster"))
 	role := &rbacv1.Role{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
-	g.Expect(role.Rules).To(HaveLen(3))
+	// 4 rules after KD-3b: secrets/create (no resourceNames, K8s RBAC
+	// silent-fail workaround), secrets/get,update,patch on the named
+	// kubeconfig Secret, kubevirt.io VMI/get (CAPK SAN detection),
+	// services/get (CAPK LB endpoint discovery).
+	g.Expect(role.Rules).To(HaveLen(4))
 	rb := &rbacv1.RoleBinding{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, rb)).To(Succeed())
 	g.Expect(rb.RoleRef.Name).To(Equal(saName))

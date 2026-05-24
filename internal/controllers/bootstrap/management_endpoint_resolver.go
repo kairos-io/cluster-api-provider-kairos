@@ -116,12 +116,32 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		},
 	}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, role, func() error {
+		// Kubernetes RBAC silently ignores resourceNames for the `create`
+		// verb because at create-time the named resource doesn't exist yet
+		// (https://kubernetes.io/docs/reference/access-authn-authz/rbac/
+		//  #referring-to-resources). Granting `create` with resourceNames
+		// produces a Role that get/update/patch correctly on the named
+		// Secret but blocks create with HTTP 403 — observable as the node
+		// failing to push its kubeconfig on first boot. Split into two
+		// rules: a narrow create rule with no resourceNames, and a
+		// resourceNames-restricted rule for the rest. Net authorization
+		// after the split is "this SA may create any Secret in this
+		// namespace, and may get/update/patch ONLY the named Secret."
+		// The create-without-resourceNames widening is bounded by the
+		// per-cluster Role+RoleBinding scope (a node only ever has its own
+		// cluster's bearer token) and is least-privilege relative to
+		// granting `create` on all Secrets cluster-wide.
 		role.Rules = []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"create"},
+			},
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"secrets"},
 				ResourceNames: []string{secretName},
-				Verbs:         []string{"get", "create", "update", "patch"},
+				Verbs:         []string{"get", "update", "patch"},
 			},
 			{
 				APIGroups: []string{"kubevirt.io"},
