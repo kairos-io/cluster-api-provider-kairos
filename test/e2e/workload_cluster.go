@@ -48,9 +48,14 @@ var (
 	vmiGVR                  = schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances"}
 )
 
-// applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt.
-// The VM boots directly from the Kairos cloud image (kairos-kubevirt DataVolume) — no ISO
-// install step is needed since the cloud image is a pre-built bootable disk.
+// applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt
+// using the 2-disk Kairos installer pattern (KD-50): the VM boots the Kairos LIVE installer
+// ISO (cdrom, bootOrder: 1), the installer auto-detects the cloud-config (rendered into the
+// KubeVirt configdrive by CAPK), runs `install: { auto: true, device: "auto", reboot: true }`,
+// writes the COS A/B layout onto a blank target disk (rootdisk, virtio, bootOrder: 2), and
+// reboots into the installed system. This mirrors the lab CAPK validation path and bypasses
+// the OSArtifact cloudImage:true → direct-boot raw build path, which produces a layout that
+// Hadron's initrd does not boot ("Expecting device /dev/disk/by-label/COS_ACTIVE" hang).
 func applyWorkloadClusterManifests(env *kubevirtenv.Environment, dc dynamic.Interface, cfg *rest.Config, clusterName, namespace string) {
 	yaml := fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
@@ -105,6 +110,17 @@ spec:
       virtualMachineTemplate:
         spec:
           runStrategy: Always
+          dataVolumeTemplates:
+          - metadata:
+              name: %[1]s-rootdisk
+            spec:
+              source:
+                blank: {}
+              pvc:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: %[3]dGi
           template:
             metadata:
               labels:
@@ -118,10 +134,14 @@ spec:
                     memory: 4Gi
                 devices:
                   disks:
+                  - name: installerdisk
+                    cdrom:
+                      bus: sata
+                    bootOrder: 1
                   - name: rootdisk
                     disk:
                       bus: virtio
-                    bootOrder: 1
+                    bootOrder: 2
                   interfaces:
                   - name: default
                     masquerade: {}
@@ -138,9 +158,12 @@ spec:
               - name: default
                 pod: {}
               volumes:
-              - name: rootdisk
+              - name: installerdisk
                 dataVolume:
                   name: kairos-kubevirt
+              - name: rootdisk
+                dataVolume:
+                  name: %[1]s-rootdisk
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
@@ -153,13 +176,17 @@ spec:
       role: control-plane
       distribution: k3s
       kubernetesVersion: "v1.35.4+k3s1"
+      install:
+        auto: true
+        device: "auto"
+        reboot: true
       dnsServers:
         - "8.8.8.8"
       userName: kairos
       userPassword: kairos
       userGroups:
         - admin
-`, clusterName, namespace)
+`, clusterName, namespace, kubevirtenv.KairosRootDiskGiB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

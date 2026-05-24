@@ -24,22 +24,22 @@ import (
 )
 
 const (
+	// kairosCloudImageName is the DataVolume name for the Kairos installer ISO uploaded to CDI.
+	// It is also the OSArtifact CR name. The name predates the v0.0.4 → v0.2.0 + installer-pattern
+	// switch and is intentionally unchanged to avoid churn across the test stack.
 	kairosCloudImageName = "kairos-kubevirt"
 	cdiUploadDefaultPort = 18443
-	// kairosOSArtifactDiskMiB is spec.artifacts.diskSize (MiB); the built .raw virtual size matches this.
-	// hadron-standard-k3s itself fits in ~5 GiB, but with hadron's A/B partition layout this leaves
-	// only ~3.3 GiB for the persistent partition on an 8 GiB disk. That was enough for the alpha-1
-	// SSH-poll path (the controller fetched the kubeconfig early in boot, before k3s finished its
-	// image pulls). After KD-3b (PR #55) the controller waits for the node to POST its kubeconfig
-	// via push_kubeconfig() inside kairos-k3s-post-bootstrap.service — which only runs after k3s is
-	// fully up. By that time, k3s's containerd has pulled pause/coredns/traefik/metrics-server etc.
-	// (~2 GiB extracted) and the persistent partition fills, producing virt-launcher "No disk
-	// capacity" → 25 min e2e timeout. 16 GiB virtual disk leaves ~11 GiB persistent, enough for
-	// k3s + workload pods + logs over the e2e lifetime. Bumping only slows build/upload; the
-	// alternative is aligning CI on the user's lab Ubuntu-Kairos images, tracked as KD-50.
+	// kairosOSArtifactDiskMiB is spec.artifacts.diskSize (MiB). For the installer-ISO build path
+	// (iso: true) this controls the on-disk staging area in the kairos-operator builder and the
+	// CDI PVC size, not the rootdisk size of the workload VM (which gets its own blank DV).
+	// 16 GiB stays generous enough for the installer + initramfs + tools without slowing builds.
 	kairosOSArtifactDiskMiB = 16000
 	// kairosCDIUploadExtraMiB is added to the CDI DataVolume virtctl --size so the PVC exceeds the raw image.
 	kairosCDIUploadExtraMiB = 1024
+	// KairosRootDiskGiB is the size of the blank target disk into which the Kairos installer writes
+	// the COS A/B layout + persistent partition. Sized for k3s + workload pods + ~2 GiB of container
+	// image cache. Exported so the e2e workload-cluster manifest can reference it.
+	KairosRootDiskGiB = 16
 )
 
 func (e *Environment) kairosImageBuildDir() string {
@@ -253,11 +253,16 @@ func (e *Environment) findKairosImageFile() (string, error) {
 			return envFile, nil
 		}
 	}
-	defaultFile := filepath.Join(e.kairosImageBuildDir(), fmt.Sprintf("%s.raw", kairosCloudImageName))
-	if _, err := os.Stat(defaultFile); err == nil {
-		return defaultFile, nil
-	}
+	// Prefer .iso (installer; current build path) but accept .raw / .qcow2 for
+	// backwards compatibility with the cloudImage:true build path and for local
+	// experiments where the operator runs both exporters.
 	buildDir := e.kairosImageBuildDir()
+	for _, ext := range []string{".iso", ".raw", ".qcow2"} {
+		candidate := filepath.Join(buildDir, kairosCloudImageName+ext)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
 	if entries, err := os.ReadDir(buildDir); err == nil {
 		for _, entry := range entries {
 			if entry.IsDir() {
@@ -266,13 +271,13 @@ func (e *Environment) findKairosImageFile() (string, error) {
 			name := entry.Name()
 			if strings.HasPrefix(name, kairosCloudImageName) {
 				ext := filepath.Ext(name)
-				if ext == ".raw" || ext == ".qcow2" {
+				if ext == ".iso" || ext == ".raw" || ext == ".qcow2" {
 					return filepath.Join(buildDir, name), nil
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("image file not found under %s", buildDir)
+	return "", fmt.Errorf("image file not found under %s (expected %s.iso or .raw/.qcow2)", buildDir, kairosCloudImageName)
 }
 
 func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kubernetes.Interface) error {
@@ -361,7 +366,7 @@ spec:
     ref: %q
   artifacts:
     arch: %s
-    cloudImage: true
+    iso: true
     diskSize: "%d"
     cloudConfigRef:
       name: %s-cloud-config
