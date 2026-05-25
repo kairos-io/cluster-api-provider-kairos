@@ -116,12 +116,32 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		},
 	}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, role, func() error {
+		// Kubernetes RBAC silently ignores resourceNames for the `create`
+		// verb because at create-time the named resource doesn't exist yet
+		// (https://kubernetes.io/docs/reference/access-authn-authz/rbac/
+		//  #referring-to-resources). Granting `create` with resourceNames
+		// produces a Role that get/update/patch correctly on the named
+		// Secret but blocks create with HTTP 403 — observable as the node
+		// failing to push its kubeconfig on first boot. Split into two
+		// rules: a narrow create rule with no resourceNames, and a
+		// resourceNames-restricted rule for the rest. Net authorization
+		// after the split is "this SA may create any Secret in this
+		// namespace, and may get/update/patch ONLY the named Secret."
+		// The create-without-resourceNames widening is bounded by the
+		// per-cluster Role+RoleBinding scope (a node only ever has its own
+		// cluster's bearer token) and is least-privilege relative to
+		// granting `create` on all Secrets cluster-wide.
 		role.Rules = []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"create"},
+			},
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"secrets"},
 				ResourceNames: []string{secretName},
-				Verbs:         []string{"get", "create", "update", "patch"},
+				Verbs:         []string{"get", "update", "patch"},
 			},
 			{
 				APIGroups: []string{"kubevirt.io"},
@@ -176,7 +196,20 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 	expirationSeconds := int64(24 * 60 * 60)
 	tokenRequest := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
-			Audiences:         []string{"https://kubernetes.default.svc"},
+			// Include both common audience variants so the token validates
+			// against kube-apiservers configured with either the short DNS
+			// name (--api-audiences=https://kubernetes.default.svc) or the
+			// FQDN (--api-audiences=https://kubernetes.default.svc.cluster.local,
+			// which is the kubeadm/kind/most-managed-K8s default). Tokens
+			// minted with a single audience that doesn't match the
+			// api-server's accepted set fail with HTTP 401 at push time —
+			// surfaced by the KD-3b PR-7 lab regression on the CI kind
+			// cluster (which uses the FQDN), where the production lab
+			// cluster happens to accept the short form. KD-50.
+			Audiences: []string{
+				"https://kubernetes.default.svc",
+				"https://kubernetes.default.svc.cluster.local",
+			},
 			ExpirationSeconds: &expirationSeconds,
 		},
 	}

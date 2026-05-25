@@ -24,13 +24,23 @@ import (
 )
 
 const (
+	// kairosCloudImageName is the DataVolume name for the Kairos installer ISO uploaded to CDI.
+	// It is also the OSArtifact CR name. The name predates the v0.0.4 → v0.2.0 + installer-pattern
+	// switch and is intentionally unchanged to avoid churn across the test stack.
 	kairosCloudImageName = "kairos-kubevirt"
 	cdiUploadDefaultPort = 18443
-	// kairosOSArtifactDiskMiB is spec.artifacts.diskSize (MiB); the built .raw virtual size matches this.
-	// hadron-standard-k3s fits comfortably in 8 GiB; bumping this only slows down the build/upload.
-	kairosOSArtifactDiskMiB = 8000
+	// kairosOSArtifactDiskMiB is spec.artifacts.diskSize (MiB). For the installer-ISO build path
+	// (iso: true) this controls the on-disk staging area in the kairos-operator builder and the
+	// CDI PVC size, not the rootdisk size of the workload VM (which gets its own blank DV).
+	// 16 GiB stays generous enough for the installer + initramfs + tools without slowing builds.
+	kairosOSArtifactDiskMiB = 16000
 	// kairosCDIUploadExtraMiB is added to the CDI DataVolume virtctl --size so the PVC exceeds the raw image.
 	kairosCDIUploadExtraMiB = 1024
+	// KairosRootDiskGiB is the size of the blank target disk into which the Kairos installer writes
+	// the COS A/B layout + persistent partition. The KD-3b lab manifest sizes this at 40 GiB, which
+	// leaves enough headroom for the A/B images + persistent partition + k3s containerd image cache.
+	// Exported so the e2e workload-cluster manifest can reference it.
+	KairosRootDiskGiB = 40
 )
 
 func (e *Environment) kairosImageBuildDir() string {
@@ -40,12 +50,20 @@ func (e *Environment) kairosImageBuildDir() string {
 // kairosOSArtifactBaseImage is a published Kairos hadron image with k3s preinstalled, matching the host GOARCH.
 // The "core" family ships without a Kubernetes distro and is unusable for CAPI workload nodes; "hadron-standard-k3s"
 // is also significantly smaller, which speeds up build + CDI upload.
+//
+// Pinned to v0.2.0 GA to align CI with the image stack used for KD-3b PR-7
+// lab validation (Hadron Linux v0.2.0, kernel 7.0.6-hadron). The previous
+// v0.0.4 pin pre-dated the post-bootstrap unit changes in this PR and let
+// CI diverge from the lab in ways that were impossible to reproduce.
+// k3s baked into the image is v1.35.4; the manifest's `kubernetesVersion`
+// is ignored by the Kairos k3s.enabled cloud-config primitive (the binary
+// in the image wins). Tracked separately as KD-50 / task #12.
 func kairosOSArtifactBaseImage(goarch string) string {
 	switch goarch {
 	case "arm64":
-		return "quay.io/kairos/hadron:v0.0.4-standard-arm64-generic-v4.0.3-k3s-v1.35.2-k3s1"
+		return "quay.io/kairos/hadron:v0.2.0-standard-arm64-generic-v4.1.0-k3s-v1.35.4-k3s1"
 	default:
-		return "quay.io/kairos/hadron:v0.0.4-standard-amd64-generic-v4.0.3-k3s-v1.35.2-k3s1"
+		return "quay.io/kairos/hadron:v0.2.0-standard-amd64-generic-v4.1.0-k3s-v1.35.4-k3s1"
 	}
 }
 
@@ -236,11 +254,16 @@ func (e *Environment) findKairosImageFile() (string, error) {
 			return envFile, nil
 		}
 	}
-	defaultFile := filepath.Join(e.kairosImageBuildDir(), fmt.Sprintf("%s.raw", kairosCloudImageName))
-	if _, err := os.Stat(defaultFile); err == nil {
-		return defaultFile, nil
-	}
+	// Prefer .iso (installer; current build path) but accept .raw / .qcow2 for
+	// backwards compatibility with the cloudImage:true build path and for local
+	// experiments where the operator runs both exporters.
 	buildDir := e.kairosImageBuildDir()
+	for _, ext := range []string{".iso", ".raw", ".qcow2"} {
+		candidate := filepath.Join(buildDir, kairosCloudImageName+ext)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
 	if entries, err := os.ReadDir(buildDir); err == nil {
 		for _, entry := range entries {
 			if entry.IsDir() {
@@ -249,22 +272,39 @@ func (e *Environment) findKairosImageFile() (string, error) {
 			name := entry.Name()
 			if strings.HasPrefix(name, kairosCloudImageName) {
 				ext := filepath.Ext(name)
-				if ext == ".raw" || ext == ".qcow2" {
+				if ext == ".iso" || ext == ".raw" || ext == ".qcow2" {
 					return filepath.Join(buildDir, name), nil
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("image file not found under %s", buildDir)
+	return "", fmt.Errorf("image file not found under %s (expected %s.iso or .raw/.qcow2)", buildDir, kairosCloudImageName)
 }
 
 func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kubernetes.Interface) error {
 	log := e.log()
 	log.Infof("Creating cloud-config Secret...")
+	// This cloud-config is baked into the live installer ISO via the OSArtifact
+	// `cloudConfigRef`. The `install.auto/device/reboot` triple is what tells the
+	// live installer to run an unattended install and reboot into the installed
+	// system on first boot — without it the live installer drops to an
+	// interactive root shell (KD-50 lab finding: e2e log showed
+	// "Welcome to Kairos! / [root@... ~]#" instead of an install banner).
+	// The KairosConfigTemplate in the workload manifest also sets install.auto
+	// for completeness, but the LIVE installer's decision uses the baked /oem/.
+	// extra_cmdline puts `console=ttyS0` AFTER the default `console=tty1`
+	// so the kernel's primary console is the virtio serial — `forward_to_console`
+	// then writes the systemd journal to /dev/console which our serial0-log
+	// captures. Prior iteration ended `console=tty0` which routed the journal
+	// to the (uncaptured) graphics console and left us blind past t≈16s of
+	// the installed-system boot.
 	cloudConfig := `#cloud-config
 install:
+  auto: true
+  device: "/dev/vda"
+  reboot: true
   grub_options:
-    extra_cmdline: "console=ttyS0 console=tty0"
+    extra_cmdline: "console=ttyS0 systemd.journald.forward_to_console=1"
 `
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -344,7 +384,7 @@ spec:
     ref: %q
   artifacts:
     arch: %s
-    cloudImage: true
+    iso: true
     diskSize: "%d"
     cloudConfigRef:
       name: %s-cloud-config
@@ -460,27 +500,51 @@ func (e *Environment) downloadImageFromNginx(ctx context.Context, clientset kube
 	if nodeIP == "" {
 		return fmt.Errorf("node internal IP not found")
 	}
-	fn := fmt.Sprintf("%s.raw", kairosCloudImageName)
-	url := fmt.Sprintf("http://%s:%d/%s", nodeIP, nodePort, fn)
-	outPath := filepath.Join(buildDir, fn)
-	log.Infof("Downloading %s from %s", fn, url)
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
+	// OSArtifact iso:true publishes <name>.iso through the nginx exporter; older
+	// cloudImage:true paths publish <name>.raw. Try the current build's expected
+	// filename first, then fall back to the legacy extension so a local exporter
+	// configured differently still works.
+	exts := []string{"iso", "raw"}
+	var (
+		fn      string
+		outPath string
+		fetched bool
+	)
+	for _, ext := range exts {
+		candidate := fmt.Sprintf("%s.%s", kairosCloudImageName, ext)
+		candidateURL := fmt.Sprintf("http://%s:%d/%s", nodeIP, nodePort, candidate)
+		log.Infof("Trying %s ...", candidateURL)
+		resp, err := http.Get(candidateURL)
+		if err != nil {
+			log.Infof("  GET error: %v", err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			log.Infof("  HTTP %d", resp.StatusCode)
+			continue
+		}
+		fn = candidate
+		outPath = filepath.Join(buildDir, fn)
+		out, err := os.Create(outPath)
+		if err != nil {
+			_ = resp.Body.Close()
+			return err
+		}
+		if _, copyErr := io.Copy(out, resp.Body); copyErr != nil {
+			_ = out.Close()
+			_ = resp.Body.Close()
+			return copyErr
+		}
+		_ = out.Close()
+		_ = resp.Body.Close()
+		fetched = true
+		log.Infof("Downloaded %s -> %s", fn, outPath)
+		break
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
+	if !fetched {
+		return fmt.Errorf("download: no %s.iso or %s.raw served from exporter on %s:%d", kairosCloudImageName, kairosCloudImageName, nodeIP, nodePort)
 	}
-	out, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
-	}
-	log.Infof("Downloaded to: %s", outPath)
 	log.Infof("Checking for built image...")
 	matches, err := filepath.Glob(filepath.Join(buildDir, fmt.Sprintf("%s*", kairosCloudImageName)))
 	if err == nil && len(matches) > 0 {

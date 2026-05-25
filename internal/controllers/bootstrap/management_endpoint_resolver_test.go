@@ -139,7 +139,11 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	g.Expect(sa.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, "test-cluster"))
 	role := &rbacv1.Role{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
-	g.Expect(role.Rules).To(HaveLen(3))
+	// 4 rules after KD-3b: secrets/create (no resourceNames, K8s RBAC
+	// silent-fail workaround), secrets/get,update,patch on the named
+	// kubeconfig Secret, kubevirt.io VMI/get (CAPK SAN detection),
+	// services/get (CAPK LB endpoint discovery).
+	g.Expect(role.Rules).To(HaveLen(4))
 	rb := &rbacv1.RoleBinding{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, rb)).To(Succeed())
 	g.Expect(rb.RoleRef.Name).To(Equal(saName))
@@ -223,6 +227,30 @@ func TestResolve_Idempotent_TwoCallsNoConflict(t *testing.T) {
 	// (KD-33b will add caching; this assertion is the regression guard for
 	// the "remove caching by accident" reverse direction.)
 	g.Expect(sub.createCalls).To(Equal(2))
+}
+
+// TestResolve_HappyPath_CAPVCluster asserts the resolver returns the same
+// ManagementEndpoint shape regardless of the underlying infrastructure
+// provider — for KD-3b, the resolver is called for CAPV control planes too
+// (gate broadened from CAPK-only). The test deliberately constructs no CAPK
+// or CAPV-specific objects: the resolver is infra-agnostic on its happy path
+// (the per-infra differentiation lives in supportsManagementEndpoint, not
+// here). What this test asserts is that nothing in the resolver implicitly
+// depends on a KubeVirt-only object existing.
+func TestResolve_HappyPath_CAPVCluster(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok-capv"}
+	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	cluster.Name = "capv-cluster" // override the default name to make assertions sharper
+
+	got, err := r.Resolve(context.Background(), kc, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(got).NotTo(BeNil())
+	g.Expect(got.Token).To(Equal("tok-capv"))
+	g.Expect(got.KubeconfigSecretName).To(Equal("capv-cluster-kubeconfig"))
+	g.Expect(got.KubeconfigSecretNamespace).To(Equal("default"))
+	g.Expect(got.APIServer).To(Equal("https://mgmt:6443"))
 }
 
 // TestResolve_PreExistingServiceAccount_StillSucceeds covers the case where

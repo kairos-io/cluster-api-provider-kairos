@@ -68,18 +68,32 @@ type TemplateData struct {
 	ManagementEndpoint *ManagementEndpoint
 }
 
-// ManagementEndpoint bundles the four values the rendered cloud-config needs
+// ManagementEndpoint bundles the values the rendered cloud-config needs
 // to push the workload kubeconfig back to the management cluster without SSH:
-// the management API URL, an authenticated bearer token, and the
-// (namespace, name) of the kubeconfig Secret to write. All four fields are
-// rendered into shell command positions via the shquote template func — any
-// new field added here that lands in a shell context MUST be routed through
-// shquote per the rules in internal/bootstrap/CLAUDE.md § "Shell contexts".
+// the management API URL, an authenticated bearer token, the (namespace, name)
+// of the kubeconfig Secret to write, plus identity metadata stamped onto that
+// Secret. All shell-context fields are rendered into shell command positions
+// via the shquote template func — any new field added here that lands in a
+// shell context MUST be routed through shquote per the rules in
+// internal/bootstrap/CLAUDE.md § "Shell contexts".
+//
+// ClusterName is stamped into the Secret as the `cluster.x-k8s.io/cluster-name`
+// label so the controller's Secret-watch predicate (KD-15-compliant under
+// KD-3b) can match by label rather than name suffix.
+//
+// ControlPlaneEndpointHost is used by non-CAPK infrastructure paths
+// (CAPV today; CAPM3/Tinkerbell when they land) to rewrite the kubeconfig
+// `server:` URL so the management cluster reaches the API server via the
+// canonical control-plane endpoint instead of `127.0.0.1`. For CAPK,
+// ControlPlaneLBEndpoint covers this — ControlPlaneEndpointHost is only read
+// by the CAPV templates.
 type ManagementEndpoint struct {
 	APIServer                 string
 	Token                     string
 	KubeconfigSecretName      string
 	KubeconfigSecretNamespace string
+	ClusterName               string
+	ControlPlaneEndpointHost  string
 }
 
 // InstallConfig holds installation configuration for the template

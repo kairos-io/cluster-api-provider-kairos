@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.8.x (go.mod), provider release v0.1.0-alpha.1 / v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.8.x (go.mod), provider branch fix/kd-3b-eliminate-ssh-kubeconfig (pre-alpha-2).
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md).
 
@@ -270,11 +270,12 @@ The `namespace` field is not part of this reference. The namespace defaults to t
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
 | `updatedReplicas` | `int32` | Number of Machines running the desired version. |
 | `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
 | `selector` | `string` | Label selector string identifying control plane Machines. |
+| `lastNodePushObserved` | `*Time` | Timestamp at which the control-plane controller first observed that the workload-cluster kubeconfig Secret was absent on the node-push path (alpha-2+). Cleared once the Secret is present and `KubeconfigReady` condition transitions to `True`. Used to escalate condition severity from `Info` to `Warning` after 10 minutes — not a terminal state. |
 
 ### Example
 

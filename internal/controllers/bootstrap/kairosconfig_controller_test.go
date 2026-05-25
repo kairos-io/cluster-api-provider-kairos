@@ -1177,3 +1177,160 @@ func TestReconcile_SuccessClearsFailureFields(t *testing.T) {
 	g.Expect(got.Status.FailureMessage).To(BeEmpty(), "FailureMessage should be cleared on success (KD-14)")
 	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(5)))
 }
+
+// TestSupportsManagementEndpoint exhaustively pins the truth table for the
+// gate that decides whether a control-plane Machine's render gets a
+// kubeconfig-push block. The matrix is small and explicit on purpose: a new
+// infrastructure kind needs an entry here as well as in the templates, and
+// the test surfaces the omission.
+func TestSupportsManagementEndpoint(t *testing.T) {
+	mkMachine := func(kind string) *clusterv1.Machine {
+		return &clusterv1.Machine{
+			Spec: clusterv1.MachineSpec{
+				InfrastructureRef: corev1.ObjectReference{Kind: kind},
+			},
+		}
+	}
+	cases := []struct {
+		name    string
+		machine *clusterv1.Machine
+		want    bool
+	}{
+		{name: "nil machine", machine: nil, want: false},
+		{name: "missing kind", machine: mkMachine(""), want: false},
+		{name: "KubevirtMachine (CAPK lowercase v)", machine: mkMachine("KubevirtMachine"), want: true},
+		{name: "KubeVirtMachine (CAPK uppercase V)", machine: mkMachine("KubeVirtMachine"), want: true},
+		{name: "VSphereMachine (CAPV)", machine: mkMachine("VSphereMachine"), want: true},
+		{name: "DockerMachine (unsupported today)", machine: mkMachine("DockerMachine"), want: false},
+		{name: "AWSMachine (unsupported today)", machine: mkMachine("AWSMachine"), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(supportsManagementEndpoint(tc.machine)).To(Equal(tc.want))
+		})
+	}
+}
+
+// stubResolver is a tiny test double for ManagementEndpointResolver that
+// returns a canned endpoint (or nil) without touching the API server. The
+// reconciler tests for the KD-3b gate use this to assert routing decisions
+// without spinning up a full kubeVirtTokenResolver.
+type stubResolver struct {
+	endpoint *ManagementEndpoint
+	err      error
+	calls    int
+}
+
+func (s *stubResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
+	s.calls++
+	return s.endpoint, s.err
+}
+
+// TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock asserts the
+// KD-3b gate extension: a VSphereMachine control plane Machine now triggers
+// the resolver path and renders the push_kubeconfig block. Pre-KD-3b the
+// gate was CAPK-only.
+func TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	resolver := &stubResolver{endpoint: &ManagementEndpoint{
+		APIServer:                 "https://mgmt.example.com:6443",
+		Token:                     "test-token",
+		KubeconfigSecretName:      "test-cluster-kubeconfig",
+		KubeconfigSecretNamespace: "default",
+	}}
+	reconciler := &KairosConfigReconciler{
+		Client:               client,
+		Scheme:               scheme,
+		MgmtEndpointResolver: resolver,
+	}
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-config", Namespace: "default"},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:         "control-plane",
+			Distribution: "k0s",
+			SingleNode:   true,
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+		},
+	}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
+		Spec: clusterv1.MachineSpec{
+			InfrastructureRef: corev1.ObjectReference{Kind: "VSphereMachine"},
+		},
+	}
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "10.0.0.42", Port: 6443},
+		},
+	}
+
+	out, err := reconciler.generateK0sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "control-plane", "")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(resolver.calls).To(Equal(1), "resolver must be invoked for CAPV control-plane")
+	g.Expect(out).To(ContainSubstring("push_kubeconfig()"), "CAPV control-plane render must include push block")
+	// Cluster-name and ControlPlaneEndpointHost must be stamped from the
+	// Cluster (not the resolver output), per the call-site convention.
+	g.Expect(out).To(ContainSubstring("local cluster_name='test-cluster'"))
+	g.Expect(out).To(ContainSubstring("local cp_endpoint_host='10.0.0.42'"))
+}
+
+// TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock guards the role gate: a
+// CAPK worker (not a control-plane) must NOT trigger the resolver, and the
+// rendered output must not include a push block.
+func TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	resolver := &stubResolver{endpoint: &ManagementEndpoint{
+		APIServer: "https://mgmt.example.com:6443",
+		Token:     "test-token",
+	}}
+	reconciler := &KairosConfigReconciler{
+		Client:               client,
+		Scheme:               scheme,
+		MgmtEndpointResolver: resolver,
+	}
+
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-config", Namespace: "default"},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:         "worker",
+			Distribution: "k0s",
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+			WorkerToken:  "tok",
+		},
+	}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
+		Spec: clusterv1.MachineSpec{
+			InfrastructureRef: corev1.ObjectReference{Kind: "KubevirtMachine"},
+		},
+	}
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+
+	out, err := reconciler.generateK0sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "worker", "")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(resolver.calls).To(Equal(0), "resolver must NOT be invoked for worker role")
+	g.Expect(out).NotTo(ContainSubstring("push_kubeconfig"), "worker render must not include push block")
+}

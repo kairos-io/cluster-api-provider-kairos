@@ -221,8 +221,391 @@ write_files:
       fi
       exit 1
   {{- end }}
+  {{- /*
+    Post-bootstrap unit + script writes were previously emitted via
+    stages.initramfs.files. Lab validation against Hadron installer images
+    (kairos-hadron-k0s-rootdisk DV) revealed that files written under
+    stages.initramfs.files do NOT persist on the installed Hadron rootfs —
+    the initramfs phase runs before the persistent layer is mounted on that
+    image stack, so the writes vanish on first boot. Moving them to
+    top-level write_files: persists on both Hadron and Ubuntu-Kairos.
+  */ -}}
+  {{- if or .Hostname .HostnamePrefix }}
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      {{- if .Hostname }}
+      {{ .Hostname }}
+      {{- else }}
+      {{ .HostnamePrefix }}{{ "{{ trunc 4 .MachineID }}" }}
+      {{- end }}
+  {{- end }}
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      [Unit]
+      Description=Kairos k0s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k0s
+      # node registration that never happens on the installer, holding
+      # up cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      {{- if eq .Role "control-plane" }}
+      After=k0s.service
+      Wants=k0s.service
+      {{- else }}
+      After=k0s-worker.service
+      Wants=k0s-worker.service
+      {{- end }}
 
-{{- /* DNS overrides and post-bootstrap service */}}
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k0s-post-bootstrap.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      [Unit]
+      Description=Enable kairos-k0s-post-bootstrap service
+      # Skip on live installer; pairs with the same gate on the main
+      # post-bootstrap service. (KD-3b.)
+      ConditionKernelCommandLine=!cdroot
+      After=systemd-udev-settle.service
+      Before=multi-user.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/systemctl daemon-reload
+      # `enable --now`: create the multi-user.target.wants/ symlink AND
+      # start the unit on this boot. After the KD-3b write_files move,
+      # the main service file lands on disk during cloud-init early boot;
+      # this helper runs once multi-user.target is set up and triggers
+      # both enablement and immediate start of the post-bootstrap service.
+      ExecStart=/bin/systemctl enable --now kairos-k0s-post-bootstrap.service
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
+    permissions: "0755"
+    owner: 0
+    group: 0
+    content: |
+      #!/bin/bash
+      set -e
+
+      {{- if .IsKubeVirt }}
+      # CAPK: always mark bootstrap success on script exit
+      mark_bootstrap_success() {
+        mkdir -p /run/cluster-api
+        echo "success" > /run/cluster-api/bootstrap-success.complete
+        chmod 0644 /run/cluster-api/bootstrap-success.complete
+      }
+      trap mark_bootstrap_success EXIT
+      {{- end }}
+
+      {{- if .HostnamePrefix }}
+      # Enforce hostname from cloud-config on immutable rootfs
+      if [ -f /usr/local/etc/hostname ]; then
+        /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
+        if ! grep -qE "127\.0\.1\.1[[:space:]]+$(cat /usr/local/etc/hostname)" /etc/hosts; then
+          echo "127.0.1.1 $(cat /usr/local/etc/hostname)" >> /etc/hosts
+        fi
+      fi
+      {{- end }}
+
+      {{- if and .IsKubeVirt (eq .Role "control-plane") }}
+      # KubeVirt: ensure the API server cert includes the node IP (pod or bridged)
+      # This prevents TLS SAN mismatch when CAPI connects to the workload cluster.
+      {{- if .PrimaryIP }}
+      KAIROS_PRIMARY_IP={{ .PrimaryIP | shquote }}
+      {{- end }}
+      {{- if .MachineName }}
+      KAIROS_VMI_NAME={{ .MachineName | shquote }}
+      {{- end }}
+      {{- if .ClusterNS }}
+      KAIROS_VMI_NAMESPACE={{ .ClusterNS | shquote }}
+      {{- end }}
+      {{- if .ManagementEndpoint }}
+      KAIROS_MGMT_API={{ .ManagementEndpoint.APIServer | shquote }}
+      KAIROS_MGMT_TOKEN={{ .ManagementEndpoint.Token | shquote }}
+      {{- end }}
+      fetch_vmi_ip_from_management() {
+        if [ -z "${KAIROS_MGMT_API}" ] || [ -z "${KAIROS_MGMT_TOKEN}" ] || [ -z "${KAIROS_VMI_NAME}" ] || [ -z "${KAIROS_VMI_NAMESPACE}" ]; then
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          return 1
+        fi
+        local url="${KAIROS_MGMT_API}/apis/kubevirt.io/v1/namespaces/${KAIROS_VMI_NAMESPACE}/virtualmachineinstances/${KAIROS_VMI_NAME}"
+        local json
+        json=$(curl -k -sS -H "Authorization: Bearer ${KAIROS_MGMT_TOKEN}" "${url}" 2>/dev/null || true)
+        if [ -z "${json}" ]; then
+          return 1
+        fi
+        local ip
+        ip=$(echo "${json}" | sed -n 's/.*"ipAddress":"\\([^"]*\\)".*/\\1/p' | head -n1)
+        if [ -n "${ip}" ]; then
+          echo "${ip}"
+          return 0
+        fi
+        return 1
+      }
+      detect_primary_ip_once() {
+        if [ -n "${KAIROS_PRIMARY_IP}" ]; then
+          echo "Using primary IP override: ${KAIROS_PRIMARY_IP}"
+          echo "${KAIROS_PRIMARY_IP}"
+          return 0
+        fi
+        local mgmt_ip=""
+        mgmt_ip=$(fetch_vmi_ip_from_management || true)
+        if [ -n "${mgmt_ip}" ]; then
+          echo "Using VMI IP from management API: ${mgmt_ip}"
+          echo "${mgmt_ip}"
+          return 0
+        fi
+        local dev=""
+        local ip=""
+        dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+        if [ -n "${dev}" ]; then
+          ip=$(ip -4 -o addr show dev "${dev}" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+        fi
+        if [ -z "${ip}" ]; then
+          ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+        fi
+        if [ -n "${ip}" ]; then
+          echo "Using detected guest IP: ${ip}"
+        fi
+        echo "${ip}"
+      }
+      detect_primary_ip() {
+        local ip=""
+        for i in {1..30}; do
+          ip="$(detect_primary_ip_once)"
+          if [ -n "${ip}" ]; then
+            echo "${ip}"
+            return 0
+          fi
+          echo "Waiting for primary IP... (${i}/30)"
+          sleep 5
+        done
+        return 1
+      }
+
+      KAIROS_SANS_CHANGED=0
+      ensure_k0s_api_sans() {
+        local api_ip="$1"
+        if [ -z "${api_ip}" ]; then
+          echo "WARN: unable to detect node IP for k0s api.sans"
+          return 1
+        fi
+
+        local cfg="/etc/k0s/k0s.yaml"
+        if [ ! -f "${cfg}" ]; then
+          printf '%s\n' \
+            "apiVersion: k0s.k0sproject.io/v1beta1" \
+            "kind: ClusterConfig" \
+            "metadata:" \
+            "  name: k0s" \
+            "spec:" \
+            "  api:" \
+            "    sans:" \
+            "    - ${api_ip}" > "${cfg}"
+          KAIROS_SANS_CHANGED=1
+          return 0
+        fi
+
+        if grep -qE '^[[:space:]]*api:' "${cfg}"; then
+          if grep -qE '^[[:space:]]*sans:' "${cfg}"; then
+            if ! grep -qE '^[[:space:]]*-[[:space:]]*'"${api_ip}"'([[:space:]]|$)' "${cfg}"; then
+              sed -i "/^[[:space:]]*sans:/a\\    - ${api_ip}" "${cfg}"
+              KAIROS_SANS_CHANGED=1
+            fi
+            return 0
+          fi
+          sed -i "/^[[:space:]]*api:/a\\    sans:\\\n    - ${api_ip}" "${cfg}"
+          KAIROS_SANS_CHANGED=1
+          return 0
+        fi
+
+        if grep -qE '^[[:space:]]*spec:' "${cfg}"; then
+          sed -i "/^[[:space:]]*spec:/a\\  api:\\\n    sans:\\\n    - ${api_ip}" "${cfg}"
+          KAIROS_SANS_CHANGED=1
+          return 0
+        fi
+
+        printf '%s\n' \
+          "spec:" \
+          "  api:" \
+          "    sans:" \
+          "    - ${api_ip}" >> "${cfg}"
+        KAIROS_SANS_CHANGED=1
+        return 0
+      }
+
+      API_IP="$(detect_primary_ip || true)"
+      ensure_k0s_api_sans "${API_IP}" || true
+
+      if [ "${KAIROS_SANS_CHANGED}" = "1" ]; then
+        echo "Updated k0s api.sans entries"
+        KAIROS_REPUSH_KUBECONFIG=true
+        # Force apiserver cert regeneration with updated SANs
+        rm -f /var/lib/k0s/pki/apiserver.crt /var/lib/k0s/pki/apiserver.key || true
+        if systemctl is-active --quiet k0scontroller; then
+          systemctl restart k0scontroller || true
+        else
+          systemctl restart k0s || true
+        fi
+      fi
+      {{- end }}
+
+      {{- if .Manifests }}
+      # Write k0s manifests
+      echo "Writing k0s manifests..."
+      mkdir -p /var/lib/k0s/manifests
+      {{- range .Manifests }}
+      mkdir -p /var/lib/k0s/manifests/{{ .Name }}
+      cat > /var/lib/k0s/manifests/{{ .Name }}/{{ .File }} << 'MANIFEST_EOF'
+{{ .Content }}
+MANIFEST_EOF
+      chmod 0644 /var/lib/k0s/manifests/{{ .Name }}/{{ .File }}
+      echo "Written manifest: /var/lib/k0s/manifests/{{ .Name }}/{{ .File }}"
+      {{- end }}
+      {{- end }}
+
+      {{- if .ProviderID }}
+      # Wait for k0s to be ready and Node to be registered
+      echo "Waiting for k0s node to be registered..."
+      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      MAX_WAIT=300
+      ELAPSED=0
+      while ! kubectl get node $(hostname) &>/dev/null; do
+        if [ $ELAPSED -ge $MAX_WAIT ]; then
+          echo "ERROR: Timeout waiting for node to be registered"
+          exit 1
+        fi
+        echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
+      done
+
+      # Set providerID on the Node
+      # Retry in case of temporary API server unavailability
+      echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
+      PROVIDER_ID_SET=false
+      for i in {1..30}; do
+        if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
+          echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
+          PROVIDER_ID_SET=true
+          break
+        fi
+        echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+        sleep 5
+      done
+
+      if [ "$PROVIDER_ID_SET" != "true" ]; then
+        echo "ERROR: Failed to set providerID after 30 attempts"
+        exit 1
+      fi
+      {{- else }}
+      echo "No providerID to set"
+      {{- end }}
+
+      {{- if .ManagementEndpoint }}
+      # Push kubeconfig to management cluster without SSH (KubeVirt)
+      push_kubeconfig() {
+        local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
+        # Wait up to 5min for k0s to write admin.conf. After=k0s.service only
+        # orders against service activation, not bootstrap completion, so on
+        # slower hosts (Hadron+CAPV lab finding) the file is not yet present
+        # when this unit fires. Without this wait the unit silently abandons
+        # the push and KCP stays in WaitingForNodePush forever (KD-3b).
+        local _wait_budget=300
+        local _wait_elapsed=0
+        while [ ! -f "${kubeconfig_file}" ] && [ ${_wait_elapsed} -lt ${_wait_budget} ]; do
+          sleep 5
+          _wait_elapsed=$((_wait_elapsed + 5))
+        done
+        if [ ! -f "${kubeconfig_file}" ]; then
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file} after ${_wait_budget}s"
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push kubeconfig"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push kubeconfig"
+          return 1
+        fi
+        local kubeconfig_b64
+        kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
+        local api={{ .ManagementEndpoint.APIServer | shquote }}
+        local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
+        local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
+        local token={{ .ManagementEndpoint.Token | shquote }}
+        local cluster_name={{ .ManagementEndpoint.ClusterName | shquote }}
+        local payload
+        # cluster.x-k8s.io/cluster-name label and node-push provenance
+        # annotation are required by the KCP controller's Secret-watch
+        # predicate (KD-15) and KD-3b observability respectively.
+        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" \
+          -X PUT \
+          --data "${payload}" \
+          "${url}" || true)
+        if [ "${status}" = "404" ]; then
+          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "${payload}" \
+            "${api}/api/v1/namespaces/${ns}/secrets" || true)
+        fi
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed kubeconfig to management secret ${ns}/${name}"
+          return 0
+        fi
+        echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
+        return 1
+      }
+      if [ "${KAIROS_REPUSH_KUBECONFIG}" = "true" ]; then
+        for i in {1..12}; do
+          if push_kubeconfig; then
+            break
+          fi
+          echo "Retrying kubeconfig push after cert update ($i/12)..."
+          sleep 5
+        done
+      fi
+      if ! push_kubeconfig; then
+        echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+      {{- end }}
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      # This file is used by Cluster API to determine bootstrap completion
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+
+      echo "k0s post-bootstrap tasks completed successfully"
+
+{{- /* DNS overrides */}}
 stages:
   boot:
     - name: "Ensure SSH service is enabled"
@@ -237,374 +620,28 @@ stages:
         {{- end }}
         path: "/etc/resolv.conf"
     {{- end }}
-  initramfs:
-    - name: "Create k0s post-bootstrap service and script"
-      files:
-        {{- if or .Hostname .HostnamePrefix }}
-        - path: /usr/local/etc/hostname
-          permissions: "0644"
-          owner: 0
-          group: 0
-          content: |
-            {{- if .Hostname }}
-            {{ .Hostname }}
-            {{- else }}
-            {{ .HostnamePrefix }}{{ "{{ trunc 4 .MachineID }}" }}
-            {{- end }}
-        {{- end }}
-        - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
-          permissions: "0644"
-          owner: 0
-          group: 0
-          content: |
-            [Unit]
-            Description=Kairos k0s post-bootstrap tasks
-            {{- if eq .Role "control-plane" }}
-            After=k0s.service
-            Wants=k0s.service
-            {{- else }}
-            After=k0s-worker.service
-            Wants=k0s-worker.service
-            {{- end }}
-            
-            [Service]
-            Type=oneshot
-            RemainAfterExit=yes
-            ExecStart=/usr/local/bin/kairos-k0s-post-bootstrap.sh
-            
-            [Install]
-            WantedBy=multi-user.target
-        - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
-          permissions: "0644"
-          owner: 0
-          group: 0
-          content: |
-            [Unit]
-            Description=Enable kairos-k0s-post-bootstrap service
-            After=systemd-udev-settle.service
-            Before=multi-user.target
-            
-            [Service]
-            Type=oneshot
-            RemainAfterExit=yes
-            ExecStart=/bin/systemctl daemon-reload
-            ExecStart=/bin/systemctl enable kairos-k0s-post-bootstrap.service
-            
-            [Install]
-            WantedBy=multi-user.target
-        - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
-          permissions: "0755"
-          owner: 0
-          group: 0
-          content: |
-            #!/bin/bash
-            set -e
-            
-            {{- if .IsKubeVirt }}
-            # CAPK: always mark bootstrap success on script exit
-            mark_bootstrap_success() {
-              mkdir -p /run/cluster-api
-              echo "success" > /run/cluster-api/bootstrap-success.complete
-              chmod 0644 /run/cluster-api/bootstrap-success.complete
-            }
-            trap mark_bootstrap_success EXIT
-            {{- end }}
-            
-            {{- if .HostnamePrefix }}
-            # Enforce hostname from cloud-config on immutable rootfs
-            if [ -f /usr/local/etc/hostname ]; then
-              /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
-              if ! grep -qE "127\.0\.1\.1[[:space:]]+$(cat /usr/local/etc/hostname)" /etc/hosts; then
-                echo "127.0.1.1 $(cat /usr/local/etc/hostname)" >> /etc/hosts
-              fi
-            fi
-            {{- end }}
-
-            {{- if and .IsKubeVirt (eq .Role "control-plane") }}
-            # KubeVirt: ensure the API server cert includes the node IP (pod or bridged)
-            # This prevents TLS SAN mismatch when CAPI connects to the workload cluster.
-            {{- if .PrimaryIP }}
-            KAIROS_PRIMARY_IP={{ .PrimaryIP | shquote }}
-            {{- end }}
-            {{- if .MachineName }}
-            KAIROS_VMI_NAME={{ .MachineName | shquote }}
-            {{- end }}
-            {{- if .ClusterNS }}
-            KAIROS_VMI_NAMESPACE={{ .ClusterNS | shquote }}
-            {{- end }}
-            {{- if .ManagementEndpoint }}
-            KAIROS_MGMT_API={{ .ManagementEndpoint.APIServer | shquote }}
-            KAIROS_MGMT_TOKEN={{ .ManagementEndpoint.Token | shquote }}
-            {{- end }}
-            fetch_vmi_ip_from_management() {
-              if [ -z "${KAIROS_MGMT_API}" ] || [ -z "${KAIROS_MGMT_TOKEN}" ] || [ -z "${KAIROS_VMI_NAME}" ] || [ -z "${KAIROS_VMI_NAMESPACE}" ]; then
-                return 1
-              fi
-              if ! command -v curl >/dev/null 2>&1; then
-                return 1
-              fi
-              local url="${KAIROS_MGMT_API}/apis/kubevirt.io/v1/namespaces/${KAIROS_VMI_NAMESPACE}/virtualmachineinstances/${KAIROS_VMI_NAME}"
-              local json
-              json=$(curl -k -sS -H "Authorization: Bearer ${KAIROS_MGMT_TOKEN}" "${url}" 2>/dev/null || true)
-              if [ -z "${json}" ]; then
-                return 1
-              fi
-              local ip
-              ip=$(echo "${json}" | sed -n 's/.*"ipAddress":"\\([^"]*\\)".*/\\1/p' | head -n1)
-              if [ -n "${ip}" ]; then
-                echo "${ip}"
-                return 0
-              fi
-              return 1
-            }
-            detect_primary_ip_once() {
-              if [ -n "${KAIROS_PRIMARY_IP}" ]; then
-                echo "Using primary IP override: ${KAIROS_PRIMARY_IP}"
-                echo "${KAIROS_PRIMARY_IP}"
-                return 0
-              fi
-              local mgmt_ip=""
-              mgmt_ip=$(fetch_vmi_ip_from_management || true)
-              if [ -n "${mgmt_ip}" ]; then
-                echo "Using VMI IP from management API: ${mgmt_ip}"
-                echo "${mgmt_ip}"
-                return 0
-              fi
-              local dev=""
-              local ip=""
-              dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
-              if [ -n "${dev}" ]; then
-                ip=$(ip -4 -o addr show dev "${dev}" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
-              fi
-              if [ -z "${ip}" ]; then
-                ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
-              fi
-              if [ -n "${ip}" ]; then
-                echo "Using detected guest IP: ${ip}"
-              fi
-              echo "${ip}"
-            }
-            detect_primary_ip() {
-              local ip=""
-              for i in {1..30}; do
-                ip="$(detect_primary_ip_once)"
-                if [ -n "${ip}" ]; then
-                  echo "${ip}"
-                  return 0
-                fi
-                echo "Waiting for primary IP... (${i}/30)"
-                sleep 5
-              done
-              return 1
-            }
-
-            KAIROS_SANS_CHANGED=0
-            ensure_k0s_api_sans() {
-              local api_ip="$1"
-              if [ -z "${api_ip}" ]; then
-                echo "WARN: unable to detect node IP for k0s api.sans"
-                return 1
-              fi
-
-              local cfg="/etc/k0s/k0s.yaml"
-              if [ ! -f "${cfg}" ]; then
-                printf '%s\n' \
-                  "apiVersion: k0s.k0sproject.io/v1beta1" \
-                  "kind: ClusterConfig" \
-                  "metadata:" \
-                  "  name: k0s" \
-                  "spec:" \
-                  "  api:" \
-                  "    sans:" \
-                  "    - ${api_ip}" > "${cfg}"
-                KAIROS_SANS_CHANGED=1
-                return 0
-              fi
-
-              if grep -qE '^[[:space:]]*api:' "${cfg}"; then
-                if grep -qE '^[[:space:]]*sans:' "${cfg}"; then
-                  if ! grep -qE '^[[:space:]]*-[[:space:]]*'"${api_ip}"'([[:space:]]|$)' "${cfg}"; then
-                    sed -i "/^[[:space:]]*sans:/a\\    - ${api_ip}" "${cfg}"
-                    KAIROS_SANS_CHANGED=1
-                  fi
-                  return 0
-                fi
-                sed -i "/^[[:space:]]*api:/a\\    sans:\\\n    - ${api_ip}" "${cfg}"
-                KAIROS_SANS_CHANGED=1
-                return 0
-              fi
-
-              if grep -qE '^[[:space:]]*spec:' "${cfg}"; then
-                sed -i "/^[[:space:]]*spec:/a\\  api:\\\n    sans:\\\n    - ${api_ip}" "${cfg}"
-                KAIROS_SANS_CHANGED=1
-                return 0
-              fi
-
-              printf '%s\n' \
-                "spec:" \
-                "  api:" \
-                "    sans:" \
-                "    - ${api_ip}" >> "${cfg}"
-              KAIROS_SANS_CHANGED=1
-              return 0
-            }
-
-            API_IP="$(detect_primary_ip || true)"
-            ensure_k0s_api_sans "${API_IP}" || true
-
-            if [ "${KAIROS_SANS_CHANGED}" = "1" ]; then
-              echo "Updated k0s api.sans entries"
-              KAIROS_REPUSH_KUBECONFIG=true
-              # Force apiserver cert regeneration with updated SANs
-              rm -f /var/lib/k0s/pki/apiserver.crt /var/lib/k0s/pki/apiserver.key || true
-              if systemctl is-active --quiet k0scontroller; then
-                systemctl restart k0scontroller || true
-              else
-                systemctl restart k0s || true
-              fi
-            fi
-            {{- end }}
-
-            {{- if .Manifests }}
-            # Write k0s manifests
-            echo "Writing k0s manifests..."
-            mkdir -p /var/lib/k0s/manifests
-            {{- range .Manifests }}
-            mkdir -p /var/lib/k0s/manifests/{{ .Name }}
-            cat > /var/lib/k0s/manifests/{{ .Name }}/{{ .File }} << 'MANIFEST_EOF'
-{{ .Content }}
-MANIFEST_EOF
-            chmod 0644 /var/lib/k0s/manifests/{{ .Name }}/{{ .File }}
-            echo "Written manifest: /var/lib/k0s/manifests/{{ .Name }}/{{ .File }}"
-            {{- end }}
-            {{- end }}
-            
-            {{- if .ProviderID }}
-            # Wait for k0s to be ready and Node to be registered
-            echo "Waiting for k0s node to be registered..."
-            export KUBECONFIG=/var/lib/k0s/pki/admin.conf
-            MAX_WAIT=300
-            ELAPSED=0
-            while ! kubectl get node $(hostname) &>/dev/null; do
-              if [ $ELAPSED -ge $MAX_WAIT ]; then
-                echo "ERROR: Timeout waiting for node to be registered"
-                exit 1
-              fi
-              echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
-              sleep 5
-              ELAPSED=$((ELAPSED + 5))
-            done
-            
-            # Set providerID on the Node
-            # Retry in case of temporary API server unavailability
-            echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
-            PROVIDER_ID_SET=false
-            for i in {1..30}; do
-              if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
-                echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
-                PROVIDER_ID_SET=true
-                break
-              fi
-              echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
-              sleep 5
-            done
-            
-            if [ "$PROVIDER_ID_SET" != "true" ]; then
-              echo "ERROR: Failed to set providerID after 30 attempts"
-              exit 1
-            fi
-            {{- else }}
-            echo "No providerID to set"
-            {{- end }}
-            
-            {{- if .ManagementEndpoint }}
-            # Push kubeconfig to management cluster without SSH (KubeVirt)
-            push_kubeconfig() {
-              local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
-              if [ ! -f "${kubeconfig_file}" ]; then
-                echo "WARN: kubeconfig file not found at ${kubeconfig_file}"
-                return 1
-              fi
-              if ! command -v curl >/dev/null 2>&1; then
-                echo "WARN: curl not available; cannot push kubeconfig"
-                return 1
-              fi
-              if ! command -v base64 >/dev/null 2>&1; then
-                echo "WARN: base64 not available; cannot push kubeconfig"
-                return 1
-              fi
-              local kubeconfig_b64
-              kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
-              local api={{ .ManagementEndpoint.APIServer | shquote }}
-              local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
-              local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
-              local token={{ .ManagementEndpoint.Token | shquote }}
-              local payload
-              payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
-              local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
-              local status
-              status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-                -H "Authorization: Bearer ${token}" \
-                -H "Content-Type: application/json" \
-                -X PUT \
-                --data "${payload}" \
-                "${url}" || true)
-              if [ "${status}" = "404" ]; then
-                status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-                  -H "Authorization: Bearer ${token}" \
-                  -H "Content-Type: application/json" \
-                  -X POST \
-                  --data "${payload}" \
-                  "${api}/api/v1/namespaces/${ns}/secrets" || true)
-              fi
-              if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
-                echo "Pushed kubeconfig to management secret ${ns}/${name}"
-                return 0
-              fi
-              echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
-              return 1
-            }
-            if [ "${KAIROS_REPUSH_KUBECONFIG}" = "true" ]; then
-              for i in {1..12}; do
-                if push_kubeconfig; then
-                  break
-                fi
-                echo "Retrying kubeconfig push after cert update ($i/12)..."
-                sleep 5
-              done
-            fi
-            if ! push_kubeconfig; then
-              echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
-            fi
-            {{- end }}
-            
-            # Mark bootstrap success for CAPI/CAPK consumers
-            # This file is used by Cluster API to determine bootstrap completion
-            mkdir -p /run/cluster-api
-            echo "success" > /run/cluster-api/bootstrap-success.complete
-            chmod 0644 /run/cluster-api/bootstrap-success.complete
-            
-            echo "k0s post-bootstrap tasks completed successfully"
-      commands:
-        # Create symlink to enable the helper service that enables the main service
-        - mkdir -p /etc/systemd/system/multi-user.target.wants
-        - ln -sf /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service /etc/systemd/system/multi-user.target.wants/kairos-k0s-post-bootstrap-enable.service || true
 
 {{- /*
   Post-bootstrap service enablement: kairos-k0s-post-bootstrap.service is
-  enabled by kairos-k0s-post-bootstrap-enable.service, which is itself
-  symlinked into multi-user.target.wants by the stages.initramfs commands
-  above. No explicit `systemctl enable kairos-k0s-post-bootstrap.service`
-  is needed in runcmd — keeping one here was a duplicate of the enabler.
-
-  The kairos-k0s-lb-sans.path watcher does still need to be enabled
-  explicitly on control-plane nodes; there is no equivalent enabler
-  service for it, so we enable + start it here once after initramfs has
-  written the unit file.
-*/ -}}
-{{- if and .IsKubeVirt (eq .Role "control-plane") }}
+  enabled by kairos-k0s-post-bootstrap-enable.service. The previous
+  symlink-via-`ln -sf` approach worked when the unit file was written by
+  stages.initramfs.files (early boot, before multi-user.target was active).
+  After moving the unit writes to top-level write_files for Hadron compat
+  (KD-3b), runcmd executes too late in boot for systemd to re-scan
+  multi-user.target.wants/, so the helper service never starts. Replace
+  the manual symlink with `systemctl enable --now` (same pattern the
+  kairos-k0s-lb-sans block uses below): enable creates the multi-user
+  symlink AND starts the helper service immediately on this boot.
+*/}}
 runcmd:
+  # Enable + start the helper service explicitly. `enable --now` both
+  # creates the multi-user.target.wants/ symlink for next boot AND starts
+  # the unit on this boot. Required after KD-3b moved unit writes from
+  # stages.initramfs.files to top-level write_files (runcmd is now too
+  # late in boot for ln-only symlink creation to be honored by systemd).
   - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k0s-post-bootstrap-enable.service || true
+{{- if and .IsKubeVirt (eq .Role "control-plane") }}
   - /bin/systemctl enable kairos-k0s-lb-sans.path || true
   - /bin/systemctl start kairos-k0s-lb-sans.path || true
 {{- end }}

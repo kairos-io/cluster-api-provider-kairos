@@ -139,8 +139,22 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		const (
 			wlClusterName = "e2e-workload"
 			wlNamespace   = "default"
-			wlTimeout     = 45 * time.Minute
-			cpTimeout     = 25 * time.Minute
+			// wlTimeout covers Cluster→Provisioned phase (much earlier than KCP
+			// becoming Ready). Keep generous.
+			wlTimeout = 45 * time.Minute
+			// cpTimeout must cover the FULL Kairos install lifecycle on a
+			// GH-Actions-sized KubeVirt VM (2 vCPU / 4 GiB):
+			//   - live installer boot:          ~2 min
+			//   - elemental install to /dev/vda: ~20-25 min (slow KVM I/O on the runner)
+			//   - reboot into installed system:  ~1 min
+			//   - systemd + k3s + post-bootstrap
+			//     wait-loop + push:              ~3-5 min
+			// Empirically the previous 25-min budget timed out right as the
+			// installed-system reboot was starting (serial-log capture caught
+			// the post-install GRUB menu literally as ginkgo gave up). Bump to
+			// 50 min to leave 10-15 min margin; total ginkgo timeout is 130m
+			// so we still have room for cleanup.
+			cpTimeout = 50 * time.Minute
 		)
 
 		By(fmt.Sprintf("kubectl rollout status deployment/%s -n %s", kairosControllerDeployName, kairosProviderNamespace))
@@ -173,6 +187,8 @@ var _ = Describe("Cluster API Provider Kairos", Ordered, func() {
 		expectMachinesRunning(ctx, dc, wlNamespace, wlClusterName)
 
 		By("connecting to the workload cluster and waiting for a Ready Node")
-		waitForWorkloadNodeReady(ctx, stackEnv, wlNamespace, wlClusterName, 25*time.Minute)
+		// 15 min is generous after KCP-Ready; k3s already reports the node Ready
+		// at that point. Mostly here to cover kubeconfig fetch + first Node poll.
+		waitForWorkloadNodeReady(ctx, stackEnv, wlNamespace, wlClusterName, 15*time.Minute)
 	})
 })

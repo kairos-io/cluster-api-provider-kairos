@@ -111,8 +111,11 @@ func quote(v any) (string, error) {
 // shell metacharacters. The fields that pass through shquote today are
 // .ManagementEndpoint.APIServer, .ManagementEndpoint.Token,
 // .ManagementEndpoint.KubeconfigSecretName,
-// .ManagementEndpoint.KubeconfigSecretNamespace (all four rendered only
-// when ManagementEndpoint is non-nil), .PrimaryIP, .MachineName, .ClusterNS,
+// .ManagementEndpoint.KubeconfigSecretNamespace,
+// .ManagementEndpoint.ClusterName,
+// .ManagementEndpoint.ControlPlaneEndpointHost (all six rendered only
+// when ManagementEndpoint is non-nil; the latter two added in KD-3b for
+// the CAPV node-push pattern), .PrimaryIP, .MachineName, .ClusterNS,
 // and .ControlPlaneLBEndpoint. None of these are intended to carry
 // shell-active input today, but the renderer is the LAST line of defense
 // between user/provider input and root-privileged userdata.

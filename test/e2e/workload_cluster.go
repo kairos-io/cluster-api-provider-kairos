@@ -19,6 +19,8 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubevirtenv"
@@ -46,9 +48,24 @@ var (
 	vmiGVR                  = schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances"}
 )
 
-// applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt.
-// The VM boots directly from the Kairos cloud image (kairos-kubevirt DataVolume) — no ISO
-// install step is needed since the cloud image is a pre-built bootable disk.
+// applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt
+// using the 2-disk Kairos installer pattern from the KD-3b lab validation. Disk layout
+// mirrors the lab manifest /tmp/kd3b-capk-k3s.yaml exactly:
+//
+//   rootdisk      virtio, bootOrder: 1   blank target (no MBR)
+//   installerdisk virtio, bootOrder: 2   the Kairos installer image (OSArtifact iso:true)
+//
+// Firmware tries to boot vda first (rootdisk); since it's blank it falls through to vdb
+// (installerdisk), which has the hybrid ISO boot record. The installer reads the baked
+// /system/oem/ + the KubeVirt configdrive (CAPK-injected cloud-config), runs `install:
+// { auto: true, device: "/dev/vda", reboot: true }` from the lab's KairosConfigTemplate,
+// writes the COS A/B layout to /dev/vda, then reboots. The next boot now finds a
+// bootable vda and skips the installer disk.
+//
+// Earlier CI attempts attached the installer as `cdrom` with bootOrder 1; that boots the
+// Kairos LIVE menu's default "Kairos" entry which drops to an interactive root shell
+// instead of running the unattended installer. Attaching as a virtio disk with the lab's
+// reversed bootOrder is the configuration we actually validated 4/4 scenarios on (KD-50).
 func applyWorkloadClusterManifests(env *kubevirtenv.Environment, dc dynamic.Interface, cfg *rest.Config, clusterName, namespace string) {
 	yaml := fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
@@ -79,7 +96,7 @@ metadata:
   namespace: %[2]s
 spec:
   replicas: 1
-  version: "v1.35.2+k3s1"
+  version: "v1.35.4+k3s1"
   distribution: k3s
   machineTemplate:
     infrastructureRef:
@@ -103,6 +120,17 @@ spec:
       virtualMachineTemplate:
         spec:
           runStrategy: Always
+          dataVolumeTemplates:
+          - metadata:
+              name: %[1]s-rootdisk
+            spec:
+              source:
+                blank: {}
+              pvc:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: %[3]dGi
           template:
             metadata:
               labels:
@@ -120,6 +148,10 @@ spec:
                     disk:
                       bus: virtio
                     bootOrder: 1
+                  - name: installerdisk
+                    disk:
+                      bus: virtio
+                    bootOrder: 2
                   interfaces:
                   - name: default
                     masquerade: {}
@@ -136,9 +168,12 @@ spec:
               - name: default
                 pod: {}
               volumes:
-              - name: rootdisk
+              - name: installerdisk
                 dataVolume:
                   name: kairos-kubevirt
+              - name: rootdisk
+                dataVolume:
+                  name: %[1]s-rootdisk
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
@@ -150,14 +185,23 @@ spec:
     spec:
       role: control-plane
       distribution: k3s
-      kubernetesVersion: "v1.35.2+k3s1"
+      kubernetesVersion: "v1.35.4+k3s1"
+      install:
+        auto: true
+        device: "/dev/vda"
+        reboot: true
       dnsServers:
         - "8.8.8.8"
+      # podCIDR / serviceCIDR match the KD-3b lab manifest used to validate
+      # all four scenarios — keeps the e2e and the lab on the same k3s
+      # networking layout so any future divergence is in one place.
+      podCIDR: "10.201.0.0/16"
+      serviceCIDR: "10.200.0.0/16"
       userName: kairos
       userPassword: kairos
       userGroups:
         - admin
-`, clusterName, namespace)
+`, clusterName, namespace, kubevirtenv.KairosRootDiskGiB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -331,6 +375,91 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 			_ = rc.Close()
 			_, _ = fmt.Fprintln(w)
 		}
+	}
+
+	// Bootstrap-data Secret structural check (KD-3b lab finding: when push doesn't fire,
+	// confirm the template actually rendered the unit + wait-loop into the Secret, instead
+	// of having to guess. We deliberately do NOT dump the Secret payload — it contains the
+	// bearer token and user password. We only assert markers are present.)
+	_, _ = fmt.Fprintf(w, "\n--- Bootstrap data Secret structural check ---\n")
+	if list, err := cs.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "cluster.x-k8s.io/cluster-name=" + clusterName,
+	}); err == nil {
+		for _, s := range list.Items {
+			if t := s.Type; t != "cluster.x-k8s.io/secret" && string(t) != "Opaque" {
+				continue
+			}
+			payload, ok := s.Data["value"]
+			if !ok || len(payload) == 0 {
+				continue
+			}
+			body := string(payload)
+			markers := []string{
+				"kairos-k0s-post-bootstrap.service",
+				"kairos-k3s-post-bootstrap.service",
+				"push_kubeconfig()",
+				"_wait_budget=300",
+				"ConditionKernelCommandLine=!cdroot",
+				"systemctl enable --now",
+				"bootstrap-success.complete",
+			}
+			_, _ = fmt.Fprintf(w, "  Secret %s (type=%s, %d bytes):\n", s.Name, s.Type, len(payload))
+			for _, m := range markers {
+				_, _ = fmt.Fprintf(w, "    %-44s present=%v\n", m, strings.Contains(body, m))
+			}
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
+	}
+
+	// Guest serial-log tail — KubeVirt writes virtio-serial output to
+	// /var/run/kubevirt-private/<vmi-uid>/virt-serial0-log inside the virt-launcher
+	// compute container. This is the only way to see what cloud-init / systemd /
+	// the kairos-*-post-bootstrap unit actually did inside the guest after CI fails.
+	_, _ = fmt.Fprintf(w, "\n--- VMI guest serial log (tail) ---\n")
+	if list, err := dc.Resource(vmiGVR).Namespace(namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, vmi := range list.Items {
+			uid := string(vmi.GetUID())
+			vmiName := vmi.GetName()
+			podName := ""
+			if pods, perr := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: "kubevirt.io=virt-launcher,vm.kubevirt.io/name=" + vmiName,
+			}); perr == nil && len(pods.Items) > 0 {
+				podName = pods.Items[0].Name
+			}
+			if podName == "" {
+				_, _ = fmt.Fprintf(w, "  vmi=%s no virt-launcher pod found\n", vmiName)
+				continue
+			}
+			serialPath := fmt.Sprintf("/var/run/kubevirt-private/%s/virt-serial0-log", uid)
+			// Capture file size first so we know whether we're hitting tail-truncation
+			// or whether the VM actually stopped writing serial output.
+			sizeCmd := exec.CommandContext(ctx, "kubectl",
+				"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
+				"-n", namespace, "exec", podName, "-c", "compute", "--",
+				"sh", "-c", fmt.Sprintf("wc -c %s 2>&1 || true", serialPath),
+			)
+			sizeOut, _ := sizeCmd.CombinedOutput()
+			_, _ = fmt.Fprintf(w, "  vmi=%s pod=%s path=%s\n", vmiName, podName, serialPath)
+			_, _ = fmt.Fprintf(w, "  size: %s", string(sizeOut))
+			// Dump up to ~2 MiB tail. For a hung early-boot VM this is the whole file;
+			// for a long-running VM it's enough to capture the last few minutes of
+			// cloud-init / systemd / k0s|k3s / kairos-*-post-bootstrap output.
+			cmd := exec.CommandContext(ctx, "kubectl",
+				"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
+				"-n", namespace, "exec", podName, "-c", "compute", "--",
+				"tail", "-c", "2097152", serialPath,
+			)
+			out, runErr := cmd.CombinedOutput()
+			if runErr != nil {
+				_, _ = fmt.Fprintf(w, "  exec error: %v\n  output:\n%s\n", runErr, string(out))
+			} else {
+				_, _ = w.Write(out)
+				_, _ = fmt.Fprintln(w)
+			}
+		}
+	} else {
+		_, _ = fmt.Fprintf(w, "list error: %v\n", err)
 	}
 }
 

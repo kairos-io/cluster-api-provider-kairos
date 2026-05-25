@@ -17,11 +17,9 @@ permissions and limitations under the License.
 package controlplane
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -29,7 +27,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,6 +61,18 @@ type KairosControlPlaneReconciler struct {
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
+
+// kubeconfigReadyTimeout is the elapsed since Status.LastNodePushObserved
+// after which KubeconfigReadyCondition's severity escalates from Info to
+// Warning. The timeout is not a terminal — past it, the controller still
+// waits on the Secret watch. Operator visibility (condition severity)
+// changes; no controller-side recovery action. PR-9's SSHFallback opt-in
+// is the recovery surface.
+//
+// 10 minutes covers normal boot/network-init time on lab-grade VMs with
+// margin for kairos package downloads; tightening on infra with faster
+// boot lands as a per-infra-provider override in a follow-up.
+const kubeconfigReadyTimeout = 10 * time.Minute
 
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes/status,verbs=get;update;patch
@@ -248,127 +257,28 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	// Retrieve and store kubeconfig if control plane infrastructure is ready
-	// We check infrastructure readiness as a fallback even if NodeRef isn't set yet
-	// This allows us to retrieve kubeconfig before the node is fully registered
-	shouldRetrieveKubeconfig := false
-	if kcp.Status.ReadyReplicas > 0 && kcp.Status.Initialized {
-		shouldRetrieveKubeconfig = true
-		log.Info("Control plane is ready (NodeRef set), attempting to retrieve kubeconfig",
-			"readyReplicas", kcp.Status.ReadyReplicas,
-			"initialized", kcp.Status.Initialized)
-	} else {
-		// Fallback: Check if infrastructure is ready even without NodeRef
-		// This is useful when k0s is running but node hasn't registered yet
-		// But first check if kubeconfig already exists to avoid unnecessary work
-		secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
-		secretKey := types.NamespacedName{
-			Name:      secretName,
-			Namespace: cluster.Namespace,
-		}
-		existingSecret := &corev1.Secret{}
-		if err := r.Get(ctx, secretKey, existingSecret); err == nil {
-			if kubeconfig, ok := existingSecret.Data["value"]; ok && len(kubeconfig) > 0 {
-				// Kubeconfig already exists, skip retrieval
-				log.V(4).Info("Kubeconfig already exists, skipping retrieval",
-					"readyReplicas", kcp.Status.ReadyReplicas,
-					"initialized", kcp.Status.Initialized)
-			} else {
-				// Kubeconfig secret exists but is empty, try to retrieve
-				machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
-				if err == nil && len(machines) > 0 {
-					for _, machine := range machines {
-						// Check if infrastructure is ready
-						if conditions.IsTrue(machine, clusterv1.InfrastructureReadyCondition) &&
-							conditions.IsTrue(machine, clusterv1.BootstrapReadyCondition) {
-							// Infrastructure and bootstrap are ready, try to retrieve kubeconfig
-							shouldRetrieveKubeconfig = true
-							log.Info("Control plane infrastructure ready (fallback), attempting to retrieve kubeconfig",
-								"machine", machine.Name,
-								"infrastructureReady", conditions.IsTrue(machine, clusterv1.InfrastructureReadyCondition),
-								"bootstrapReady", conditions.IsTrue(machine, clusterv1.BootstrapReadyCondition))
-							break
-						}
-					}
-				}
-			}
-		} else if apierrors.IsNotFound(err) {
-			// Kubeconfig doesn't exist, try to retrieve if infrastructure is ready
-			machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
-			if err == nil && len(machines) > 0 {
-				for _, machine := range machines {
-					// Check if infrastructure is ready
-					if conditions.IsTrue(machine, clusterv1.InfrastructureReadyCondition) &&
-						conditions.IsTrue(machine, clusterv1.BootstrapReadyCondition) {
-						// Infrastructure and bootstrap are ready, try to retrieve kubeconfig
-						shouldRetrieveKubeconfig = true
-						log.Info("Control plane infrastructure ready (fallback), attempting to retrieve kubeconfig",
-							"machine", machine.Name,
-							"infrastructureReady", conditions.IsTrue(machine, clusterv1.InfrastructureReadyCondition),
-							"bootstrapReady", conditions.IsTrue(machine, clusterv1.BootstrapReadyCondition))
-						break
-					}
-				}
-			}
-		}
-		if !shouldRetrieveKubeconfig {
-			log.V(4).Info("Control plane not ready yet, skipping kubeconfig retrieval",
-				"readyReplicas", kcp.Status.ReadyReplicas,
-				"initialized", kcp.Status.Initialized)
-		}
+	// KD-3b: the controller no longer SSHes into the node to fetch the
+	// kubeconfig. Instead, the node (CAPK + CAPV today) pushes its
+	// kubeconfig as a Secret using a per-cluster ServiceAccount token
+	// minted by the bootstrap controller's ManagementEndpointResolver.
+	// Here we observe the Secret's presence and reflect it on
+	// KubeconfigReadyCondition.
+	//
+	// The Secret watch (SetupWithManager) wakes us when the node writes
+	// the kubeconfig, so no requeue is needed on the missing-Secret path.
+	// LastNodePushObserved is anchored on first-miss observation and
+	// drives the Info → Warning severity escalation after
+	// kubeconfigReadyTimeout.
+	kubeconfigReady, err := r.observeKubeconfigSecret(ctx, log, kcp, cluster)
+	if err != nil {
+		// Hard errors (Get failures other than NotFound) propagate. The
+		// missing-Secret case is signalled by kubeconfigReady=false and a
+		// nil err.
+		return ctrl.Result{}, fmt.Errorf("observe kubeconfig secret: %w", err)
 	}
-
-	if shouldRetrieveKubeconfig {
-		if err := r.reconcileKubeconfig(ctx, log, kcp, cluster); err != nil {
-			// Check if this is a transient error that should be retried
-			errMsg := err.Error()
-			isTransientError := false
-			retryDelay := 30 * time.Second // Default retry delay
-
-			// Check for transient errors that indicate k0s/k3s is not ready yet or VM is rebooting
-			if strings.Contains(errMsg, "k0s is not ready") ||
-				strings.Contains(errMsg, "k0s service is not active") ||
-				strings.Contains(errMsg, "k3s is not ready") ||
-				strings.Contains(errMsg, "k3s service is not active") ||
-				(strings.Contains(errMsg, "admin config") && strings.Contains(errMsg, "not found")) ||
-				strings.Contains(errMsg, "connection refused") ||
-				(strings.Contains(errMsg, "dial") && strings.Contains(errMsg, "failed")) ||
-				strings.Contains(errMsg, "no such host") ||
-				strings.Contains(errMsg, "still be initializing") {
-				isTransientError = true
-				log.Info("Transient error during kubeconfig retrieval, will retry",
-					"error", errMsg,
-					"retryDelay", retryDelay)
-			}
-
-			if isTransientError {
-				// Requeue with delay to retry later
-				// This allows k0s/k3s to finish initializing after Kairos reboots
-				log.Info("Requeuing kubeconfig retrieval due to transient error",
-					"readyReplicas", kcp.Status.ReadyReplicas,
-					"initialized", kcp.Status.Initialized,
-					"retryDelay", retryDelay)
-				// Update status before requeuing to ensure progress is tracked
-				if err := r.updateStatus(ctx, log, kcp, cluster); err != nil {
-					log.Error(err, "Failed to update status before requeue")
-				}
-				// Use Status().Update() to ensure all status fields are included
-				if updateErr := r.Status().Update(ctx, kcp); updateErr != nil {
-					if apierrors.IsConflict(updateErr) {
-						log.V(4).Info("Conflict updating KCP status before requeue, will retry", "error", updateErr)
-						return ctrl.Result{Requeue: true}, nil
-					}
-					log.Error(updateErr, "Failed to update KCP status before requeue")
-					return ctrl.Result{RequeueAfter: retryDelay}, nil
-				}
-				return ctrl.Result{RequeueAfter: retryDelay}, nil
-			} else {
-				log.Error(err, "Failed to reconcile kubeconfig (non-transient error)",
-					"readyReplicas", kcp.Status.ReadyReplicas,
-					"initialized", kcp.Status.Initialized)
-				// Don't fail the reconcile for non-transient errors, just log
-			}
-		}
+	if !kubeconfigReady {
+		log.V(4).Info("Kubeconfig Secret not yet observed; waiting for node push (KD-3b)",
+			"cluster", cluster.Name)
 	}
 
 	// Ensure Node providerID is set in the workload cluster once kubeconfig is available.
@@ -887,148 +797,85 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	return nil
 }
 
-// reconcileKubeconfig retrieves the kubeconfig from the control plane node and stores it in a secret
-func (r *KairosControlPlaneReconciler) reconcileKubeconfig(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
-	// Check if kubeconfig secret already exists
+// observeKubeconfigSecret implements the KD-3b node-push-wait pattern.
+//
+// The controller no longer SSHes into nodes to fetch the kubeconfig (KD-10).
+// The node (CAPK / CAPV under KD-3b) writes its kubeconfig as a Secret to
+// the management cluster using a per-cluster ServiceAccount token. Here we
+// observe that Secret's presence and reflect it on KubeconfigReadyCondition.
+//
+// Return values:
+//   - ready=true when the Secret exists, parses as a valid kubeconfig, and
+//     has the cluster-name label. KubeconfigReadyCondition transitions to
+//     True; Status.LastNodePushObserved is cleared.
+//   - ready=false on a missing or empty Secret. The condition is set to
+//     False(WaitingForNodePush). Status.LastNodePushObserved is anchored
+//     to now on first observation; once
+//     Now - LastNodePushObserved > kubeconfigReadyTimeout the condition
+//     severity escalates from Info to Warning. No requeue is issued; the
+//     Secret watch wakes us when the node writes the kubeconfig.
+//   - err is non-nil only for hard Get failures (apiserver unreachable,
+//     RBAC denied). NotFound is the missing-Secret signal, not an error.
+//
+// Why not parse-validate the kubeconfig in Go: the node-push payload
+// always writes a base64 of the actual on-node admin.conf / k3s.yaml,
+// which we trust the distribution to keep syntactically valid. A deeper
+// validator (e.g. clientcmd.Load) belongs in PR-8 once
+// ensureProviderIDOnNodes uses the parsed config.
+func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (bool, error) {
 	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
 	secretKey := types.NamespacedName{
 		Name:      secretName,
 		Namespace: cluster.Namespace,
 	}
 
-	existingSecret := &corev1.Secret{}
-	if err := r.Get(ctx, secretKey, existingSecret); err == nil {
-		// Secret already exists, check if it's valid
-		if kubeconfig, ok := existingSecret.Data["value"]; ok && len(kubeconfig) > 0 {
-			if updated, err := r.ensureKubeconfigSecretMetadata(ctx, existingSecret, cluster); err != nil {
-				return err
-			} else if updated {
-				log.Info("Updated kubeconfig secret metadata", "secret", secretName)
-			}
-			log.V(4).Info("Kubeconfig secret already exists", "secret", secretName)
-			return nil
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, secretKey, secret)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return false, err
+	}
+	if err == nil {
+		if kubeconfig, ok := secret.Data["value"]; ok && len(kubeconfig) > 0 {
+			// Secret present and non-empty: kubeconfig is ready. Use
+			// conditions.Set rather than MarkTrue so the Reason is
+			// populated for downstream consumers — `MarkTrue` deliberately
+			// leaves Reason empty per CAPI convention, but KubeconfigReady
+			// is a custom condition where the Reason is the observable
+			// signal of which path achieved readiness (node-push, vs.
+			// PR-9's SSH fallback once it lands).
+			kcp.Status.LastNodePushObserved = nil
+			conditions.Set(kcp, &clusterv1.Condition{
+				Type:   controlplanev1beta2.KubeconfigReadyCondition,
+				Status: corev1.ConditionTrue,
+				Reason: controlplanev1beta2.KubeconfigReadyReason,
+			})
+			log.V(4).Info("Kubeconfig Secret observed",
+				"secret", secretKey.String(),
+				"size", len(kubeconfig))
+			return true, nil
 		}
 	}
 
-	// Get the first ready control plane machine
-	// Prefer machines with NodeRef, but fallback to infrastructure-ready machines
-	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
-	if err != nil {
-		return fmt.Errorf("failed to get control plane machines: %w", err)
+	// Missing or empty Secret. Anchor LastNodePushObserved on first miss so
+	// the severity escalation has a stable timestamp; if a previous reconcile
+	// already anchored it, keep that timestamp (we're measuring elapsed since
+	// first observation, not since last).
+	if kcp.Status.LastNodePushObserved == nil {
+		now := metav1.Now()
+		kcp.Status.LastNodePushObserved = &now
 	}
-
-	var readyMachine *clusterv1.Machine
-	var fallbackMachine *clusterv1.Machine
-
-	for _, machine := range machines {
-		// Prefer machines with NodeRef (fully registered)
-		if machine.Status.NodeRef != nil {
-			readyMachine = machine
-			break
-		}
-		// Fallback: use infrastructure-ready machine even without NodeRef
-		// This allows kubeconfig retrieval when k0s is running but node hasn't registered yet
-		if fallbackMachine == nil &&
-			conditions.IsTrue(machine, clusterv1.InfrastructureReadyCondition) &&
-			conditions.IsTrue(machine, clusterv1.BootstrapReadyCondition) {
-			fallbackMachine = machine
-		}
+	severity := clusterv1.ConditionSeverityInfo
+	message := fmt.Sprintf("Waiting for the workload node to push its kubeconfig as Secret %s/%s.", cluster.Namespace, secretName)
+	if elapsed := time.Since(kcp.Status.LastNodePushObserved.Time); elapsed > kubeconfigReadyTimeout {
+		severity = clusterv1.ConditionSeverityWarning
+		message = fmt.Sprintf("Workload node has not pushed its kubeconfig to %s/%s for %s; check node networking to the management API server.", cluster.Namespace, secretName, elapsed.Round(time.Second))
 	}
-
-	// Use fallback if no machine with NodeRef found
-	if readyMachine == nil {
-		readyMachine = fallbackMachine
-	}
-
-	if readyMachine == nil {
-		return fmt.Errorf("no ready control plane machine found (checked NodeRef and infrastructure readiness)")
-	}
-
-	if readyMachine.Status.NodeRef != nil {
-		log.Info("Found ready control plane machine with NodeRef", "machine", readyMachine.Name, "nodeRef", readyMachine.Status.NodeRef)
-	} else {
-		log.Info("Found infrastructure-ready control plane machine (no NodeRef yet)", "machine", readyMachine.Name,
-			"infrastructureReady", conditions.IsTrue(readyMachine, clusterv1.InfrastructureReadyCondition),
-			"bootstrapReady", conditions.IsTrue(readyMachine, clusterv1.BootstrapReadyCondition))
-	}
-
-	// For KubeVirt, skip SSH once kubeconfig is present to avoid timeouts in bridged setups.
-	if isKubevirtMachine(readyMachine) {
-		kubevirtSecret := &corev1.Secret{}
-		if err := r.Get(ctx, secretKey, kubevirtSecret); err == nil {
-			if kubeconfig, ok := kubevirtSecret.Data["value"]; ok && len(kubeconfig) > 0 {
-				log.Info("Skipping SSH kubeconfig retrieval for KubeVirt; secret already exists", "secret", secretName)
-				return nil
-			}
-		}
-	}
-
-	// Retrieve kubeconfig from the node
-	// For k0s: k0s kubeconfig admin (from /var/lib/k0s/pki/admin.conf)
-	// For k3s: cat /etc/rancher/k3s/k3s.yaml
-	log.Info("Retrieving kubeconfig from node", "machine", readyMachine.Name, "distribution", kcp.Spec.Distribution)
-	kubeconfig, err := r.retrieveKubeconfigFromNode(ctx, log, kcp, readyMachine, cluster)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve kubeconfig from node: %w", err)
-	}
-
-	// k3s default kubeconfig uses https://127.0.0.1:6443 - update to reachable address so management cluster can connect
-	// For KubeVirt, prefer LB endpoint over node IP (canonical reachable address from management cluster)
-	if kcp.Spec.Distribution == "k3s" {
-		serverHost := ""
-		if isKubevirtControlPlane(kcp) {
-			lbHost, lbPort, lbErr := r.getControlPlaneLBEndpoint(ctx, log, cluster)
-			if lbErr == nil && lbHost != "" && lbPort != 0 {
-				serverHost = lbHost
-				log.V(4).Info("Using LoadBalancer endpoint for k3s kubeconfig server", "host", lbHost, "port", lbPort)
-			}
-		}
-		if serverHost == "" {
-			nodeIP, nodeErr := r.getNodeIP(ctx, log, readyMachine)
-			sshHost, hostErr := resolveSSHHost(readyMachine, cluster, nodeIP, nodeErr, log)
-			if hostErr == nil && sshHost != "" {
-				serverHost = sshHost
-			}
-		}
-		if serverHost != "" {
-			updated, updateErr := updateKubeconfigServerToNodeIP(kubeconfig, serverHost, 6443)
-			if updateErr != nil {
-				log.Error(updateErr, "Failed to update kubeconfig server for k3s, using as-is")
-			} else {
-				kubeconfig = updated
-				log.Info("Updated k3s kubeconfig server", "host", serverHost)
-			}
-		}
-	}
-
-	// Create or update the kubeconfig secret
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: cluster.Namespace,
-		},
-		Type: clusterv1.ClusterSecretType,
-		Data: map[string][]byte{
-			"value": kubeconfig,
-		},
-	}
-	if _, err := r.ensureKubeconfigSecretMetadata(ctx, secret, cluster); err != nil {
-		return err
-	}
-
-	if err := r.Create(ctx, secret); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			// Update existing secret
-			if err := r.Update(ctx, secret); err != nil {
-				return fmt.Errorf("failed to update kubeconfig secret: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to create kubeconfig secret: %w", err)
-		}
-	}
-
-	log.Info("Kubeconfig secret created/updated", "secret", secretName)
-	return nil
+	conditions.MarkFalse(kcp,
+		controlplanev1beta2.KubeconfigReadyCondition,
+		controlplanev1beta2.WaitingForNodePushReason,
+		severity,
+		"%s", message)
+	return false, nil
 }
 
 // ensureProviderIDOnNodes patches workload cluster Nodes with the Machine providerID.
@@ -1229,48 +1076,6 @@ func (r *KairosControlPlaneReconciler) getInfrastructureProviderID(ctx context.C
 	return ""
 }
 
-// retrieveKubeconfigFromNode retrieves the kubeconfig from a control plane node
-// For k0s: runs `k0s kubeconfig admin` (from /var/lib/k0s/pki/admin.conf)
-// For k3s: runs `cat /etc/rancher/k3s/k3s.yaml`
-func (r *KairosControlPlaneReconciler) retrieveKubeconfigFromNode(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machine *clusterv1.Machine, cluster *clusterv1.Cluster) ([]byte, error) {
-	// Get node IP from infrastructure provider
-	nodeIP, nodeErr := r.getNodeIP(ctx, log, machine)
-	sshHost, err := resolveSSHHost(machine, cluster, nodeIP, nodeErr, log)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve SSH host: %w", err)
-	}
-
-	log.Info("Retrieving kubeconfig from node", "nodeIP", sshHost, "distribution", kcp.Spec.Distribution)
-
-	// Get SSH credentials from KairosConfig
-	userName, userPassword, err := r.getSSHCredentials(ctx, log, machine)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get SSH credentials: %w", err)
-	}
-
-	distribution := kcp.Spec.Distribution
-	if distribution == "" {
-		distribution = "k0s"
-	}
-
-	var kubeconfig []byte
-	switch distribution {
-	case "k3s":
-		kubeconfig, err = r.executeK3sKubeconfigCommand(ctx, log, sshHost, userName, userPassword)
-		if err != nil {
-			return nil, fmt.Errorf("failed to execute k3s kubeconfig command: %w", err)
-		}
-	default:
-		kubeconfig, err = r.executeK0sKubeconfigCommand(ctx, log, sshHost, userName, userPassword)
-		if err != nil {
-			return nil, fmt.Errorf("failed to execute k0s kubeconfig command: %w", err)
-		}
-	}
-
-	log.Info("Successfully retrieved kubeconfig", "nodeIP", sshHost, "distribution", distribution, "kubeconfigSize", len(kubeconfig))
-	return kubeconfig, nil
-}
-
 // getNodeIP retrieves the node IP from the infrastructure provider.
 // Supports CAPD (DockerMachine), CAPV (VSphereMachine/VSphereVM), and CAPK (KubevirtMachine).
 func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, error) {
@@ -1451,26 +1256,6 @@ func (r *KairosControlPlaneReconciler) getKubevirtVMIIP(ctx context.Context, log
 	return "", fmt.Errorf("no IP address found in VMI status.interfaces")
 }
 
-func resolveSSHHost(machine *clusterv1.Machine, cluster *clusterv1.Cluster, nodeIP string, nodeErr error, log logr.Logger) (string, error) {
-	if nodeIP != "" {
-		return nodeIP, nil
-	}
-
-	if isKubevirtMachine(machine) && cluster != nil {
-		fallbackHost := cluster.Spec.ControlPlaneEndpoint.Host
-		if isValidEndpointHost(fallbackHost) {
-			log.Info("Using controlPlaneEndpoint host for KubeVirt SSH fallback", "host", fallbackHost, "machine", machine.Name)
-			return fallbackHost, nil
-		}
-	}
-
-	if nodeErr != nil {
-		return "", nodeErr
-	}
-
-	return "", fmt.Errorf("node IP not available yet")
-}
-
 func isKubevirtMachine(machine *clusterv1.Machine) bool {
 	if machine == nil {
 		return false
@@ -1496,368 +1281,6 @@ func isValidEndpointHost(host string) bool {
 	return host != "" && host != "0.0.0.0" && host != "::"
 }
 
-// getSSHCredentials retrieves SSH credentials from KairosConfig.
-//
-// KD-3a (v0.1.0-alpha.2): UserPassword no longer silently defaults to
-// "kairos". Password resolution mirrors the bootstrap controller's
-// resolveUserPassword:
-//
-//	UserPasswordSecretRef > inline UserPassword > error.
-//
-// If neither is set, the helper returns an error so the caller surfaces it
-// as a clear reconcile failure instead of silently using a wrong password
-// and burning a 60-second SSH dial timeout.
-//
-// Note: this entire SSH path is slated for removal in KD-3b, where the
-// control-plane controller stops SSHing into nodes (the kubeconfig and
-// providerID are pushed from inside the node via the CAPK pattern,
-// extended to all infras). Until then, this resolver is the right
-// behaviour — and an SSH-key-only KairosConfig (`sshPublicKey` /
-// `gitHubUser` with no password set) cannot currently work on infras that
-// rely on controller-side SSH (CAPV today; CAPM3/Tinkerbell/etc. when
-// they land). Users who need that combination must wait for KD-3b.
-func (r *KairosControlPlaneReconciler) getSSHCredentials(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, string, error) {
-	if machine.Spec.Bootstrap.ConfigRef == nil {
-		return "", "", fmt.Errorf("machine has no bootstrap config ref")
-	}
-
-	// Get KairosConfig
-	kairosConfig := &bootstrapv1beta2.KairosConfig{}
-	kairosConfigKey := types.NamespacedName{
-		Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-		Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
-	}
-
-	if err := r.Get(ctx, kairosConfigKey, kairosConfig); err != nil {
-		return "", "", fmt.Errorf("failed to get KairosConfig: %w", err)
-	}
-
-	userName := kairosConfig.Spec.UserName
-	if userName == "" {
-		userName = "kairos"
-	}
-
-	userPassword, err := r.resolveUserPasswordForSSH(ctx, kairosConfig)
-	if err != nil {
-		return "", "", err
-	}
-	if userPassword == "" {
-		return "", "", fmt.Errorf("KairosConfig %s/%s has no userPassword or userPasswordSecretRef configured; "+
-			"controller-side SSH operations (kubeconfig fetch, providerID set) require a password until KD-3b lands. "+
-			"Set spec.userPassword or spec.userPasswordSecretRef.",
-			kairosConfig.Namespace, kairosConfig.Name)
-	}
-
-	log.V(4).Info("Retrieved SSH credentials", "userName", userName)
-	return userName, userPassword, nil
-}
-
-// resolveUserPasswordForSSH mirrors internal/controllers/bootstrap/
-// resolveUserPassword. The duplication is deliberate for now: the two
-// controllers live in separate packages with unexported helpers; extracting
-// a shared resolver is bigger work that belongs in a controller-split PR
-// (see internal/controllers/CLAUDE.md § "File-size policy"). When that
-// split lands, both call sites consolidate.
-func (r *KairosControlPlaneReconciler) resolveUserPasswordForSSH(ctx context.Context, kairosConfig *bootstrapv1beta2.KairosConfig) (string, error) {
-	if ref := kairosConfig.Spec.UserPasswordSecretRef; ref != nil && ref.Name != "" {
-		secretKey := types.NamespacedName{
-			Namespace: kairosConfig.Namespace,
-			Name:      ref.Name,
-		}
-		if ref.Namespace != "" {
-			secretKey.Namespace = ref.Namespace
-		}
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, secretKey, secret); err != nil {
-			return "", fmt.Errorf("get user password secret %s/%s: %w", secretKey.Namespace, secretKey.Name, err)
-		}
-		key := ref.Key
-		if key == "" {
-			key = "password"
-		}
-		data, ok := secret.Data[key]
-		if !ok {
-			return "", fmt.Errorf("user password secret %s/%s does not contain key %q", secretKey.Namespace, secretKey.Name, key)
-		}
-		return string(data), nil
-	}
-	return kairosConfig.Spec.UserPassword, nil
-}
-
-// checkK0sReady checks if k0s is ready by verifying the service is running and admin.conf exists
-func (r *KairosControlPlaneReconciler) checkK0sReady(ctx context.Context, log logr.Logger, client *ssh.Client) error {
-	// Check if k0s service is running
-	checkCommands := []string{
-		"sudo -n systemctl is-active k0scontroller || sudo -n systemctl is-active k0s",
-		"sudo systemctl is-active k0scontroller || sudo systemctl is-active k0s",
-		"systemctl is-active k0scontroller || systemctl is-active k0s",
-	}
-
-	for _, cmd := range checkCommands {
-		session, err := client.NewSession()
-		if err != nil {
-			continue
-		}
-
-		var stdout, stderr bytes.Buffer
-		session.Stdout = &stdout
-		session.Stderr = &stderr
-
-		err = session.Run(cmd)
-		session.Close()
-
-		if err == nil {
-			output := stdout.String()
-			if output == "active\n" || output == "active" {
-				log.V(4).Info("k0s service is active")
-				// Also check if admin.conf exists
-				checkFileCmd := "sudo -n test -f /var/lib/k0s/pki/admin.conf || sudo test -f /var/lib/k0s/pki/admin.conf || test -f /var/lib/k0s/pki/admin.conf"
-				fileSession, err := client.NewSession()
-				if err == nil {
-					err = fileSession.Run(checkFileCmd)
-					fileSession.Close()
-					if err == nil {
-						log.V(4).Info("k0s admin.conf file exists")
-						return nil
-					}
-				}
-				// Service is active but admin.conf doesn't exist yet - k0s is still initializing
-				log.V(4).Info("k0s service is active but admin.conf not found yet, k0s may still be initializing")
-				return fmt.Errorf("k0s is running but admin.conf not found yet - k0s may still be initializing")
-			}
-		}
-	}
-
-	return fmt.Errorf("k0s service is not active")
-}
-
-// executeK0sKubeconfigCommand SSHes into the node and runs `k0s kubeconfig admin`
-func (r *KairosControlPlaneReconciler) executeK0sKubeconfigCommand(ctx context.Context, log logr.Logger, nodeIP, userName, userPassword string) ([]byte, error) {
-	// Create SSH client config
-	config := &ssh.ClientConfig{
-		User: userName,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(userPassword),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // In production, use proper host key verification
-		Timeout:         30 * time.Second,
-	}
-
-	// Connect to the node
-	address := net.JoinHostPort(nodeIP, "22")
-	log.V(4).Info("Connecting to node via SSH", "address", address)
-
-	client, err := ssh.Dial("tcp", address, config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial SSH: %w", err)
-	}
-	defer client.Close()
-
-	// Check if k0s is ready before attempting to get kubeconfig
-	if err := r.checkK0sReady(ctx, log, client); err != nil {
-		return nil, fmt.Errorf("k0s is not ready yet: %w", err)
-	}
-
-	// Create a session
-	session, err := client.NewSession()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSH session: %w", err)
-	}
-	defer session.Close()
-
-	// Run k0s kubeconfig admin command with sudo
-	// k0s kubeconfig admin typically requires root/sudo access to read the kubeconfig
-	// Use timeout context to avoid hanging
-	commandCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	// Try with sudo first (non-interactive), fallback to direct command if sudo is not available
-	// sudo -n (non-interactive) will fail if password is required, but won't hang
-	commands := []string{
-		"sudo -n k0s kubeconfig admin", // Non-interactive sudo (requires passwordless sudo)
-		"sudo k0s kubeconfig admin",    // Interactive sudo (may prompt for password)
-		"k0s kubeconfig admin",         // Direct command (if user has permissions)
-	}
-
-	var output []byte
-	var lastErr error
-
-	for _, cmd := range commands {
-		log.V(4).Info("Trying kubeconfig command", "command", cmd)
-
-		// Create a new session for each attempt
-		session, err := client.NewSession()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SSH session: %w", err)
-		}
-
-		// Capture both stdout and stderr
-		var stdout, stderr bytes.Buffer
-		session.Stdout = &stdout
-		session.Stderr = &stderr
-
-		// Execute command with timeout
-		done := make(chan error, 1)
-
-		go func() {
-			err := session.Run(cmd)
-			done <- err
-		}()
-
-		select {
-		case err := <-done:
-			session.Close()
-			if err == nil {
-				output = stdout.Bytes()
-				if len(output) > 0 {
-					log.Info("Successfully retrieved kubeconfig", "command", cmd, "size", len(output))
-					return output, nil
-				}
-			} else {
-				stderrStr := stderr.String()
-				lastErr = fmt.Errorf("command '%s' failed: %w, stderr: %s", cmd, err, stderrStr)
-				log.Info("Command failed, trying next", "command", cmd, "error", err, "stderr", stderrStr)
-			}
-		case <-commandCtx.Done():
-			session.Close()
-			lastErr = fmt.Errorf("timeout waiting for kubeconfig command: %s", cmd)
-			log.V(4).Info("Command timed out, trying next", "command", cmd)
-		}
-	}
-
-	// All commands failed
-	if lastErr != nil {
-		return nil, fmt.Errorf("all kubeconfig commands failed, last error: %w. Ensure the user has sudo access or k0s is accessible without sudo", lastErr)
-	}
-
-	return nil, fmt.Errorf("k0s kubeconfig command returned empty output")
-}
-
-// checkK3sReady checks if k3s is ready by verifying the service is running and k3s.yaml exists
-func (r *KairosControlPlaneReconciler) checkK3sReady(ctx context.Context, log logr.Logger, client *ssh.Client) error {
-	// Check if k3s service is running (k3s server uses "k3s" service name)
-	checkCommands := []string{
-		"sudo -n systemctl is-active k3s",
-		"sudo systemctl is-active k3s",
-		"systemctl is-active k3s",
-	}
-
-	for _, cmd := range checkCommands {
-		session, err := client.NewSession()
-		if err != nil {
-			continue
-		}
-
-		var stdout, stderr bytes.Buffer
-		session.Stdout = &stdout
-		session.Stderr = &stderr
-
-		err = session.Run(cmd)
-		session.Close()
-
-		if err == nil {
-			output := stdout.String()
-			if output == "active\n" || output == "active" {
-				log.V(4).Info("k3s service is active")
-				// Also check if k3s.yaml exists
-				checkFileCmd := "sudo -n test -f /etc/rancher/k3s/k3s.yaml || sudo test -f /etc/rancher/k3s/k3s.yaml || test -f /etc/rancher/k3s/k3s.yaml"
-				fileSession, err := client.NewSession()
-				if err == nil {
-					err = fileSession.Run(checkFileCmd)
-					fileSession.Close()
-					if err == nil {
-						log.V(4).Info("k3s kubeconfig file exists")
-						return nil
-					}
-				}
-				log.V(4).Info("k3s service is active but k3s.yaml not found yet, k3s may still be initializing")
-				return fmt.Errorf("k3s is running but k3s.yaml not found yet - k3s may still be initializing")
-			}
-		}
-	}
-
-	return fmt.Errorf("k3s service is not active")
-}
-
-// executeK3sKubeconfigCommand SSHes into the node and runs `cat /etc/rancher/k3s/k3s.yaml`
-func (r *KairosControlPlaneReconciler) executeK3sKubeconfigCommand(ctx context.Context, log logr.Logger, nodeIP, userName, userPassword string) ([]byte, error) {
-	config := &ssh.ClientConfig{
-		User: userName,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(userPassword),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         30 * time.Second,
-	}
-
-	address := net.JoinHostPort(nodeIP, "22")
-	log.V(4).Info("Connecting to node via SSH", "address", address)
-
-	client, err := ssh.Dial("tcp", address, config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial SSH: %w", err)
-	}
-	defer client.Close()
-
-	if err := r.checkK3sReady(ctx, log, client); err != nil {
-		return nil, fmt.Errorf("k3s is not ready yet: %w", err)
-	}
-
-	// k3s kubeconfig is at /etc/rancher/k3s/k3s.yaml
-	commands := []string{
-		"sudo -n cat /etc/rancher/k3s/k3s.yaml",
-		"sudo cat /etc/rancher/k3s/k3s.yaml",
-		"cat /etc/rancher/k3s/k3s.yaml",
-	}
-
-	commandCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	var output []byte
-	var lastErr error
-
-	for _, cmd := range commands {
-		log.V(4).Info("Trying k3s kubeconfig command", "command", cmd)
-
-		session, err := client.NewSession()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SSH session: %w", err)
-		}
-
-		var stdout, stderr bytes.Buffer
-		session.Stdout = &stdout
-		session.Stderr = &stderr
-
-		done := make(chan error, 1)
-		go func() {
-			done <- session.Run(cmd)
-		}()
-
-		select {
-		case err := <-done:
-			session.Close()
-			if err == nil {
-				output = stdout.Bytes()
-				if len(output) > 0 {
-					log.Info("Successfully retrieved k3s kubeconfig", "command", cmd, "size", len(output))
-					return output, nil
-				}
-			} else {
-				lastErr = fmt.Errorf("command '%s' failed: %w, stderr: %s", cmd, err, stderr.String())
-				log.V(4).Info("Command failed, trying next", "command", cmd, "error", err)
-			}
-		case <-commandCtx.Done():
-			session.Close()
-			lastErr = fmt.Errorf("timeout waiting for kubeconfig command: %s", cmd)
-			log.V(4).Info("Command timed out, trying next", "command", cmd)
-		}
-	}
-
-	if lastErr != nil {
-		return nil, fmt.Errorf("all k3s kubeconfig commands failed, last error: %w", lastErr)
-	}
-	return nil, fmt.Errorf("k3s kubeconfig command returned empty output")
-}
 
 // updateClusterStatus updates the Cluster status based on control plane readiness
 func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
@@ -2444,8 +1867,22 @@ func (r *KairosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.secretToKairosControlPlane),
+			// KD-15-compliant predicate: filter by Type and the
+			// cluster-name label, never by name suffix. The previous
+			// strings.HasSuffix predicate matched anything-kubeconfig,
+			// including unrelated workload-cluster Secrets and any
+			// future tenant that happens to suffix with -kubeconfig.
+			// The KD-3b push payload always stamps both fields, so a
+			// node-pushed kubeconfig Secret reliably matches.
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-				return strings.HasSuffix(obj.GetName(), "-kubeconfig")
+				secret, ok := obj.(*corev1.Secret)
+				if !ok {
+					return false
+				}
+				if secret.Type != clusterv1.ClusterSecretType {
+					return false
+				}
+				return secret.Labels[clusterv1.ClusterNameLabel] != ""
 			})),
 		).
 		Complete(r)
@@ -2523,17 +1960,17 @@ func (r *KairosControlPlaneReconciler) clusterToKairosControlPlane(ctx context.C
 
 // secretToKairosControlPlane maps a kubeconfig Secret to its KairosControlPlane.
 // This ensures KCP reconciles when kubeconfig is pushed from the VM.
+//
+// KD-15-compliant: the cluster lookup uses the `cluster.x-k8s.io/cluster-name`
+// label, not the legacy `strings.TrimSuffix(secret.Name, "-kubeconfig")`
+// heuristic that would mis-match user-created secrets named *-kubeconfig.
 func (r *KairosControlPlaneReconciler) secretToKairosControlPlane(ctx context.Context, o client.Object) []reconcile.Request {
 	secret, ok := o.(*corev1.Secret)
 	if !ok {
 		return nil
 	}
 
-	if !strings.HasSuffix(secret.Name, "-kubeconfig") {
-		return nil
-	}
-
-	clusterName := strings.TrimSuffix(secret.Name, "-kubeconfig")
+	clusterName := secret.Labels[clusterv1.ClusterNameLabel]
 	if clusterName == "" {
 		return nil
 	}

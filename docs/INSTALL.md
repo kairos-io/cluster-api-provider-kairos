@@ -112,6 +112,25 @@ make uninstall
 
 ---
 
+## Network reachability requirement for non-CAPK infrastructure
+
+Starting with v0.1.0-alpha.2, the controller no longer SSHes into nodes to
+retrieve the workload kubeconfig. Instead, control-plane nodes POST their
+kubeconfig back to a Secret in the management cluster.
+
+**Workload VMs (CAPV / CAPM3 / Tinkerbell) must have network reachability to
+the management cluster's API server URL.** Verify from a sample workload node
+before deploying:
+
+```bash
+curl -k https://<mgmt-api-server-host>:6443/api
+```
+
+For air-gapped or strictly-segmented network environments, see the planned
+`SSHFallback` opt-in mechanism (post-alpha-2, PR-9).
+
+---
+
 ## Next steps
 
 - [CAPD Quickstart](QUICKSTART_CAPD.md) — create a cluster with Docker (development only).

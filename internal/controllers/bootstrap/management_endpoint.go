@@ -24,18 +24,26 @@ import (
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
-// ManagementEndpoint carries the four values a node needs to push its
-// kubeconfig back to the management cluster without SSH. It is the
-// controller-package twin of internal/bootstrap.ManagementEndpoint — the two
-// structs are kept separate so the renderer stays free of any controller /
-// Kubernetes-API concerns (cloudconfig-rendering-safety rule: the renderer
-// does not talk to the API server). The call site in generate*CloudConfig
-// performs a one-line struct-literal conversion.
+// ManagementEndpoint carries the values a node needs to push its kubeconfig
+// back to the management cluster without SSH. It is the controller-package
+// twin of internal/bootstrap.ManagementEndpoint — the two structs are kept
+// separate so the renderer stays free of any controller / Kubernetes-API
+// concerns (cloudconfig-rendering-safety rule: the renderer does not talk to
+// the API server). The call site in generate*CloudConfig performs a one-line
+// struct-literal conversion.
+//
+// ClusterName is stamped into the pushed Secret as the
+// `cluster.x-k8s.io/cluster-name` label so the controlplane controller's
+// Secret-watch predicate (KD-15-compliant under KD-3b) can filter by label.
+// ControlPlaneEndpointHost is the cluster's control-plane endpoint host that
+// CAPV templates use to rewrite the kubeconfig `server:` URL before pushing.
 type ManagementEndpoint struct {
 	APIServer                 string
 	Token                     string
 	KubeconfigSecretName      string
 	KubeconfigSecretNamespace string
+	ClusterName               string
+	ControlPlaneEndpointHost  string
 }
 
 // ManagementEndpointResolver materialises the management-cluster contact info
