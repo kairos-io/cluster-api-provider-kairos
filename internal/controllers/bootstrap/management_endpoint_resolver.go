@@ -196,7 +196,20 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 	expirationSeconds := int64(24 * 60 * 60)
 	tokenRequest := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
-			Audiences:         []string{"https://kubernetes.default.svc"},
+			// Include both common audience variants so the token validates
+			// against kube-apiservers configured with either the short DNS
+			// name (--api-audiences=https://kubernetes.default.svc) or the
+			// FQDN (--api-audiences=https://kubernetes.default.svc.cluster.local,
+			// which is the kubeadm/kind/most-managed-K8s default). Tokens
+			// minted with a single audience that doesn't match the
+			// api-server's accepted set fail with HTTP 401 at push time —
+			// surfaced by the KD-3b PR-7 lab regression on the CI kind
+			// cluster (which uses the FQDN), where the production lab
+			// cluster happens to accept the short form. KD-50.
+			Audiences: []string{
+				"https://kubernetes.default.svc",
+				"https://kubernetes.default.svc.cluster.local",
+			},
 			ExpirationSeconds: &expirationSeconds,
 		},
 	}
