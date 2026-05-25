@@ -283,8 +283,19 @@ func (e *Environment) findKairosImageFile() (string, error) {
 func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kubernetes.Interface) error {
 	log := e.log()
 	log.Infof("Creating cloud-config Secret...")
+	// This cloud-config is baked into the live installer ISO via the OSArtifact
+	// `cloudConfigRef`. The `install.auto/device/reboot` triple is what tells the
+	// live installer to run an unattended install and reboot into the installed
+	// system on first boot — without it the live installer drops to an
+	// interactive root shell (KD-50 lab finding: e2e log showed
+	// "Welcome to Kairos! / [root@... ~]#" instead of an install banner).
+	// The KairosConfigTemplate in the workload manifest also sets install.auto
+	// for completeness, but the LIVE installer's decision uses the baked /oem/.
 	cloudConfig := `#cloud-config
 install:
+  auto: true
+  device: "auto"
+  reboot: true
   grub_options:
     extra_cmdline: "console=ttyS0 console=tty0"
 `
