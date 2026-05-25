@@ -404,11 +404,11 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 	defer teardown()
 
 	const (
-		nsName            = "kd4-held"
-		clusterName       = "kd4-held-cluster"
-		kcpName           = "kd4-held-kcp"
-		machineName       = "kd4-held-kcp-0"
-		foreignFinalizer  = "foreign-controller.example.com/wait"
+		nsName           = "kd4-held"
+		clusterName      = "kd4-held-cluster"
+		kcpName          = "kd4-held-kcp"
+		machineName      = "kd4-held-kcp-0"
+		foreignFinalizer = "foreign-controller.example.com/wait"
 	)
 
 	g.Expect(c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}})).To(Succeed())
