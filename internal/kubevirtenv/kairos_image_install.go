@@ -292,18 +292,19 @@ func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kub
 	// "Welcome to Kairos! / [root@... ~]#" instead of an install banner).
 	// The KairosConfigTemplate in the workload manifest also sets install.auto
 	// for completeness, but the LIVE installer's decision uses the baked /oem/.
-	// console+journald forwarding so the live installer's kairos-install
-	// service output (and anything else systemd logs) lands in the virtio
-	// serial0 log. Without this our diagnostic tail only sees the kernel
-	// dmesg ring and we can't tell whether the install ever attempted to
-	// run.
+	// extra_cmdline puts `console=ttyS0` AFTER the default `console=tty1`
+	// so the kernel's primary console is the virtio serial — `forward_to_console`
+	// then writes the systemd journal to /dev/console which our serial0-log
+	// captures. Prior iteration ended `console=tty0` which routed the journal
+	// to the (uncaptured) graphics console and left us blind past t≈16s of
+	// the installed-system boot.
 	cloudConfig := `#cloud-config
 install:
   auto: true
   device: "/dev/vda"
   reboot: true
   grub_options:
-    extra_cmdline: "console=ttyS0 console=tty0 systemd.journald.forward_to_console=1"
+    extra_cmdline: "console=ttyS0 systemd.journald.forward_to_console=1"
 `
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
