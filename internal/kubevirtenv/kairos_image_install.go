@@ -294,7 +294,7 @@ func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kub
 	cloudConfig := `#cloud-config
 install:
   auto: true
-  device: "auto"
+  device: "/dev/vda"
   reboot: true
   grub_options:
     extra_cmdline: "console=ttyS0 console=tty0"

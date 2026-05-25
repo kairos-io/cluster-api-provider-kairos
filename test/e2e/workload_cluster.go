@@ -49,13 +49,23 @@ var (
 )
 
 // applyWorkloadClusterManifests creates a single-node k3s CAPI cluster backed by KubeVirt
-// using the 2-disk Kairos installer pattern (KD-50): the VM boots the Kairos LIVE installer
-// ISO (cdrom, bootOrder: 1), the installer auto-detects the cloud-config (rendered into the
-// KubeVirt configdrive by CAPK), runs `install: { auto: true, device: "auto", reboot: true }`,
-// writes the COS A/B layout onto a blank target disk (rootdisk, virtio, bootOrder: 2), and
-// reboots into the installed system. This mirrors the lab CAPK validation path and bypasses
-// the OSArtifact cloudImage:true → direct-boot raw build path, which produces a layout that
-// Hadron's initrd does not boot ("Expecting device /dev/disk/by-label/COS_ACTIVE" hang).
+// using the 2-disk Kairos installer pattern from the KD-3b lab validation. Disk layout
+// mirrors the lab manifest /tmp/kd3b-capk-k3s.yaml exactly:
+//
+//   rootdisk      virtio, bootOrder: 1   blank target (no MBR)
+//   installerdisk virtio, bootOrder: 2   the Kairos installer image (OSArtifact iso:true)
+//
+// Firmware tries to boot vda first (rootdisk); since it's blank it falls through to vdb
+// (installerdisk), which has the hybrid ISO boot record. The installer reads the baked
+// /system/oem/ + the KubeVirt configdrive (CAPK-injected cloud-config), runs `install:
+// { auto: true, device: "/dev/vda", reboot: true }` from the lab's KairosConfigTemplate,
+// writes the COS A/B layout to /dev/vda, then reboots. The next boot now finds a
+// bootable vda and skips the installer disk.
+//
+// Earlier CI attempts attached the installer as `cdrom` with bootOrder 1; that boots the
+// Kairos LIVE menu's default "Kairos" entry which drops to an interactive root shell
+// instead of running the unattended installer. Attaching as a virtio disk with the lab's
+// reversed bootOrder is the configuration we actually validated 4/4 scenarios on (KD-50).
 func applyWorkloadClusterManifests(env *kubevirtenv.Environment, dc dynamic.Interface, cfg *rest.Config, clusterName, namespace string) {
 	yaml := fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
@@ -134,11 +144,11 @@ spec:
                     memory: 4Gi
                 devices:
                   disks:
-                  - name: installerdisk
-                    cdrom:
-                      bus: sata
-                    bootOrder: 1
                   - name: rootdisk
+                    disk:
+                      bus: virtio
+                    bootOrder: 1
+                  - name: installerdisk
                     disk:
                       bus: virtio
                     bootOrder: 2
@@ -178,7 +188,7 @@ spec:
       kubernetesVersion: "v1.35.4+k3s1"
       install:
         auto: true
-        device: "auto"
+        device: "/dev/vda"
         reboot: true
       dnsServers:
         - "8.8.8.8"
