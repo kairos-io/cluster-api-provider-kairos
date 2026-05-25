@@ -56,7 +56,7 @@ func TestKD3b_KubeconfigReady_TransitionsOnNodePush(t *testing.T) {
 		t.Skip("Skipping envtest in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, teardown := startKCPEnvtest(t)
+	ctx, c, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	// Per-test unique namespace so repeat runs against a long-lived envtest

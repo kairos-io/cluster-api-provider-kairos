@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -215,10 +216,11 @@ func TestControlPlaneIntegration(t *testing.T) {
 }
 
 // startKCPEnvtest spins up a fresh envtest + manager + KCP reconciler. Returns
-// a cancel-and-wait teardown closure. Each KD-4 delete-flow test sets up its
-// own envtest because envtest start/stop is slow but parallelization across
-// tests is unsafe (shared apiserver port).
-func startKCPEnvtest(t *testing.T) (context.Context, client.Client, func()) {
+// a cancel-and-wait teardown closure plus the envtest *rest.Config (callers
+// that don't need cfg discard it with `_`). Each KD-4 delete-flow test sets
+// up its own envtest because envtest start/stop is slow but parallelization
+// across tests is unsafe (shared apiserver port).
+func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config, func()) {
 	t.Helper()
 	g := NewWithT(t)
 
@@ -266,7 +268,7 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, func()) {
 		<-mgrErrCh
 		g.Expect(testEnv.Stop()).To(Succeed())
 	}
-	return ctx, mgr.GetClient(), teardown
+	return ctx, mgr.GetClient(), cfg, teardown
 }
 
 // TestControlPlaneIntegration_DeleteDrainsOwnedMachine verifies KD-4:
@@ -284,7 +286,7 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, teardown := startKCPEnvtest(t)
+	ctx, c, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	const (
@@ -400,7 +402,7 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 		t.Skip("Skipping integration test in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, teardown := startKCPEnvtest(t)
+	ctx, c, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	const (
