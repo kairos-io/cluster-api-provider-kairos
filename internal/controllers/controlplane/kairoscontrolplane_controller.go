@@ -903,11 +903,6 @@ func controlPlaneLBServiceName(clusterName string) string {
 	return fmt.Sprintf("%s-%s", clusterName, controlPlaneLBServiceSuffix)
 }
 
-func isValidEndpointHost(host string) bool {
-	return host != "" && host != "0.0.0.0" && host != "::"
-}
-
-
 // updateClusterStatus updates the Cluster status based on control plane readiness
 func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
 	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
