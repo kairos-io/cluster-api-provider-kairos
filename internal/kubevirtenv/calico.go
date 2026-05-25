@@ -79,3 +79,4 @@ func (e *Environment) InstallCalico(ctx context.Context) error {
 	log.Step("Calico CNI installed ✓")
 	return nil
 }
+

@@ -33,10 +33,10 @@ package bootstrap
 //  2. Why /run/cos/extra-layout.env and not /run/cos/cos-layout.env?
 //     immucore reads BOTH files when it computes the runtime persistence
 //     overlay:
-//     - /run/cos/cos-layout.env       (primary, written by Kairos's own
-//     00_rootfs.yaml in the base image)
-//     - /run/cos/extra-layout.env     (additive, intended for downstream
-//     consumers like us)
+//       - /run/cos/cos-layout.env       (primary, written by Kairos's own
+//                                        00_rootfs.yaml in the base image)
+//       - /run/cos/extra-layout.env     (additive, intended for downstream
+//                                        consumers like us)
 //     immucore's loader UNIONs PERSISTENT_STATE_PATHS across both files (see
 //     immucore steps_shared.go — keys are split on whitespace and deduped).
 //     The yip "Environment" plugin under the hood is godotenv, which on a
@@ -49,18 +49,18 @@ package bootstrap
 //  3. Why these twelve paths and only these twelve?
 //     They are exactly the directories the CAPI provider's own cloud-config
 //     (in this package's templates) writes to OR depends on after first boot:
-//     /etc/cni            — CNI plugin configs (workloads)
-//     /etc/k0s            — k0s config + token file (worker join)
-//     /etc/kubernetes     — kubeconfigs, manifests staging
-//     /etc/rancher        — k3s config + token file (worker join)
-//     /etc/ssh            — host keys (avoids MITM on reboot)
-//     /etc/systemd        — drop-in units we install (post-bootstrap, lb-sans)
-//     /var/lib/cni        — CNI runtime state
-//     /var/lib/containerd — container image cache + state
-//     /var/lib/k0s        — k0s data dir (etcd-like state, PKI)
-//     /var/lib/kubelet    — kubelet state (volumes, pods)
-//     /var/lib/rancher    — k3s data dir (etcd-like state, PKI, manifests)
-//     /var/log            — journal/log retention across reboot
+//       /etc/cni            — CNI plugin configs (workloads)
+//       /etc/k0s            — k0s config + token file (worker join)
+//       /etc/kubernetes     — kubeconfigs, manifests staging
+//       /etc/rancher        — k3s config + token file (worker join)
+//       /etc/ssh            — host keys (avoids MITM on reboot)
+//       /etc/systemd        — drop-in units we install (post-bootstrap, lb-sans)
+//       /var/lib/cni        — CNI runtime state
+//       /var/lib/containerd — container image cache + state
+//       /var/lib/k0s        — k0s data dir (etcd-like state, PKI)
+//       /var/lib/kubelet    — kubelet state (volumes, pods)
+//       /var/lib/rancher    — k3s data dir (etcd-like state, PKI, manifests)
+//       /var/log            — journal/log retention across reboot
 //     The list is intentionally conservative: only directories this provider
 //     touches. We do not add /opt, /home, /root, or application paths — those
 //     are user responsibilities, addressable via Spec.Files writing
