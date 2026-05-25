@@ -14,6 +14,13 @@ This guide walks you through creating a single-node k0s or k3s cluster on Kairos
    - A Kairos VM template uploaded to vSphere with Kairos OS.
    - Resource Pool (optional).
 
+   Example template preparation (vSphere UI):
+   1. Create a new VM with the hardware profile you want your nodes to use (for example: 2 vCPU, 4 GiB RAM, 50 GiB disk, VMXNET3 NIC on your target network).
+   2. Attach the Kairos ISO to the VM CD-ROM.
+   3. Do **not** power on the VM.
+   4. Right-click the VM and convert it to a template.
+   5. Use that template name in `VSphereMachineTemplate.spec.template` (for example `kairos-opensuse-leap-v3.6.0`).
+
 2. **Management Cluster**: A Kubernetes cluster with network access to vSphere.
 
 3. **Cluster API**: CAPI v1.8.x installed. v1.11.x is on the roadmap (KD-13).
