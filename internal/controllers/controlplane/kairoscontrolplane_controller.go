@@ -280,12 +280,6 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 			"cluster", cluster.Name)
 	}
 
-	// Ensure Node providerID is set in the workload cluster once kubeconfig is available.
-	// This avoids relying on in-VM scripts and unblocks NodeRef reconciliation.
-	if err := r.ensureProviderIDOnNodes(ctx, log, kcp, cluster); err != nil {
-		log.Error(err, "Failed to ensure providerID on workload nodes")
-	}
-
 	// Update Cluster status
 	if err := r.updateClusterStatus(ctx, log, kcp, cluster); err != nil {
 		log.Error(err, "Failed to update cluster status")
