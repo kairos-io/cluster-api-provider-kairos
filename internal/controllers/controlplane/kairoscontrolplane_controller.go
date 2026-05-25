@@ -810,10 +810,13 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 //     RBAC denied). NotFound is the missing-Secret signal, not an error.
 //
 // Why not parse-validate the kubeconfig in Go: the node-push payload
-// always writes a base64 of the actual on-node admin.conf / k3s.yaml,
-// which we trust the distribution to keep syntactically valid. A deeper
-// validator (e.g. clientcmd.Load) belongs in PR-8 once
-// ensureProviderIDOnNodes uses the parsed config.
+// always writes a base64 of the actual on-node admin.conf / k3s.yaml.
+// The distribution (k0s / k3s) is the appointed writer and is trusted
+// to produce a syntactically valid kubeconfig. Parse-validation in the
+// controller would duplicate that responsibility without adding
+// correctness — if the distribution writes a malformed kubeconfig, the
+// right fix is in the cloud-config template, not in a Go parser here.
+// This posture is permanent; no future PR is expected to change it.
 func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (bool, error) {
 	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
 	secretKey := types.NamespacedName{
