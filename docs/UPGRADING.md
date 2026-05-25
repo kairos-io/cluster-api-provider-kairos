@@ -22,6 +22,46 @@ via a label-filtered watch.
 | CAPV control-plane healthy, kubeconfig Secret present (was SSH-fetched in alpha-1) | Controller's existing-Secret check still passes. Cluster keeps working. | None. |
 | CAPV control-plane mid-bootstrap | **Old KairosConfig has no push block.** Controller's SSH path is GONE. The node will never push; the controller will never SSH. The cluster will sit indefinitely on `KubeconfigReadyCondition=False(WaitingForNodePush)`. | **Required**: delete the KairosConfig (or trigger a KCP rollout) so the bootstrap controller renders a new userdata with the push block. CAPV will create a new VM with new userdata. |
 | Air-gapped CAPV control-plane (no network reachability from VM to management cluster API server) | Cluster stuck on `KubeconfigReadyCondition=False(WaitingForNodePush)` indefinitely; condition severity transitions Info → Warning after 10 minutes. | Wait for `SSHFallback` (post-alpha-2 PR). Or open a network path from the VM to `<management-cluster-api-server-host>:6443`. |
+| Bootstrap Secret rendered before alpha-2 (no post-bootstrap providerID service block in the cloud-config) | Controller no longer patches `Node.Spec.ProviderID` (PR-8 deleted `ensureProviderIDOnNodes`). The old Secret also has no in-node patch script. `Node.Spec.ProviderID` stays empty → CAPI Machine controller cannot match the NodeRef → Machine stays `NodeNotFound`. | **Required**: trigger a KCP rollout (or delete the KairosConfig) so the bootstrap controller re-renders the Secret with the alpha-2 template, which includes the post-bootstrap providerID service. |
+
+### KD-3b part 2: Node.Spec.ProviderID is now set exclusively in-VM
+
+PR-8 deletes `ensureProviderIDOnNodes` — the management-controller helper
+that patched `Node.Spec.ProviderID` from outside the VM. That function was
+the last piece of controller-side synchronous workload-cluster I/O (KD-10).
+
+The in-VM cloud-config now owns `Node.Spec.ProviderID` exclusively:
+
+- **k3s (CAPV and CAPK)**: kubelet receives `--kubelet-arg=provider-id=<value>`
+  at startup via a `config.yaml.d/90-provider-id.yaml` drop-in written by a
+  systemd `ExecStartPre` unit. A DMI-based discovery script runs when the
+  providerID was not known at cloud-config render time (first-boot race).
+- **k0s (CAPV and CAPK)**: a post-bootstrap systemd service patches
+  `Node.Spec.ProviderID` using the local `/var/lib/k0s/pki/admin.conf`
+  after k0s starts, retrying 30 times at 5-second intervals. When ProviderID
+  is empty at render time the patch is deferred to the next reconcile cycle,
+  which re-renders the Secret with the correct value.
+
+**For most operators this is a no-op.** If `Node.Spec.ProviderID` was already
+set (alpha-1 or alpha-2 healthy clusters), the in-VM scripts either write the
+same value idempotently (k3s) or skip the patch because the Node field is
+already populated (k0s, which treats a non-empty providerID as immutable).
+
+**If you maintain a fork or derivative that re-added `ensureProviderIDOnNodes`
+between PR-7 and PR-8:** that helper is gone from the upstream source; the
+code will not compile. Remove the derivative — the in-VM scripts cover the
+same contract without management-cluster Node access.
+
+To diagnose a stuck `Node.Spec.ProviderID` after PR-8, inspect the VM journal
+rather than controller logs:
+
+```bash
+# On the workload node (k0s):
+journalctl -u kairos-k0s-post-bootstrap --no-pager
+
+# On the workload node (k3s):
+journalctl -u kairos-k3s-post-bootstrap --no-pager
+```
 
 ### Network reachability requirement
 
