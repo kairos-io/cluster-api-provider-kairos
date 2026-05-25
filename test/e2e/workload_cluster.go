@@ -192,6 +192,11 @@ spec:
         reboot: true
       dnsServers:
         - "8.8.8.8"
+      # podCIDR / serviceCIDR match the KD-3b lab manifest used to validate
+      # all four scenarios — keeps the e2e and the lab on the same k3s
+      # networking layout so any future divergence is in one place.
+      podCIDR: "10.201.0.0/16"
+      serviceCIDR: "10.200.0.0/16"
       userName: kairos
       userPassword: kairos
       userGroups:

@@ -37,9 +37,10 @@ const (
 	// kairosCDIUploadExtraMiB is added to the CDI DataVolume virtctl --size so the PVC exceeds the raw image.
 	kairosCDIUploadExtraMiB = 1024
 	// KairosRootDiskGiB is the size of the blank target disk into which the Kairos installer writes
-	// the COS A/B layout + persistent partition. Sized for k3s + workload pods + ~2 GiB of container
-	// image cache. Exported so the e2e workload-cluster manifest can reference it.
-	KairosRootDiskGiB = 16
+	// the COS A/B layout + persistent partition. The KD-3b lab manifest sizes this at 40 GiB, which
+	// leaves enough headroom for the A/B images + persistent partition + k3s containerd image cache.
+	// Exported so the e2e workload-cluster manifest can reference it.
+	KairosRootDiskGiB = 40
 )
 
 func (e *Environment) kairosImageBuildDir() string {
@@ -291,13 +292,18 @@ func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kub
 	// "Welcome to Kairos! / [root@... ~]#" instead of an install banner).
 	// The KairosConfigTemplate in the workload manifest also sets install.auto
 	// for completeness, but the LIVE installer's decision uses the baked /oem/.
+	// console+journald forwarding so the live installer's kairos-install
+	// service output (and anything else systemd logs) lands in the virtio
+	// serial0 log. Without this our diagnostic tail only sees the kernel
+	// dmesg ring and we can't tell whether the install ever attempted to
+	// run.
 	cloudConfig := `#cloud-config
 install:
   auto: true
   device: "/dev/vda"
   reboot: true
   grub_options:
-    extra_cmdline: "console=ttyS0 console=tty0"
+    extra_cmdline: "console=ttyS0 console=tty0 systemd.journald.forward_to_console=1"
 `
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
