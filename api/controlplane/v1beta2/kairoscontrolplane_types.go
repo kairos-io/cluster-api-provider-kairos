@@ -67,6 +67,125 @@ type KairosControlPlaneSpec struct {
 	// RolloutStrategy defines the strategy for rolling out updates
 	// +optional
 	RolloutStrategy *RolloutStrategy `json:"rolloutStrategy,omitempty"`
+
+	// SSHFallback configures an opt-in SSH-pull fallback used to retrieve the
+	// workload-cluster kubeconfig when the in-VM node-push path is unreachable
+	// (typically: air-gapped CAPV deployments where the workload subnet has no
+	// route back to the management apiserver).
+	//
+	// The fallback runs in a dedicated, non-Reconcile controller path: when
+	// KubeconfigReadyCondition has been False(WaitingForNodePush) for longer
+	// than spec.sshFallback.activateAfter (default 15m), and Enabled=true,
+	// the SSH-fetch path dials the workload node, retrieves the local admin
+	// kubeconfig from /var/lib/k0s/pki/admin.conf (k0s) or
+	// /etc/rancher/k3s/k3s.yaml (k3s), and writes the cluster kubeconfig
+	// Secret. KubeconfigReadyCondition then transitions to
+	// True(KubeconfigReadyViaSSHFallback) so operators can audit which
+	// path supplied the kubeconfig.
+	//
+	// SECURITY: host-key verification is mandatory. The controller refuses
+	// to connect unless the workload node's host key matches an entry in
+	// the referenced KnownHostsSecretRef. There is no trust-on-first-use
+	// path.
+	//
+	// Off by default. Adding fields here is opt-in via Enabled=true.
+	// +optional
+	SSHFallback *SSHFallback `json:"sshFallback,omitempty"`
+}
+
+// SSHFallback configures the opt-in SSH-pull fallback for the
+// workload-cluster kubeconfig. See KairosControlPlaneSpec.SSHFallback.
+type SSHFallback struct {
+	// Enabled toggles the SSH fallback path. When false (the default),
+	// the controller never opens an SSH connection regardless of any
+	// other field in this struct. When true, the other fields MUST be
+	// set per the validating webhook — in particular KnownHostsSecretRef
+	// and IdentitySecretRef are required.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// IdentitySecretRef references a Secret containing the SSH
+	// private key the controller uses to authenticate to the workload
+	// node. The Secret MUST contain a key named "ssh-privatekey"
+	// holding a PEM-encoded private key (matches the Kubernetes
+	// kubernetes.io/ssh-auth Secret convention). The Secret's type
+	// SHOULD be kubernetes.io/ssh-auth; the webhook permits Opaque for
+	// back-compat but warns.
+	//
+	// The corresponding public key MUST be installed in the workload
+	// node's authorized_keys via KairosConfig.Spec.SSHPublicKey /
+	// GitHubUser. The provider does not push the public key on the
+	// operator's behalf.
+	//
+	// REQUIRED when Enabled=true. The webhook rejects Enabled=true with
+	// a nil ref.
+	// +optional
+	IdentitySecretRef *SSHFallbackSecretReference `json:"identitySecretRef,omitempty"`
+
+	// KnownHostsSecretRef references a Secret containing one or more
+	// OpenSSH `known_hosts` lines. The controller verifies the workload
+	// node's offered host key against this set BEFORE any data is
+	// exchanged. There is no first-use-trust path.
+	//
+	// The Secret data key defaults to "known_hosts". Multiple lines
+	// (one per host or wildcard entry) are supported per OpenSSH format.
+	// Hashed entries (HashKnownHosts yes) are supported.
+	//
+	// REQUIRED when Enabled=true. The webhook rejects Enabled=true with
+	// a nil ref.
+	// +optional
+	KnownHostsSecretRef *SSHFallbackSecretReference `json:"knownHostsSecretRef,omitempty"`
+
+	// User is the SSH login user. Must be a Kairos OS user with read
+	// access to the distribution's admin-kubeconfig file. Defaults to
+	// "kairos" (matches the default user produced by the bootstrap
+	// controller). Pattern matches POSIX-portable username syntax;
+	// shell-injection in the user field is rejected at admission.
+	// +kubebuilder:default=kairos
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_-]{0,31}$`
+	// +optional
+	User string `json:"user,omitempty"`
+
+	// Port is the SSH port on the workload node. Defaults to 22.
+	// +kubebuilder:default=22
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// ActivateAfter is the elapsed since KubeconfigReadyCondition first
+	// became False(WaitingForNodePush) after which the SSH fallback path
+	// becomes eligible to run. Defaults to 15m. Must be strictly greater
+	// than the controller's kubeconfigReadyTimeout (10m) — the fallback
+	// is meant to fire AFTER the Info→Warning escalation, not before.
+	// The webhook enforces this lower bound.
+	//
+	// Format: Kubernetes Duration (e.g. "15m", "1h").
+	// +kubebuilder:default="15m"
+	// +optional
+	ActivateAfter *metav1.Duration `json:"activateAfter,omitempty"`
+}
+
+// SSHFallbackSecretReference is a namespaced reference to a Secret used
+// by the SSH fallback path. Namespace defaults to the KCP's namespace;
+// the webhook rejects cross-namespace references in this release.
+type SSHFallbackSecretReference struct {
+	// Name of the Secret. Required.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Key within the Secret data. Per-field default (ssh-privatekey for
+	// IdentitySecretRef, known_hosts for KnownHostsSecretRef) is
+	// documented on the parent.
+	// +optional
+	Key string `json:"key,omitempty"`
+
+	// Namespace of the Secret. Defaults to the KCP's namespace.
+	// Cross-namespace references are rejected by the webhook in this
+	// release.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // KairosControlPlaneMachineTemplate defines the template for control plane machines
