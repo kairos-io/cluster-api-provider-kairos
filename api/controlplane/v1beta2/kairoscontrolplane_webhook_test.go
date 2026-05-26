@@ -175,3 +175,244 @@ func TestKairosControlPlane_Validate_Distribution(t *testing.T) {
 		})
 	}
 }
+
+func TestKairosControlPlane_Validate_SSHFallback(t *testing.T) {
+	validRef := func(name string) *SSHFallbackSecretReference {
+		return &SSHFallbackSecretReference{Name: name}
+	}
+	refInNamespace := func(name, ns string) *SSHFallbackSecretReference {
+		return &SSHFallbackSecretReference{Name: name, Namespace: ns}
+	}
+
+	cases := []struct {
+		name        string
+		sshFallback *SSHFallback
+		wantSubstr  string // non-empty: error MUST contain; empty: must validate cleanly
+	}{
+		{
+			name:        "nil-block is always valid",
+			sshFallback: nil,
+		},
+		{
+			name: "disabled-is-always-valid-even-with-bogus-fields",
+			sshFallback: &SSHFallback{
+				Enabled:       false,
+				User:          "ROOT!", // invalid pattern, ignored when Enabled=false
+				ActivateAfter: &metav1.Duration{Duration: 1}, // too small, ignored when Enabled=false
+			},
+		},
+		{
+			name: "enabled-without-known-hosts-secret-ref-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:           true,
+				IdentitySecretRef: validRef("id"),
+				ActivateAfter:     &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+			},
+			wantSubstr: "knownHostsSecretRef is required",
+		},
+		{
+			name: "enabled-without-identity-secret-ref-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+			},
+			wantSubstr: "identitySecretRef is required",
+		},
+		{
+			name: "enabled-with-empty-name-ref-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: &SSHFallbackSecretReference{}, // Name=""
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+			},
+			wantSubstr: "knownHostsSecretRef is required",
+		},
+		{
+			name: "enabled-with-cross-namespace-known-hosts-ref-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: refInNamespace("kh", "other-ns"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+			},
+			wantSubstr: "cross-namespace Secret references are not allowed",
+		},
+		{
+			name: "enabled-with-cross-namespace-identity-ref-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   refInNamespace("id", "other-ns"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+			},
+			wantSubstr: "cross-namespace Secret references are not allowed",
+		},
+		{
+			name: "same-namespace-explicit-is-accepted",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: refInNamespace("kh", "default"),
+				IdentitySecretRef:   refInNamespace("id", "default"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+			},
+		},
+		{
+			name: "activate-after-equal-to-timeout-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: KubeconfigReadyTimeout},
+			},
+			wantSubstr: "activateAfter must be strictly greater than",
+		},
+		{
+			name: "activate-after-below-timeout-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: KubeconfigReadyTimeout - 1},
+			},
+			wantSubstr: "activateAfter must be strictly greater than",
+		},
+		{
+			name: "activate-after-strictly-greater-is-accepted",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: KubeconfigReadyTimeout + 1},
+			},
+		},
+		{
+			name: "user-shell-injection-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+				User:                "kairos; rm -rf /",
+			},
+			wantSubstr: "user must match",
+		},
+		{
+			name: "user-uppercase-rejected",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+				User:                "Root",
+			},
+			wantSubstr: "user must match",
+		},
+		{
+			name: "user-empty-string-is-fine-defaulter-fills-it",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: 15 * 60 * 1_000_000_000},
+				User:                "",
+			},
+		},
+		{
+			name: "valid-minimal-enabled-config",
+			sshFallback: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: validRef("kh"),
+				IdentitySecretRef:   validRef("id"),
+				ActivateAfter:       &metav1.Duration{Duration: 16 * 60 * 1_000_000_000},
+				User:                "kairos",
+				Port:                22,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			kcp := newValidKCP()
+			kcp.Spec.SSHFallback = tc.sshFallback
+			err := kcp.validate()
+			if tc.wantSubstr == "" {
+				if err != nil {
+					t.Fatalf("validate() returned %v; expected nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate() returned nil; expected error containing %q", tc.wantSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("validate() error %q does not contain %q", err.Error(), tc.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestKairosControlPlane_Default_SSHFallback(t *testing.T) {
+	cases := []struct {
+		name             string
+		in               *SSHFallback
+		wantUser         string
+		wantPort         int32
+		wantActivateNNS  bool // ActivateAfter should be non-nil after defaulting
+	}{
+		{
+			name: "nil block stays nil",
+			in:   nil,
+		},
+		{
+			name: "empty block gets every default",
+			in: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: &SSHFallbackSecretReference{Name: "kh"},
+				IdentitySecretRef:   &SSHFallbackSecretReference{Name: "id"},
+			},
+			wantUser:        "kairos",
+			wantPort:        22,
+			wantActivateNNS: true,
+		},
+		{
+			name: "operator overrides are preserved",
+			in: &SSHFallback{
+				Enabled:             true,
+				KnownHostsSecretRef: &SSHFallbackSecretReference{Name: "kh"},
+				IdentitySecretRef:   &SSHFallbackSecretReference{Name: "id"},
+				User:                "custom",
+				Port:                2222,
+				ActivateAfter:       &metav1.Duration{Duration: 30 * 60 * 1_000_000_000},
+			},
+			wantUser:        "custom",
+			wantPort:        2222,
+			wantActivateNNS: true,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			kcp := newValidKCP()
+			kcp.Spec.SSHFallback = tc.in
+			kcp.Default()
+			if tc.in == nil {
+				if kcp.Spec.SSHFallback != nil {
+					t.Fatalf("nil block became non-nil after Default(); want nil, got %+v", kcp.Spec.SSHFallback)
+				}
+				return
+			}
+			if got := kcp.Spec.SSHFallback.User; got != tc.wantUser {
+				t.Errorf("User: got %q, want %q", got, tc.wantUser)
+			}
+			if got := kcp.Spec.SSHFallback.Port; got != tc.wantPort {
+				t.Errorf("Port: got %d, want %d", got, tc.wantPort)
+			}
+			if tc.wantActivateNNS && kcp.Spec.SSHFallback.ActivateAfter == nil {
+				t.Errorf("ActivateAfter: got nil, want non-nil after defaulting")
+			}
+		})
+	}
+}

@@ -60,17 +60,12 @@ type KairosControlPlaneReconciler struct {
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
-// kubeconfigReadyTimeout is the elapsed since Status.LastNodePushObserved
-// after which KubeconfigReadyCondition's severity escalates from Info to
-// Warning. The timeout is not a terminal — past it, the controller still
-// waits on the Secret watch. Operator visibility (condition severity)
-// changes; no controller-side recovery action. PR-9's SSHFallback opt-in
-// is the recovery surface.
-//
-// 10 minutes covers normal boot/network-init time on lab-grade VMs with
-// margin for kairos package downloads; tightening on infra with faster
-// boot lands as a per-infra-provider override in a follow-up.
-const kubeconfigReadyTimeout = 10 * time.Minute
+// kubeconfigReadyTimeout is a package-local alias for the canonical
+// constant in the API package. The API package owns it (single source of
+// truth) because the validating webhook needs the same value to enforce
+// SSHFallback.ActivateAfter > KubeconfigReadyTimeout — see
+// api/controlplane/v1beta2/timeouts.go for the rationale.
+const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes/status,verbs=get;update;patch
