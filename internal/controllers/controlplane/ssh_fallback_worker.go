@@ -402,12 +402,26 @@ func (w *SSHFallbackWorker) emitEvent(ctx context.Context, job SSHFallbackJob, r
 // reconciler will re-discover the outcome on its next watch tick via
 // observeKubeconfigSecret). This is a defensive backstop, not a
 // steady-state behavior.
+// postResult publishes a worker result onto the buffered channel the
+// sibling reconciler drains. The send BLOCKS on a full channel rather
+// than silently dropping — a dropped `Failed` / `Misconfigured` envelope
+// would leave the KCP wedged in `SSHFallbackDialingReason` because the
+// reconciler's eligibility predicate treats `Dialing` as "in flight, do
+// not retry" (see ssh_fallback_controller.go evaluateEligibility, the
+// SSHFallbackDialingReason case). A dropped Success is recoverable via
+// observeKubeconfigSecret's Secret watch; a dropped Failure is not.
+// (security-architect review of f5379d0 flagged this as Medium.)
+//
+// The only legitimate exit without sending is manager shutdown, signalled
+// by ctx.Done(). Until then, blocking on the drain pushes back on the
+// worker pool — which is exactly the semantics we want; if the drain is
+// stalled, do not generate more work that the same stalled drain would
+// have to handle.
 func (w *SSHFallbackWorker) postResult(ctx context.Context, key types.NamespacedName, res SSHFallbackResult) {
 	envelope := SSHFallbackResultEnvelope{KCPKey: key, Result: res}
 	select {
 	case w.results <- envelope:
 	case <-ctx.Done():
-	default:
 	}
 }
 
