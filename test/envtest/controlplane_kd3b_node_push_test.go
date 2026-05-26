@@ -46,15 +46,17 @@ import (
 //     LastNodePushObserved is cleared, and Initialized flips to true.
 //
 // The test deliberately writes a SYNTHETIC kubeconfig payload (no
-// envtest-spinning required). The controller doesn't parse-validate the
-// payload today (see observeKubeconfigSecret docstring); deeper validation
-// lands with PR-8 when ensureProviderIDOnNodes uses the parsed config.
+// real API server is needed). The controller does not parse-validate the
+// payload — the distribution is the appointed writer and is trusted to
+// produce a syntactically valid kubeconfig (see observeKubeconfigSecret
+// docstring). The synthetic-payload posture is permanent; the test
+// reflects that steady state.
 func TestKD3b_KubeconfigReady_TransitionsOnNodePush(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping envtest in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, teardown := startKCPEnvtest(t)
+	ctx, c, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	// Per-test unique namespace so repeat runs against a long-lived envtest

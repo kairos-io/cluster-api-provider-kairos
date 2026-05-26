@@ -30,10 +30,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/clientcmd"
@@ -279,12 +277,6 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if !kubeconfigReady {
 		log.V(4).Info("Kubeconfig Secret not yet observed; waiting for node push (KD-3b)",
 			"cluster", cluster.Name)
-	}
-
-	// Ensure Node providerID is set in the workload cluster once kubeconfig is available.
-	// This avoids relying on in-VM scripts and unblocks NodeRef reconciliation.
-	if err := r.ensureProviderIDOnNodes(ctx, log, kcp, cluster); err != nil {
-		log.Error(err, "Failed to ensure providerID on workload nodes")
 	}
 
 	// Update Cluster status
@@ -818,10 +810,13 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 //     RBAC denied). NotFound is the missing-Secret signal, not an error.
 //
 // Why not parse-validate the kubeconfig in Go: the node-push payload
-// always writes a base64 of the actual on-node admin.conf / k3s.yaml,
-// which we trust the distribution to keep syntactically valid. A deeper
-// validator (e.g. clientcmd.Load) belongs in PR-8 once
-// ensureProviderIDOnNodes uses the parsed config.
+// always writes a base64 of the actual on-node admin.conf / k3s.yaml.
+// The distribution (k0s / k3s) is the appointed writer and is trusted
+// to produce a syntactically valid kubeconfig. Parse-validation in the
+// controller would duplicate that responsibility without adding
+// correctness — if the distribution writes a malformed kubeconfig, the
+// right fix is in the cloud-config template, not in a Go parser here.
+// This posture is permanent; no future PR is expected to change it.
 func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (bool, error) {
 	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
 	secretKey := types.NamespacedName{
@@ -878,383 +873,17 @@ func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Conte
 	return false, nil
 }
 
-// ensureProviderIDOnNodes patches workload cluster Nodes with the Machine providerID.
-// This avoids relying on in-VM scripts and allows Machine-to-NodeRef matching.
-func (r *KairosControlPlaneReconciler) ensureProviderIDOnNodes(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
-	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
-	secretKey := types.NamespacedName{
-		Name:      secretName,
-		Namespace: cluster.Namespace,
-	}
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
+// ensureProviderIDOnNodes and getInfrastructureProviderID were deleted in
+// PR-8 of the KD-3b sequence. The in-VM cloud-config now owns setting
+// Node.Spec.ProviderID (kubelet --provider-id flag for k3s, systemd
+// ExecStartPre drop-in, on-VM self-discovery script, and a post-bootstrap
+// `kubectl patch` fallback — all rendered by internal/bootstrap/templates).
+// The CAPI core Machine controller then matches Node.Spec.ProviderID to
+// Machine.Spec.ProviderID to populate Machine.Status.NodeRef. The
+// controlplane reconciler no longer needs to perform the patch itself.
 
-	kubeconfig, ok := secret.Data["value"]
-	if !ok || len(kubeconfig) == 0 {
-		return nil
-	}
-
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
-	if err != nil {
-		return fmt.Errorf("failed to build workload rest config: %w", err)
-	}
-
-	workloadClient, err := client.New(restConfig, client.Options{Scheme: r.Scheme})
-	if err != nil {
-		return fmt.Errorf("failed to create workload client: %w", err)
-	}
-
-	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
-	if err != nil {
-		return err
-	}
-	if len(machines) == 0 {
-		return nil
-	}
-
-	nodeList := &corev1.NodeList{}
-	if err := workloadClient.List(ctx, nodeList); err != nil {
-		return fmt.Errorf("failed to list workload nodes: %w", err)
-	}
-
-	singleNodeFallback := len(machines) == 1 && len(nodeList.Items) == 1
-
-	for _, machine := range machines {
-		providerID := ""
-		if machine.Spec.ProviderID != nil {
-			providerID = *machine.Spec.ProviderID
-		}
-		if providerID == "" {
-			providerID = r.getInfrastructureProviderID(ctx, log, machine)
-		}
-		if providerID == "" {
-			log.V(4).Info("Skipping providerID patch: no providerID for machine", "machine", machine.Name)
-			continue
-		}
-		if machine.Status.NodeRef != nil {
-			continue
-		}
-
-		addressSet := map[string]struct{}{}
-		for _, addr := range machine.Status.Addresses {
-			if addr.Address != "" {
-				addressSet[addr.Address] = struct{}{}
-			}
-		}
-		if len(addressSet) == 0 {
-			if ip, err := r.getNodeIP(ctx, log, machine); err == nil && ip != "" {
-				addressSet[ip] = struct{}{}
-			} else if err != nil {
-				log.V(4).Info("Failed to get node IP for providerID patch", "machine", machine.Name, "error", err)
-			}
-		}
-
-		var nodeToPatch *corev1.Node
-		for i := range nodeList.Items {
-			node := &nodeList.Items[i]
-			if len(addressSet) > 0 {
-				matches := false
-				for _, addr := range node.Status.Addresses {
-					if _, ok := addressSet[addr.Address]; ok {
-						matches = true
-						break
-					}
-				}
-				if !matches {
-					continue
-				}
-			} else if singleNodeFallback {
-				// Single-node fallback: when exactly 1 machine and 1 node, match them
-				// (e.g. k3s may use different address formats than CAPV reports)
-				log.Info("Using single-node fallback to match machine to node", "machine", machine.Name, "node", node.Name)
-			} else {
-				continue
-			}
-
-			if node.Spec.ProviderID == providerID {
-				log.V(4).Info("Node already has providerID", "node", node.Name, "providerID", node.Spec.ProviderID)
-				break
-			}
-			// Kubernetes forbids changing providerID once set; only empty -> valid is allowed
-			if node.Spec.ProviderID != "" {
-				log.V(4).Info("Node already has providerID (immutable), skipping patch",
-					"node", node.Name, "existingProviderID", node.Spec.ProviderID, "machineProviderID", providerID)
-				break
-			}
-
-			nodeToPatch = node
-			break
-		}
-
-		if nodeToPatch != nil {
-			patchBase := nodeToPatch.DeepCopy()
-			nodeToPatch.Spec.ProviderID = providerID
-			if err := workloadClient.Patch(ctx, nodeToPatch, client.MergeFrom(patchBase)); err != nil {
-				return fmt.Errorf("failed to patch node providerID: %w", err)
-			}
-
-			log.Info("Patched workload node providerID",
-				"node", nodeToPatch.Name,
-				"providerID", nodeToPatch.Spec.ProviderID,
-				"machine", machine.Name)
-		}
-	}
-
-	return nil
-}
-
-// getInfrastructureProviderID attempts to retrieve providerID from the infrastructure machine object.
-func (r *KairosControlPlaneReconciler) getInfrastructureProviderID(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) string {
-	if machine == nil || machine.Spec.InfrastructureRef.Kind == "" {
-		return ""
-	}
-
-	switch machine.Spec.InfrastructureRef.Kind {
-	case "VSphereMachine":
-		vsphereMachine := &unstructured.Unstructured{}
-		vsphereMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		vsphereMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err != nil {
-			log.V(4).Info("Failed to get VSphereMachine for providerID", "machine", machine.Name, "error", err)
-			return ""
-		}
-
-		if providerID, found, err := unstructured.NestedString(vsphereMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			return providerID
-		}
-		if vmUUID, found, err := unstructured.NestedString(vsphereMachine.Object, "status", "vmUUID"); err == nil && found && vmUUID != "" {
-			return fmt.Sprintf("vsphere://%s", vmUUID)
-		}
-		if providerID, found, err := unstructured.NestedString(vsphereMachine.Object, "status", "providerID"); err == nil && found && providerID != "" {
-			return providerID
-		}
-	case "KubevirtMachine", "KubeVirtMachine":
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err != nil {
-			log.V(4).Info("Failed to get KubevirtMachine for providerID", "machine", machine.Name, "error", err)
-			return ""
-		}
-		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			return providerID
-		}
-		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "status", "providerID"); err == nil && found && providerID != "" {
-			return providerID
-		}
-		// CAPK uses kubevirt://<KubevirtMachine.Name>; construct when VMI exists
-		if _, err := r.getKubevirtVMIIP(ctx, log, machine); err == nil {
-			return fmt.Sprintf("kubevirt://%s", kubevirtMachineKey.Name)
-		}
-	case "DockerMachine":
-		dockerMachine := &unstructured.Unstructured{}
-		dockerMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		dockerMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, dockerMachineKey, dockerMachine); err != nil {
-			log.V(4).Info("Failed to get DockerMachine for providerID", "machine", machine.Name, "error", err)
-			return ""
-		}
-		if providerID, found, err := unstructured.NestedString(dockerMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			return providerID
-		}
-	}
-
-	return ""
-}
-
-// getNodeIP retrieves the node IP from the infrastructure provider.
-// Supports CAPD (DockerMachine), CAPV (VSphereMachine/VSphereVM), and CAPK (KubevirtMachine).
-func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, error) {
-	switch machine.Spec.InfrastructureRef.Kind {
-	case "VSphereMachine":
-		// First, try to get IP from VSphereMachine status
-		vsphereMachine := &unstructured.Unstructured{}
-		vsphereMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		vsphereMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err != nil {
-			return "", fmt.Errorf("failed to get VSphereMachine: %w", err)
-		}
-
-		// Try to get IP from VSphereMachine status.addresses
-		if ip := r.extractIPFromUnstructured(vsphereMachine); ip != "" {
-			return ip, nil
-		}
-
-		// Fallback: try VSphereVM (CAPV creates VSphereVM with the same name)
-		vsphereVM := &unstructured.Unstructured{}
-		vsphereVM.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "infrastructure.cluster.x-k8s.io",
-			Version: "v1beta1",
-			Kind:    "VSphereVM",
-		})
-		vsphereVMKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, vsphereVMKey, vsphereVM); err != nil {
-			return "", fmt.Errorf("failed to get VSphereVM: %w", err)
-		}
-
-		if ip := r.extractIPFromUnstructured(vsphereVM); ip != "" {
-			return ip, nil
-		}
-
-		return "", fmt.Errorf("no IP address found in VSphereMachine or VSphereVM status")
-	case "KubevirtMachine", "KubeVirtMachine":
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err != nil {
-			return "", fmt.Errorf("failed to get KubevirtMachine: %w", err)
-		}
-
-		if ip := r.extractIPFromUnstructured(kubevirtMachine); ip != "" {
-			return ip, nil
-		}
-
-		if ip, err := r.getKubevirtVMIIP(ctx, log, machine); err == nil && ip != "" {
-			log.Info("Resolved KubeVirt VMI IP", "machine", machine.Name, "ip", ip)
-			return ip, nil
-		}
-
-		return "", fmt.Errorf("no IP address found in KubevirtMachine status")
-	case "DockerMachine":
-		dockerMachine := &unstructured.Unstructured{}
-		dockerMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		dockerMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, dockerMachineKey, dockerMachine); err != nil {
-			return "", fmt.Errorf("failed to get DockerMachine: %w", err)
-		}
-		if ip := r.extractIPFromUnstructured(dockerMachine); ip != "" {
-			return ip, nil
-		}
-		return "", fmt.Errorf("no IP address found in DockerMachine status")
-	default:
-		return "", fmt.Errorf("unsupported infrastructure provider: %s", machine.Spec.InfrastructureRef.Kind)
-	}
-}
-
-// extractIPFromUnstructured extracts IP address from an unstructured object's status
-func (r *KairosControlPlaneReconciler) extractIPFromUnstructured(obj *unstructured.Unstructured) string {
-
-	// Extract IP from status.addresses
-	// VSphere status structure: status.addresses[].address or status.network[].ipAddrs[]
-	addresses, found, err := unstructured.NestedSlice(obj.Object, "status", "addresses")
-	if err == nil && found && len(addresses) > 0 {
-		// Try to get IP from addresses array
-		// Prefer InternalIP, then ExternalIP, then any address
-		var internalIP, externalIP, anyIP string
-		for _, addr := range addresses {
-			if addrMap, ok := addr.(map[string]interface{}); ok {
-				addrType, _ := addrMap["type"].(string)
-				if ip, ok := addrMap["address"].(string); ok && ip != "" {
-					switch addrType {
-					case "InternalIP":
-						internalIP = ip
-					case "ExternalIP":
-						externalIP = ip
-					default:
-						if anyIP == "" {
-							anyIP = ip
-						}
-					}
-				}
-			}
-		}
-		// Return in priority order: InternalIP > ExternalIP > any IP
-		if internalIP != "" {
-			return internalIP
-		}
-		if externalIP != "" {
-			return externalIP
-		}
-		if anyIP != "" {
-			return anyIP
-		}
-	}
-
-	// Fallback: try status.network[].ipAddrs[]
-	network, found, err := unstructured.NestedSlice(obj.Object, "status", "network")
-	if err == nil && found && len(network) > 0 {
-		for _, net := range network {
-			if netMap, ok := net.(map[string]interface{}); ok {
-				if ipAddrs, ok := netMap["ipAddrs"].([]interface{}); ok && len(ipAddrs) > 0 {
-					if ip, ok := ipAddrs[0].(string); ok && ip != "" {
-						return ip
-					}
-				}
-			}
-		}
-	}
-
-	// Also check if there's a direct IP in status (some CAPV versions)
-	if ip, found, err := unstructured.NestedString(obj.Object, "status", "vmIp"); err == nil && found && ip != "" {
-		return ip
-	}
-
-	return ""
-}
-
-func (r *KairosControlPlaneReconciler) getKubevirtVMIIP(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, error) {
-	if machine == nil {
-		return "", fmt.Errorf("machine is nil")
-	}
-
-	vmi := &unstructured.Unstructured{}
-	vmi.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "kubevirt.io",
-		Version: "v1",
-		Kind:    "VirtualMachineInstance",
-	})
-	vmiKey := types.NamespacedName{
-		Name:      machine.Spec.InfrastructureRef.Name,
-		Namespace: machine.Spec.InfrastructureRef.Namespace,
-	}
-	if err := r.Get(ctx, vmiKey, vmi); err != nil {
-		return "", fmt.Errorf("failed to get VMI: %w", err)
-	}
-
-	interfaces, found, err := unstructured.NestedSlice(vmi.Object, "status", "interfaces")
-	if err != nil || !found {
-		return "", fmt.Errorf("VMI interfaces not found")
-	}
-
-	for _, iface := range interfaces {
-		if ifaceMap, ok := iface.(map[string]interface{}); ok {
-			if ip, ok := ifaceMap["ipAddress"].(string); ok && ip != "" {
-				return ip, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no IP address found in VMI status.interfaces")
-}
+// getNodeIP, extractIPFromUnstructured, getKubevirtVMIIP have been relocated
+// to infra_lookup.go (PR-8 of the KD-3b sequence).
 
 func isKubevirtMachine(machine *clusterv1.Machine) bool {
 	if machine == nil {
@@ -1276,11 +905,6 @@ func isKubevirtControlPlane(kcp *controlplanev1beta2.KairosControlPlane) bool {
 func controlPlaneLBServiceName(clusterName string) string {
 	return fmt.Sprintf("%s-%s", clusterName, controlPlaneLBServiceSuffix)
 }
-
-func isValidEndpointHost(host string) bool {
-	return host != "" && host != "0.0.0.0" && host != "::"
-}
-
 
 // updateClusterStatus updates the Cluster status based on control plane readiness
 func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
