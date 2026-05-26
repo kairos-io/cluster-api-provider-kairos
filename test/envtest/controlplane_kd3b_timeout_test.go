@@ -55,7 +55,7 @@ func TestKD3b_KubeconfigReady_SeverityEscalatesAfterTimeout(t *testing.T) {
 		t.Skip("Skipping envtest in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, _, teardown := startKCPEnvtest(t)
+	ctx, c, _, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	ns := &corev1.Namespace{

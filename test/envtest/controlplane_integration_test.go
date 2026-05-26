@@ -215,12 +215,18 @@ func TestControlPlaneIntegration(t *testing.T) {
 	// with mocked infrastructure. For full integration testing, use a real infrastructure provider.
 }
 
-// startKCPEnvtest spins up a fresh envtest + manager + KCP reconciler. Returns
-// a cancel-and-wait teardown closure plus the envtest *rest.Config (callers
-// that don't need cfg discard it with `_`). Each KD-4 delete-flow test sets
-// up its own envtest because envtest start/stop is slow but parallelization
-// across tests is unsafe (shared apiserver port).
-func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config, func()) {
+// startKCPEnvtest spins up a fresh envtest + manager + KCP reconciler + the
+// PR-9 SSHFallback sibling reconciler (plus its worker, exposed in the return
+// tuple so tests can swap the Dial function for a fake SSH server). Returns a
+// cancel-and-wait teardown closure plus the envtest *rest.Config (callers that
+// don't need cfg or the worker discard with `_`). Each KD-4 delete-flow test
+// sets up its own envtest because envtest start/stop is slow but
+// parallelization across tests is unsafe (shared apiserver port).
+//
+// Wiring the SSHFallback reconciler unconditionally is safe: its predicate
+// filters to KCPs with Spec.SSHFallback.Enabled=true, so tests that don't
+// configure SSHFallback are unaffected.
+func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config, *controlplane.SSHFallbackWorker, func()) {
 	t.Helper()
 	g := NewWithT(t)
 
@@ -255,6 +261,18 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 	}
 	g.Expect(cpReconciler.SetupWithManager(mgr)).To(Succeed())
 
+	sshWorker := controlplane.NewSSHFallbackWorker(
+		mgr.GetClient(), mgr.GetScheme(),
+		mgr.GetEventRecorderFor("kairoscontrolplane-ssh-fallback"),
+	)
+	sshReconciler := &controlplane.SSHFallbackReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Worker: sshWorker,
+	}
+	g.Expect(sshReconciler.SetupWithManager(mgr)).To(Succeed())
+	g.Expect(mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		return sshReconciler.StartResultDrain(ctx)
+	}))).To(Succeed())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	mgrErrCh := make(chan error, 1)
 	go func() { mgrErrCh <- mgr.Start(ctx) }()
@@ -268,7 +286,7 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 		<-mgrErrCh
 		g.Expect(testEnv.Stop()).To(Succeed())
 	}
-	return ctx, mgr.GetClient(), cfg, teardown
+	return ctx, mgr.GetClient(), cfg, sshWorker, teardown
 }
 
 // TestControlPlaneIntegration_DeleteDrainsOwnedMachine verifies KD-4:
@@ -286,7 +304,7 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, _, teardown := startKCPEnvtest(t)
+	ctx, c, _, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	const (
@@ -402,7 +420,7 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 		t.Skip("Skipping integration test in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, _, teardown := startKCPEnvtest(t)
+	ctx, c, _, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	const (
