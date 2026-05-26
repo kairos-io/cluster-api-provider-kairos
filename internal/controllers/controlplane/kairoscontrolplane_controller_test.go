@@ -590,6 +590,53 @@ func TestObserveKubeconfigSecret_TransitionsCondition(t *testing.T) {
 	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.KubeconfigReadyReason))
 }
 
+// TestObserveKubeconfigSecret_SSHFallbackAnnotation_SetsViaSSHReason
+// guards the one-line annotation check added in PR-9: when the
+// kubeconfig Secret was written by the SSH fallback worker (annotation
+// "controllers.cluster.x-k8s.io/kubeconfig-source: ssh-fallback"), the
+// condition Reason is KubeconfigReadyViaSSHFallback rather than the
+// default KubeconfigReady. This is the operator-visible audit signal
+// for "this cluster's kubeconfig was retrieved via SSH fallback."
+func TestObserveKubeconfigSecret_SSHFallbackAnnotation_SetsViaSSHReason(t *testing.T) {
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-kcp", Namespace: "default"},
+	}
+
+	sshFallbackSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-kubeconfig",
+			Namespace: "default",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+			Annotations: map[string]string{
+				KubeconfigSourceAnnotation: KubeconfigSourceSSHFallback,
+			},
+		},
+		Type: clusterv1.ClusterSecretType,
+		Data: map[string][]byte{"value": []byte("apiVersion: v1\nkind: Config")},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sshFallbackSecret).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	ready, err := r.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeTrue())
+	cond := conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(corev1.ConditionTrue))
+	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.KubeconfigReadyViaSSHFallbackReason),
+		"Secret annotated with ssh-fallback source must produce the via-SSH Reason")
+}
+
 // TestSecretToKairosControlPlane_UsesClusterNameLabel guards the KD-15 label
 // lookup: the handler must consult `cluster.x-k8s.io/cluster-name`, never
 // derive the cluster name from the Secret's name suffix.

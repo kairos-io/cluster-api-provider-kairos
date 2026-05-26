@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 
@@ -27,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -151,6 +153,38 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KairosControlPlane")
+		os.Exit(1)
+	}
+
+	// Wire the PR-9 SSH-fallback sibling controller. The worker pool is a
+	// process-singleton owned by main.go and shared with the reconciler:
+	// the reconciler enqueues work, the worker performs the SSH dial in
+	// a goroutine pool (bounded at 4 — see ssh_fallback_worker.go), and
+	// the reconciler drains the result channel in a manager-managed
+	// runnable so graceful shutdown is honoured.
+	//
+	// SECURITY: the worker enforces strict host-key verification via
+	// golang.org/x/crypto/ssh/knownhosts.New; there is no TOFU path
+	// anywhere in this wiring. The pool size is hard-coded (no flag) per
+	// ADR 0002 § F.2.
+	sshFallbackWorker := controlplane.NewSSHFallbackWorker(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		mgr.GetEventRecorderFor("kairoscontrolplane-ssh-fallback"),
+	)
+	sshFallbackReconciler := &controlplane.SSHFallbackReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Worker: sshFallbackWorker,
+	}
+	if err = sshFallbackReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "KairosControlPlane.SSHFallback")
+		os.Exit(1)
+	}
+	if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		return sshFallbackReconciler.StartResultDrain(ctx)
+	})); err != nil {
+		setupLog.Error(err, "unable to add SSHFallback result drain runnable")
 		os.Exit(1)
 	}
 

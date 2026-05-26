@@ -831,13 +831,23 @@ func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Conte
 			// populated for downstream consumers — `MarkTrue` deliberately
 			// leaves Reason empty per CAPI convention, but KubeconfigReady
 			// is a custom condition where the Reason is the observable
-			// signal of which path achieved readiness (node-push, vs.
-			// PR-9's SSH fallback once it lands).
+			// signal of which path achieved readiness (node-push vs.
+			// PR-9's SSH fallback).
+			//
+			// The "ssh-fallback" annotation is stamped by the SSH
+			// fallback worker (see ssh_fallback_worker.go) so we can
+			// distinguish operator-audit-worthy SSH retrievals from
+			// the default node-push path without adding a new
+			// condition type.
 			kcp.Status.LastNodePushObserved = nil
+			reason := controlplanev1beta2.KubeconfigReadyReason
+			if secret.Annotations[KubeconfigSourceAnnotation] == KubeconfigSourceSSHFallback {
+				reason = controlplanev1beta2.KubeconfigReadyViaSSHFallbackReason
+			}
 			conditions.Set(kcp, &clusterv1.Condition{
 				Type:   controlplanev1beta2.KubeconfigReadyCondition,
 				Status: corev1.ConditionTrue,
-				Reason: controlplanev1beta2.KubeconfigReadyReason,
+				Reason: reason,
 			})
 			log.V(4).Info("Kubeconfig Secret observed",
 				"secret", secretKey.String(),
