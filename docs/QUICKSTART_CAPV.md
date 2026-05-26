@@ -196,8 +196,10 @@ kubeconfig to a Secret in the management cluster at bootstrap time. The
 workload VM must have network reachability to the management cluster's API
 server (`<mgmt-api-server-host>:6443`). See
 [docs/INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure)
-for verification steps. If the VM has no network path to the API server, see
-the planned `SSHFallback` opt-in (post-alpha-2, PR-9).
+for verification steps. If the VM has no network path to the API server,
+enable the opt-in
+[Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback)
+on the `KairosControlPlane`.
 
 ## Field Reference
 
