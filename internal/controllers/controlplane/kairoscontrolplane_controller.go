@@ -63,8 +63,11 @@ const controlPlaneLBServiceSuffix = "control-plane-lb"
 // kubeconfigReadyTimeout is a package-local alias for the canonical
 // constant in the API package. The API package owns it (single source of
 // truth) because the validating webhook needs the same value to enforce
-// SSHFallback.ActivateAfter > KubeconfigReadyTimeout — see
-// api/controlplane/v1beta2/timeouts.go for the rationale.
+// SSHFallback.ActivateAfter > KubeconfigReadyTimeout, and the SSH fallback
+// sibling reconciler uses it as the activation baseline. See
+// api/controlplane/v1beta2/timeouts.go for the value and rationale.
+// The SSHFallback opt-in is the recovery surface for operators whose
+// workload VMs have no network path back to the management apiserver.
 const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=get;list;watch;create;update;patch;delete
@@ -832,7 +835,10 @@ func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Conte
 			// leaves Reason empty per CAPI convention, but KubeconfigReady
 			// is a custom condition where the Reason is the observable
 			// signal of which path achieved readiness (node-push vs.
-			// PR-9's SSH fallback).
+			// SSHFallback). The Reason surfaced here is what operators
+			// see in `kubectl describe kairoscontrolplane`:
+			//   - KubeconfigReady → node-push (normal path)
+			//   - KubeconfigReadyViaSSHFallback → SSH fallback supplied it
 			//
 			// The "ssh-fallback" annotation is stamped by the SSH
 			// fallback worker (see ssh_fallback_worker.go) so we can
