@@ -2,7 +2,30 @@
 
 > This file is a stub. The canonical upgrade procedures land in a later PR
 > (`docs/kd-35-kd-36-install-upgrade`). For now this captures the
-> alpha-1 → alpha-2 KD-3b impact only.
+> alpha-1 → alpha-2 KD-3b impact and the alpha-2 → alpha-3 KD-12 impact.
+
+## v0.1.0-alpha.2 → v0.1.0-alpha.3
+
+### KD-12: KCP no longer writes `Cluster.Spec.ControlPlaneEndpoint`
+
+The alpha-3 release removes the two blocks in `updateClusterStatus` that wrote
+`Cluster.Spec.ControlPlaneEndpoint` from Machine IP addresses (CAPV/CAPD) or
+from the LoadBalancer Service Ingress IP (CAPK). `Cluster.Spec.ControlPlaneEndpoint`
+is now written exclusively by CAPI core, which copies it from the infra-cluster's
+own `Spec.ControlPlaneEndpoint`. This is the behaviour the CAPI v1beta2 contract
+requires.
+
+| Cluster state at upgrade | Behaviour after KD-12 | Operator action |
+|---|---|---|
+| Healthy cluster, `Cluster.Spec.ControlPlaneEndpoint` already populated | No change. The endpoint is preserved; the KCP controller stops overwriting it. CAPI core is now the sole writer, which is byte-identical to what KCP was writing. | None. |
+| Mid-provisioning cluster, infra provider has already populated `<Infra>Cluster.Spec.ControlPlaneEndpoint` | CAPI core copies it on its next reconcile; everything proceeds. | None. |
+| CAPV / CAPD / CAPK cluster whose `<Infra>Cluster.Spec.ControlPlaneEndpoint` (CAPV/CAPD) or `KubevirtCluster.Spec.ControlPlaneServiceTemplate` (CAPK) is unset — including any cluster that relied on KCP auto-discovering the endpoint from Machine IPs | `Cluster.Spec.ControlPlaneEndpoint` stays empty. KCP stalls with `KairosControlPlane.Status.Conditions[Available].Reason=WaitingForInfrastructureControlPlaneEndpoint`. | Set `VSphereCluster.Spec.ControlPlaneEndpoint` (CAPV), `DockerCluster.Spec.ControlPlaneEndpoint` (CAPD), or supply a LoadBalancer IP via the sample's `Cluster.spec.controlPlaneEndpoint` placeholder (CAPK) per the upstream provider's contract. For an in-flight cluster: `kubectl edit cluster <name>` and set `spec.controlPlaneEndpoint.host` and `spec.controlPlaneEndpoint.port` directly. CAPI core does not overwrite a populated value. |
+
+No CRD changes in this release for KD-12. The new condition Reason
+(`WaitingForInfrastructureControlPlaneEndpoint`) is additive — clients
+that treat unknown Reasons as opaque strings are unaffected.
+
+---
 
 ## v0.1.0-alpha.1 → v0.1.0-alpha.2
 

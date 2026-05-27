@@ -45,6 +45,16 @@ spec:
     apiGroup: controlplane.cluster.x-k8s.io
     kind: KairosControlPlane
     name: kairos-control-plane
+  # Required: set a stable API endpoint before applying.
+  # Pre-allocate a LoadBalancer IP or VIP; CAPV does not auto-discover the
+  # endpoint. Without this, KairosControlPlane stalls with
+  # Available=False(WaitingForInfrastructureControlPlaneEndpoint).
+  # For an in-flight cluster: kubectl edit cluster kairos-cluster and set
+  # spec.controlPlaneEndpoint.host/port directly (CAPI does not overwrite a
+  # populated value).
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-LB-OR-VIP"
+    port: 6443
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: VSphereCluster

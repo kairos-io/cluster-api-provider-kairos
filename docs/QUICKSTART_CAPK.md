@@ -9,6 +9,8 @@ This guide covers two paths:
 
 Both paths use the 2-disk Kairos installer pattern, described below.
 
+**Note on `controlPlaneEndpoint`**: the sample manifests require `Cluster.spec.controlPlaneEndpoint` to be set to the IP that your LoadBalancer implementation (MetalLB or equivalent) will assign to the control-plane Service. The provider does not auto-populate this field. If the IP is unknown at apply time, use the `TODO-REPLACE-WITH-LB-IP` placeholder in the sample, wait for MetalLB to assign the LB IP to the `<cluster>-control-plane-lb` Service, then update the field with `kubectl edit cluster <name>`. CAPI core does not overwrite a populated value. Without a valid endpoint, `KairosControlPlane` stalls with `Available=False(WaitingForInfrastructureControlPlaneEndpoint)`.
+
 ---
 
 ## The 2-disk Kairos installer pattern

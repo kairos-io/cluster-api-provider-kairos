@@ -51,6 +51,19 @@ spec:
     apiGroup: controlplane.cluster.x-k8s.io
     kind: KairosControlPlane
     name: kairos-control-plane-kv-capk
+  # Required: set to the IP that MetalLB (or your LB implementation) will
+  # assign to the control-plane LoadBalancer Service before applying.
+  # If the IP is not yet known, apply the manifest with this placeholder,
+  # wait for MetalLB to assign an IP to the <cluster>-control-plane-lb
+  # Service, then run:
+  #   kubectl edit cluster kairos-cluster-kv
+  # and set spec.controlPlaneEndpoint.host to the assigned IP.
+  # CAPI core does not overwrite a populated value.
+  # Without a valid endpoint, KairosControlPlane stalls with
+  # Available=False(WaitingForInfrastructureControlPlaneEndpoint).
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-LB-IP"
+    port: 6443
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
 kind: KubevirtCluster

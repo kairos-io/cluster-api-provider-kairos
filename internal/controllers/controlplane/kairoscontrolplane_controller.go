@@ -283,7 +283,19 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// Don't fail the reconcile, just log the error
 	}
 
-	// Update conditions based on status
+	// Update conditions based on status.
+	//
+	// Per CAPI v1beta2 contract + KD-12: when the infrastructure provider
+	// has not yet populated Cluster.Spec.ControlPlaneEndpoint, the KCP
+	// MUST report that wait state distinctly from "waiting for machines"
+	// so operators can tell whether they need to fix the InfraCluster's
+	// endpoint or just wait for VM provisioning. The endpoint check runs
+	// FIRST on the False branches because an empty endpoint is the
+	// operator-actionable wait; "waiting for machines" implies the
+	// endpoint is already populated and the controller is just waiting
+	// on bootstrap.
+	endpointReady := cluster.Spec.ControlPlaneEndpoint.IsValid()
+
 	if kcp.Status.Initialized {
 		conditions.MarkTrue(kcp, clusterv1.ReadyCondition)
 		conditions.MarkTrue(kcp, controlplanev1beta2.AvailableCondition)
@@ -292,6 +304,13 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		} else {
 			conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForMachinesReadyReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane machines to be ready")
 		}
+	} else if !endpointReady {
+		const endpointMsg = "Waiting for the infrastructure provider to populate Cluster.Spec.ControlPlaneEndpoint. " +
+			"Set VSphereCluster.spec.controlPlaneEndpoint (CAPV), " +
+			"KubevirtCluster.spec.controlPlaneServiceTemplate (CAPK), " +
+			"or Cluster.spec.controlPlaneEndpoint (CAPD / direct) per the provider's contract."
+		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForInfrastructureControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, "%s", endpointMsg)
+		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForInfrastructureControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, "%s", endpointMsg)
 	} else {
 		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
@@ -925,123 +944,24 @@ func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, 
 		Namespace: cluster.Namespace,
 	}
 
-	// Re-fetch the cluster to ensure we have the latest version before updating
-	// This prevents conflicts with other controllers that might be updating the cluster
-	clusterKey := types.NamespacedName{
-		Name:      cluster.Name,
-		Namespace: cluster.Namespace,
-	}
-	clusterToPatch := &clusterv1.Cluster{}
-	if err := r.Get(ctx, clusterKey, clusterToPatch); err != nil {
-		return fmt.Errorf("failed to re-fetch cluster for updating: %w", err)
-	}
+	// KD-12: this controller MUST NOT write Cluster.Spec.ControlPlaneEndpoint.
+	// The infrastructure provider populates <Infra>Cluster.Spec.ControlPlaneEndpoint,
+	// CAPI core copies it into Cluster.Spec.ControlPlaneEndpoint, and this
+	// control-plane provider only reads. See ADR 0003.
+	//
+	// The one remaining concern of this function is the CAPK-specific
+	// kubeconfig-server rewrite: when the kubeconfig Secret exists, we may
+	// need to retarget its `server:` URL at the LoadBalancer endpoint so
+	// `clusterctl get kubeconfig` and downstream tooling reach the cluster
+	// through the LB instead of the in-cluster API server address baked in
+	// by the distribution. (A follow-up split will rename this function to
+	// reconcileKubeconfigServer; out of scope for KD-12.)
 
-	// Set controlPlaneEndpoint if not already set (runs before kubeconfig check so LB endpoint
-	// is set as soon as LoadBalancer has an IP, enabling SSH retrieval and Machine controller)
-	needsSpecUpdate := false
-	currentHost := clusterToPatch.Spec.ControlPlaneEndpoint.Host
-	currentPort := clusterToPatch.Spec.ControlPlaneEndpoint.Port
-	log.V(4).Info("Checking controlPlaneEndpoint", "cluster", clusterToPatch.Name, "currentHost", currentHost, "currentPort", currentPort)
-
-	if isKubevirtControlPlane(kcp) {
-		lbHost, lbPort, err := r.getControlPlaneLBEndpoint(ctx, log, clusterToPatch)
-		if err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to get control plane LoadBalancer endpoint", "cluster", clusterToPatch.Name)
-		}
-		if lbHost != "" && lbPort != 0 {
-			shouldUpdate := currentHost == "" || currentPort == 0 || currentHost != lbHost || currentPort != lbPort
-			if shouldUpdate {
-				clusterToPatch.Spec.ControlPlaneEndpoint.Host = lbHost
-				clusterToPatch.Spec.ControlPlaneEndpoint.Port = lbPort
-				needsSpecUpdate = true
-				log.Info("Setting controlPlaneEndpoint from LoadBalancer", "cluster", clusterToPatch.Name, "host", lbHost, "port", lbPort)
-			} else {
-				log.V(4).Info("controlPlaneEndpoint already set to LoadBalancer", "currentHost", currentHost, "currentPort", currentPort)
-			}
-			// ensureKubeconfigServer runs below, only when secret exists
-		} else {
-			log.Info("LoadBalancer endpoint not ready yet", "cluster", clusterToPatch.Name)
-		}
-	} else {
-		machines, err := r.getControlPlaneMachines(ctx, kcp, clusterToPatch)
-		if err != nil {
-			log.V(4).Info("Failed to get machines", "error", err)
-		} else if len(machines) == 0 {
-			log.V(4).Info("No machines found")
-		} else {
-			log.V(4).Info("Found machines", "count", len(machines))
-			// Find the first machine with an IP address
-			// Try machine.Status.Addresses first, then fallback to VSphereMachine/VSphereVM
-			for _, machine := range machines {
-				log.V(4).Info("Checking machine", "machine", machine.Name, "addressCount", len(machine.Status.Addresses))
-				var controlPlaneAddress string
-
-				// First, try machine.Status.Addresses (if populated)
-				if len(machine.Status.Addresses) > 0 {
-					var controlPlaneIP string
-					var controlPlaneHostname string
-					for _, addr := range machine.Status.Addresses {
-						log.V(4).Info("Machine address", "machine", machine.Name, "type", addr.Type, "address", addr.Address)
-						if addr.Type == clusterv1.MachineExternalIP || addr.Type == clusterv1.MachineInternalIP {
-							controlPlaneIP = addr.Address
-						}
-						if addr.Type == clusterv1.MachineInternalDNS {
-							controlPlaneHostname = addr.Address
-						}
-					}
-					// Prefer IP address, fallback to hostname
-					controlPlaneAddress = controlPlaneIP
-					if controlPlaneAddress == "" && controlPlaneHostname != "" {
-						controlPlaneAddress = controlPlaneHostname
-						log.V(4).Info("Using hostname from machine status", "hostname", controlPlaneHostname)
-					}
-				}
-
-				// Fallback: Get IP from infrastructure provider (same method used for kubeconfig)
-				if controlPlaneAddress == "" {
-					log.V(4).Info("Machine.Status.Addresses empty, trying infrastructure provider", "machine", machine.Name)
-					if ip, err := r.getNodeIP(ctx, log, machine); err == nil && ip != "" {
-						controlPlaneAddress = ip
-						log.V(4).Info("Found IP from infrastructure provider", "machine", machine.Name, "ip", ip)
-					} else if err != nil {
-						log.V(4).Info("Failed to get IP from infrastructure provider", "machine", machine.Name, "error", err)
-					}
-				}
-
-				if controlPlaneAddress != "" {
-					shouldUpdate := currentHost == "" || currentPort == 0 || currentHost != controlPlaneAddress
-					if shouldUpdate {
-						clusterToPatch.Spec.ControlPlaneEndpoint.Host = controlPlaneAddress
-						clusterToPatch.Spec.ControlPlaneEndpoint.Port = 6443 // Default k0s API server port
-						needsSpecUpdate = true
-						log.Info("Setting controlPlaneEndpoint", "cluster", clusterToPatch.Name, "host", controlPlaneAddress, "port", 6443)
-						break
-					}
-					log.V(4).Info("controlPlaneEndpoint already set", "currentHost", currentHost, "currentPort", currentPort)
-				} else {
-					log.V(4).Info("No IP or hostname found for machine", "machine", machine.Name)
-				}
-			}
-		}
-	}
-
-	// Check if kubeconfig secret exists - early exit if not, but controlPlaneEndpoint already updated above
+	// Check if the kubeconfig secret exists yet; if not, nothing to do here.
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, secretKey, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.V(4).Info("Kubeconfig secret not found, skipping cluster status update", "secret", secretName)
-			// Still update spec if controlPlaneEndpoint was set (e.g. from LB)
-			if needsSpecUpdate {
-				log.Info("Updating cluster spec with controlPlaneEndpoint", "cluster", clusterToPatch.Name, "host", clusterToPatch.Spec.ControlPlaneEndpoint.Host, "port", clusterToPatch.Spec.ControlPlaneEndpoint.Port)
-				if err := r.Update(ctx, clusterToPatch); err != nil {
-					if apierrors.IsConflict(err) {
-						log.V(4).Info("Conflict updating cluster spec, will retry on next reconcile", "cluster", clusterToPatch.Name, "error", err)
-						return nil
-					}
-					return fmt.Errorf("failed to update cluster spec: %w", err)
-				}
-				log.Info("Successfully updated cluster spec with controlPlaneEndpoint", "cluster", clusterToPatch.Name)
-			}
 			return nil
 		}
 		return err
@@ -1051,41 +971,16 @@ func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, 
 
 	// For KubeVirt, ensure kubeconfig server URL matches LoadBalancer endpoint (only when secret exists)
 	if isKubevirtControlPlane(kcp) {
-		lbHost, lbPort, err := r.getControlPlaneLBEndpoint(ctx, log, clusterToPatch)
+		lbHost, lbPort, err := r.getControlPlaneLBEndpoint(ctx, log, cluster)
 		if err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to get control plane LoadBalancer endpoint for kubeconfig", "cluster", clusterToPatch.Name)
+			log.Error(err, "Failed to get control plane LoadBalancer endpoint for kubeconfig", "cluster", cluster.Name)
 		} else if lbHost != "" && lbPort != 0 {
 			updated, err := r.ensureKubeconfigServer(ctx, log, secret, lbHost, lbPort)
 			if err != nil {
-				log.Error(err, "Failed to ensure kubeconfig server", "cluster", clusterToPatch.Name)
+				log.Error(err, "Failed to ensure kubeconfig server", "cluster", cluster.Name)
 			} else if updated {
-				log.Info("Updated kubeconfig server to match LoadBalancer endpoint", "cluster", clusterToPatch.Name, "host", lbHost, "port", lbPort)
+				log.Info("Updated kubeconfig server to match LoadBalancer endpoint", "cluster", cluster.Name, "host", lbHost, "port", lbPort)
 			}
-		}
-	}
-
-	// The Cluster API Cluster controller manages the ControlPlaneInitialized condition
-	// based on the control plane's status.Initialized field.
-	// We should NOT try to set this condition directly, as it causes reconcile loops
-	// and conflicts with the Cluster controller's logic.
-	// Instead, we ensure status.Initialized is set correctly on the KCP resource,
-	// and let the Cluster controller manage the condition on the Cluster resource.
-
-	// Update spec first if needed (controlPlaneEndpoint)
-	if needsSpecUpdate {
-		log.Info("Updating cluster spec with controlPlaneEndpoint", "cluster", clusterToPatch.Name, "host", clusterToPatch.Spec.ControlPlaneEndpoint.Host, "port", clusterToPatch.Spec.ControlPlaneEndpoint.Port)
-		// Use Update() for spec changes
-		if err := r.Update(ctx, clusterToPatch); err != nil {
-			if apierrors.IsConflict(err) {
-				log.V(4).Info("Conflict updating cluster spec, will retry on next reconcile", "cluster", clusterToPatch.Name, "error", err)
-				return nil // Will retry on next reconcile
-			}
-			return fmt.Errorf("failed to update cluster spec: %w", err)
-		}
-		log.Info("Successfully updated cluster spec with controlPlaneEndpoint", "cluster", clusterToPatch.Name)
-		// Re-fetch after spec update to ensure we have latest version
-		if err := r.Get(ctx, client.ObjectKeyFromObject(clusterToPatch), clusterToPatch); err != nil {
-			return fmt.Errorf("failed to re-fetch cluster after spec update: %w", err)
 		}
 	}
 

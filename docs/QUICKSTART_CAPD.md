@@ -8,6 +8,8 @@ This guide walks you through creating a single-node k0s cluster on Kairos using 
 
 **Note:** CAPD is a development-only infrastructure provider. Docker-based Kairos clusters do not represent a production topology.
 
+**Note on `controlPlaneEndpoint`**: the sample manifest requires `Cluster.spec.controlPlaneEndpoint` to be set to a reachable host and port before applying. CAPD (like CAPV) does not auto-provision an endpoint; you must supply one. For local kind-based management clusters the Docker container's IP or a host port mapping is the typical choice. Without a valid endpoint, `KairosControlPlane` stalls with `Available=False(WaitingForInfrastructureControlPlaneEndpoint)`.
+
 ## Prerequisites
 
 1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster).
