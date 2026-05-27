@@ -71,7 +71,7 @@ func TestProviderID_NotPatchedByController(t *testing.T) {
 		t.Skip("Skipping envtest in short mode")
 	}
 	g := NewWithT(t)
-	ctx, c, cfg, teardown := startKCPEnvtest(t)
+	ctx, c, cfg, _, teardown := startKCPEnvtest(t)
 	defer teardown()
 
 	ns := &corev1.Namespace{

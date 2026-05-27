@@ -69,4 +69,34 @@ const (
 	// once the workload-cluster kubeconfig Secret has been observed and
 	// parses successfully.
 	KubeconfigReadyReason = "KubeconfigReady"
+
+	// KubeconfigReadyViaSSHFallbackReason is the True reason for
+	// KubeconfigReadyCondition when the kubeconfig Secret was supplied
+	// by the opt-in SSH fallback path (Spec.SSHFallback.Enabled=true)
+	// rather than the node-push path. Operators auditing "how did this
+	// cluster get its kubeconfig?" see this in `kubectl describe kcp`.
+	KubeconfigReadyViaSSHFallbackReason = "KubeconfigReadyViaSSHFallback"
+
+	// SSHFallbackDialingReason is the False reason for
+	// KubeconfigReadyCondition while the SSH fallback path is dialing
+	// the workload node. Severity Info. Transitions to True (one of
+	// the two Ready reasons) on success, or to SSHFallbackFailedReason
+	// on hard error.
+	SSHFallbackDialingReason = "SSHFallbackDialing"
+
+	// SSHFallbackFailedReason is the False reason for
+	// KubeconfigReadyCondition when the SSH fallback attempt failed in
+	// a way that prevented kubeconfig retrieval. Severity Warning.
+	// Common causes: host-key mismatch, auth failure, file not found
+	// on remote. The controller continues to honour any concurrent
+	// node-push; a successful node-push will still transition to
+	// KubeconfigReadyReason.
+	SSHFallbackFailedReason = "SSHFallbackFailed"
+
+	// SSHFallbackMisconfiguredReason is the False reason for
+	// KubeconfigReadyCondition when SSHFallback.Enabled=true but a
+	// referenced Secret is missing, empty, or unparseable. Severity
+	// Warning. Resolution: fix the referenced Secret; the path retries
+	// on next reconcile.
+	SSHFallbackMisconfiguredReason = "SSHFallbackMisconfigured"
 )

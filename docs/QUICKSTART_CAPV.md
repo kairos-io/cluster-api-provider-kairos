@@ -196,8 +196,10 @@ kubeconfig to a Secret in the management cluster at bootstrap time. The
 workload VM must have network reachability to the management cluster's API
 server (`<mgmt-api-server-host>:6443`). See
 [docs/INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure)
-for verification steps. If the VM has no network path to the API server, see
-the planned `SSHFallback` opt-in (post-alpha-2, PR-9).
+for verification steps. If the VM has no network path to the API server,
+enable the opt-in
+[Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback)
+on the `KairosControlPlane`.
 
 ## Field Reference
 
@@ -270,7 +272,106 @@ If `KairosConfig.status.failureMessage` is set, the issue is transient — it cl
 - Configure additional worker nodes via `MachineDeployment`.
 - Add custom Kubernetes manifests via `spec.manifests` in `KairosConfigTemplate`.
 - Multi-node control planes are tracked for a future release (KD-5b / KD-25).
-- SSH opt-in fallback for air-gapped scenarios is tracked for a future PR (KD-3b / PR-9).
+
+## Air-gapped fallback (SSHFallback)
+
+**When to use:** the workload VM has no network route back to the management
+cluster API server (`<mgmt-api-server-host>:6443`). The node-push path —
+where the VM POSTs its kubeconfig to a management cluster Secret — is
+unreachable. Without this fallback, `KubeconfigReadyCondition` stays
+`False(WaitingForNodePush)` indefinitely.
+
+**When NOT to use:** the default node-push path works in most networks. Do
+not enable SSHFallback unless you have confirmed that the VM cannot reach
+the management API server. The fallback is an escape hatch, not a
+replacement for node-push.
+
+**Security requirement:** host-key verification is mandatory. The controller
+verifies the workload node's SSH host key against a `known_hosts` Secret
+before any data is exchanged. There is no trust-on-first-use mode.
+`activateAfter` must be at least 15 minutes (greater than the
+`KubeconfigReadyCondition` Info→Warning threshold of 10 minutes).
+
+### Step 1: Create the SSH identity Secret
+
+The Secret holds the private key the controller uses to authenticate to the
+workload node. The corresponding public key must already be installed on the
+node via `KairosConfig.spec.sshPublicKey` or `KairosConfig.spec.githubUser`.
+
+```bash
+kubectl create secret generic kairos-ssh-identity \
+  --type=kubernetes.io/ssh-auth \
+  --from-file=ssh-privatekey=/path/to/your/private_key \
+  -n <cluster-namespace>
+```
+
+### Step 2: Create the known-hosts Secret
+
+Obtain the workload node's SSH host key (for example with `ssh-keyscan`
+against the VM's IP while you still have network access, or from the Kairos
+OS image's pre-generated host key material). The `known_hosts` format is
+standard OpenSSH: one `<host> <key-type> <base64-key>` line per entry.
+
+```bash
+kubectl create secret generic kairos-ssh-known-hosts \
+  --from-file=known_hosts=/path/to/known_hosts_file \
+  -n <cluster-namespace>
+```
+
+### Step 3: Enable SSHFallback on the KairosControlPlane
+
+Add the following stanza to your `KairosControlPlane` spec. All values shown
+are defaults except the Secret names, which you must set:
+
+```yaml
+spec:
+  sshFallback:
+    enabled: true
+    user: kairos          # default; must match the node's SSH user
+    port: 22              # default
+    activateAfter: 15m    # default; must exceed kubeconfigReadyTimeout (10m)
+    identitySecretRef:
+      name: kairos-ssh-identity     # Secret from Step 1
+    knownHostsSecretRef:
+      name: kairos-ssh-known-hosts  # Secret from Step 2
+```
+
+Both Secrets must be in the same namespace as the `KairosControlPlane`. The
+webhook rejects cross-namespace references.
+
+Apply the updated manifest:
+
+```bash
+kubectl apply -f your-kairoscontrolplane.yaml
+```
+
+### Step 4: Verify activation
+
+The fallback fires `activateAfter` after `KubeconfigReadyCondition` first
+becomes `False(WaitingForNodePush)`. Watch the condition Reason with:
+
+```bash
+kubectl describe kairoscontrolplane <name> -n <cluster-namespace>
+```
+
+The `KubeconfigReadyCondition` Reason tells you which path is active:
+
+| Reason | Meaning |
+|--------|---------|
+| `KubeconfigReady` | Node-push succeeded (normal path; SSHFallback did not fire). |
+| `KubeconfigReadyViaSSHFallback` | SSH fallback supplied the kubeconfig. |
+| `SSHFallbackDialing` | SSH fallback is in progress; wait up to 30 seconds. |
+| `SSHFallbackFailed` | SSH attempt failed. Check Events for the categorized error (host-key mismatch, auth failure, file not found). |
+| `SSHFallbackMisconfigured` | A referenced Secret is missing, empty, or unparseable. Fix the Secret; the controller retries automatically. |
+
+For detailed error information when the Reason is `SSHFallbackFailed` or
+`SSHFallbackMisconfigured`:
+
+```bash
+kubectl get events -n <cluster-namespace> \
+  --field-selector involvedObject.name=<kairoscontrolplane-name> \
+  --sort-by='.lastTimestamp'
+```
 
 ## Cleanup
 

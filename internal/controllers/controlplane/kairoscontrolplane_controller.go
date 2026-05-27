@@ -60,17 +60,15 @@ type KairosControlPlaneReconciler struct {
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
-// kubeconfigReadyTimeout is the elapsed since Status.LastNodePushObserved
-// after which KubeconfigReadyCondition's severity escalates from Info to
-// Warning. The timeout is not a terminal — past it, the controller still
-// waits on the Secret watch. Operator visibility (condition severity)
-// changes; no controller-side recovery action. PR-9's SSHFallback opt-in
-// is the recovery surface.
-//
-// 10 minutes covers normal boot/network-init time on lab-grade VMs with
-// margin for kairos package downloads; tightening on infra with faster
-// boot lands as a per-infra-provider override in a follow-up.
-const kubeconfigReadyTimeout = 10 * time.Minute
+// kubeconfigReadyTimeout is a package-local alias for the canonical
+// constant in the API package. The API package owns it (single source of
+// truth) because the validating webhook needs the same value to enforce
+// SSHFallback.ActivateAfter > KubeconfigReadyTimeout, and the SSH fallback
+// sibling reconciler uses it as the activation baseline. See
+// api/controlplane/v1beta2/timeouts.go for the value and rationale.
+// The SSHFallback opt-in is the recovery surface for operators whose
+// workload VMs have no network path back to the management apiserver.
+const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes/status,verbs=get;update;patch
@@ -836,13 +834,26 @@ func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Conte
 			// populated for downstream consumers — `MarkTrue` deliberately
 			// leaves Reason empty per CAPI convention, but KubeconfigReady
 			// is a custom condition where the Reason is the observable
-			// signal of which path achieved readiness (node-push, vs.
-			// PR-9's SSH fallback once it lands).
+			// signal of which path achieved readiness (node-push vs.
+			// SSHFallback). The Reason surfaced here is what operators
+			// see in `kubectl describe kairoscontrolplane`:
+			//   - KubeconfigReady → node-push (normal path)
+			//   - KubeconfigReadyViaSSHFallback → SSH fallback supplied it
+			//
+			// The "ssh-fallback" annotation is stamped by the SSH
+			// fallback worker (see ssh_fallback_worker.go) so we can
+			// distinguish operator-audit-worthy SSH retrievals from
+			// the default node-push path without adding a new
+			// condition type.
 			kcp.Status.LastNodePushObserved = nil
+			reason := controlplanev1beta2.KubeconfigReadyReason
+			if secret.Annotations[KubeconfigSourceAnnotation] == KubeconfigSourceSSHFallback {
+				reason = controlplanev1beta2.KubeconfigReadyViaSSHFallbackReason
+			}
 			conditions.Set(kcp, &clusterv1.Condition{
 				Type:   controlplanev1beta2.KubeconfigReadyCondition,
 				Status: corev1.ConditionTrue,
-				Reason: controlplanev1beta2.KubeconfigReadyReason,
+				Reason: reason,
 			})
 			log.V(4).Info("Kubeconfig Secret observed",
 				"secret", secretKey.String(),

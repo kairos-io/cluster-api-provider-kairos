@@ -21,7 +21,7 @@ via a label-filtered watch.
 | CAPK control-plane mid-bootstrap (Secret not yet pushed) | Controller renders a NEW bootstrap Secret on next reconcile. The node, when it comes up, uses the new template's push payload. | None unless a rollout is needed for unrelated reasons. |
 | CAPV control-plane healthy, kubeconfig Secret present (was SSH-fetched in alpha-1) | Controller's existing-Secret check still passes. Cluster keeps working. | None. |
 | CAPV control-plane mid-bootstrap | **Old KairosConfig has no push block.** Controller's SSH path is GONE. The node will never push; the controller will never SSH. The cluster will sit indefinitely on `KubeconfigReadyCondition=False(WaitingForNodePush)`. | **Required**: delete the KairosConfig (or trigger a KCP rollout) so the bootstrap controller renders a new userdata with the push block. CAPV will create a new VM with new userdata. |
-| Air-gapped CAPV control-plane (no network reachability from VM to management cluster API server) | Cluster stuck on `KubeconfigReadyCondition=False(WaitingForNodePush)` indefinitely; condition severity transitions Info → Warning after 10 minutes. | Wait for `SSHFallback` (post-alpha-2 PR). Or open a network path from the VM to `<management-cluster-api-server-host>:6443`. |
+| Air-gapped CAPV control-plane (no network reachability from VM to management cluster API server) | Cluster stuck on `KubeconfigReadyCondition=False(WaitingForNodePush)` indefinitely; condition severity transitions Info → Warning after 10 minutes. | Enable `Spec.SSHFallback`: (1) create a `kubernetes.io/ssh-auth` Secret with an `ssh-privatekey` key in the cluster's namespace; (2) create an Opaque Secret with a `known_hosts` key containing the node's SSH host-key lines; (3) set `spec.sshFallback.enabled: true`, `spec.sshFallback.identitySecretRef.name`, and `spec.sshFallback.knownHostsSecretRef.name` on the `KairosControlPlane`; (4) leave `spec.sshFallback.activateAfter` at the default `15m` unless you have a reason to change it. The fallback fires after `activateAfter` elapses from `KubeconfigReadyCondition` first becoming `False(WaitingForNodePush)`. See [Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback) for worked examples. Or open a network path from the VM to `<management-cluster-api-server-host>:6443`. |
 | Bootstrap Secret rendered before alpha-2 (no post-bootstrap providerID service block in the cloud-config) | Controller no longer patches `Node.Spec.ProviderID` (PR-8 deleted `ensureProviderIDOnNodes`). The old Secret also has no in-node patch script. `Node.Spec.ProviderID` stays empty → CAPI Machine controller cannot match the NodeRef → Machine stays `NodeNotFound`. | **Required**: trigger a KCP rollout (or delete the KairosConfig) so the bootstrap controller re-renders the Secret with the alpha-2 template, which includes the post-bootstrap providerID service. |
 
 ### KD-3b part 2: Node.Spec.ProviderID is now set exclusively in-VM
@@ -72,5 +72,7 @@ cluster's API server URL. Verify from a workload node before deploying:
 curl -k https://<mgmt-api-server-host>:6443/api
 ```
 
-For air-gapped or strictly-segmented network environments, see the planned
-`SSHFallback` opt-in mechanism (post-alpha-2, PR-9).
+For air-gapped or strictly-segmented network environments, enable
+`Spec.SSHFallback` on the `KairosControlPlane`. See
+[Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
+for the full operator procedure.
