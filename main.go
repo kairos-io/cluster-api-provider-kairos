@@ -196,6 +196,10 @@ func main() {
 		setupLog.Error(err, "unable to create webhook", "webhook", "KairosControlPlane")
 		os.Exit(1)
 	}
+	if err = (&controlplanev1beta2.KairosControlPlaneTemplate{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "KairosControlPlaneTemplate")
+		os.Exit(1)
+	}
 	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
