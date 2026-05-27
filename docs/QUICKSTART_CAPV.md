@@ -4,7 +4,7 @@ Last verified against: Kairos v3.6.0+, CAPI v1.8.x, CAPV v1.11.x, provider v0.1.
 
 This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV).
 
-**Note on k3s vs k0s**: the k3s flavor requires `Cluster.spec.controlPlaneEndpoint` to be set to a stable LoadBalancer IP or VIP before applying the manifest, because k3s agents join via the control-plane endpoint. The k0s flavor does not require a pre-set endpoint — the controller discovers the node IP after the VM is provisioned.
+**Note on `controlPlaneEndpoint`**: both the k0s and k3s flavors require `Cluster.spec.controlPlaneEndpoint` (or `VSphereCluster.spec.controlPlaneEndpoint`) to be set to a stable LoadBalancer IP or VIP before applying the manifest. The provider does not auto-discover the endpoint. Standard CAPV practice is to pre-allocate an IP via your load-balancer solution and reference it in the sample before applying. If you apply without a valid endpoint, `KairosControlPlane` will stall with `Available=False(WaitingForInfrastructureControlPlaneEndpoint)` until the endpoint is set.
 
 ## Prerequisites
 
