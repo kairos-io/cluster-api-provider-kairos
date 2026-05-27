@@ -283,7 +283,19 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// Don't fail the reconcile, just log the error
 	}
 
-	// Update conditions based on status
+	// Update conditions based on status.
+	//
+	// Per CAPI v1beta2 contract + KD-12: when the infrastructure provider
+	// has not yet populated Cluster.Spec.ControlPlaneEndpoint, the KCP
+	// MUST report that wait state distinctly from "waiting for machines"
+	// so operators can tell whether they need to fix the InfraCluster's
+	// endpoint or just wait for VM provisioning. The endpoint check runs
+	// FIRST on the False branches because an empty endpoint is the
+	// operator-actionable wait; "waiting for machines" implies the
+	// endpoint is already populated and the controller is just waiting
+	// on bootstrap.
+	endpointReady := cluster.Spec.ControlPlaneEndpoint.IsValid()
+
 	if kcp.Status.Initialized {
 		conditions.MarkTrue(kcp, clusterv1.ReadyCondition)
 		conditions.MarkTrue(kcp, controlplanev1beta2.AvailableCondition)
@@ -292,6 +304,13 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		} else {
 			conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForMachinesReadyReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane machines to be ready")
 		}
+	} else if !endpointReady {
+		const endpointMsg = "Waiting for the infrastructure provider to populate Cluster.Spec.ControlPlaneEndpoint. " +
+			"Set VSphereCluster.spec.controlPlaneEndpoint (CAPV), " +
+			"KubevirtCluster.spec.controlPlaneServiceTemplate (CAPK), " +
+			"or Cluster.spec.controlPlaneEndpoint (CAPD / direct) per the provider's contract."
+		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForInfrastructureControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, "%s", endpointMsg)
+		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForInfrastructureControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, "%s", endpointMsg)
 	} else {
 		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
