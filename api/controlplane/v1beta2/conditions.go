@@ -99,4 +99,37 @@ const (
 	// Warning. Resolution: fix the referenced Secret; the path retries
 	// on next reconcile.
 	SSHFallbackMisconfiguredReason = "SSHFallbackMisconfigured"
+
+	// WaitingForInfrastructureControlPlaneEndpointReason is the False
+	// reason for the KairosControlPlane AvailableCondition and the
+	// derived ReadyCondition while `Cluster.Spec.ControlPlaneEndpoint`
+	// is not yet populated. Severity Info.
+	//
+	// Per the CAPI v1beta2 contract, the infrastructure provider's
+	// `<Infra>Cluster` resource is the source of truth for the
+	// control-plane endpoint:
+	//   - CAPV operators set `VSphereCluster.Spec.ControlPlaneEndpoint`.
+	//   - CAPK operators set
+	//     `KubevirtCluster.Spec.ControlPlaneServiceTemplate`; CAPK then
+	//     creates the LoadBalancer Service and reflects its IP into
+	//     `KubevirtCluster.Spec.ControlPlaneEndpoint`.
+	//   - CAPD operators set `Cluster.Spec.ControlPlaneEndpoint`
+	//     directly (CAPD does not auto-discover).
+	// CAPI core then copies `<Infra>Cluster.Spec.ControlPlaneEndpoint`
+	// into `Cluster.Spec.ControlPlaneEndpoint`. This Reason names that
+	// upstream wait so operators see clearly that the control-plane
+	// controller is correctly NOT writing the field (KD-12). Closely
+	// related to CAPI's own
+	// `InfrastructureReadyV1Beta1Condition` /
+	// `WaitingForInfrastructureFallback` on the Cluster — when the
+	// infrastructure provider is itself stalled, this Reason on KCP
+	// and that condition on the Cluster show up together; operators
+	// fix the InfraCluster spec and both clear.
+	//
+	// Resolution: set the endpoint on the InfraCluster per the
+	// upstream provider's contract. For an in-flight cluster, also
+	// valid to `kubectl edit cluster <name>` and populate
+	// `spec.controlPlaneEndpoint.host`/`port` directly — CAPI core
+	// does not overwrite a populated value.
+	WaitingForInfrastructureControlPlaneEndpointReason = "WaitingForInfrastructureControlPlaneEndpoint"
 )
