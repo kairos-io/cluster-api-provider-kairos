@@ -881,3 +881,121 @@ func TestRenderK0sCloudConfig_WithoutInstallConfig(t *testing.T) {
 		t.Error("Install block should not be present when Install is nil")
 	}
 }
+
+// TestRenderK0sCloudConfig_ControlPlaneWithProviderID verifies the KD-3c
+// kubelet-arg injection: when ProviderID is known at render time, the k0s
+// args block must include `--kubelet-extra-args=--provider-id=<X>` so k0s
+// passes that flag to kubelet at startup. Without this, kubelet registers
+// the Node before the post-bootstrap kubectl patch can set ProviderID, and
+// ProviderID being immutable in K8s once set means the patch silently
+// no-ops. (PR-8 audit finding, ADR 0001 § E.)
+func TestRenderK0sCloudConfig_ControlPlaneWithProviderID(t *testing.T) {
+	data := TemplateData{
+		Role:         "control-plane",
+		SingleNode:   true,
+		Hostname:     "kairos-control-plane-k0s-0",
+		ProviderID:   "vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc",
+		UserName:     "kairos",
+		UserPassword: "kairos",
+		UserGroups:   []string{"admin"},
+	}
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "--kubelet-extra-args=--provider-id=vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc") {
+		t.Error("k0s args MUST include --kubelet-extra-args=--provider-id=<X> when ProviderID is set so kubelet registers the Node with the correct providerID from the start (KD-3c)")
+	}
+	// The args block must be rendered (the surrounding `args:` key must exist) — a missing key would mean
+	// the OR-gate in the template didn't pick up .ProviderID.
+	if !strings.Contains(result, "  args:") {
+		t.Error("k0s `args:` block missing entirely; the OR-gate for the args block must include .ProviderID")
+	}
+	// The post-bootstrap kubectl patch fallback stays — it's defense-in-depth
+	// for the case where the kubelet flag didn't take (e.g., a future k0s version
+	// that changes how --kubelet-extra-args is consumed). Assert it's still rendered.
+	if !strings.Contains(result, "kubectl patch node $(hostname)") {
+		t.Error("post-bootstrap kubectl patch fallback should still render for defense in depth")
+	}
+}
+
+// TestRenderK0sCloudConfig_ControlPlaneWithoutProviderID is the negative
+// case: with no ProviderID, the args block MUST NOT carry a
+// --kubelet-extra-args entry (would emit a syntactically invalid k0s flag).
+// The post-bootstrap patch block also adjusts — it logs "No providerID to
+// set" instead of attempting a patch.
+func TestRenderK0sCloudConfig_ControlPlaneWithoutProviderID(t *testing.T) {
+	data := TemplateData{
+		Role:         "control-plane",
+		SingleNode:   true,
+		Hostname:     "kairos-control-plane-k0s-0",
+		// ProviderID intentionally empty.
+		UserName:     "kairos",
+		UserPassword: "kairos",
+		UserGroups:   []string{"admin"},
+	}
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if strings.Contains(result, "--kubelet-extra-args=--provider-id=") {
+		t.Error("k0s args MUST NOT include --kubelet-extra-args=--provider-id= when ProviderID is empty (would emit a malformed flag)")
+	}
+	// SingleNode=true should still render --single, so the args block exists.
+	if !strings.Contains(result, "--single") {
+		t.Error("SingleNode=true must still render --single")
+	}
+}
+
+// TestRenderK0sCloudConfig_WorkerWithProviderID verifies the same flag is
+// injected into the k0s-worker args block. Worker scope matters less today
+// (HA gated on KD-5), but the field exists and the rule is uniform.
+func TestRenderK0sCloudConfig_WorkerWithProviderID(t *testing.T) {
+	data := TemplateData{
+		Role:         "worker",
+		WorkerToken:  "fake-worker-token",
+		Hostname:     "kairos-worker-k0s-0",
+		ProviderID:   "kubevirt://kairos-worker-k0s-0",
+		UserName:     "kairos",
+		UserPassword: "kairos",
+		UserGroups:   []string{"admin"},
+	}
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	if !strings.Contains(result, "--kubelet-extra-args=--provider-id=kubevirt://kairos-worker-k0s-0") {
+		t.Error("k0s-worker args MUST include --kubelet-extra-args=--provider-id=<X> when ProviderID is set")
+	}
+	// The existing --token-file arg must still render.
+	if !strings.Contains(result, "--token-file /etc/k0s/token") {
+		t.Error("worker --token-file arg lost; the addition of the providerID conditional must not break the existing arg")
+	}
+}
+
+// TestRenderK0sCloudConfig_ProviderID_InjectionRejected pins the security
+// rationale that lets us interpolate .ProviderID bare in a shell-context
+// position (the args list value): the validator at internal/bootstrap/validate.go
+// must reject any value containing characters outside the strict providerID
+// regex. If a future refactor weakens the validator, this test catches it
+// before reaching the renderer.
+func TestRenderK0sCloudConfig_ProviderID_InjectionRejected(t *testing.T) {
+	injectionAttempts := []string{
+		`vsphere://X"; rm -rf /; echo "`,
+		`vsphere://X` + "\n" + `bash -c "rm -rf /"`,
+		`vsphere://X$(id)`,
+		`vsphere://X` + "`id`",
+		`vsphere://X--config=/etc/shadow`,
+	}
+	for _, p := range injectionAttempts {
+		p := p
+		t.Run("rejected:"+p[:min(len(p), 30)], func(t *testing.T) {
+			if err := ValidateProviderID(p); err == nil {
+				t.Errorf("ValidateProviderID(%q) returned nil; should have rejected (shell injection surface)", p)
+			}
+		})
+	}
+}

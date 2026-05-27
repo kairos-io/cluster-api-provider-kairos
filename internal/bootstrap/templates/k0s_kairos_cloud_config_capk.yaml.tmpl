@@ -60,13 +60,23 @@ users:
 # Control-plane node configuration
 k0s:
   enabled: true
-  {{- if or .SingleNode .PodCIDR .ServiceCIDR .IsKubeVirt }}
+  {{- if or .SingleNode .PodCIDR .ServiceCIDR .IsKubeVirt .ProviderID }}
   args:
   {{- if .SingleNode }}
     - --single
   {{- end }}
   {{- if or .PodCIDR .ServiceCIDR .IsKubeVirt }}
     - --config /etc/k0s/k0s.yaml
+  {{- end }}
+  {{- if .ProviderID }}
+    # KD-3c: tell kubelet the providerID BEFORE the Node is registered so it
+    # appears in spec.providerID from first registration. The PR-8 audit
+    # surfaced that k0s would otherwise register the Node and the
+    # post-bootstrap kubectl patch would race the immutable-once-set
+    # ProviderID. Mirrors the k3s ExecStartPre pattern. Validator at
+    # internal/bootstrap/validate.go pins ProviderID to a strict regex,
+    # so direct interpolation here is safe (no shell injection surface).
+    - --kubelet-extra-args=--provider-id={{ .ProviderID }}
   {{- end }}
   {{- end }}
 
@@ -77,6 +87,10 @@ k0s-worker:
   enabled: true
   args:
     - --token-file /etc/k0s/token
+    {{- if .ProviderID }}
+    # KD-3c: same providerID-at-startup story as the control-plane block above.
+    - --kubelet-extra-args=--provider-id={{ .ProviderID }}
+    {{- end }}
 
 {{- end }}
 
