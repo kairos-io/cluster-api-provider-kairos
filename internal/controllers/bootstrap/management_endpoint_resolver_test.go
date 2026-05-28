@@ -123,6 +123,10 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "tok-abc"}
 	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	// k0s control-plane is the config shape that exercises every rule the
+	// resolver can grant (incl. the conditional VMI/get for SAN detection).
+	kc.Spec.Role = "control-plane"
+	kc.Spec.Distribution = "k0s"
 
 	got, err := r.Resolve(context.Background(), kc, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -139,15 +143,102 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	g.Expect(sa.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, "test-cluster"))
 	role := &rbacv1.Role{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
-	// 4 rules after KD-3b: secrets/create (no resourceNames, K8s RBAC
-	// silent-fail workaround), secrets/get,update,patch on the named
-	// kubeconfig Secret, kubevirt.io VMI/get (CAPK SAN detection),
-	// services/get (CAPK LB endpoint discovery).
-	g.Expect(role.Rules).To(HaveLen(4))
+	// KD-46 minimization: a k0s control-plane (CAPK) SA gets exactly 3 rules:
+	//   1. secrets/create (no resourceNames — K8s RBAC silent-fail workaround)
+	//   2. secrets/get,update,patch on the named kubeconfig Secret
+	//   3. kubevirt.io VMI/get (k0s CAPK control-plane SAN detection only)
+	// services/get was removed (dead grant — no template reads Services
+	// with the node SA token).
+	g.Expect(role.Rules).To(HaveLen(3))
+	g.Expect(roleGrantsVMIGet(role)).To(BeTrue(), "k0s control-plane SA must retain virtualmachineinstances:get for SAN detection")
+	g.Expect(roleGrantsServicesGet(role)).To(BeFalse(), "services:get is a dead grant and must be removed (KD-46)")
 	rb := &rbacv1.RoleBinding{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, rb)).To(Succeed())
 	g.Expect(rb.RoleRef.Name).To(Equal(saName))
 	g.Expect(sub.createCalls).To(Equal(1))
+}
+
+// roleGrantsVMIGet reports whether the Role grants get on kubevirt.io
+// virtualmachineinstances.
+func roleGrantsVMIGet(role *rbacv1.Role) bool {
+	for _, rule := range role.Rules {
+		for _, g := range rule.APIGroups {
+			if g != "kubevirt.io" {
+				continue
+			}
+			for _, res := range rule.Resources {
+				if res == "virtualmachineinstances" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// roleGrantsServicesGet reports whether the Role grants any verb on core
+// Services — used to assert the KD-46 removal of the dead services:get rule.
+func roleGrantsServicesGet(role *rbacv1.Role) bool {
+	for _, rule := range role.Rules {
+		coreGroup := false
+		for _, g := range rule.APIGroups {
+			if g == "" {
+				coreGroup = true
+				break
+			}
+		}
+		if !coreGroup {
+			continue
+		}
+		for _, res := range rule.Resources {
+			if res == "services" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane verifies the
+// KD-46 conditional grant: only a k0s control-plane config receives
+// virtualmachineinstances:get. k3s control-planes and all workers get the
+// minimal 2-rule Secret-only Role.
+func TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane(t *testing.T) {
+	cases := []struct {
+		name         string
+		role         string
+		distribution string
+		wantVMIGet   bool
+		wantRuleLen  int
+	}{
+		{"k0s-control-plane-gets-vmi", "control-plane", "k0s", true, 3},
+		{"k0s-empty-distribution-defaults-k0s", "control-plane", "", true, 3},
+		{"k3s-control-plane-no-vmi", "control-plane", "k3s", false, 2},
+		{"k0s-worker-no-vmi", "worker", "k0s", false, 2},
+		{"k3s-worker-no-vmi", "worker", "k3s", false, 2},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := newResolverScheme(t)
+			sub := &fakeSubResourceClient{token: "tok"}
+			r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+			kc.Spec.Role = tc.role
+			kc.Spec.Distribution = tc.distribution
+
+			_, err := r.Resolve(context.Background(), kc, cluster)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			role := &rbacv1.Role{}
+			saName := kubeconfigWriterName("test-cluster")
+			g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
+			g.Expect(role.Rules).To(HaveLen(tc.wantRuleLen))
+			g.Expect(roleGrantsVMIGet(role)).To(Equal(tc.wantVMIGet))
+			// services:get must never appear regardless of config shape.
+			g.Expect(roleGrantsServicesGet(role)).To(BeFalse())
+		})
+	}
 }
 
 // TestResolve_SubResourceError_ReturnsError asserts that a TokenRequest
