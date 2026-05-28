@@ -131,6 +131,26 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		// per-cluster Role+RoleBinding scope (a node only ever has its own
 		// cluster's bearer token) and is least-privilege relative to
 		// granting `create` on all Secrets cluster-wide.
+		// KD-46 (RBAC minimization): the per-cluster node SA only needs the
+		// permissions the rendered cloud-config's bearer-token requests
+		// actually exercise. Audited against every template under
+		// internal/bootstrap/templates/:
+		//
+		//   secrets:create                        — node-push POST (all
+		//                                            distros/infra) when the
+		//                                            kubeconfig Secret is absent.
+		//   secrets:get/update/patch (named)      — node-push PUT (all
+		//                                            distros/infra) to refresh
+		//                                            the existing Secret.
+		//   virtualmachineinstances:get           — ONLY the k0s CAPK
+		//                                            control-plane SAN-detection
+		//                                            block (fetch_vmi_ip_from_management
+		//                                            in k0s_kairos_cloud_config_capk.yaml.tmpl,
+		//                                            gated `and .IsKubeVirt (eq .Role "control-plane")`).
+		//                                            Granted conditionally below.
+		//   services:get                          — REMOVED. No template path
+		//                                            reads Services with the node
+		//                                            SA token; it was a dead grant.
 		role.Rules = []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
@@ -143,16 +163,20 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 				ResourceNames: []string{secretName},
 				Verbs:         []string{"get", "update", "patch"},
 			},
-			{
+		}
+		// Grant virtualmachineinstances:get only for the exact config shape
+		// that consumes it. This resolver is the CAPK (KubeVirt) resolver, so
+		// IsKubeVirt is implied; the SAN-detection block additionally requires
+		// the control-plane role and the k0s distribution (the k3s CAPK
+		// template has no VMI query). Distribution is webhook-defaulted to
+		// "k0s" when empty, so this comparison is reliable. k3s control-plane
+		// SAs and all worker SAs no longer receive this grant.
+		if kc.Spec.Role == "control-plane" && (kc.Spec.Distribution == "k0s" || kc.Spec.Distribution == "") {
+			role.Rules = append(role.Rules, rbacv1.PolicyRule{
 				APIGroups: []string{"kubevirt.io"},
 				Resources: []string{"virtualmachineinstances"},
 				Verbs:     []string{"get"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"services"},
-				Verbs:     []string{"get"},
-			},
+			})
 		}
 		if role.Labels == nil {
 			role.Labels = map[string]string{}
