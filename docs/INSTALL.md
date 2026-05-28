@@ -30,7 +30,7 @@ Use this if you want to consume a tagged release.
 ### Install
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
 ```
 
 This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace.
@@ -52,7 +52,7 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 ### Uninstall
 
 ```bash
-kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
 ```
 
 **Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:
@@ -126,8 +126,10 @@ before deploying:
 curl -k https://<mgmt-api-server-host>:6443/api
 ```
 
-For air-gapped or strictly-segmented network environments, see the planned
-`SSHFallback` opt-in mechanism (post-alpha-2, PR-9).
+For air-gapped or strictly-segmented network environments, enable
+`spec.sshFallback` on the `KairosControlPlane`. See
+[CAPV quickstart — Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
+for the full operator procedure.
 
 ---
 
@@ -137,4 +139,4 @@ For air-gapped or strictly-segmented network environments, see the planned
 - [CAPV Quickstart](QUICKSTART_CAPV.md) — create a cluster with vSphere.
 - [CAPK Quickstart](QUICKSTART_CAPK.md) — create a cluster with KubeVirt.
 
-For the current release status, known issues, and security caveats, read the [release notes](release-notes/v0.1.0-alpha.1.md).
+For the current release status, known issues, and security caveats, read the [release notes](release-notes/v0.1.0-alpha.2.md).

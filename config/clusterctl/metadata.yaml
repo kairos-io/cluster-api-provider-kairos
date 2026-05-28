@@ -1,20 +1,30 @@
 # clusterctl metadata.yaml
-# This file is used by clusterctl to discover and install the provider
-# It should be published alongside the components.yaml in releases
+# This file is used by clusterctl to discover and install the provider.
+# It is published alongside the components manifest in each release.
+#
+# NOTE: clusterctl integration is not yet claimed for the v0.1.0-alpha line —
+# the provider currently ships as a flat manifest installed via
+# `kubectl apply -f kairos-capi-provider.yaml` (see docs/INSTALL.md). This file
+# is forward-looking scaffolding. Before clusterctl support is advertised, a
+# release-and-supply-chain pass must reconcile: the `contract` value against the
+# CAPI version actually vendored (go.mod), the artifact file names against what
+# the release workflow publishes, and `sha256` population in CI. Per policy,
+# `sha256` keys are intentionally omitted here rather than left empty — an empty
+# checksum defeats clusterctl's integrity check. CI populates them at tag time.
 
 apiVersion: clusterctl.cluster.x-k8s.io/v1beta1
 kind: Metadata
 releaseSeries:
   - major: 0
     minor: 1
+    contract: v1beta2
     patches:
-      - version: v0.1.0
-        releaseDate: "2024-11-21"
-        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
-        contract: v1beta2
-        files:
-          - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
-            sha256: "" # TODO: Add SHA256 checksum
-          - url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/metadata.yaml
-            sha256: "" # TODO: Add SHA256 checksum
-
+      - version: v0.1.0-alpha.1
+        releaseDate: "2026-05-18"
+        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+      # v0.1.0-alpha.2 is staged but NOT yet released. The release is gated on a
+      # published Kairos (Hadron) image with open-vm-tools enabled; see
+      # docs/release-notes/v0.1.0-alpha.2.md. Date is filled in at tag time.
+      - version: v0.1.0-alpha.2
+        releaseDate: "TBD"
+        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml

@@ -69,7 +69,7 @@ kubectl label namespace default vsphere-identity=allowed
 **Recommended (released artifact):**
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
 ```
 
 **Developer install (from source):**

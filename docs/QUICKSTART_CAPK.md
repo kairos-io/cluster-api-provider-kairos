@@ -167,7 +167,7 @@ Do not use `clusterctl init --bootstrap kairos` — clusterctl integration is de
   - A LoadBalancer implementation (MetalLB or equivalent)
 - Kairos CAPI provider installed:
   ```bash
-  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
   ```
 - A Kairos image uploaded to CDI as a DataVolume named `kairos-rootdisk` (for k0s) or `kairos-k3s-rootdisk` (for k3s) in namespace `default`. The image must be a Kairos live-installer image — not a pre-installed disk image.
 
