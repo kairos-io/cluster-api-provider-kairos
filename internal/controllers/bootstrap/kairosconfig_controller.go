@@ -606,9 +606,9 @@ func isKubevirtMachine(machine *clusterv1.Machine) bool {
 // supportsManagementEndpoint returns true for infrastructure kinds whose
 // control-plane Machines run the in-node kubeconfig-push block (KD-3b).
 //
-// Today: KubeVirt (CAPK) and vSphere (CAPV). When CAPM3 / Tinkerbell / etc.
-// gain Kairos support, they're added here once the rendered templates support
-// the push block on their cloud-config layout.
+// Today: KubeVirt (CAPK), vSphere (CAPV), and Metal3 (CAPM3). Bare-metal
+// nodes have real routable IPs and real management-cluster reachability,
+// making the node-push pattern a natural fit for CAPM3.
 //
 // KD-46 (post-alpha-2): the resolver's RBAC currently grants
 // `kubevirt.io/virtualmachineinstances:get` on every cluster that uses this
@@ -621,10 +621,19 @@ func supportsManagementEndpoint(machine *clusterv1.Machine) bool {
 		return false
 	}
 	switch machine.Spec.InfrastructureRef.Kind {
-	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine":
+	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine", "Metal3Machine":
 		return true
 	}
 	return false
+}
+
+// isMetal3Machine reports whether machine is backed by CAPM3 (Metal3Machine).
+// Used as a detection seam for Metal3-specific rendering decisions (Phase 1b).
+func isMetal3Machine(machine *clusterv1.Machine) bool {
+	if machine == nil {
+		return false
+	}
+	return machine.Spec.InfrastructureRef.Kind == "Metal3Machine"
 }
 
 func (r *KairosConfigReconciler) sanitizeCapkUserdataSecret(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) (bool, bool, error) {
@@ -1391,6 +1400,7 @@ func kubeconfigWriterName(clusterName string) string {
 var optionalInfraWatches = []schema.GroupVersionKind{
 	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta1", Kind: "VSphereMachine"},
 	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "KubevirtMachine"},
+	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "Metal3Machine"},
 }
 
 func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {

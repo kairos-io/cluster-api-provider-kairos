@@ -42,7 +42,8 @@ import (
 )
 
 // getNodeIP retrieves the node IP from the infrastructure provider.
-// Supports CAPD (DockerMachine), CAPV (VSphereMachine/VSphereVM), and CAPK (KubevirtMachine).
+// Supports CAPD (DockerMachine), CAPV (VSphereMachine/VSphereVM), CAPK (KubevirtMachine),
+// and CAPM3 (Metal3Machine).
 func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, error) {
 	switch machine.Spec.InfrastructureRef.Kind {
 	case "VSphereMachine":
@@ -120,6 +121,22 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 			return ip, nil
 		}
 		return "", fmt.Errorf("no IP address found in DockerMachine status")
+	case "Metal3Machine":
+		// Metal3Machine.status.addresses uses the same MachineAddresses shape as CAPV,
+		// so the generic extractor handles it without a provider-specific fallback.
+		metal3Machine := &unstructured.Unstructured{}
+		metal3Machine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
+		metal3MachineKey := types.NamespacedName{
+			Name:      machine.Spec.InfrastructureRef.Name,
+			Namespace: machine.Spec.InfrastructureRef.Namespace,
+		}
+		if err := r.Get(ctx, metal3MachineKey, metal3Machine); err != nil {
+			return "", fmt.Errorf("failed to get Metal3Machine: %w", err)
+		}
+		if ip := r.extractIPFromUnstructured(metal3Machine); ip != "" {
+			return ip, nil
+		}
+		return "", fmt.Errorf("no IP address found in Metal3Machine status")
 	default:
 		return "", fmt.Errorf("unsupported infrastructure provider: %s", machine.Spec.InfrastructureRef.Kind)
 	}

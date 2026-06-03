@@ -59,6 +59,8 @@ func CloneInfrastructureMachine(ctx context.Context, c client.Client, scheme *ru
 	case "KubevirtMachineTemplate", "KubeVirtMachineTemplate":
 		logger.Info("Cloning KubevirtMachineTemplate", "machineName", machineName)
 		return cloneKubevirtMachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
+	case "Metal3MachineTemplate":
+		return cloneMetal3MachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
 	default:
 		return nil, fmt.Errorf("unsupported infrastructure provider: %s (Group: %s, Version: %s, FullGVK: %s)",
 			kind,
@@ -136,6 +138,38 @@ func cloneVSphereMachineTemplate(ctx context.Context, c client.Client, scheme *r
 	}
 
 	return vsphereMachine, nil
+}
+
+func cloneMetal3MachineTemplate(ctx context.Context, c client.Client, scheme *runtime.Scheme, template *unstructured.Unstructured, machineName, namespace string, labels, annotations map[string]string) (client.Object, error) {
+	// For CAPM3, create a Metal3Machine from Metal3MachineTemplate.
+	// Metal3Machine.spec is a verbatim copy of spec.template.spec — identical
+	// to the CAPV/CAPD pattern. We derive the API version from the template ref
+	// so we are tolerant of both v1beta1 and v1beta2 Metal3MachineTemplate objects,
+	// defaulting to v1beta2 (CAPM3 v1.13+, the maintainer-chosen baseline).
+	metal3Machine := &unstructured.Unstructured{}
+	version := template.GroupVersionKind().Version
+	if version == "" {
+		version = "v1beta2"
+	}
+	metal3Machine.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: version,
+		Kind:    "Metal3Machine",
+	})
+
+	metal3Machine.SetName(machineName)
+	metal3Machine.SetNamespace(namespace)
+	metal3Machine.SetLabels(labels)
+	metal3Machine.SetAnnotations(annotations)
+
+	// Copy spec from template
+	if spec, ok, _ := unstructured.NestedMap(template.UnstructuredContent(), "spec", "template", "spec"); ok {
+		if err := unstructured.SetNestedMap(metal3Machine.UnstructuredContent(), spec, "spec"); err != nil {
+			return nil, fmt.Errorf("failed to set spec: %w", err)
+		}
+	}
+
+	return metal3Machine, nil
 }
 
 func cloneKubevirtMachineTemplate(ctx context.Context, c client.Client, scheme *runtime.Scheme, template *unstructured.Unstructured, machineName, namespace string, labels, annotations map[string]string) (client.Object, error) {
