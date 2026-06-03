@@ -17,10 +17,13 @@ permissions and limitations under the License.
 package bootstrap
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"gopkg.in/yaml.v3"
 )
 
 func TestRenderK0sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
@@ -927,9 +930,9 @@ func TestRenderK0sCloudConfig_ControlPlaneWithProviderID(t *testing.T) {
 // set" instead of attempting a patch.
 func TestRenderK0sCloudConfig_ControlPlaneWithoutProviderID(t *testing.T) {
 	data := TemplateData{
-		Role:         "control-plane",
-		SingleNode:   true,
-		Hostname:     "kairos-control-plane-k0s-0",
+		Role:       "control-plane",
+		SingleNode: true,
+		Hostname:   "kairos-control-plane-k0s-0",
 		// ProviderID intentionally empty.
 		UserName:     "kairos",
 		UserPassword: "kairos",
@@ -995,6 +998,347 @@ func TestRenderK0sCloudConfig_ProviderID_InjectionRejected(t *testing.T) {
 		t.Run("rejected:"+p[:min(len(p), 30)], func(t *testing.T) {
 			if err := ValidateProviderID(p); err == nil {
 				t.Errorf("ValidateProviderID(%q) returned nil; should have rejected (shell injection surface)", p)
+			}
+		})
+	}
+}
+
+// metal3ControlPlaneData returns a TemplateData for a Metal3 control-plane node
+// with a ManagementEndpoint set, used across the Metal3 test suite.
+func metal3ControlPlaneData() TemplateData {
+	return TemplateData{
+		Role:       "control-plane",
+		SingleNode: true,
+		Hostname:   "bare-metal-cp-0",
+		UserName:   "kairos",
+		UserGroups: []string{"admin"},
+		Metal3:     true,
+		// ProviderID intentionally empty: the controller suppresses it for Metal3.
+		ManagementEndpoint: &ManagementEndpoint{
+			Token:                     "test-token",
+			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+			APIServer:                 "https://mgmt.example.com:6443",
+			ClusterName:               "bare-metal-cluster",
+			ControlPlaneEndpointHost:  "192.168.10.10",
+		},
+	}
+}
+
+// TestRenderMetal3_PostBootstrapScriptValidBash renders the Metal3 cloud-config
+// for both distributions, extracts the post-bootstrap shell script from
+// write_files, and runs `bash -n` on it. The Metal3 UUID validation added in
+// Phase 1b (the `case`/`[[ =~ ]]` constructs hardened after the security
+// review) only executes at node boot, so a bash syntax regression there would
+// otherwise stay invisible until lab provisioning. This locks the rendered
+// script's syntax at unit-test time.
+func TestRenderMetal3_PostBootstrapScriptValidBash(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available; skipping rendered-script syntax check")
+	}
+	cases := []struct {
+		name   string
+		render func(TemplateData) (string, error)
+	}{
+		{"k0s", RenderK0sCloudConfig},
+		{"k3s", RenderK3sCloudConfig},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render(metal3ControlPlaneData())
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			var cc struct {
+				WriteFiles []struct {
+					Path    string `yaml:"path"`
+					Content string `yaml:"content"`
+				} `yaml:"write_files"`
+			}
+			if err := yaml.Unmarshal([]byte(out), &cc); err != nil {
+				t.Fatalf("parse rendered YAML: %v", err)
+			}
+			var script string
+			for _, wf := range cc.WriteFiles {
+				if strings.HasSuffix(wf.Path, "post-bootstrap.sh") {
+					script = wf.Content
+					break
+				}
+			}
+			if script == "" {
+				t.Fatal("post-bootstrap.sh not found in rendered write_files")
+			}
+			if !strings.Contains(script, "set_metal3_uuid_label") {
+				t.Fatal("extracted script is not the Metal3 variant (missing set_metal3_uuid_label)")
+			}
+			f := filepathJoinTemp(t, "post-bootstrap.sh")
+			if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
+				t.Fatalf("write temp script: %v", err)
+			}
+			if outBytes, err := exec.Command(bashPath, "-n", f).CombinedOutput(); err != nil {
+				t.Fatalf("bash -n on rendered %s Metal3 post-bootstrap script failed: %v\n%s", tc.name, err, outBytes)
+			}
+		})
+	}
+}
+
+// filepathJoinTemp returns a path under the test's temp dir.
+func filepathJoinTemp(t *testing.T, name string) string {
+	t.Helper()
+	return t.TempDir() + string(os.PathSeparator) + name
+}
+
+// TestRenderMetal3_K0sControlPlane verifies the full Metal3 k0s render:
+// (a) metal3.io/uuid label stage present, (b) no providerID injection,
+// (c) push_kubeconfig block present, (d) valid YAML.
+func TestRenderMetal3_K0sControlPlane(t *testing.T) {
+	result, err := RenderK0sCloudConfig(metal3ControlPlaneData())
+	if err != nil {
+		t.Fatalf("RenderK0sCloudConfig with Metal3=true: %v", err)
+	}
+
+	// (a) Metal3 node-label stage must be present.
+	if !strings.Contains(result, "set_metal3_uuid_label") {
+		t.Error("Metal3 k0s: missing set_metal3_uuid_label function")
+	}
+	if !strings.Contains(result, "meta_data.json") {
+		t.Error("Metal3 k0s: missing meta_data.json reference (config-drive read)")
+	}
+	if !strings.Contains(result, `metal3.io/uuid=`) {
+		t.Error("Metal3 k0s: missing metal3.io/uuid= label command")
+	}
+	// UUID regex validation must be present in the script.
+	if !strings.Contains(result, `[0-9a-fA-F]`) {
+		t.Error("Metal3 k0s: missing UUID regex validation in script")
+	}
+	// Fail-closed messaging must be present.
+	if !strings.Contains(result, "fail-closed") {
+		t.Error("Metal3 k0s: missing fail-closed comment/log in label stage")
+	}
+
+	// (b) No providerID injection.
+	if strings.Contains(result, "--provider-id=") {
+		t.Error("Metal3 k0s: --provider-id= must NOT appear (CAPM3 owns providerID)")
+	}
+	if strings.Contains(result, "provider-id=") {
+		t.Error("Metal3 k0s: provider-id= must NOT appear (CAPM3 owns providerID)")
+	}
+	if strings.Contains(result, `kubectl patch node`) {
+		t.Error("Metal3 k0s: kubectl patch node (providerID) must NOT appear (CAPM3 owns providerID)")
+	}
+
+	// (c) push_kubeconfig block must still be present.
+	if !strings.Contains(result, "push_kubeconfig") {
+		t.Error("Metal3 k0s: push_kubeconfig block must still be rendered")
+	}
+
+	// (d) Rendered output must parse as valid YAML.
+	var parsed any
+	if err := yaml.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Errorf("Metal3 k0s render is not valid YAML: %v", err)
+	}
+}
+
+// TestRenderMetal3_K3sControlPlane is the k3s twin of TestRenderMetal3_K0sControlPlane.
+func TestRenderMetal3_K3sControlPlane(t *testing.T) {
+	result, err := RenderK3sCloudConfig(metal3ControlPlaneData())
+	if err != nil {
+		t.Fatalf("RenderK3sCloudConfig with Metal3=true: %v", err)
+	}
+
+	// (a) Metal3 node-label stage must be present.
+	if !strings.Contains(result, "set_metal3_uuid_label") {
+		t.Error("Metal3 k3s: missing set_metal3_uuid_label function")
+	}
+	if !strings.Contains(result, "meta_data.json") {
+		t.Error("Metal3 k3s: missing meta_data.json reference (config-drive read)")
+	}
+	if !strings.Contains(result, `metal3.io/uuid=`) {
+		t.Error("Metal3 k3s: missing metal3.io/uuid= label command")
+	}
+	if !strings.Contains(result, `[0-9a-fA-F]`) {
+		t.Error("Metal3 k3s: missing UUID regex validation in script")
+	}
+	if !strings.Contains(result, "fail-closed") {
+		t.Error("Metal3 k3s: missing fail-closed comment/log in label stage")
+	}
+
+	// (b) No providerID injection.
+	if strings.Contains(result, "--provider-id=") {
+		t.Error("Metal3 k3s: --provider-id= must NOT appear (CAPM3 owns providerID)")
+	}
+	if strings.Contains(result, "provider-id=") {
+		t.Error("Metal3 k3s: provider-id= must NOT appear (CAPM3 owns providerID)")
+	}
+	if strings.Contains(result, `kubectl patch node`) {
+		t.Error("Metal3 k3s: kubectl patch node (providerID) must NOT appear (CAPM3 owns providerID)")
+	}
+	// The z-provider-id.conf drop-in and discover-provider-id script must also be absent.
+	if strings.Contains(result, "z-provider-id.conf") {
+		t.Error("Metal3 k3s: z-provider-id.conf must NOT appear (CAPM3 owns providerID)")
+	}
+	if strings.Contains(result, "kairos-k3s-discover-provider-id.sh") {
+		t.Error("Metal3 k3s: kairos-k3s-discover-provider-id.sh must NOT appear for Metal3")
+	}
+
+	// (c) push_kubeconfig block must still be present.
+	if !strings.Contains(result, "push_kubeconfig") {
+		t.Error("Metal3 k3s: push_kubeconfig block must still be rendered")
+	}
+
+	// (d) Rendered output must parse as valid YAML.
+	var parsed any
+	if err := yaml.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Errorf("Metal3 k3s render is not valid YAML: %v", err)
+	}
+}
+
+// TestRenderMetal3_SuppressionWithNonEmptyProviderID verifies that even when
+// the controller accidentally passes a non-empty ProviderID alongside Metal3=true,
+// the template guards (not .Metal3) prevent any providerID content from rendering.
+// This is the belt-and-braces check for the controller's suppression logic.
+func TestRenderMetal3_SuppressionWithNonEmptyProviderID(t *testing.T) {
+	for _, dist := range []string{"k0s", "k3s"} {
+		dist := dist
+		t.Run(dist, func(t *testing.T) {
+			data := metal3ControlPlaneData()
+			// Deliberately set ProviderID even though Metal3=true.
+			// The template must ignore it.
+			data.ProviderID = "metal3://default/some-bmh/some-m3m"
+
+			var (
+				result string
+				err    error
+			)
+			if dist == "k0s" {
+				result, err = RenderK0sCloudConfig(data)
+			} else {
+				result, err = RenderK3sCloudConfig(data)
+			}
+			if err != nil {
+				t.Fatalf("render with Metal3=true + ProviderID set (%s): %v", dist, err)
+			}
+
+			if strings.Contains(result, "--provider-id=") {
+				t.Errorf("%s: --provider-id= must NOT appear when Metal3=true (CAPM3 owns providerID)", dist)
+			}
+			if strings.Contains(result, `kubectl patch node`) {
+				t.Errorf("%s: kubectl patch node must NOT appear when Metal3=true", dist)
+			}
+			// The Metal3 label stage must still be present.
+			if !strings.Contains(result, "set_metal3_uuid_label") {
+				t.Errorf("%s: set_metal3_uuid_label must appear when Metal3=true", dist)
+			}
+		})
+	}
+}
+
+// TestRenderMetal3_SizeGuard_Exceeded tests that renderTemplate returns the
+// 60 KiB size-guard error when Metal3=true and the rendered output exceeds the
+// config-drive budget.
+func TestRenderMetal3_SizeGuard_Exceeded(t *testing.T) {
+	// Build a data set with enough Manifests to push the output over 60 KiB.
+	// Each manifest injects ~1 KiB of content; 70 manifests easily exceeds 60 KiB
+	// for any of the CAPV templates (baseline ~8 KiB + Metal3 block ~3 KiB).
+	data := metal3ControlPlaneData()
+	for i := 0; i < 70; i++ {
+		data.Manifests = append(data.Manifests, bootstrapv1beta2.Manifest{
+			Name:    "big",
+			File:    "manifest.yaml",
+			Content: strings.Repeat("# padding line to inflate config-drive size budget\n", 20),
+		})
+	}
+
+	// k0s: Metal3=true must error.
+	_, err := RenderK0sCloudConfig(data)
+	if err == nil {
+		t.Error("k0s: expected size-guard error when Metal3=true and output > 60 KiB, got nil")
+	} else if !strings.Contains(err.Error(), "60KiB safety budget") {
+		t.Errorf("k0s: size-guard error message unexpected: %v", err)
+	}
+
+	// k3s: Metal3=true must error.
+	_, err = RenderK3sCloudConfig(data)
+	if err == nil {
+		t.Error("k3s: expected size-guard error when Metal3=true and output > 60 KiB, got nil")
+	} else if !strings.Contains(err.Error(), "60KiB safety budget") {
+		t.Errorf("k3s: size-guard error message unexpected: %v", err)
+	}
+}
+
+// TestRenderMetal3_SizeGuard_NotEnforcedForNonMetal3 tests that the same
+// large Manifests set does NOT error when Metal3=false (CAPV path has no
+// config-drive budget).
+func TestRenderMetal3_SizeGuard_NotEnforcedForNonMetal3(t *testing.T) {
+	data := metal3ControlPlaneData()
+	data.Metal3 = false
+	for i := 0; i < 70; i++ {
+		data.Manifests = append(data.Manifests, bootstrapv1beta2.Manifest{
+			Name:    "big",
+			File:    "manifest.yaml",
+			Content: strings.Repeat("# padding line to inflate config-drive size budget\n", 20),
+		})
+	}
+
+	if _, err := RenderK0sCloudConfig(data); err != nil {
+		t.Errorf("k0s: size-guard MUST NOT fire when Metal3=false, got: %v", err)
+	}
+	if _, err := RenderK3sCloudConfig(data); err != nil {
+		t.Errorf("k3s: size-guard MUST NOT fire when Metal3=false, got: %v", err)
+	}
+}
+
+// TestRenderMetal3_NonMetal3RendersUnchanged is the byte-identity guard:
+// with Metal3=false, the (not .Metal3) guards must not alter what the templates
+// were already rendering. We assert the existing CAPV invariants continue to
+// hold — providerID injection present when ProviderID is set, push block
+// present when ManagementEndpoint is set.
+func TestRenderMetal3_NonMetal3RendersUnchanged(t *testing.T) {
+	for _, dist := range []string{"k0s", "k3s"} {
+		dist := dist
+		t.Run(dist, func(t *testing.T) {
+			data := TemplateData{
+				Role:       "control-plane",
+				SingleNode: true,
+				Hostname:   "capv-cp-0",
+				UserName:   "kairos",
+				UserGroups: []string{"admin"},
+				Metal3:     false,
+				ProviderID: "vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc",
+				ManagementEndpoint: &ManagementEndpoint{
+					Token:                     "tok",
+					KubeconfigSecretName:      "kc",
+					KubeconfigSecretNamespace: "default",
+					APIServer:                 "https://mgmt.example.com:6443",
+					ClusterName:               "capv-cluster",
+					ControlPlaneEndpointHost:  "10.0.0.5",
+				},
+			}
+			var (
+				result string
+				err    error
+			)
+			if dist == "k0s" {
+				result, err = RenderK0sCloudConfig(data)
+			} else {
+				result, err = RenderK3sCloudConfig(data)
+			}
+			if err != nil {
+				t.Fatalf("render non-Metal3 CAPV (%s): %v", dist, err)
+			}
+
+			// Non-Metal3: providerID injection must still be present.
+			if !strings.Contains(result, "provider-id=vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc") {
+				t.Errorf("%s: non-Metal3 render lost provider-id injection", dist)
+			}
+			// Non-Metal3: push_kubeconfig must still be present.
+			if !strings.Contains(result, "push_kubeconfig") {
+				t.Errorf("%s: non-Metal3 render lost push_kubeconfig block", dist)
+			}
+			// Non-Metal3: Metal3 label stage must NOT appear.
+			if strings.Contains(result, "set_metal3_uuid_label") {
+				t.Errorf("%s: non-Metal3 render must NOT contain Metal3 label stage", dist)
 			}
 		})
 	}

@@ -64,8 +64,11 @@ users:
 # ProviderID is regex-validated by validateTemplateData before rendering — see internal/bootstrap/validate.go.
 k3s:
   enabled: true
-  {{- if .ProviderID }}
+  {{- if and .ProviderID (not .Metal3) }}
   args:
+    # KD-3c: pass providerID at k3s startup so the Node registers with the
+    # correct providerID from the start (avoids k3s:// vs vsphere:// mismatch).
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-arg=provider-id={{ .ProviderID }}
   {{- end }}
 
@@ -98,13 +101,14 @@ write_files:
     content: |
       [Unit]
       ConditionKernelCommandLine=!cdroot
-  {{- if and (eq .Role "control-plane") .ProviderID }}
+  {{- if and (eq .Role "control-plane") .ProviderID (not .Metal3) }}
   - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
     permissions: "0644"
     owner: 0
     group: 0
     content: |
-      # ProviderID for CAPI/CAPV node matching (k3s loads this on every start)
+      # ProviderID for CAPI/CAPV node matching (k3s loads this on every start).
+      # Not written for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
       kubelet-arg:
         - provider-id={{ .ProviderID }}
   {{- end }}
@@ -172,10 +176,11 @@ write_files:
       
       [Install]
       WantedBy=multi-user.target
-  {{- if eq .Role "control-plane" }}
+  {{- if and (eq .Role "control-plane") (not .Metal3) }}
   # Systemd override: write providerID to k3s config before k3s starts.
   # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
   # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
+  # Omitted for Metal3: CAPM3 owns Node.spec.providerID; no ExecStartPre needed (ADR 0004).
   - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
     permissions: "0644"
     owner: 0
@@ -188,8 +193,9 @@ write_files:
       ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-discover-provider-id.sh || true'
       {{- end }}
   {{- end }}
-  {{- if and (eq .Role "control-plane") (not .ProviderID) }}
-  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre)
+  {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
+  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre).
+  # Omitted for Metal3: discovery is done at post-bootstrap via config-drive read (ADR 0004).
   # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
   - path: /usr/local/bin/kairos-k3s-discover-provider-id.sh
     permissions: "0755"
@@ -248,8 +254,9 @@ MANIFEST_EOF
       {{- end }}
       {{- end }}
       
-      {{- if .ProviderID }}
-      # Fallback: post-bootstrap providerID patch (same approach as k0s CAPV single-node)
+      {{- if and .ProviderID (not .Metal3) }}
+      # Fallback: post-bootstrap providerID patch (same approach as k0s CAPV single-node).
+      # Not executed for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
       # If k3s registered with k3s://hostname, providerID is immutable and patch will fail - that's expected.
       # If node has empty providerID, patch will succeed and unblock Machine-to-Node matching.
       echo "Waiting for k3s node to be registered..."
@@ -265,7 +272,7 @@ MANIFEST_EOF
         sleep 5
         ELAPSED=$((ELAPSED + 5))
       done
-      
+
       if kubectl get node $(hostname) &>/dev/null; then
         echo "Attempting to set providerID={{ .ProviderID }} on node $(hostname)..."
         for i in $(seq 1 30); do
@@ -282,6 +289,107 @@ MANIFEST_EOF
           echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
           sleep 5
         done
+      fi
+      {{- end }}
+
+      {{- if .Metal3 }}
+      # Metal3 / CAPM3 node-label stage (ADR 0004, OQ-1 RESOLVED).
+      #
+      # CAPM3 owns Node.spec.providerID — we must NOT set it. Instead, we label
+      # the Node with metal3.io/uuid=<BareMetalHost-UID> so that CAPM3 can find
+      # the Node and patch providerID itself (its reconcile loop is level-triggered
+      # and patient, so a label applied shortly after registration is fine).
+      #
+      # The UUID is read from the Ironic config-drive at boot. We CANNOT template
+      # it at render time because yip uses Go text/template + sprig over sysinfo
+      # only — ds.meta_data.uuid is a cloud-init Jinja expression that yip does
+      # not know. (Empirically: "function ds not defined". See ADR 0004 § OQ-1.)
+      # The config-drive partition (label "config-2") persists across reboots
+      # because Ironic writes it as a persistent partition, not a ramdisk.
+      #
+      # Security: the UUID is regex-validated in bash before labeling —
+      # fail-closed, never label with garbage from a malformed config-drive.
+      # This entire block is STATIC (no Go template interpolation) — there is
+      # no render-time injection surface here.
+      set_metal3_uuid_label() {
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        # Wait for Node to register (reuse the pattern from the providerID block).
+        local max_wait=300
+        local elapsed=0
+        while ! kubectl get node "$(hostname)" &>/dev/null; do
+          if [ "${elapsed}" -ge "${max_wait}" ]; then
+            echo "WARN: Timeout waiting for node to register; skipping metal3.io/uuid label"
+            return 0
+          fi
+          echo "metal3-label: waiting for node registration... (${elapsed}s/${max_wait}s)"
+          sleep 5
+          elapsed=$((elapsed + 5))
+        done
+        # Locate the Ironic config-drive by partition label "config-2".
+        local cfgdev=""
+        if blkid -L config-2 &>/dev/null; then
+          cfgdev=$(blkid -L config-2)
+        elif [ -b /dev/disk/by-label/config-2 ]; then
+          cfgdev=/dev/disk/by-label/config-2
+        fi
+        local cfgmount=/run/metal3-cfgdrive
+        local mounted_here=false
+        if [ -n "${cfgdev}" ]; then
+          mkdir -p "${cfgmount}"
+          if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
+            mounted_here=true
+          fi
+        fi
+        # The Ironic config-drive (OpenStack layout) carries the instance UUID at
+        # /openstack/latest/meta_data.json. This is the ONLY trusted source: do
+        # NOT fall back to cloud-init paths — Kairos uses yip (not cloud-init),
+        # and a stale instance-data/pickle file would yield a WRONG-but-valid
+        # UUID and mis-label the Node. Fail closed if the config-drive is absent.
+        local meta_json="${cfgmount}/openstack/latest/meta_data.json"
+        if [ ! -f "${meta_json}" ]; then
+          echo "ERROR: metal3-label: ${meta_json} not found (config-drive label 'config-2' present and mounted?); cannot determine BareMetalHost UUID — skipping label (fail-closed)"
+          [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+          return 0
+        fi
+        # Extract .uuid — prefer jq if available, fall back to POSIX grep+sed.
+        local uuid=""
+        if command -v jq &>/dev/null; then
+          uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
+        else
+          uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+        fi
+        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+        # Strict UUID validation — fail closed on missing or malformed value.
+        # Whole-string validation, fail-closed. First reject any value with a
+        # character outside [hex,dash] (catches newlines, spaces, '=', ',', '/',
+        # shell metachars — closes both label-value injection and the multi-line
+        # bypass where a jq-decoded "\n" escape would slip past a per-line grep
+        # anchor). Then enforce the exact UUID shape with bash =~ (string-anchored,
+        # not line-anchored).
+        local uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+        case "${uuid}" in
+          "" | *[!0-9a-fA-F-]* )
+            echo "ERROR: metal3-label: extracted UUID is empty or contains illegal characters; skipping label (fail-closed)"
+            return 0 ;;
+        esac
+        if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
+          echo "ERROR: metal3-label: extracted UUID '${uuid}' does not match UUID pattern; skipping label (fail-closed)"
+          return 0
+        fi
+        # Apply the label with retries for transient API errors.
+        for attempt in 1 2 3; do
+          if kubectl label node "$(hostname)" "metal3.io/uuid=${uuid}" --overwrite 2>/dev/null; then
+            echo "metal3-label: labeled node $(hostname) with metal3.io/uuid=${uuid}"
+            return 0
+          fi
+          echo "metal3-label: attempt ${attempt}/3 failed; retrying in 5s..."
+          sleep 5
+        done
+        echo "WARN: metal3-label: failed to label node after 3 attempts; CAPM3 may not be able to match this Node"
+        return 0
+      }
+      if ! set_metal3_uuid_label; then
+        echo "WARN: metal3-label stage exited non-zero; proceeding to next stage"
       fi
       {{- end }}
 
@@ -371,7 +479,7 @@ MANIFEST_EOF
 {{- /* DNS overrides and bootstrap stages */}}
 stages:
   boot:
-    {{- if and (eq .Role "control-plane") (not .ProviderID) }}
+    {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
     - name: "Discover providerID for k3s (VM self-discovery)"
       commands:
         - /usr/local/bin/kairos-k3s-discover-provider-id.sh || true

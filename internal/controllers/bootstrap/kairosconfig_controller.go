@@ -221,8 +221,14 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (ctrl.Result, error) {
 	// Get providerID - it may not be available initially (before VM is created)
-	// We allow bootstrap secret creation without providerID initially, then regenerate when providerID becomes available
+	// We allow bootstrap secret creation without providerID initially, then regenerate when providerID becomes available.
+	// Metal3 (CAPM3) is an explicit exception: CAPM3 owns providerID end-to-end; we never embed it in the bootstrap
+	// secret. Zeroing it here prevents the reconcile loop from treating CAPM3's post-registration providerID as a
+	// "missing from secret" signal and triggering infinite regeneration. (ADR 0004.)
 	currentProviderID := r.getProviderID(ctx, log, machine)
+	if isMetal3Machine(machine) {
+		currentProviderID = ""
+	}
 
 	// For VSphere: Only wait for providerID if VSphereMachine is Ready (VM already provisioned)
 	// If VSphereMachine is not Ready yet, allow secret creation so VM can be provisioned
@@ -359,9 +365,10 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 				return ctrl.Result{}, fmt.Errorf("failed to get bootstrap secret: %w", err)
 			}
 		} else {
-			// Secret exists, check if we need to regenerate it due to providerID availability
+			// Secret exists, check if we need to regenerate it due to providerID availability.
+			// Note: currentProviderID is already zeroed for Metal3 at the top of this function
+			// so the regeneration-check below is a no-op for Metal3 machines.
 			needsRegeneration := false
-			currentProviderID := r.getProviderID(ctx, log, machine)
 
 			if currentProviderID != "" {
 				// Machine has providerID, check if the secret contains it
@@ -962,9 +969,14 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		log.Info("No install configuration provided; install block will be omitted")
 	}
 
-	// Get providerID from Machine's infrastructure reference
-	// This is needed to set the Node's providerID so the Machine controller can match Nodes to Machines
-	providerID := r.getProviderID(ctx, log, machine)
+	// Get providerID from Machine's infrastructure reference.
+	// CAPM3 owns Node.spec.providerID for Metal3 machines — suppress it here so
+	// the template does not emit --provider-id args or the kubectl patch block.
+	// (ADR 0004, OQ-1 RESOLVED.)
+	var providerID string
+	if !isMetal3Machine(machine) {
+		providerID = r.getProviderID(ctx, log, machine)
+	}
 
 	// Control-plane: ask the resolver for the management-endpoint bundle
 	// the node needs to push its kubeconfig back without SSH. KD-3b broadened
@@ -1002,6 +1014,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		MachineName:                    "",
 		ClusterNS:                      "",
 		IsKubeVirt:                     isKubevirtMachine(machine),
+		Metal3:                         isMetal3Machine(machine),
 		Install:                        installConfig,
 		ProviderID:                     providerID,
 		ControlPlaneLBServiceName:      "",
@@ -1206,8 +1219,14 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		log.Info("No install configuration provided; install block will be omitted")
 	}
 
-	// Get providerID from Machine's infrastructure reference
-	providerID := r.getProviderID(ctx, log, machine)
+	// Get providerID from Machine's infrastructure reference.
+	// CAPM3 owns Node.spec.providerID for Metal3 machines — suppress it here so
+	// the template does not emit --provider-id args or the kubectl patch block.
+	// (ADR 0004, OQ-1 RESOLVED.)
+	var providerID string
+	if !isMetal3Machine(machine) {
+		providerID = r.getProviderID(ctx, log, machine)
+	}
 
 	// Control-plane: same routing as the k0s path above. KD-3b broadened
 	// the gate from CAPK-only to any supported infrastructure kind.
@@ -1237,6 +1256,7 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		MachineName:                    "",
 		ClusterNS:                      "",
 		IsKubeVirt:                     isKubevirtMachine(machine),
+		Metal3:                         isMetal3Machine(machine),
 		Install:                        installConfig,
 		ProviderID:                     providerID,
 		K3sServerURL:                   serverAddress,

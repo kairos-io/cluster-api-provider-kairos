@@ -68,7 +68,7 @@ k0s:
   {{- if or .PodCIDR .ServiceCIDR }}
     - --config /etc/k0s/k0s.yaml
   {{- end }}
-  {{- if .ProviderID }}
+  {{- if and .ProviderID (not .Metal3) }}
     # KD-3c: tell kubelet the providerID BEFORE the Node is registered so it
     # appears in spec.providerID from first registration. The PR-8 audit
     # surfaced that k0s would otherwise register the Node and the
@@ -76,6 +76,7 @@ k0s:
     # ProviderID. Mirrors the k3s ExecStartPre pattern. Validator at
     # internal/bootstrap/validate.go pins ProviderID to a strict regex,
     # so direct interpolation here is safe (no shell injection surface).
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-extra-args=--provider-id={{ .ProviderID }}
   {{- end }}
   {{- end }}
@@ -87,8 +88,9 @@ k0s-worker:
   enabled: true
   args:
     - --token-file /etc/k0s/token
-    {{- if .ProviderID }}
+    {{- if and .ProviderID (not .Metal3) }}
     # KD-3c: same providerID-at-startup story as the control-plane block above.
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-extra-args=--provider-id={{ .ProviderID }}
     {{- end }}
 
@@ -235,7 +237,7 @@ MANIFEST_EOF
       {{- end }}
       {{- end }}
 
-      {{- if .ProviderID }}
+      {{- if and .ProviderID (not .Metal3) }}
       # Wait for k0s to be ready and Node to be registered
       echo "Waiting for k0s node to be registered..."
       export KUBECONFIG=/var/lib/k0s/pki/admin.conf
@@ -269,8 +271,109 @@ MANIFEST_EOF
         echo "ERROR: Failed to set providerID after 30 attempts"
         exit 1
       fi
-      {{- else }}
+      {{- else if not .Metal3 }}
       echo "No providerID to set"
+      {{- end }}
+
+      {{- if .Metal3 }}
+      # Metal3 / CAPM3 node-label stage (ADR 0004, OQ-1 RESOLVED).
+      #
+      # CAPM3 owns Node.spec.providerID — we must NOT set it. Instead, we label
+      # the Node with metal3.io/uuid=<BareMetalHost-UID> so that CAPM3 can find
+      # the Node and patch providerID itself (its reconcile loop is level-triggered
+      # and patient, so a label applied shortly after registration is fine).
+      #
+      # The UUID is read from the Ironic config-drive at boot. We CANNOT template
+      # it at render time because yip uses Go text/template + sprig over sysinfo
+      # only — ds.meta_data.uuid is a cloud-init Jinja expression that yip does
+      # not know. (Empirically: "function ds not defined". See ADR 0004 § OQ-1.)
+      # The config-drive partition (label "config-2") persists across reboots
+      # because Ironic writes it as a persistent partition, not a ramdisk.
+      #
+      # Security: the UUID is regex-validated in bash before labeling —
+      # fail-closed, never label with garbage from a malformed config-drive.
+      # This entire block is STATIC (no Go template interpolation) — there is
+      # no render-time injection surface here.
+      set_metal3_uuid_label() {
+        export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+        # Wait for Node to register (reuse the pattern from the providerID block).
+        local max_wait=300
+        local elapsed=0
+        while ! kubectl get node "$(hostname)" &>/dev/null; do
+          if [ "${elapsed}" -ge "${max_wait}" ]; then
+            echo "WARN: Timeout waiting for node to register; skipping metal3.io/uuid label"
+            return 0
+          fi
+          echo "metal3-label: waiting for node registration... (${elapsed}s/${max_wait}s)"
+          sleep 5
+          elapsed=$((elapsed + 5))
+        done
+        # Locate the Ironic config-drive by partition label "config-2".
+        local cfgdev=""
+        if blkid -L config-2 &>/dev/null; then
+          cfgdev=$(blkid -L config-2)
+        elif [ -b /dev/disk/by-label/config-2 ]; then
+          cfgdev=/dev/disk/by-label/config-2
+        fi
+        local cfgmount=/run/metal3-cfgdrive
+        local mounted_here=false
+        if [ -n "${cfgdev}" ]; then
+          mkdir -p "${cfgmount}"
+          if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
+            mounted_here=true
+          fi
+        fi
+        # The Ironic config-drive (OpenStack layout) carries the instance UUID at
+        # /openstack/latest/meta_data.json. This is the ONLY trusted source: do
+        # NOT fall back to cloud-init paths — Kairos uses yip (not cloud-init),
+        # and a stale instance-data/pickle file would yield a WRONG-but-valid
+        # UUID and mis-label the Node. Fail closed if the config-drive is absent.
+        local meta_json="${cfgmount}/openstack/latest/meta_data.json"
+        if [ ! -f "${meta_json}" ]; then
+          echo "ERROR: metal3-label: ${meta_json} not found (config-drive label 'config-2' present and mounted?); cannot determine BareMetalHost UUID — skipping label (fail-closed)"
+          [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+          return 0
+        fi
+        # Extract .uuid — prefer jq if available, fall back to POSIX grep+sed.
+        local uuid=""
+        if command -v jq &>/dev/null; then
+          uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
+        else
+          uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+        fi
+        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+        # Strict UUID validation — fail closed on missing or malformed value.
+        # Whole-string validation, fail-closed. First reject any value with a
+        # character outside [hex,dash] (catches newlines, spaces, '=', ',', '/',
+        # shell metachars — closes both label-value injection and the multi-line
+        # bypass where a jq-decoded "\n" escape would slip past a per-line grep
+        # anchor). Then enforce the exact UUID shape with bash =~ (string-anchored,
+        # not line-anchored).
+        local uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+        case "${uuid}" in
+          "" | *[!0-9a-fA-F-]* )
+            echo "ERROR: metal3-label: extracted UUID is empty or contains illegal characters; skipping label (fail-closed)"
+            return 0 ;;
+        esac
+        if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
+          echo "ERROR: metal3-label: extracted UUID '${uuid}' does not match UUID pattern; skipping label (fail-closed)"
+          return 0
+        fi
+        # Apply the label with retries for transient API errors.
+        for attempt in 1 2 3; do
+          if kubectl label node "$(hostname)" "metal3.io/uuid=${uuid}" --overwrite 2>/dev/null; then
+            echo "metal3-label: labeled node $(hostname) with metal3.io/uuid=${uuid}"
+            return 0
+          fi
+          echo "metal3-label: attempt ${attempt}/3 failed; retrying in 5s..."
+          sleep 5
+        done
+        echo "WARN: metal3-label: failed to label node after 3 attempts; CAPM3 may not be able to match this Node"
+        return 0
+      }
+      if ! set_metal3_uuid_label; then
+        echo "WARN: metal3-label stage exited non-zero; proceeding to next stage"
+      fi
       {{- end }}
 
       {{- if .ManagementEndpoint }}

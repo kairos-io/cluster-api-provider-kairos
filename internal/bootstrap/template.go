@@ -35,24 +35,30 @@ var templateFS embed.FS
 // interpolation. See internal/bootstrap/funcs.go and the
 // cloudconfig-rendering-safety skill for the rules.
 type TemplateData struct {
-	Role                           string
-	SingleNode                     bool
-	Hostname                       string
-	UserName                       string
-	UserPassword                   string
-	UserGroups                     []string
-	GitHubUser                     string
-	SSHPublicKey                   string
-	WorkerToken                    string
-	Manifests                      []bootstrapv1beta2.Manifest
-	HostnamePrefix                 string
-	DNSServers                     []string
-	PodCIDR                        string
-	ServiceCIDR                    string
-	PrimaryIP                      string
-	MachineName                    string
-	ClusterNS                      string
-	IsKubeVirt                     bool
+	Role           string
+	SingleNode     bool
+	Hostname       string
+	UserName       string
+	UserPassword   string
+	UserGroups     []string
+	GitHubUser     string
+	SSHPublicKey   string
+	WorkerToken    string
+	Manifests      []bootstrapv1beta2.Manifest
+	HostnamePrefix string
+	DNSServers     []string
+	PodCIDR        string
+	ServiceCIDR    string
+	PrimaryIP      string
+	MachineName    string
+	ClusterNS      string
+	IsKubeVirt     bool
+	// Metal3 selects the CAPM3 bare-metal render path: emit the metal3.io/uuid
+	// node-label shell stage (read from the Ironic config-drive at boot) and
+	// SUPPRESS our providerID arg + kubectl-patch block, because CAPM3 owns
+	// Node.spec.providerID. Metal3 rides the generic (non-KubeVirt) CAPV
+	// template. (ADR 0004, OQ-1 RESOLVED.)
+	Metal3                         bool
 	Install                        *InstallConfig
 	ProviderID                     string // ProviderID for the Node (e.g., "vsphere://<vm-uuid>"). Validated against providerIDPattern at render time.
 	K3sServerURL                   string
@@ -145,5 +151,15 @@ func renderTemplate(name, templatePath string, data TemplateData) (string, error
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", fmt.Errorf("failed to execute template %s: %w", templatePath, err)
 	}
-	return buf.String(), nil
+	rendered := buf.String()
+	// Metal3 config-drive size guard: Ironic delivers bootstrap data via
+	// config-drive, which without Swift is capped at ~64 KiB. We enforce a
+	// conservative 60 KiB budget to leave headroom for other config-drive
+	// partitions. Only enforced for Metal3; CAPK/CAPV/CAPD have no config-drive.
+	// (ADR 0004, RISK-2.)
+	const metal3ConfigDriveSafetyBudget = 60 * 1024
+	if data.Metal3 && len(rendered) > metal3ConfigDriveSafetyBudget {
+		return "", fmt.Errorf("rendered cloud-config is %d bytes; exceeds the 60KiB safety budget for the Ironic config-drive (~64KiB hard cap without Swift) — reduce manifests/files", len(rendered))
+	}
+	return rendered, nil
 }
