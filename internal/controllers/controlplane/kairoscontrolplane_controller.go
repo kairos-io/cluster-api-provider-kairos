@@ -82,12 +82,13 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 // reads the infra Machine (and the CAPV VSphereVM fallback) for a best-effort
 // node IP. We never update/patch infra Machines (the controller owner-ref is
 // set on the in-memory object before Create) and never delete them directly
-// (they cascade via the CAPI Machine's OwnerReferences — KD-11). list/watch is
-// retained on the Machine kinds for the bootstrap controller's optional infra
-// watches, which share this aggregated role. metal3machines/-templates added
-// for CAPM3 (ADR 0004). Metal3Cluster/BareMetalHost are deliberately absent: we
-// never read them (CAPI core copies the endpoint per KD-12; CAPM3 mediates BMH).
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines,verbs=create;get;list;watch
+// (they cascade via the CAPI Machine's OwnerReferences — KD-11), and never
+// list/watch them (the control-plane manager registers no infra-kind watch; the
+// bootstrap controller owns the infra Watches via its own list/watch grant).
+// metal3machines/-templates added for CAPM3 (ADR 0004). Metal3Cluster and
+// BareMetalHost are deliberately absent: we never read them (CAPI core copies
+// the endpoint per KD-12; CAPM3 mediates BMH).
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines,verbs=create;get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
