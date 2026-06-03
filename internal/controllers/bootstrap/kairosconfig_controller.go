@@ -75,7 +75,15 @@ type KairosConfigReconciler struct {
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs/finalizers,verbs=update
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;clusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines/status;clusters/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines,verbs=get;list;watch
+// Infrastructure-provider access (KD-6: enumerated, no resource wildcard).
+// getProviderID/reconcileBootstrapData read the infra Machine to discover the
+// providerID and provisioning readiness (VSphereMachine, KubevirtMachine,
+// DockerMachine — get). optionalInfraWatches sets up a Watch on the same kinds
+// plus Metal3Machine (list/watch) so a providerID update re-reconciles the
+// owning KairosConfig. Metal3Machine is watched but never Get-ed here: CAPM3
+// owns providerID, so getProviderID has no Metal3 case (ADR 0004). No
+// create/update/patch/delete on infra Machines from this controller.
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines,verbs=get;list;watch
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status,verbs=get
 //+kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
 //+kubebuilder:rbac:groups="",resources=secrets;events,verbs=get;list;watch;create;update;patch;delete

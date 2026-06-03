@@ -76,7 +76,21 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machines,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters/status;machines/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs;kairosconfigtemplates,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
+// Infrastructure-provider access (KD-6: enumerated, no resource wildcard).
+// We clone an infra Machine from its *MachineTemplate (get on the templates),
+// create the resulting infra Machine, and re-get it on AlreadyExists; getNodeIP
+// reads the infra Machine (and the CAPV VSphereVM fallback) for a best-effort
+// node IP. We never update/patch infra Machines (the controller owner-ref is
+// set on the in-memory object before Create) and never delete them directly
+// (they cascade via the CAPI Machine's OwnerReferences — KD-11). list/watch is
+// retained on the Machine kinds for the bootstrap controller's optional infra
+// watches, which share this aggregated role. metal3machines/-templates added
+// for CAPM3 (ADR 0004). Metal3Cluster/BareMetalHost are deliberately absent: we
+// never read them (CAPI core copies the endpoint per KD-12; CAPM3 mediates BMH).
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines,verbs=create;get;list;watch
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status,verbs=get
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates,verbs=get
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
 //+kubebuilder:rbac:groups="",resources=services;endpoints,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
