@@ -52,8 +52,8 @@ var (
 // using the 2-disk Kairos installer pattern from the KD-3b lab validation. Disk layout
 // mirrors the lab manifest /tmp/kd3b-capk-k3s.yaml exactly:
 //
-//   rootdisk      virtio, bootOrder: 1   blank target (no MBR)
-//   installerdisk virtio, bootOrder: 2   the Kairos installer image (OSArtifact iso:true)
+//	rootdisk      virtio, bootOrder: 1   blank target (no MBR)
+//	installerdisk virtio, bootOrder: 2   the Kairos installer image (OSArtifact iso:true)
 //
 // Firmware tries to boot vda first (rootdisk); since it's blank it falls through to vdb
 // (installerdisk), which has the hybrid ISO boot record. The installer reads the baked
