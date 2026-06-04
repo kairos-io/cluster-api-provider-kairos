@@ -238,38 +238,45 @@ MANIFEST_EOF
       {{- end }}
 
       {{- if and .ProviderID (not .Metal3) }}
-      # Wait for k0s to be ready and Node to be registered
+      # Wait for k0s to be ready and the Node to be registered, then set providerID.
+      # KD-55: fail-OPEN. A providerID hiccup (API blip, slow registration) must NOT
+      # abort the rest of post-bootstrap — the kubeconfig push below MUST still run,
+      # or a transient failure strands the cluster in WaitingForNodePush forever.
+      # Warn and continue instead of `exit 1`; the Machine may briefly stay
+      # NodeNotFound until providerID is set, but the kubeconfig still reaches the
+      # management cluster (and the controller re-renders to retry providerID).
       echo "Waiting for k0s node to be registered..."
       export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      node_registered=false
       MAX_WAIT=300
       ELAPSED=0
-      while ! kubectl get node $(hostname) &>/dev/null; do
-        if [ $ELAPSED -ge $MAX_WAIT ]; then
-          echo "ERROR: Timeout waiting for node to be registered"
-          exit 1
+      while [ $ELAPSED -lt $MAX_WAIT ]; do
+        if kubectl get node $(hostname) &>/dev/null; then
+          node_registered=true
+          break
         fi
         echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
         sleep 5
         ELAPSED=$((ELAPSED + 5))
       done
-
-      # Set providerID on the Node
-      # Retry in case of temporary API server unavailability
-      echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
-      PROVIDER_ID_SET=false
-      for i in {1..30}; do
-        if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
-          echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
-          PROVIDER_ID_SET=true
-          break
+      if [ "$node_registered" != "true" ]; then
+        echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+      else
+        # Set providerID on the Node. Retry for transient API-server unavailability.
+        echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
+        PROVIDER_ID_SET=false
+        for i in {1..30}; do
+          if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
+            echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
+            PROVIDER_ID_SET=true
+            break
+          fi
+          echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+          sleep 5
+        done
+        if [ "$PROVIDER_ID_SET" != "true" ]; then
+          echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
         fi
-        echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
-        sleep 5
-      done
-
-      if [ "$PROVIDER_ID_SET" != "true" ]; then
-        echo "ERROR: Failed to set providerID after 30 attempts"
-        exit 1
       fi
       {{- else if not .Metal3 }}
       echo "No providerID to set"
