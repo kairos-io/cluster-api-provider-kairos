@@ -27,7 +27,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"os"
+	"strings"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -199,6 +201,34 @@ func TestBootstrapIntegration(t *testing.T) {
 			Namespace: "test-namespace",
 		}, secret) == nil
 	}, 10*time.Second).Should(BeTrue())
+
+	// KD-48: the bootstrap Secret name is deterministic == kairosConfig.Name
+	// (no random suffix). This is required for infrastructure providers — notably
+	// CAPM3, which derives the userData Secret name from the Machine name — and it
+	// prevents the orphaned/duplicate Secrets a fresh random suffix produced on
+	// every regeneration. The Machine here carries no spec.bootstrap.dataSecretName,
+	// so this exercises the default naming path.
+	g.Expect(secretName).To(Equal("test-kairos-config"),
+		"bootstrap Secret must be named deterministically after the KairosConfig")
+
+	// And no random-suffixed duplicates accumulate for this KairosConfig: the only
+	// Secret whose name is prefixed with the KairosConfig name is the deterministic
+	// one. Consistently guards against churn that recreates the Secret under a new
+	// name on subsequent reconciles (KD-9 footgun).
+	g.Consistently(func() []string {
+		list := &corev1.SecretList{}
+		if err := mgr.GetClient().List(ctx, list, client.InNamespace("test-namespace")); err != nil {
+			return []string{"(list error)"}
+		}
+		var names []string
+		for i := range list.Items {
+			if strings.HasPrefix(list.Items[i].Name, "test-kairos-config") {
+				names = append(names, list.Items[i].Name)
+			}
+		}
+		return names
+	}, 5*time.Second, 1*time.Second).Should(ConsistOf("test-kairos-config"),
+		"exactly one bootstrap Secret, named deterministically, must exist (no random-suffixed duplicates)")
 
 	// Verify Secret contains cloud-config with k0s configuration
 	g.Expect(secret.Data).To(HaveKey("value"))

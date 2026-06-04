@@ -18,7 +18,6 @@ package bootstrap
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -490,18 +489,33 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// correctly, so this error is non-blocking and the cluster will function properly.
 	// Do NOT base64 encode it ourselves - let CAPV handle the encoding
 
-	// Create Secret with bootstrap data
+	// Create Secret with bootstrap data.
+	//
+	// Naming (KD-48): the bootstrap Secret is named deterministically after the
+	// KairosConfig — which our KCP names identically to the owning Machine
+	// (fmt.Sprintf("%s-%d", kcp.Name, index)). This mirrors CABPK, where the
+	// KubeadmConfig's data Secret is named after the config, and is REQUIRED for
+	// correctness with infrastructure providers that derive the userData Secret
+	// name from the Machine name rather than from Machine.spec.bootstrap.dataSecretName.
+	// CAPM3 (Metal3) is the concrete case: it caches Metal3Machine.status.userData
+	// to the Machine name (write-once) during the window before CAPI propagates
+	// dataSecretName, then writes that name into BareMetalHost.spec.userData. A
+	// random suffix here produced a Secret name CAPM3 never referenced, leaving
+	// BMH.userData pointing at a non-existent Secret (provisioning stalled until
+	// the Secret was created out-of-band). A stable name == kairosConfig.Name makes
+	// the names coincide for every provider and also eliminates the duplicate /
+	// orphaned Secrets that a fresh random suffix produced on every regeneration.
+	//
+	// Precedence still honors an already-set Machine.spec.bootstrap.dataSecretName
+	// (immutable once CAPI sets it) so Machines created before this change keep
+	// their original (possibly random-suffixed) Secret name across an upgrade.
 	secretName := ""
 	if machine != nil && machine.Spec.Bootstrap.DataSecretName != nil && *machine.Spec.Bootstrap.DataSecretName != "" {
 		secretName = *machine.Spec.Bootstrap.DataSecretName
 	} else if kairosConfig.Status.DataSecretName != nil && *kairosConfig.Status.DataSecretName != "" {
 		secretName = *kairosConfig.Status.DataSecretName
 	} else {
-		randomSuffix, err := randomString(6)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to generate random string: %w", err)
-		}
-		secretName = fmt.Sprintf("%s-%s", kairosConfig.Name, randomSuffix)
+		secretName = kairosConfig.Name
 	}
 
 	secretKey := types.NamespacedName{
@@ -1383,21 +1397,6 @@ func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.L
 // owned bootstrap Secret to be garbage-collected. Short because Secret GC
 // is normally near-instant; long enough not to hammer the apiserver.
 const bootstrapDeleteRequeueAfter = 5 * time.Second
-
-// randomString generates a random lowercase alphanumeric string of the given length
-// This ensures the string is RFC 1123 compliant for Kubernetes resource names
-func randomString(length int) (string, error) {
-	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		randomByte := make([]byte, 1)
-		if _, err := rand.Read(randomByte); err != nil {
-			return "", err
-		}
-		b[i] = charset[randomByte[0]%byte(len(charset))]
-	}
-	return string(b), nil
-}
 
 // kubeconfigPushConfig + ensureKubeconfigPushConfig were moved out to
 // management_endpoint_resolver.go's kubeVirtTokenResolver implementation as
