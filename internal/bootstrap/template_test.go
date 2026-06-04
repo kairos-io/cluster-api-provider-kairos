@@ -1066,7 +1066,7 @@ func TestRenderMetal3_ProviderIDScriptValidBash(t *testing.T) {
 		pidScript   string // suffix of the config-drive providerID script
 		mustContain string // a marker that proves we extracted the right script
 	}{
-		{"k0s", RenderK0sCloudConfig, "kairos-k0s-metal3-providerid.sh", "kubelet-extra-args=--provider-id=metal3://"},
+		{"k0s", RenderK0sCloudConfig, "kairos-k0s-metal3-providerid.sh", "kubelet-extra-args=\\\"--provider-id=metal3://"},
 		{"k3s", RenderK3sCloudConfig, "kairos-k3s-metal3-providerid.sh", "provider-id=metal3://"},
 	}
 	for _, tc := range cases {
@@ -1154,6 +1154,23 @@ func TestRenderMetal3_K0sControlPlane(t *testing.T) {
 	}
 	if !strings.Contains(result, "--node-labels=metal3.io/uuid=") {
 		t.Error("Metal3 k0s: missing --node-labels=metal3.io/uuid= kubelet arg")
+	}
+	// Regression guard (KD-51): both kubelet flags MUST be wrapped in a SINGLE
+	// double-quoted --kubelet-extra-args so systemd passes one argument to k0s.
+	// The earlier unquoted form split --node-labels into a standalone (invalid)
+	// k0s flag that aborted k0s startup.
+	if !strings.Contains(result, `--kubelet-extra-args=\"--provider-id=metal3://`) {
+		t.Error("Metal3 k0s: provider-id + node-labels must be inside ONE double-quoted --kubelet-extra-args (systemd single-arg grouping); the unquoted form aborts k0s startup")
+	}
+	// The KD-51 guard against a pre-existing --kubelet-extra-args (last-wins
+	// flag parsing would drop our provider-id) must be present.
+	if !strings.Contains(result, "refusing to append a second") {
+		t.Error("Metal3 k0s: missing the KD-51 fail-closed guard against a pre-existing --kubelet-extra-args")
+	}
+	// Fail-open invariant (KD-51): the pre-start unit must NOT Requires=/BindsTo=
+	// the k0s service, so an injection hiccup cannot block k0s from starting.
+	if strings.Contains(result, "Requires=k0scontroller") || strings.Contains(result, "BindsTo=k0scontroller") {
+		t.Error("Metal3 k0s: providerID unit must NOT Requires=/BindsTo= the k0s service (fail-open invariant, KD-51)")
 	}
 	// UUID regex validation must be present in the script.
 	if !strings.Contains(result, `[0-9a-fA-F]`) {
