@@ -529,20 +529,21 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			Labels: map[string]string{
 				clusterv1.ClusterNameLabel: cluster.Name,
 			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: kairosConfig.APIVersion,
-					Kind:       kairosConfig.Kind,
-					Name:       kairosConfig.Name,
-					UID:        kairosConfig.UID,
-					Controller: func() *bool { b := true; return &b }(),
-				},
-			},
 		},
 		Type: clusterv1.ClusterSecretType,
 		Data: map[string][]byte{
 			"value": []byte(cloudConfig),
 		},
+	}
+	// KD-48a: set the controller owner reference via the scheme instead of
+	// hand-rolling it. A KairosConfig fetched with r.Get carries an empty
+	// TypeMeta, so the previous hand-rolled reference had empty APIVersion/Kind
+	// and the garbage collector could not resolve the owner — the bootstrap
+	// Secret (which holds root userdata) was never GC'd when its KairosConfig
+	// was deleted. SetControllerReference derives the GVK from the scheme,
+	// producing a well-formed, GC-able reference (area CLAUDE.md non-negotiable #3).
+	if err := controllerutil.SetControllerReference(kairosConfig, secret, r.Scheme); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to set controller reference on bootstrap secret %q: %w", secretName, err)
 	}
 
 	// Create or update the secret in-place to preserve the name referenced by Machine
@@ -556,6 +557,18 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			return ctrl.Result{}, err
 		}
 	} else {
+		// KD-48b: the bootstrap Secret name is now deterministic, hence
+		// predictable. Before overwriting a pre-existing Secret of that name,
+		// confirm it is ours — otherwise a Secret pre-seeded by another actor
+		// would be silently adopted. (Its content is corrected here, but a node
+		// could read it in the window before this runs.) Ownership is proven by
+		// an owner reference carrying this KairosConfig's UID, or the cluster-name
+		// label this controller always sets (covers Secrets written before KD-48a).
+		if !bootstrapSecretBelongsTo(existingSecret, kairosConfig, cluster.Name) {
+			return ctrl.Result{}, fmt.Errorf(
+				"refusing to overwrite bootstrap secret %q: not owned by KairosConfig %q (foreign Secret with the same name)",
+				secretName, kairosConfig.Name)
+		}
 		existingSecret.Type = secret.Type
 		existingSecret.Labels = secret.Labels
 		existingSecret.OwnerReferences = secret.OwnerReferences
@@ -1687,4 +1700,29 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 	}
 
 	return ""
+}
+
+// bootstrapSecretBelongsTo reports whether an existing bootstrap data Secret
+// (found under the deterministic name == kairosConfig.Name) belongs to the
+// given KairosConfig and may therefore be safely overwritten in place.
+//
+// KD-48b: with a deterministic, predictable Secret name, the controller must
+// not blindly adopt a same-named Secret it did not create. Ownership is proven
+// by either:
+//   - an owner reference carrying this KairosConfig's UID (the authoritative
+//     signal — the UID was set correctly even by the pre-KD-48a hand-rolled
+//     reference, so this also covers Secrets written before that fix), or
+//   - the cluster-name label this controller always stamps on the Secret.
+//
+// A Secret matching neither is foreign (operator error or a pre-seed attempt)
+// and the caller refuses to overwrite it.
+func bootstrapSecretBelongsTo(s *corev1.Secret, kc *bootstrapv1beta2.KairosConfig, clusterName string) bool {
+	if kc.UID != "" {
+		for _, or := range s.OwnerReferences {
+			if or.UID == kc.UID {
+				return true
+			}
+		}
+	}
+	return clusterName != "" && s.Labels[clusterv1.ClusterNameLabel] == clusterName
 }

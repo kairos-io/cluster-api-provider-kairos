@@ -1334,3 +1334,64 @@ func TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock(t *testing.T) {
 	g.Expect(resolver.calls).To(Equal(0), "resolver must NOT be invoked for worker role")
 	g.Expect(out).NotTo(ContainSubstring("push_kubeconfig"), "worker render must not include push block")
 }
+
+// TestBootstrapSecretBelongsTo guards the KD-48b ownership check that gates the
+// in-place overwrite of the deterministically-named bootstrap Secret. A Secret
+// is "ours" iff it carries an owner reference with the KairosConfig's UID, or
+// the cluster-name label this controller always stamps; anything else is foreign
+// and must NOT be adopted.
+func TestBootstrapSecretBelongsTo(t *testing.T) {
+	g := NewWithT(t)
+
+	kc := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "ns", UID: "uid-1234"},
+	}
+	const clusterName = "demo"
+
+	secretWith := func(ownerUID string, label string) *corev1.Secret {
+		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "ns"}}
+		if ownerUID != "" {
+			s.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: bootstrapv1beta2.GroupVersion.String(),
+				Kind:       "KairosConfig",
+				Name:       "cp-0",
+				UID:        types.UID(ownerUID),
+				Controller: ptr.To(true),
+			}}
+		}
+		if label != "" {
+			s.Labels = map[string]string{clusterv1.ClusterNameLabel: label}
+		}
+		return s
+	}
+
+	cases := []struct {
+		name    string
+		secret  *corev1.Secret
+		cluster string
+		want    bool
+	}{
+		{"owned by UID (well-formed ref)", secretWith("uid-1234", ""), clusterName, true},
+		{"owned by UID even with empty Kind (pre-KD-48a ref)", func() *corev1.Secret {
+			s := secretWith("uid-1234", "")
+			s.OwnerReferences[0].APIVersion = ""
+			s.OwnerReferences[0].Kind = ""
+			return s
+		}(), clusterName, true},
+		{"cluster-name label fallback (no owner ref)", secretWith("", clusterName), clusterName, true},
+		{"foreign: no owner ref, no label", secretWith("", ""), clusterName, false},
+		{"foreign: different owner UID, different label", secretWith("uid-evil", "other"), clusterName, false},
+		{"foreign: matching label but wrong cluster name arg", secretWith("", clusterName), "different", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g.Expect(bootstrapSecretBelongsTo(tc.secret, kc, tc.cluster)).To(Equal(tc.want))
+		})
+	}
+
+	// A KairosConfig with an empty UID must not match a Secret by UID (avoids a
+	// "" == "" false-positive); only the label path can prove ownership then.
+	kcNoUID := &bootstrapv1beta2.KairosConfig{ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "ns"}}
+	g.Expect(bootstrapSecretBelongsTo(secretWith("", ""), kcNoUID, clusterName)).To(BeFalse())
+	g.Expect(bootstrapSecretBelongsTo(secretWith("", clusterName), kcNoUID, clusterName)).To(BeTrue())
+}
