@@ -130,201 +130,6 @@ write_files:
     content: |
       {{ .WorkerToken }}
   {{- end }}
-  {{- if .Metal3 }}
-  # Metal3 / CAPM3 providerID + node-label pre-start mechanism (ADR 0004,
-  # OQ-1 RESOLVED, corrected after CAPM3 v1.13 lab validation).
-  #
-  # CAPM3 v1.13 with cloudProviderEnabled:false does NOT patch
-  # Node.spec.providerID. It finds the Node by the metal3.io/uuid label and then
-  # REQUIRES the Node to ALREADY carry providerID=metal3://<uuid> (legacy) at
-  # first registration. providerID is immutable, so it must be correct the FIRST
-  # time the kubelet registers — a post-bootstrap label is too late (k0s would
-  # have already registered the kubelet with no provider-id, and CAPM3 rejects a
-  # mismatched/absent providerID).
-  #
-  # k0s (unlike k3s) has no config.yaml.d kubelet-arg drop-in: kubelet args are
-  # baked into the k0s service ExecStart at bootstrap time
-  # (/etc/systemd/system/{{ if eq .Role "control-plane" }}k0scontroller{{ else }}k0sworker{{ end }}.service.d/override.conf,
-  # written by the Kairos provider's OverrideCmd). Because the UUID is only known
-  # at boot, we cannot put it in the static k0s `args:` block. Instead a dedicated
-  # oneshot service runs BEFORE the k0s service, reads+validates the config-drive
-  # UUID, appends --kubelet-extra-args to that override.conf ExecStart, and
-  # daemon-reloads — so the k0s service starts the kubelet with
-  # provider-id=metal3://<uuid> and the metal3.io/uuid node-label already set.
-  # This is the k0s analog of the k3s ExecStartPre and is race-free because it
-  # completes (Before=) before the k0s ExecStart is evaluated.
-  - path: /etc/systemd/system/kairos-k0s-metal3-providerid.service
-    permissions: "0644"
-    owner: 0
-    group: 0
-    content: |
-      [Unit]
-      Description=Kairos Metal3 providerID/node-label injection (pre-k0s)
-      # Skip on the Kairos live installer (no real k0s start there).
-      ConditionKernelCommandLine=!cdroot
-      DefaultDependencies=no
-      After=local-fs.target
-      # KD-51: this unit declares ONLY ordering (Before=) + a WantedBy= install
-      # dep — intentionally NO Requires=/BindsTo= on the k0s service. That
-      # absence is load-bearing: it makes providerID injection FAIL-OPEN. The
-      # script exits 0 on every skip path, but even an unexpected non-zero exit
-      # (set -euo pipefail) must not block k0s from starting. Do NOT add
-      # Requires=/BindsTo= here — that would turn a degraded-but-running node
-      # into a non-starting one on any injection hiccup.
-      {{- if eq .Role "control-plane" }}
-      Before=k0scontroller.service
-      {{- else }}
-      Before=k0sworker.service
-      {{- end }}
-
-      [Service]
-      Type=oneshot
-      RemainAfterExit=yes
-      ExecStart=/usr/local/bin/kairos-k0s-metal3-providerid.sh
-
-      [Install]
-      {{- if eq .Role "control-plane" }}
-      WantedBy=k0scontroller.service
-      {{- else }}
-      WantedBy=k0sworker.service
-      {{- end }}
-  # Metal3 config-drive providerID discovery script (runs Before the k0s
-  # service, via kairos-k0s-metal3-providerid.service above).
-  #
-  # This block is STATIC shell except for the UUID, which is read from the
-  # config-drive at boot — there is NO render-time interpolation of the UUID,
-  # so there is no Go-template injection surface here. The only trusted source
-  # of the BareMetalHost UUID is the Ironic config-drive's
-  # /openstack/latest/meta_data.json; we mount it read-only (nodev,nosuid,noexec)
-  # and fail closed on any missing/malformed value rather than ever writing a
-  # garbage provider-id.
-  - path: /usr/local/bin/kairos-k0s-metal3-providerid.sh
-    permissions: "0755"
-    owner: 0
-    group: 0
-    content: |
-      #!/bin/bash
-      set -euo pipefail
-      {{- if eq .Role "control-plane" }}
-      k0s_override=/etc/systemd/system/k0scontroller.service.d/override.conf
-      {{- else }}
-      k0s_override=/etc/systemd/system/k0sworker.service.d/override.conf
-      {{- end }}
-      # Locate the Ironic config-drive by partition label "config-2".
-      cfgdev=""
-      if blkid -L config-2 &>/dev/null; then
-        cfgdev=$(blkid -L config-2)
-      elif [ -b /dev/disk/by-label/config-2 ]; then
-        cfgdev=/dev/disk/by-label/config-2
-      fi
-      cfgmount=/run/metal3-cfgdrive
-      mounted_here=false
-      if [ -n "${cfgdev}" ]; then
-        mkdir -p "${cfgmount}"
-        if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
-          mounted_here=true
-        fi
-      fi
-      # The Ironic config-drive (OpenStack layout) carries the instance UUID at
-      # /openstack/latest/meta_data.json. This is the ONLY trusted source: do
-      # NOT fall back to cloud-init paths — Kairos uses yip (not cloud-init),
-      # and a stale instance-data/pickle file would yield a WRONG-but-valid
-      # UUID and mis-register the Node. Fail closed if the config-drive is absent.
-      meta_json="${cfgmount}/openstack/latest/meta_data.json"
-      if [ ! -f "${meta_json}" ]; then
-        echo "ERROR: metal3-providerid: ${meta_json} not found (config-drive label 'config-2' present and mounted?); cannot determine BareMetalHost UUID — skipping (fail-closed)"
-        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
-        exit 0
-      fi
-      # Extract .uuid — prefer jq if available, fall back to POSIX grep+sed.
-      uuid=""
-      if command -v jq &>/dev/null; then
-        uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
-      else
-        uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
-      fi
-      [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
-      # Strict UUID validation — fail closed on missing or malformed value.
-      # Whole-string validation: first reject any value with a character outside
-      # [hex,dash] (catches newlines, spaces, '=', ',', '/', shell metachars —
-      # closes both provider-id/label-value injection and the multi-line bypass
-      # where a jq-decoded "\n" escape would slip past a per-line grep anchor).
-      # Then enforce the exact UUID shape with bash =~ (string-anchored, not
-      # line-anchored).
-      uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
-      case "${uuid}" in
-        "" | *[!0-9a-fA-F-]* )
-          echo "ERROR: metal3-providerid: extracted UUID is empty or contains illegal characters; skipping (fail-closed)"
-          exit 0 ;;
-      esac
-      if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
-        echo "ERROR: metal3-providerid: extracted UUID '${uuid}' does not match UUID pattern; skipping (fail-closed)"
-        exit 0
-      fi
-      # Append --kubelet-extra-args to the k0s service ExecStart drop-in BEFORE
-      # the k0s service starts. LEGACY metal3://<uuid> format: accepted by CAPM3
-      # v1.13 (the new metal3://<ns>/<bmh>/<m3m> format is not derivable from
-      # config-drive metadata). The k0s service writes its ExecStart into
-      # override.conf at bootstrap; we append the flag to that ExecStart line so
-      # the kubelet registers the Node with this providerID + label on first
-      # registration, and CAPM3 then matches by the label and accepts the
-      # providerID. ${uuid} is validated above; it is a bare hex/dash UUID so it
-      # is safe to interpolate into the systemd ExecStart line.
-      # Pass BOTH kubelet flags inside a SINGLE --kubelet-extra-args value. The
-      # surrounding double quotes are LOAD-BEARING: systemd ExecStart parsing
-      # groups a double-quoted token into one argument, so k0s receives one
-      # --kubelet-extra-args whose value is "--provider-id=… --node-labels=…" and
-      # forwards it verbatim to the kubelet. WITHOUT the quotes, systemd splits on
-      # the space and --node-labels=… becomes a SECOND, standalone ExecStart token
-      # — which is not a valid k0s flag and aborts k0s startup. (k3s does not hit
-      # this: it sets node-label natively in its config.yaml.d drop-in.) ${uuid}
-      # is a validated bare hex/dash UUID (no shell/sed metacharacters), so direct
-      # interpolation into the systemd line — and the sed replacement below — is safe.
-      kubelet_args="--kubelet-extra-args=\"--provider-id=metal3://${uuid} --node-labels=metal3.io/uuid=${uuid}\""
-      if [ ! -f "${k0s_override}" ]; then
-        echo "ERROR: metal3-providerid: ${k0s_override} not found; cannot inject kubelet provider-id — skipping (fail-closed)"
-        exit 0
-      fi
-      if grep -q -- '--provider-id=metal3://' "${k0s_override}"; then
-        echo "metal3-providerid: provider-id already present in ${k0s_override}; not re-appending"
-      elif grep -q -- '--kubelet-extra-args' "${k0s_override}"; then
-        # KD-51 guard: today the static render-time --kubelet-extra-args is
-        # (not .Metal3)-suppressed, so a Metal3 ExecStart carries exactly zero
-        # prior --kubelet-extra-args and the line below adds the only one. If a
-        # future field ever emits a second --kubelet-extra-args onto the k0s
-        # ExecStart, k0s/pflag keeps only the LAST occurrence and would silently
-        # drop our provider-id. Refuse to create that ambiguity: fail closed and
-        # make the conflict loud. The injection must then be reworked to MERGE
-        # into the existing --kubelet-extra-args value rather than append a second.
-        echo "ERROR: metal3-providerid: ${k0s_override} already carries a --kubelet-extra-args; refusing to append a second (last-wins parsing would drop our provider-id) — skipping (fail-closed)"
-        exit 0
-      else
-        # Append the single --kubelet-extra-args token to the (single) non-empty
-        # ExecStart= line. The k0s override.conf has exactly one non-empty
-        # ExecStart= line (Kairos OverrideCmd writes
-        # `ExecStart=\nExecStart=<bin> <role> <args>`); match it.
-        sed -i "/^ExecStart=.\+/ s|$| ${kubelet_args}|" "${k0s_override}"
-        systemctl daemon-reload || true
-        echo "metal3-providerid: injected provider-id=metal3://${uuid} and metal3.io/uuid=${uuid} into ${k0s_override}"
-      fi
-      # Safety net: if the k0s service already started (e.g. systemd did not honor
-      # the Before= ordering because the Kairos provider starts k0s
-      # programmatically), restart it so the kubelet picks up the new ExecStart.
-      # providerID is immutable once the Node registers, so this only helps if the
-      # restart happens before first registration; the Before= ordering above is
-      # the primary, race-free path. This mirrors the CAPK lb-sans restart pattern.
-      {{- if eq .Role "control-plane" }}
-      if systemctl is-active --quiet k0scontroller; then
-        echo "metal3-providerid: k0scontroller already active; restarting to apply provider-id before Node registration"
-        systemctl restart k0scontroller || true
-      fi
-      {{- else }}
-      if systemctl is-active --quiet k0sworker; then
-        echo "metal3-providerid: k0sworker already active; restarting to apply provider-id before Node registration"
-        systemctl restart k0sworker || true
-      fi
-      {{- end }}
-  {{- end }}
   {{- /*
     Post-bootstrap unit + script writes were previously emitted via
     stages.initramfs.files. Lab validation against Hadron installer images
@@ -470,15 +275,116 @@ MANIFEST_EOF
       echo "No providerID to set"
       {{- end }}
 
-      {{- /*
-        Metal3 / CAPM3 providerID is set PRE-START via the
-        kairos-k0s-metal3-providerid.service (ordered Before the k0s service;
-        see write_files above), NOT post-bootstrap. CAPM3 v1.13 requires
-        Node.spec.providerID to be metal3://<uuid> at first registration
-        (providerID is immutable), so a post-bootstrap kubectl label/patch is
-        too late. No Metal3 work happens in this post-bootstrap script.
-        (ADR 0004, corrected after lab validation.)
-      */ -}}
+      {{- if .Metal3 }}
+      {{- if eq .Role "control-plane" }}
+      # Metal3 / CAPM3 providerID + node-label (post-bootstrap patch). REDESIGNED
+      # after the k0s lab e2e (ADR 0004): the previous pre-start ExecStart-injection
+      # oneshot is unworkable on k0s. k0scontroller is started by the Kairos provider
+      # BEFORE cloud-config runs, so a boot-stage `systemctl enable` only arms a
+      # WantedBy symlink for a k0s start that never comes (the unit never runs); and a
+      # Before=k0scontroller oneshot that restarts the k0s service to apply the change
+      # deadlocks (systemd ordering cycle — confirmed on the node, apiserver stuck down).
+      #
+      # CAPM3 v1.13 (cloudProviderEnabled:false) selects the Node by the metal3.io/uuid
+      # label and VALIDATES Node.spec.providerID == metal3://<uuid>; it does not set
+      # them. Setting a PREVIOUSLY-EMPTY providerID is permitted by the apiserver
+      # (immutability only guards a non-empty value), so we patch it here, reusing the
+      # same admin.conf-based post-bootstrap patch the non-Metal3 path above uses. This
+      # runs inside the already-enabled kairos-k0s-post-bootstrap.service: no extra
+      # unit, no Before=, no restart, no deadlock, no Node-registration race.
+      # Control-plane only — admin.conf is CP-only and Metal3 is single-node-CP this
+      # release (replicas > 1 is webhook-rejected; k0s Metal3 workers are a future item).
+      set_metal3_providerid() {
+        # Read + validate the BMH UUID from the Ironic config-drive (config-2 /
+        # /openstack/latest/meta_data.json). This is the ONLY trusted source; mount
+        # it read-only (nodev,nosuid,noexec) and FAIL-CLOSED (skip, leaving the Node
+        # unpatched) on any missing/malformed value rather than ever writing a garbage
+        # provider-id. Do NOT fall back to cloud-init paths (Kairos uses yip; a stale
+        # instance-data file would yield a WRONG-but-valid UUID).
+        local cfgdev="" cfgmount=/run/metal3-cfgdrive mounted_here=false meta_json uuid=""
+        if blkid -L config-2 &>/dev/null; then
+          cfgdev=$(blkid -L config-2)
+        elif [ -b /dev/disk/by-label/config-2 ]; then
+          cfgdev=/dev/disk/by-label/config-2
+        fi
+        if [ -n "${cfgdev}" ]; then
+          mkdir -p "${cfgmount}"
+          if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
+            mounted_here=true
+          fi
+        fi
+        meta_json="${cfgmount}/openstack/latest/meta_data.json"
+        if [ ! -f "${meta_json}" ]; then
+          echo "WARN: metal3-providerid: ${meta_json} not found (config-drive 'config-2' present+mounted?); skipping (fail-closed)"
+          [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+          return 0
+        fi
+        if command -v jq &>/dev/null; then
+          uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
+        else
+          uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+        fi
+        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+        # Whole-string validation: reject any value with a character outside [hex,dash]
+        # (newlines, spaces, '=', ',', '/', shell/JSON metachars — closes provider-id/
+        # label-value injection and the multi-line bypass), then enforce the exact UUID
+        # shape (string-anchored, not line-anchored).
+        local uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+        case "${uuid}" in
+          "" | *[!0-9a-fA-F-]* )
+            echo "WARN: metal3-providerid: extracted UUID is empty or contains illegal characters; skipping (fail-closed)"
+            return 0 ;;
+        esac
+        if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
+          echo "WARN: metal3-providerid: extracted UUID '${uuid}' does not match UUID pattern; skipping (fail-closed)"
+          return 0
+        fi
+        # Wait for the Node to register, then set provider-id + the metal3.io/uuid
+        # label. LEGACY metal3://<uuid> format (accepted by CAPM3 v1.13; the new
+        # metal3://<ns>/<bmh>/<m3m> form is not derivable from config-drive metadata).
+        # ${uuid} is a validated bare hex/dash UUID, so interpolation into the patch
+        # JSON is injection-safe. Use `k0s kubectl` (resolves the local admin kubeconfig).
+        local desired="metal3://${uuid}" w=0 cur
+        while ! k0s kubectl get node "$(hostname)" &>/dev/null; do
+          if [ ${w} -ge 300 ]; then
+            echo "WARN: metal3-providerid: timed out waiting for Node registration; skipping"
+            return 0
+          fi
+          sleep 5; w=$((w + 5))
+        done
+        for i in $(seq 1 30); do
+          cur=$(k0s kubectl get node "$(hostname)" -o jsonpath='{.spec.providerID}' 2>/dev/null || true)
+          if [ "${cur}" = "${desired}" ]; then
+            echo "metal3-providerid: Node $(hostname) already has provider-id=${desired}; ensuring label"
+            k0s kubectl label node "$(hostname)" "metal3.io/uuid=${uuid}" --overwrite &>/dev/null || true
+            return 0
+          fi
+          if [ -n "${cur}" ]; then
+            echo "WARN: metal3-providerid: Node $(hostname) has a different non-empty provider-id '${cur}'; not overwriting (immutable)"
+            return 0
+          fi
+          if k0s kubectl patch node "$(hostname)" --type=merge \
+               -p "{\"spec\":{\"providerID\":\"${desired}\"},\"metadata\":{\"labels\":{\"metal3.io/uuid\":\"${uuid}\"}}}" &>/dev/null; then
+            echo "metal3-providerid: set provider-id=${desired} + metal3.io/uuid=${uuid} on Node $(hostname)"
+            return 0
+          fi
+          echo "metal3-providerid: attempt ${i}/30 to patch Node failed; retrying in 5s..."
+          sleep 5
+        done
+        echo "WARN: metal3-providerid: failed to set provider-id after 30 attempts; CAPM3 will not bind until it is set"
+        return 0
+      }
+      # Called with `|| true` so a failure here never aborts the rest of post-bootstrap
+      # (kubeconfig push etc.). bash also suppresses `set -e` inside a function invoked
+      # in a `||` list, so the function's internal fail-closed `return 0`s are the
+      # control flow and a stray command error cannot kill the node bring-up.
+      set_metal3_providerid || echo "WARN: metal3-providerid: step errored; continuing post-bootstrap"
+      {{- else }}
+      # Metal3 k0s WORKER providerID is not supported in this release: a worker has no
+      # local admin.conf to patch and k0s has no config.yaml.d kubelet-arg drop-in.
+      # Metal3 is single-node control-plane only (replicas > 1 is webhook-rejected).
+      {{- end }}
+      {{- end }}
 
       {{- if .ManagementEndpoint }}
       # Push kubeconfig to management cluster without SSH (KD-3b).
@@ -570,17 +476,6 @@ stages:
     - name: "Ensure SSH service is enabled"
       commands:
         - systemctl enable --now sshd || systemctl enable --now ssh || true
-    {{- if .Metal3 }}
-    # Enable the Metal3 providerID pre-start unit EARLY (boot stage runs before
-    # the Kairos provider's Bootstrap event starts k0s), so systemd honors the
-    # unit's Before=/WantedBy= ordering against the k0s service and injects
-    # provider-id=metal3://<uuid> + the metal3.io/uuid node-label into the
-    # kubelet ExecStart before the kubelet first registers the Node. (ADR 0004.)
-    - name: "Enable Metal3 providerID pre-start unit (before k0s)"
-      commands:
-        - systemctl daemon-reload || true
-        - systemctl enable kairos-k0s-metal3-providerid.service || true
-    {{- end }}
     {{- if .DNSServers }}
     - name: "Configure DNS resolvers for early boot"
       dns:

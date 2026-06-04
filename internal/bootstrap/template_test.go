@@ -1066,7 +1066,9 @@ func TestRenderMetal3_ProviderIDScriptValidBash(t *testing.T) {
 		pidScript   string // suffix of the config-drive providerID script
 		mustContain string // a marker that proves we extracted the right script
 	}{
-		{"k0s", RenderK0sCloudConfig, "kairos-k0s-metal3-providerid.sh", "kubelet-extra-args=\\\"--provider-id=metal3://"},
+		// k0s: providerID is set by a post-bootstrap kubectl patch (ADR 0004 redesign),
+		// so the Metal3 logic lives in the post-bootstrap script, not a pre-start unit.
+		{"k0s", RenderK0sCloudConfig, "kairos-k0s-post-bootstrap.sh", "set_metal3_providerid"},
 		{"k3s", RenderK3sCloudConfig, "kairos-k3s-metal3-providerid.sh", "provider-id=metal3://"},
 	}
 	for _, tc := range cases {
@@ -1133,76 +1135,68 @@ func TestRenderMetal3_K0sControlPlane(t *testing.T) {
 		t.Fatalf("RenderK0sCloudConfig with Metal3=true: %v", err)
 	}
 
-	// (a) Config-drive providerID pre-start mechanism present.
-	if !strings.Contains(result, "kairos-k0s-metal3-providerid.service") {
-		t.Error("Metal3 k0s: missing kairos-k0s-metal3-providerid.service pre-start unit")
+	// (a) The broken pre-start ExecStart-injection mechanism must be GONE. The k0s
+	// Metal3 providerID is now set by a post-bootstrap kubectl patch (ADR 0004
+	// redesign): the pre-start oneshot deadlocked k0scontroller in lab e2e (a
+	// Before=k0scontroller unit that restarts k0scontroller is a systemd ordering
+	// cycle), and the boot-stage enable ran too late (k0s starts before cloud-config).
+	for _, gone := range []string{
+		"kairos-k0s-metal3-providerid.service",
+		"kairos-k0s-metal3-providerid.sh",
+		"Before=k0scontroller.service",
+		`--kubelet-extra-args=\"--provider-id=metal3://`,
+	} {
+		if strings.Contains(result, gone) {
+			t.Errorf("Metal3 k0s: removed pre-start mechanism must NOT appear: %q", gone)
+		}
 	}
-	if !strings.Contains(result, "kairos-k0s-metal3-providerid.sh") {
-		t.Error("Metal3 k0s: missing kairos-k0s-metal3-providerid.sh script")
+	if strings.Contains(result, "systemctl restart k0scontroller") {
+		t.Error("Metal3 k0s: must NOT restart k0scontroller (the pre-start restart deadlocked); providerID is set via post-bootstrap patch")
 	}
-	// The unit must be ordered BEFORE the k0s service so providerID is set at
-	// first registration (providerID is immutable).
-	if !strings.Contains(result, "Before=k0scontroller.service") {
-		t.Error("Metal3 k0s: pre-start unit must be ordered Before=k0scontroller.service")
+
+	// (b) The post-bootstrap patch mechanism must be present: the function, the
+	// config-drive read (mounted ro,nodev,nosuid,noexec), the fail-closed UUID
+	// validation, and a kubectl patch that sets providerID=metal3://<uuid> + the
+	// metal3.io/uuid label via the local admin kubeconfig.
+	if !strings.Contains(result, "set_metal3_providerid") {
+		t.Error("Metal3 k0s: missing the set_metal3_providerid post-bootstrap function")
 	}
 	if !strings.Contains(result, "meta_data.json") {
 		t.Error("Metal3 k0s: missing meta_data.json reference (config-drive read)")
 	}
-	// Both the kubelet provider-id (metal3://) AND the node-label must be set.
-	if !strings.Contains(result, "--provider-id=metal3://") {
-		t.Error("Metal3 k0s: missing --provider-id=metal3:// kubelet arg")
+	if !strings.Contains(result, "ro,nodev,nosuid,noexec") {
+		t.Error("Metal3 k0s: config-drive must be mounted ro,nodev,nosuid,noexec")
 	}
-	if !strings.Contains(result, "--node-labels=metal3.io/uuid=") {
-		t.Error("Metal3 k0s: missing --node-labels=metal3.io/uuid= kubelet arg")
-	}
-	// Regression guard (KD-51): both kubelet flags MUST be wrapped in a SINGLE
-	// double-quoted --kubelet-extra-args so systemd passes one argument to k0s.
-	// The earlier unquoted form split --node-labels into a standalone (invalid)
-	// k0s flag that aborted k0s startup.
-	if !strings.Contains(result, `--kubelet-extra-args=\"--provider-id=metal3://`) {
-		t.Error("Metal3 k0s: provider-id + node-labels must be inside ONE double-quoted --kubelet-extra-args (systemd single-arg grouping); the unquoted form aborts k0s startup")
-	}
-	// The KD-51 guard against a pre-existing --kubelet-extra-args (last-wins
-	// flag parsing would drop our provider-id) must be present.
-	if !strings.Contains(result, "refusing to append a second") {
-		t.Error("Metal3 k0s: missing the KD-51 fail-closed guard against a pre-existing --kubelet-extra-args")
-	}
-	// Fail-open invariant (KD-51): the pre-start unit must NOT Requires=/BindsTo=
-	// the k0s service, so an injection hiccup cannot block k0s from starting.
-	if strings.Contains(result, "Requires=k0scontroller") || strings.Contains(result, "BindsTo=k0scontroller") {
-		t.Error("Metal3 k0s: providerID unit must NOT Requires=/BindsTo= the k0s service (fail-open invariant, KD-51)")
-	}
-	// UUID regex validation must be present in the script.
 	if !strings.Contains(result, `[0-9a-fA-F]`) {
-		t.Error("Metal3 k0s: missing UUID regex validation in script")
+		t.Error("Metal3 k0s: missing UUID regex validation")
 	}
 	if !strings.Contains(result, "case ") || !strings.Contains(result, "*[!0-9a-fA-F-]*") {
 		t.Error("Metal3 k0s: missing the char-class case guard on the UUID")
 	}
 	if !strings.Contains(result, "fail-closed") {
-		t.Error("Metal3 k0s: missing fail-closed comment/log in providerID script")
+		t.Error("Metal3 k0s: missing fail-closed handling in the providerID logic")
+	}
+	if !strings.Contains(result, "k0s kubectl patch node") {
+		t.Error("Metal3 k0s: must patch the Node providerID via `k0s kubectl patch node`")
+	}
+	if !strings.Contains(result, `desired="metal3://`) {
+		t.Error("Metal3 k0s: patch must target providerID=metal3://<uuid>")
+	}
+	if !strings.Contains(result, "metal3.io/uuid") {
+		t.Error("Metal3 k0s: must set the metal3.io/uuid Node label")
 	}
 
-	// (b) No vsphere://-style providerID and no post-bootstrap kubectl patch.
-	if strings.Contains(result, "vsphere://") {
-		t.Error("Metal3 k0s: vsphere:// must NOT appear (wrong providerID for Metal3)")
-	}
-	if strings.Contains(result, "provider-id=vsphere") {
-		t.Error("Metal3 k0s: provider-id=vsphere must NOT appear")
-	}
-	if strings.Contains(result, `kubectl patch node`) {
-		t.Error("Metal3 k0s: kubectl patch node (providerID) must NOT appear (set pre-start instead)")
-	}
-	if strings.Contains(result, "set_metal3_uuid_label") {
-		t.Error("Metal3 k0s: old post-bootstrap set_metal3_uuid_label must NOT appear (moved to pre-start)")
+	// (c) No vsphere://-style providerID for Metal3.
+	if strings.Contains(result, "vsphere://") || strings.Contains(result, "provider-id=vsphere") {
+		t.Error("Metal3 k0s: vsphere:// providerID must NOT appear (wrong providerID for Metal3)")
 	}
 
-	// (c) push_kubeconfig block must still be present.
+	// (d) push_kubeconfig block must still be present.
 	if !strings.Contains(result, "push_kubeconfig") {
 		t.Error("Metal3 k0s: push_kubeconfig block must still be rendered")
 	}
 
-	// (d) Rendered output must parse as valid YAML.
+	// (e) Rendered output must parse as valid YAML.
 	var parsed any
 	if err := yaml.Unmarshal([]byte(result), &parsed); err != nil {
 		t.Errorf("Metal3 k0s render is not valid YAML: %v", err)
@@ -1317,12 +1311,23 @@ func TestRenderMetal3_SuppressionWithNonEmptyProviderID(t *testing.T) {
 			if strings.Contains(result, "422fa74a-5d60-3a4a-af24-1f07be515fcc") {
 				t.Errorf("%s: the render-time providerID UUID must NOT appear when Metal3=true", dist)
 			}
-			if strings.Contains(result, `kubectl patch node`) {
-				t.Errorf("%s: kubectl patch node must NOT appear when Metal3=true", dist)
-			}
-			// The metal3:// boot-computed provider-id mechanism must still be present.
-			if !strings.Contains(result, "--provider-id=metal3://") && !strings.Contains(result, "provider-id=metal3://") {
-				t.Errorf("%s: the metal3:// config-drive providerID mechanism must appear when Metal3=true", dist)
+			// The render-time vsphere:// providerID path is suppressed for Metal3
+			// (gated `(not .Metal3)`); only the boot-computed metal3:// mechanism
+			// remains. The mechanism differs by distribution:
+			if dist == "k3s" {
+				// k3s sets providerID via a config.yaml.d drop-in — no kubectl patch.
+				if strings.Contains(result, "kubectl patch node") {
+					t.Errorf("%s: kubectl patch node must NOT appear when Metal3=true", dist)
+				}
+				if !strings.Contains(result, "provider-id=metal3://") {
+					t.Errorf("%s: the metal3:// config-drive providerID mechanism must appear when Metal3=true", dist)
+				}
+			} else {
+				// k0s sets providerID via a post-bootstrap `k0s kubectl patch node`
+				// using the boot-read UUID (never the render-time vsphere:// value).
+				if !strings.Contains(result, `desired="metal3://`) {
+					t.Errorf("%s: the metal3:// config-drive providerID mechanism must appear when Metal3=true", dist)
+				}
 			}
 		})
 	}
