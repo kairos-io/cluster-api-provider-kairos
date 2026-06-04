@@ -347,7 +347,7 @@ If the node cannot reach the management API server, enable the opt-in [Air-gappe
 
 ### cloudProviderEnabled
 
-`Metal3Cluster.spec.cloudProviderEnabled: false` disables the external cloud controller manager. CAPM3 v1.13 with this setting finds the Kubernetes Node by the `metal3.io/uuid` label and validates `providerID=metal3://<BareMetalHost-UID>`. The Kairos cloud-config sets both the kubelet `--provider-id` flag and the `metal3.io/uuid` node label from the Ironic config-drive metadata before k3s/k0s registers the node. No manual providerID patching is required.
+`Metal3Cluster.spec.cloudProviderEnabled: false` disables the external cloud controller manager. CAPM3 v1.13 with this setting finds the Kubernetes Node by the `metal3.io/uuid` label and validates `providerID=metal3://<BareMetalHost-UID>` — it does not set them. The Kairos cloud-config sets both automatically from the Ironic config-drive metadata (the `config-2` drive's `meta_data.json` `.uuid`): on **k3s** via a `config.yaml.d` kubelet drop-in applied when the node registers; on **k0s** via a post-bootstrap `kubectl patch` of the node (setting a previously-empty `providerID` is permitted by the API server). Either way, **no manual providerID patching is required** — the node sets it itself.
 
 ---
 
