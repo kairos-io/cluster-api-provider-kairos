@@ -59,9 +59,18 @@ users:
 {{- if eq .Role "control-plane" }}
 
 # Control-plane node configuration
-# Pass providerID at k3s startup so node registers with correct providerID (avoids k3s:// vs vsphere:// mismatch)
+{{- if .Metal3 }}
+# Metal3: the kubelet provider-id (metal3://<uuid>) and metal3.io/uuid node-label
+# are written to config.yaml.d by the kairos-k3s-metal3-providerid.sh
+# ExecStartPre BEFORE k3s starts (UUID read from the Ironic config-drive at boot).
+# We do NOT set a render-time providerID here — CAPM3 requires metal3://<uuid> at
+# first registration (ADR 0004, corrected after CAPM3 v1.13 lab validation).
+{{- else }}
+# Pass providerID at k3s startup so node registers with the correct providerID
+# (avoids the k3s default providerID vs infra providerID mismatch).
 # Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
 # ProviderID is regex-validated by validateTemplateData before rendering — see internal/bootstrap/validate.go.
+{{- end }}
 k3s:
   enabled: true
   {{- if and .ProviderID (not .Metal3) }}
@@ -176,11 +185,36 @@ write_files:
       
       [Install]
       WantedBy=multi-user.target
-  {{- if and (eq .Role "control-plane") (not .Metal3) }}
+  {{- if and (eq .Role "control-plane") .Metal3 }}
+  # Metal3 / CAPM3 providerID + node-label drop-in (ADR 0004, OQ-1 RESOLVED,
+  # corrected after CAPM3 v1.13 lab validation).
+  #
+  # CAPM3 v1.13 with cloudProviderEnabled:false does NOT patch
+  # Node.spec.providerID. It finds the Node by the metal3.io/uuid label and then
+  # REQUIRES the Node to ALREADY carry providerID=metal3://<uuid> (legacy) at
+  # first registration. providerID is immutable, so it must be correct the
+  # FIRST time the kubelet registers — a post-bootstrap label is too late
+  # (k3s would have already registered with its default k3s://<hostname>, which
+  # CAPM3 rejects as "unsupported providerID format").
+  #
+  # Mechanism: an ExecStartPre on k3s.service (runs BEFORE k3s starts) reads the
+  # BareMetalHost UUID from the Ironic config-drive and writes
+  # /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml with BOTH the kubelet
+  # provider-id (metal3://<uuid>) and the metal3.io/uuid node-label. k3s reads
+  # config.yaml.d at startup, so the kubelet registers the Node with the correct
+  # providerID + label on first registration. Use z-provider-id.conf so it loads
+  # after override.conf (Kairos/other configs).
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: 0
+    group: 0
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-metal3-providerid.sh || true'
+  {{- else if and (eq .Role "control-plane") (not .Metal3) }}
   # Systemd override: write providerID to k3s config before k3s starts.
   # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
   # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
-  # Omitted for Metal3: CAPM3 owns Node.spec.providerID; no ExecStartPre needed (ADR 0004).
   - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
     permissions: "0644"
     owner: 0
@@ -192,6 +226,87 @@ write_files:
       {{- else }}
       ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-discover-provider-id.sh || true'
       {{- end }}
+  {{- end }}
+  {{- if and (eq .Role "control-plane") .Metal3 }}
+  # Metal3 config-drive providerID discovery script (runs as the k3s
+  # ExecStartPre above, BEFORE k3s/kubelet starts).
+  #
+  # This block is STATIC shell except for the UUID, which is read from the
+  # config-drive at boot — there is NO render-time interpolation of the UUID,
+  # so there is no Go-template injection surface here. The only trusted source
+  # of the BareMetalHost UUID is the Ironic config-drive's
+  # /openstack/latest/meta_data.json; we mount it read-only (nodev,nosuid,noexec)
+  # and fail closed on any missing/malformed value rather than ever writing a
+  # garbage provider-id.
+  - path: /usr/local/bin/kairos-k3s-metal3-providerid.sh
+    permissions: "0755"
+    owner: 0
+    group: 0
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      # Locate the Ironic config-drive by partition label "config-2".
+      cfgdev=""
+      if blkid -L config-2 &>/dev/null; then
+        cfgdev=$(blkid -L config-2)
+      elif [ -b /dev/disk/by-label/config-2 ]; then
+        cfgdev=/dev/disk/by-label/config-2
+      fi
+      cfgmount=/run/metal3-cfgdrive
+      mounted_here=false
+      if [ -n "${cfgdev}" ]; then
+        mkdir -p "${cfgmount}"
+        if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
+          mounted_here=true
+        fi
+      fi
+      # The Ironic config-drive (OpenStack layout) carries the instance UUID at
+      # /openstack/latest/meta_data.json. This is the ONLY trusted source: do
+      # NOT fall back to cloud-init paths — Kairos uses yip (not cloud-init),
+      # and a stale instance-data/pickle file would yield a WRONG-but-valid
+      # UUID and mis-register the Node. Fail closed if the config-drive is absent.
+      meta_json="${cfgmount}/openstack/latest/meta_data.json"
+      if [ ! -f "${meta_json}" ]; then
+        echo "ERROR: metal3-providerid: ${meta_json} not found (config-drive label 'config-2' present and mounted?); cannot determine BareMetalHost UUID — skipping (fail-closed)"
+        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+        exit 0
+      fi
+      # Extract .uuid — prefer jq if available, fall back to POSIX grep+sed.
+      uuid=""
+      if command -v jq &>/dev/null; then
+        uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
+      else
+        uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+      fi
+      [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+      # Strict UUID validation — fail closed on missing or malformed value.
+      # Whole-string validation: first reject any value with a character outside
+      # [hex,dash] (catches newlines, spaces, '=', ',', '/', shell metachars —
+      # closes both provider-id/label-value injection and the multi-line bypass
+      # where a jq-decoded "\n" escape would slip past a per-line grep anchor).
+      # Then enforce the exact UUID shape with bash =~ (string-anchored, not
+      # line-anchored).
+      uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+      case "${uuid}" in
+        "" | *[!0-9a-fA-F-]* )
+          echo "ERROR: metal3-providerid: extracted UUID is empty or contains illegal characters; skipping (fail-closed)"
+          exit 0 ;;
+      esac
+      if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
+        echo "ERROR: metal3-providerid: extracted UUID '${uuid}' does not match UUID pattern; skipping (fail-closed)"
+        exit 0
+      fi
+      # Write the providerID + node-label drop-in BEFORE k3s/kubelet starts.
+      # LEGACY metal3://<uuid> format: accepted by CAPM3 v1.13 (the new
+      # metal3://<ns>/<bmh>/<m3m> format is not derivable from config-drive
+      # metadata). The kubelet registers the Node with this providerID +
+      # label, and CAPM3 then matches by the label and accepts the providerID.
+      # Use printf (not an indented heredoc) so the written YAML file has no
+      # stray leading whitespace on its top-level keys — k3s rejects a
+      # config.yaml.d file whose keys are indented. ${uuid} is validated above.
+      mkdir -p /etc/rancher/k3s/config.yaml.d
+      printf 'kubelet-arg:\n  - provider-id=metal3://%s\nnode-label:\n  - metal3.io/uuid=%s\n' "${uuid}" "${uuid}" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+      echo "metal3-providerid: wrote provider-id=metal3://${uuid} and metal3.io/uuid=${uuid} for kubelet registration"
   {{- end }}
   {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
   # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre).
@@ -292,106 +407,14 @@ MANIFEST_EOF
       fi
       {{- end }}
 
-      {{- if .Metal3 }}
-      # Metal3 / CAPM3 node-label stage (ADR 0004, OQ-1 RESOLVED).
-      #
-      # CAPM3 owns Node.spec.providerID — we must NOT set it. Instead, we label
-      # the Node with metal3.io/uuid=<BareMetalHost-UID> so that CAPM3 can find
-      # the Node and patch providerID itself (its reconcile loop is level-triggered
-      # and patient, so a label applied shortly after registration is fine).
-      #
-      # The UUID is read from the Ironic config-drive at boot. We CANNOT template
-      # it at render time because yip uses Go text/template + sprig over sysinfo
-      # only — ds.meta_data.uuid is a cloud-init Jinja expression that yip does
-      # not know. (Empirically: "function ds not defined". See ADR 0004 § OQ-1.)
-      # The config-drive partition (label "config-2") persists across reboots
-      # because Ironic writes it as a persistent partition, not a ramdisk.
-      #
-      # Security: the UUID is regex-validated in bash before labeling —
-      # fail-closed, never label with garbage from a malformed config-drive.
-      # This entire block is STATIC (no Go template interpolation) — there is
-      # no render-time injection surface here.
-      set_metal3_uuid_label() {
-        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-        # Wait for Node to register (reuse the pattern from the providerID block).
-        local max_wait=300
-        local elapsed=0
-        while ! kubectl get node "$(hostname)" &>/dev/null; do
-          if [ "${elapsed}" -ge "${max_wait}" ]; then
-            echo "WARN: Timeout waiting for node to register; skipping metal3.io/uuid label"
-            return 0
-          fi
-          echo "metal3-label: waiting for node registration... (${elapsed}s/${max_wait}s)"
-          sleep 5
-          elapsed=$((elapsed + 5))
-        done
-        # Locate the Ironic config-drive by partition label "config-2".
-        local cfgdev=""
-        if blkid -L config-2 &>/dev/null; then
-          cfgdev=$(blkid -L config-2)
-        elif [ -b /dev/disk/by-label/config-2 ]; then
-          cfgdev=/dev/disk/by-label/config-2
-        fi
-        local cfgmount=/run/metal3-cfgdrive
-        local mounted_here=false
-        if [ -n "${cfgdev}" ]; then
-          mkdir -p "${cfgmount}"
-          if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
-            mounted_here=true
-          fi
-        fi
-        # The Ironic config-drive (OpenStack layout) carries the instance UUID at
-        # /openstack/latest/meta_data.json. This is the ONLY trusted source: do
-        # NOT fall back to cloud-init paths — Kairos uses yip (not cloud-init),
-        # and a stale instance-data/pickle file would yield a WRONG-but-valid
-        # UUID and mis-label the Node. Fail closed if the config-drive is absent.
-        local meta_json="${cfgmount}/openstack/latest/meta_data.json"
-        if [ ! -f "${meta_json}" ]; then
-          echo "ERROR: metal3-label: ${meta_json} not found (config-drive label 'config-2' present and mounted?); cannot determine BareMetalHost UUID — skipping label (fail-closed)"
-          [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
-          return 0
-        fi
-        # Extract .uuid — prefer jq if available, fall back to POSIX grep+sed.
-        local uuid=""
-        if command -v jq &>/dev/null; then
-          uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
-        else
-          uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
-        fi
-        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
-        # Strict UUID validation — fail closed on missing or malformed value.
-        # Whole-string validation, fail-closed. First reject any value with a
-        # character outside [hex,dash] (catches newlines, spaces, '=', ',', '/',
-        # shell metachars — closes both label-value injection and the multi-line
-        # bypass where a jq-decoded "\n" escape would slip past a per-line grep
-        # anchor). Then enforce the exact UUID shape with bash =~ (string-anchored,
-        # not line-anchored).
-        local uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
-        case "${uuid}" in
-          "" | *[!0-9a-fA-F-]* )
-            echo "ERROR: metal3-label: extracted UUID is empty or contains illegal characters; skipping label (fail-closed)"
-            return 0 ;;
-        esac
-        if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
-          echo "ERROR: metal3-label: extracted UUID '${uuid}' does not match UUID pattern; skipping label (fail-closed)"
-          return 0
-        fi
-        # Apply the label with retries for transient API errors.
-        for attempt in 1 2 3; do
-          if kubectl label node "$(hostname)" "metal3.io/uuid=${uuid}" --overwrite 2>/dev/null; then
-            echo "metal3-label: labeled node $(hostname) with metal3.io/uuid=${uuid}"
-            return 0
-          fi
-          echo "metal3-label: attempt ${attempt}/3 failed; retrying in 5s..."
-          sleep 5
-        done
-        echo "WARN: metal3-label: failed to label node after 3 attempts; CAPM3 may not be able to match this Node"
-        return 0
-      }
-      if ! set_metal3_uuid_label; then
-        echo "WARN: metal3-label stage exited non-zero; proceeding to next stage"
-      fi
-      {{- end }}
+      {{- /*
+        Metal3 / CAPM3 providerID is set PRE-START via the
+        kairos-k3s-metal3-providerid.sh ExecStartPre (see write_files above),
+        NOT post-bootstrap. CAPM3 v1.13 requires Node.spec.providerID to be
+        metal3://<uuid> at first registration (providerID is immutable), so a
+        post-bootstrap kubectl label/patch is too late. No Metal3 work happens
+        in this post-bootstrap script. (ADR 0004, corrected after lab validation.)
+      */ -}}
 
       {{- if .ManagementEndpoint }}
       # Push kubeconfig to management cluster without SSH (KD-3b).

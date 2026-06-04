@@ -1025,24 +1025,49 @@ func metal3ControlPlaneData() TemplateData {
 	}
 }
 
-// TestRenderMetal3_PostBootstrapScriptValidBash renders the Metal3 cloud-config
-// for both distributions, extracts the post-bootstrap shell script from
-// write_files, and runs `bash -n` on it. The Metal3 UUID validation added in
-// Phase 1b (the `case`/`[[ =~ ]]` constructs hardened after the security
-// review) only executes at node boot, so a bash syntax regression there would
-// otherwise stay invisible until lab provisioning. This locks the rendered
-// script's syntax at unit-test time.
-func TestRenderMetal3_PostBootstrapScriptValidBash(t *testing.T) {
+// extractWriteFile parses the rendered cloud-config and returns the content of
+// the first write_files entry whose path ends with suffix (empty string if not
+// found).
+func extractWriteFile(t *testing.T, rendered, suffix string) string {
+	t.Helper()
+	var cc struct {
+		WriteFiles []struct {
+			Path    string `yaml:"path"`
+			Content string `yaml:"content"`
+		} `yaml:"write_files"`
+	}
+	if err := yaml.Unmarshal([]byte(rendered), &cc); err != nil {
+		t.Fatalf("parse rendered YAML: %v", err)
+	}
+	for _, wf := range cc.WriteFiles {
+		if strings.HasSuffix(wf.Path, suffix) {
+			return wf.Content
+		}
+	}
+	return ""
+}
+
+// TestRenderMetal3_ProviderIDScriptValidBash renders the Metal3 cloud-config
+// for both distributions, extracts the config-drive providerID shell script
+// (moved from the post-bootstrap script to a pre-start ExecStartPre after the
+// CAPM3 v1.13 lab correction), and runs `bash -n` on it. The UUID validation
+// guards (`case`/`[[ =~ ]]`) only execute at node boot, so a bash syntax
+// regression there would otherwise stay invisible until lab provisioning. This
+// locks the rendered script's syntax at unit-test time. We also bash -n the
+// post-bootstrap script to ensure removing the Metal3 stanza left it valid.
+func TestRenderMetal3_ProviderIDScriptValidBash(t *testing.T) {
 	bashPath, err := exec.LookPath("bash")
 	if err != nil {
 		t.Skip("bash not available; skipping rendered-script syntax check")
 	}
 	cases := []struct {
-		name   string
-		render func(TemplateData) (string, error)
+		name        string
+		render      func(TemplateData) (string, error)
+		pidScript   string // suffix of the config-drive providerID script
+		mustContain string // a marker that proves we extracted the right script
 	}{
-		{"k0s", RenderK0sCloudConfig},
-		{"k3s", RenderK3sCloudConfig},
+		{"k0s", RenderK0sCloudConfig, "kairos-k0s-metal3-providerid.sh", "kubelet-extra-args=--provider-id=metal3://"},
+		{"k3s", RenderK3sCloudConfig, "kairos-k3s-metal3-providerid.sh", "provider-id=metal3://"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1050,34 +1075,35 @@ func TestRenderMetal3_PostBootstrapScriptValidBash(t *testing.T) {
 			if err != nil {
 				t.Fatalf("render: %v", err)
 			}
-			var cc struct {
-				WriteFiles []struct {
-					Path    string `yaml:"path"`
-					Content string `yaml:"content"`
-				} `yaml:"write_files"`
+			// The config-drive providerID script must exist, be the Metal3
+			// variant, and be syntactically valid bash.
+			pid := extractWriteFile(t, out, tc.pidScript)
+			if pid == "" {
+				t.Fatalf("%s providerID script (%s) not found in rendered write_files", tc.name, tc.pidScript)
 			}
-			if err := yaml.Unmarshal([]byte(out), &cc); err != nil {
-				t.Fatalf("parse rendered YAML: %v", err)
+			if !strings.Contains(pid, "metal3-providerid") {
+				t.Fatalf("extracted script is not the Metal3 providerID variant (missing metal3-providerid marker)")
 			}
-			var script string
-			for _, wf := range cc.WriteFiles {
-				if strings.HasSuffix(wf.Path, "post-bootstrap.sh") {
-					script = wf.Content
-					break
+			if !strings.Contains(pid, tc.mustContain) {
+				t.Fatalf("%s providerID script missing %q", tc.name, tc.mustContain)
+			}
+			// The post-bootstrap script must no longer carry any Metal3 stanza
+			// and must still be valid bash.
+			pb := extractWriteFile(t, out, "post-bootstrap.sh")
+			if pb == "" {
+				t.Fatalf("%s post-bootstrap.sh not found in rendered write_files", tc.name)
+			}
+			if strings.Contains(pb, "set_metal3_uuid_label") {
+				t.Errorf("%s post-bootstrap script must NOT contain the old set_metal3_uuid_label function (moved to pre-start)", tc.name)
+			}
+			for name, script := range map[string]string{tc.pidScript: pid, "post-bootstrap.sh": pb} {
+				f := filepathJoinTemp(t, strings.ReplaceAll(name, "/", "_"))
+				if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
+					t.Fatalf("write temp script: %v", err)
 				}
-			}
-			if script == "" {
-				t.Fatal("post-bootstrap.sh not found in rendered write_files")
-			}
-			if !strings.Contains(script, "set_metal3_uuid_label") {
-				t.Fatal("extracted script is not the Metal3 variant (missing set_metal3_uuid_label)")
-			}
-			f := filepathJoinTemp(t, "post-bootstrap.sh")
-			if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
-				t.Fatalf("write temp script: %v", err)
-			}
-			if outBytes, err := exec.Command(bashPath, "-n", f).CombinedOutput(); err != nil {
-				t.Fatalf("bash -n on rendered %s Metal3 post-bootstrap script failed: %v\n%s", tc.name, err, outBytes)
+				if outBytes, err := exec.Command(bashPath, "-n", f).CombinedOutput(); err != nil {
+					t.Fatalf("bash -n on rendered %s %s failed: %v\n%s", tc.name, name, err, outBytes)
+				}
 			}
 		})
 	}
@@ -1089,43 +1115,69 @@ func filepathJoinTemp(t *testing.T, name string) string {
 	return t.TempDir() + string(os.PathSeparator) + name
 }
 
-// TestRenderMetal3_K0sControlPlane verifies the full Metal3 k0s render:
-// (a) metal3.io/uuid label stage present, (b) no providerID injection,
-// (c) push_kubeconfig block present, (d) valid YAML.
+// TestRenderMetal3_K0sControlPlane verifies the full Metal3 k0s render after
+// the CAPM3 v1.13 lab correction:
+// (a) the config-drive providerID pre-start mechanism is present and sets BOTH
+//
+//	provider-id=metal3://<uuid> and the metal3.io/uuid node-label, reading
+//	meta_data.json and validating the UUID fail-closed;
+//
+// (b) NO vsphere://-style providerID and NO post-bootstrap kubectl patch
+//
+//	(those use the wrong, CAPV-shaped providerID for Metal3);
+//
+// (c) push_kubeconfig block still present; (d) valid YAML.
 func TestRenderMetal3_K0sControlPlane(t *testing.T) {
 	result, err := RenderK0sCloudConfig(metal3ControlPlaneData())
 	if err != nil {
 		t.Fatalf("RenderK0sCloudConfig with Metal3=true: %v", err)
 	}
 
-	// (a) Metal3 node-label stage must be present.
-	if !strings.Contains(result, "set_metal3_uuid_label") {
-		t.Error("Metal3 k0s: missing set_metal3_uuid_label function")
+	// (a) Config-drive providerID pre-start mechanism present.
+	if !strings.Contains(result, "kairos-k0s-metal3-providerid.service") {
+		t.Error("Metal3 k0s: missing kairos-k0s-metal3-providerid.service pre-start unit")
+	}
+	if !strings.Contains(result, "kairos-k0s-metal3-providerid.sh") {
+		t.Error("Metal3 k0s: missing kairos-k0s-metal3-providerid.sh script")
+	}
+	// The unit must be ordered BEFORE the k0s service so providerID is set at
+	// first registration (providerID is immutable).
+	if !strings.Contains(result, "Before=k0scontroller.service") {
+		t.Error("Metal3 k0s: pre-start unit must be ordered Before=k0scontroller.service")
 	}
 	if !strings.Contains(result, "meta_data.json") {
 		t.Error("Metal3 k0s: missing meta_data.json reference (config-drive read)")
 	}
-	if !strings.Contains(result, `metal3.io/uuid=`) {
-		t.Error("Metal3 k0s: missing metal3.io/uuid= label command")
+	// Both the kubelet provider-id (metal3://) AND the node-label must be set.
+	if !strings.Contains(result, "--provider-id=metal3://") {
+		t.Error("Metal3 k0s: missing --provider-id=metal3:// kubelet arg")
+	}
+	if !strings.Contains(result, "--node-labels=metal3.io/uuid=") {
+		t.Error("Metal3 k0s: missing --node-labels=metal3.io/uuid= kubelet arg")
 	}
 	// UUID regex validation must be present in the script.
 	if !strings.Contains(result, `[0-9a-fA-F]`) {
 		t.Error("Metal3 k0s: missing UUID regex validation in script")
 	}
-	// Fail-closed messaging must be present.
+	if !strings.Contains(result, "case ") || !strings.Contains(result, "*[!0-9a-fA-F-]*") {
+		t.Error("Metal3 k0s: missing the char-class case guard on the UUID")
+	}
 	if !strings.Contains(result, "fail-closed") {
-		t.Error("Metal3 k0s: missing fail-closed comment/log in label stage")
+		t.Error("Metal3 k0s: missing fail-closed comment/log in providerID script")
 	}
 
-	// (b) No providerID injection.
-	if strings.Contains(result, "--provider-id=") {
-		t.Error("Metal3 k0s: --provider-id= must NOT appear (CAPM3 owns providerID)")
+	// (b) No vsphere://-style providerID and no post-bootstrap kubectl patch.
+	if strings.Contains(result, "vsphere://") {
+		t.Error("Metal3 k0s: vsphere:// must NOT appear (wrong providerID for Metal3)")
 	}
-	if strings.Contains(result, "provider-id=") {
-		t.Error("Metal3 k0s: provider-id= must NOT appear (CAPM3 owns providerID)")
+	if strings.Contains(result, "provider-id=vsphere") {
+		t.Error("Metal3 k0s: provider-id=vsphere must NOT appear")
 	}
 	if strings.Contains(result, `kubectl patch node`) {
-		t.Error("Metal3 k0s: kubectl patch node (providerID) must NOT appear (CAPM3 owns providerID)")
+		t.Error("Metal3 k0s: kubectl patch node (providerID) must NOT appear (set pre-start instead)")
+	}
+	if strings.Contains(result, "set_metal3_uuid_label") {
+		t.Error("Metal3 k0s: old post-bootstrap set_metal3_uuid_label must NOT appear (moved to pre-start)")
 	}
 
 	// (c) push_kubeconfig block must still be present.
@@ -1147,37 +1199,55 @@ func TestRenderMetal3_K3sControlPlane(t *testing.T) {
 		t.Fatalf("RenderK3sCloudConfig with Metal3=true: %v", err)
 	}
 
-	// (a) Metal3 node-label stage must be present.
-	if !strings.Contains(result, "set_metal3_uuid_label") {
-		t.Error("Metal3 k3s: missing set_metal3_uuid_label function")
+	// (a) Config-drive providerID pre-start mechanism present. k3s reuses the
+	// z-provider-id.conf drop-in, but its ExecStartPre runs the Metal3 script.
+	if !strings.Contains(result, "z-provider-id.conf") {
+		t.Error("Metal3 k3s: z-provider-id.conf drop-in must be present (now drives the Metal3 ExecStartPre)")
+	}
+	if !strings.Contains(result, "kairos-k3s-metal3-providerid.sh") {
+		t.Error("Metal3 k3s: missing kairos-k3s-metal3-providerid.sh script")
+	}
+	if !strings.Contains(result, "ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-metal3-providerid.sh") {
+		t.Error("Metal3 k3s: z-provider-id.conf must wire the Metal3 providerID script as ExecStartPre")
 	}
 	if !strings.Contains(result, "meta_data.json") {
 		t.Error("Metal3 k3s: missing meta_data.json reference (config-drive read)")
 	}
-	if !strings.Contains(result, `metal3.io/uuid=`) {
-		t.Error("Metal3 k3s: missing metal3.io/uuid= label command")
+	// The script must write BOTH the kubelet provider-id (metal3://) and the
+	// metal3.io/uuid node-label into config.yaml.d.
+	if !strings.Contains(result, "provider-id=metal3://") {
+		t.Error("Metal3 k3s: missing provider-id=metal3:// in the config.yaml.d write")
+	}
+	if !strings.Contains(result, "metal3.io/uuid=") {
+		t.Error("Metal3 k3s: missing metal3.io/uuid= node-label in the config.yaml.d write")
+	}
+	if !strings.Contains(result, "90-provider-id.yaml") {
+		t.Error("Metal3 k3s: missing 90-provider-id.yaml config.yaml.d target")
 	}
 	if !strings.Contains(result, `[0-9a-fA-F]`) {
 		t.Error("Metal3 k3s: missing UUID regex validation in script")
 	}
+	if !strings.Contains(result, "case ") || !strings.Contains(result, "*[!0-9a-fA-F-]*") {
+		t.Error("Metal3 k3s: missing the char-class case guard on the UUID")
+	}
 	if !strings.Contains(result, "fail-closed") {
-		t.Error("Metal3 k3s: missing fail-closed comment/log in label stage")
+		t.Error("Metal3 k3s: missing fail-closed comment/log in providerID script")
 	}
 
-	// (b) No providerID injection.
-	if strings.Contains(result, "--provider-id=") {
-		t.Error("Metal3 k3s: --provider-id= must NOT appear (CAPM3 owns providerID)")
+	// (b) No vsphere://-style providerID and no post-bootstrap kubectl patch.
+	if strings.Contains(result, "vsphere://") {
+		t.Error("Metal3 k3s: vsphere:// must NOT appear (wrong providerID for Metal3)")
 	}
-	if strings.Contains(result, "provider-id=") {
-		t.Error("Metal3 k3s: provider-id= must NOT appear (CAPM3 owns providerID)")
+	if strings.Contains(result, "provider-id=vsphere") {
+		t.Error("Metal3 k3s: provider-id=vsphere must NOT appear")
 	}
 	if strings.Contains(result, `kubectl patch node`) {
-		t.Error("Metal3 k3s: kubectl patch node (providerID) must NOT appear (CAPM3 owns providerID)")
+		t.Error("Metal3 k3s: kubectl patch node (providerID) must NOT appear (set pre-start instead)")
 	}
-	// The z-provider-id.conf drop-in and discover-provider-id script must also be absent.
-	if strings.Contains(result, "z-provider-id.conf") {
-		t.Error("Metal3 k3s: z-provider-id.conf must NOT appear (CAPM3 owns providerID)")
+	if strings.Contains(result, "set_metal3_uuid_label") {
+		t.Error("Metal3 k3s: old post-bootstrap set_metal3_uuid_label must NOT appear (moved to pre-start)")
 	}
+	// The CAPV VM self-discovery script must also be absent for Metal3.
 	if strings.Contains(result, "kairos-k3s-discover-provider-id.sh") {
 		t.Error("Metal3 k3s: kairos-k3s-discover-provider-id.sh must NOT appear for Metal3")
 	}
@@ -1195,17 +1265,20 @@ func TestRenderMetal3_K3sControlPlane(t *testing.T) {
 }
 
 // TestRenderMetal3_SuppressionWithNonEmptyProviderID verifies that even when
-// the controller accidentally passes a non-empty ProviderID alongside Metal3=true,
-// the template guards (not .Metal3) prevent any providerID content from rendering.
+// the controller accidentally passes a non-empty (CAPV-shaped) ProviderID
+// alongside Metal3=true, the template guards (not .Metal3) prevent the
+// RENDER-TIME providerID from being interpolated anywhere: no vsphere://-style
+// kubelet arg, no kubectl patch. The only providerID that may appear is the
+// metal3://<uuid> value computed at boot by the config-drive pre-start script.
 // This is the belt-and-braces check for the controller's suppression logic.
 func TestRenderMetal3_SuppressionWithNonEmptyProviderID(t *testing.T) {
 	for _, dist := range []string{"k0s", "k3s"} {
 		dist := dist
 		t.Run(dist, func(t *testing.T) {
 			data := metal3ControlPlaneData()
-			// Deliberately set ProviderID even though Metal3=true.
-			// The template must ignore it.
-			data.ProviderID = "metal3://default/some-bmh/some-m3m"
+			// Deliberately set a CAPV-shaped ProviderID even though Metal3=true.
+			// The template must ignore the render-time value entirely.
+			data.ProviderID = "vsphere://422fa74a-5d60-3a4a-af24-1f07be515fcc"
 
 			var (
 				result string
@@ -1220,15 +1293,19 @@ func TestRenderMetal3_SuppressionWithNonEmptyProviderID(t *testing.T) {
 				t.Fatalf("render with Metal3=true + ProviderID set (%s): %v", dist, err)
 			}
 
-			if strings.Contains(result, "--provider-id=") {
-				t.Errorf("%s: --provider-id= must NOT appear when Metal3=true (CAPM3 owns providerID)", dist)
+			// The render-time providerID must not leak in anywhere.
+			if strings.Contains(result, "vsphere://") {
+				t.Errorf("%s: vsphere:// render-time providerID must NOT appear when Metal3=true", dist)
+			}
+			if strings.Contains(result, "422fa74a-5d60-3a4a-af24-1f07be515fcc") {
+				t.Errorf("%s: the render-time providerID UUID must NOT appear when Metal3=true", dist)
 			}
 			if strings.Contains(result, `kubectl patch node`) {
 				t.Errorf("%s: kubectl patch node must NOT appear when Metal3=true", dist)
 			}
-			// The Metal3 label stage must still be present.
-			if !strings.Contains(result, "set_metal3_uuid_label") {
-				t.Errorf("%s: set_metal3_uuid_label must appear when Metal3=true", dist)
+			// The metal3:// boot-computed provider-id mechanism must still be present.
+			if !strings.Contains(result, "--provider-id=metal3://") && !strings.Contains(result, "provider-id=metal3://") {
+				t.Errorf("%s: the metal3:// config-drive providerID mechanism must appear when Metal3=true", dist)
 			}
 		})
 	}
