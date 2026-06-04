@@ -15,9 +15,9 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 **Latest release**: [`v0.1.0-alpha.1`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-alpha.1) — initial alpha. Pre-release; API surface may change before v0.1.0.
 
-Supports single-node k0s and k3s clusters with CAPD, CAPV, and CAPK. `spec.replicas > 1` is currently webhook-rejected; HA control planes are on the roadmap (KD-5b / KD-25). Additional infrastructure providers (Metal3, Tinkerbell, hyperscalers) are also on the roadmap.
+Supports single-node k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal). `spec.replicas > 1` is currently webhook-rejected; HA control planes are on the roadmap (KD-5b / KD-25). Additional infrastructure providers (Tinkerbell, hyperscalers) are also on the roadmap.
 
-- v0.1.0-alpha.2 ships KD-3b — SSH no longer in the controller's hot path. SSH credentials in `KairosConfig` will be consumed only by the planned `SSHFallback` opt-in mechanism (post-alpha-2, PR-9). See [docs/UPGRADING.md](docs/UPGRADING.md) for the alpha-1 → alpha-2 impact.
+- The upcoming v0.1.0-alpha.2 adds Metal3 (CAPM3) bare-metal support (lab-validated), removes default credentials, and moves SSH out of the controller's hot path in favor of a node-push kubeconfig path. See [docs/UPGRADING.md](docs/UPGRADING.md) for the alpha-1 → alpha-2 migration steps.
 
 Read the [v0.1.0-alpha.1 release notes](docs/release-notes/v0.1.0-alpha.1.md) before using — there are important security caveats and known limitations.
 
@@ -41,7 +41,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | --- | --- |
 | Kubernetes (workload) | bundled in your Kairos image (k3s/k0s, typically v1.30+) |
 | Kubernetes (management) | v1.30+ |
-| Cluster API | v1.8.x (v1.11.x tracking is on the roadmap, KD-13) |
+| Cluster API | v1.9+ (for CAPM3); v1.8.x for CAPD/CAPV/CAPK |
 | Kairos | v3.6.0+ |
 | Distributions | k0s, k3s |
 
@@ -56,6 +56,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 - [CAPD (Docker)](docs/QUICKSTART_CAPD.md)
 - [CAPV (vSphere)](docs/QUICKSTART_CAPV.md)
 - [CAPK (KubeVirt)](docs/QUICKSTART_CAPK.md)
+- [Metal3 (bare metal)](docs/QUICKSTART_CAPM3.md)
 
 ## Development
 

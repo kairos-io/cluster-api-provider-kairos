@@ -118,9 +118,11 @@ Starting with v0.1.0-alpha.2, the controller no longer SSHes into nodes to
 retrieve the workload kubeconfig. Instead, control-plane nodes POST their
 kubeconfig back to a Secret in the management cluster.
 
-**Workload VMs (CAPV / CAPM3 / Tinkerbell) must have network reachability to
-the management cluster's API server URL.** Verify from a sample workload node
-before deploying:
+**Workload nodes running on non-CAPK infrastructure (CAPV / CAPM3 / Tinkerbell
+and any future provider) must have network reachability to the management
+cluster's API server URL.** This includes bare-metal nodes provisioned via
+Metal3 — they POST their kubeconfig to a Secret in the management cluster.
+Verify reachability from a sample workload node before deploying:
 
 ```bash
 curl -k https://<mgmt-api-server-host>:6443/api
@@ -136,5 +138,6 @@ For air-gapped or strictly-segmented network environments, see the planned
 - [CAPD Quickstart](QUICKSTART_CAPD.md) — create a cluster with Docker (development only).
 - [CAPV Quickstart](QUICKSTART_CAPV.md) — create a cluster with vSphere.
 - [CAPK Quickstart](QUICKSTART_CAPK.md) — create a cluster with KubeVirt.
+- [CAPM3 Quickstart](QUICKSTART_CAPM3.md) — create a cluster on bare metal via Metal3.
 
 For the current release status, known issues, and security caveats, read the [release notes](release-notes/v0.1.0-alpha.1.md).

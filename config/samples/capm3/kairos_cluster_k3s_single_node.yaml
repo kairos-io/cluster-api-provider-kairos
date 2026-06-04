@@ -1,0 +1,254 @@
+# ============================================================================
+# CAPM3 Sample: Single-Node k3s Cluster on Kairos OS (bare metal via Metal3)
+# ============================================================================
+#
+# Lab-validated path. This manifest provisions a single-node k3s control plane
+# on real (or emulated) bare metal via Metal3 + Ironic + baremetal-operator.
+#
+# PREREQUISITES (all must be satisfied before applying this manifest):
+#
+#   1. Cluster API core v1.9+ installed on the management cluster.
+#
+#   2. CAPM3 v1.13+ installed (first release with v1beta2 as the stored version).
+#      Verify: kubectl get crd metal3clusters.infrastructure.cluster.x-k8s.io
+#
+#   3. baremetal-operator (BMO) v0.13+ and Ironic running and accessible.
+#      Verify: kubectl get baremetalhosts -A
+#
+#   4. Kairos CAPI provider v0.1.0-alpha.2+ installed.
+#      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+#
+#   5. A fully-installed Kairos k3s disk image served over HTTP.
+#      See the "Building the disk image" section in docs/QUICKSTART_CAPM3.md.
+#      A Kairos *installer ISO* image does NOT work here — you need the
+#      fully-installed raw disk. See CRITICAL NOTE below.
+#
+#   6. A BareMetalHost registered with BMO for the target node.
+#      The BMC-credentials Secret and BareMetalHost examples are included
+#      below (commented out). Uncomment and edit them for your hardware.
+#
+#   7. The control-plane node's IP must be known (or DHCP-reserved) before
+#      applying, because controlPlaneEndpoint cannot be auto-discovered.
+#      Phase 1 is DHCP-only; static IPAM (Metal3DataTemplate) is future.
+#      Recommendation: set a DHCP reservation tied to the BMH MAC address.
+#
+# APPLY:
+#   kubectl apply -f config/samples/capm3/kairos_cluster_k3s_single_node.yaml
+#
+# ============================================================================
+#
+# !! CRITICAL: DISK IMAGE MUST BE FULLY INSTALLED — NOT AN INSTALLER ISO !!
+#
+# Ironic whole-disk-deploys the raw image to the node's disk, then the node
+# UEFI-boots it directly. There is NO installer stage.
+#
+# An auroraboot disk.raw (recovery / auto-reset image) does NOT work here:
+# its first-boot auto-reset repartitioning collides with the config-2
+# partition Ironic appends for the config-drive. The node boots into
+# cos-recovery (ephemeral overlay) and k3s fails with an
+# "overlay not supported as upperdir" loop — it never provisions a working
+# node.
+#
+# You MUST supply a fully-installed disk image (COS_ACTIVE + COS_PERSISTENT
+# partitions already populated). See docs/QUICKSTART_CAPM3.md §
+# "Building the disk image" for the supported QEMU install-to-disk procedure.
+#
+# !! CRITICAL: KUBERNETES VERSION IS BAKED INTO THE DISK IMAGE !!
+#
+# KairosControlPlane.spec.version and KairosConfigTemplate.spec.kubernetesVersion
+# are informational for the Metal3 whole-disk path. They do NOT change what
+# k3s version runs on the node. The version is whatever the installer ISO
+# bundled (e.g., kairos-...-k3sv1.33.5+k3s1 yields v1.33.5+k3s1 regardless
+# of what the manifest says).
+#
+# Build the disk image at the k3s version you intend to run, then set
+# spec.version and kubernetesVersion to match that version.
+#
+# ============================================================================
+#
+# SINGLE-NODE ONLY
+# replicas > 1 is webhook-rejected. HA control planes are tracked in KD-5b.
+#
+# ============================================================================
+
+# IMPORTANT: replace `password:` below with a strong value before applying.
+# `openssl rand -base64 32` generates a suitable value.
+# Inline userPassword in KairosConfig is deprecated; this Secret pattern is
+# the recommended way to provide it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: kairos-m3
+  namespace: default
+spec:
+  # v1beta2 uses apiGroup (not apiVersion) in these references.
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: Metal3Cluster
+    name: kairos-m3
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KairosControlPlane
+    name: kairos-m3-cp
+  # Required: set this to the control-plane node's stable IP before applying.
+  # CAPM3 and this provider do NOT auto-discover the endpoint.
+  # In DHCP-only Phase 1, this is the node's DHCP-assigned data-plane IP.
+  # Recommendation: set a DHCP reservation tied to the BMH's MAC address so
+  # the IP is stable across reboots.
+  # Without a valid endpoint, KairosControlPlane stalls with
+  # Available=False(WaitingForInfrastructureControlPlaneEndpoint).
+  controlPlaneEndpoint:
+    host: "TODO-CONTROL-PLANE-NODE-IP"
+    port: 6443
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: Metal3Cluster
+metadata:
+  name: kairos-m3
+  namespace: default
+spec:
+  # Must match Cluster.spec.controlPlaneEndpoint above.
+  controlPlaneEndpoint:
+    host: "TODO-CONTROL-PLANE-NODE-IP"
+    port: 6443
+  # No cloud controller manager for bare metal.
+  # CAPM3 v1.13 with cloudProviderEnabled: false finds the Node by the
+  # metal3.io/uuid label and validates providerID=metal3://<BareMetalHost-UID>.
+  # The Kairos cloud-config sets both the kubelet --provider-id flag and the
+  # node label from the config-drive metadata before k3s registers the node.
+  # No manual providerID patching is required.
+  cloudProviderEnabled: false
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-m3-cp
+  namespace: default
+spec:
+  # Single-node only. replicas > 1 is webhook-rejected (KD-5b).
+  replicas: 1
+  # Set this to match the k3s version bundled in your disk image (see CRITICAL
+  # note at the top of this file). This value is informational on the Metal3
+  # whole-disk path — it does not change what version runs on the node.
+  version: "v1.34.3+k3s3"
+  distribution: k3s
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: Metal3MachineTemplate
+      name: kairos-m3-cp
+      namespace: default
+  kairosConfigTemplate:
+    name: kairos-m3-cp-config
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: Metal3MachineTemplate
+metadata:
+  name: kairos-m3-cp
+  namespace: default
+spec:
+  template:
+    spec:
+      image:
+        # URL of the fully-installed Kairos k3s raw disk image served over HTTP.
+        # The image server must be reachable from the Ironic provisioning network.
+        # Example: http://192.168.222.2:6180/images/kairos-k3s-installed.raw
+        url: "http://TODO-IMAGE-HOST/images/kairos-k3s-installed.raw"
+        # URL of the checksum file (md5sum / sha256sum output, one line).
+        # sha256 and sha512 are also accepted by Ironic; md5 shown here for
+        # compatibility with older Ironic deployments.
+        checksum: "http://TODO-IMAGE-HOST/images/kairos-k3s-installed.raw.md5"
+        # One of: md5, sha256, sha512. Must match the checksum file above.
+        checksumType: md5
+        # Ironic whole-disk deploy; the image is a raw disk, not a partition image.
+        diskFormat: raw
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-m3-cp-config
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      distribution: k3s
+      # Set to match the k3s version bundled in your disk image (informational;
+      # the actual version is baked in — see CRITICAL note at the top of this file).
+      kubernetesVersion: "v1.34.3+k3s3"
+      # NO install: block. Ironic has already written the OS to disk via
+      # whole-disk deploy. The cloud-config is consumed on first boot via
+      # Ironic's config-drive (label "config-2"). An install: block here would
+      # cause Kairos to attempt a second install on the already-provisioned disk.
+      userName: kairos
+      # Password comes from the Secret defined at the top of this file.
+      # Alternative: set sshPublicKey: and omit userPasswordSecretRef.
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+      # Optional: add SSH public key for direct node access.
+      # sshPublicKey: "ssh-rsa AAAAB3NzaC1yc2E..."
+      # Optional: import SSH public keys from a GitHub user's profile.
+      # githubUser: "your-github-username"
+
+# ============================================================================
+# BareMetalHost and BMC credentials (REQUIRED — uncomment and edit for your hardware)
+# ============================================================================
+#
+# The BareMetalHost registers your physical server with baremetal-operator.
+# BMO + Ironic manage power control and OS provisioning from this point on.
+#
+# APPLY ORDER:
+#   1. Apply the bmc-credentials Secret first.
+#   2. Apply the BareMetalHost. BMO will inspect and make the host available.
+#   3. Apply this cluster manifest — CAPM3 will claim the available host.
+#
+# IMPORTANT:
+#   - bmc-credentials must be in the same namespace as the BareMetalHost.
+#   - BareMetalHost.spec.bootMACAddress must be the MAC address of the NIC
+#     on the provisioning network (the one Ironic PXE-boots through).
+#   - BareMetalHost.spec.bmc.address format depends on your BMC type:
+#       IPMI:    ipmi://<bmc-ip>
+#       Redfish: redfish://<bmc-ip>/redfish/v1/Systems/1
+#       iDRAC:   idrac-redfish://<bmc-ip>/redfish/v1/Systems/System.Embedded.1
+#
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: kairos-m3-bmc-credentials
+#   namespace: default
+# type: Opaque
+# stringData:
+#   username: "TODO-BMC-USERNAME"
+#   password: "TODO-BMC-PASSWORD"   # Use REPLACE_WITH_A_STRONG_PASSWORD pattern
+# ---
+# apiVersion: metal3.io/v1alpha1
+# kind: BareMetalHost
+# metadata:
+#   name: kairos-m3-node-0
+#   namespace: default
+# spec:
+#   # Set to true to allow CAPM3 to provision this host.
+#   online: true
+#   # MAC address of the NIC on the provisioning (Ironic) network.
+#   bootMACAddress: "TODO-NIC-MAC-ADDRESS"
+#   bmc:
+#     # BMC address — format depends on hardware. Examples:
+#     #   IPMI:    ipmi://192.168.0.10
+#     #   Redfish: redfish://192.168.0.10/redfish/v1/Systems/1
+#     address: "TODO-BMC-ADDRESS"
+#     credentialsName: kairos-m3-bmc-credentials
+#   # Optional: specify the root device to avoid ambiguity on multi-disk nodes.
+#   # rootDeviceHints:
+#   #   minSizeGigabytes: 100
