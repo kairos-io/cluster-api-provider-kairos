@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPM3 (Metal3 / bare metal)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.12.x, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0-alpha.2. Validated on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM); the same flow applies to physical hardware with a Redfish/IPMI BMC.
+Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.12.x, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0-alpha.2. Validated on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal, 2026-06-18); the same flow applies to physical hardware with a Redfish/IPMI BMC.
 
 This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). The k3s path is the lab-validated end-to-end path; k0s uses the identical flow and differs only in distribution and version fields.
 
@@ -36,9 +36,44 @@ This is the most important prerequisite. Ironic deploys a raw disk image. That i
 
 An auroraboot `disk.raw` (recovery / auto-reset image) is designed to auto-reset-install on first boot. Its first-boot repartitioning collides with the `config-2` partition Ironic appends as the config-drive. The node boots into `cos-recovery` (an ephemeral overlay) instead of the persistent active system. k3s / k0s then fails with an `overlay not supported as upperdir` error and never provisions a working node.
 
+### Hadron images: additional failure mode
+
+Kairos Hadron is the next-generation Kairos OS (musl-libc based). When a Hadron image that has not been fully installed is deployed via Ironic, the failure is different from the standard Kairos `cos-recovery` case described above:
+
+- `kairos-agent` reports `boot_mode=recovery_boot` on the node.
+- k0scontroller stays `disabled`; `/etc/k0s` and `/var/lib/k0s` are never created.
+- k3s similarly never starts.
+- The CAPI Machine stays `Provisioning` indefinitely.
+
+This occurs because an `auroraboot build-iso` product (or `auroraboot disk.raw`) produces an image with a populated `recovery` partition but no `state` (active) partition. Ironic writes it to disk; the node boots into recovery mode rather than the active system.
+
+The fix is the same as for standard Kairos: build a fully-installed disk. The supported pipeline for Hadron:
+
+1. Build the Hadron ISO with `auroraboot`:
+   ```bash
+   auroraboot build-iso -n <name> docker:<hadron-image>
+   # e.g.: docker:quay.io/kairos/hadron:v0.0.4-standard-amd64-generic-v4.0.3-k3s-v1.35.2-k3s1
+   ```
+2. Boot that ISO in QEMU against a blank 20 G raw disk with an install cloud-config (same QEMU procedure described below), allowing Kairos to install and power off.
+3. Verify with `losetup`: the `state` partition (label `state`) must be present alongside `recovery`.
+4. Serve the resulting `<name>-installed.raw` + `.md5` from the Ironic httpd.
+
+**Quick verification before serving the image:**
+
+```bash
+sudo losetup -fP <name>-installed.raw
+# Note the device printed, e.g. /dev/loop0
+sudo blkid /dev/loop0p*
+# A correctly-installed Hadron disk has both a "state" and a "recovery" partition.
+# If you only see "recovery" (no "state"), the image was not fully installed.
+sudo losetup -d /dev/loop0
+```
+
+The same verification applies to standard Kairos images: `COS_ACTIVE` corresponds to `state`, `COS_PERSISTENT` is the data partition.
+
 ### Required: a fully-installed Kairos raw disk
 
-The image you provide must have `COS_ACTIVE`, `COS_PERSISTENT`, `COS_OEM`, and `COS_STATE` partition labels already present. The node boots straight into the active, persistent system and reads the config-drive.
+The image you provide must have `COS_ACTIVE`, `COS_PERSISTENT`, `COS_OEM`, and `COS_STATE` partition labels already present (or for Hadron: `efi`, `oem`, `persistent`, `recovery`, `state`). The node boots straight into the active, persistent system and reads the config-drive.
 
 ### Producing the image: QEMU install-to-disk
 
@@ -119,11 +154,14 @@ Replace `/path/to/OVMF_CODE.fd` with your OVMF firmware path (commonly `/usr/sha
 sudo losetup -fP kairos-installed.raw
 # Note the device name printed, e.g. /dev/loop0
 sudo blkid /dev/loop0p*
-# Expect labels: COS_ACTIVE, COS_PERSISTENT, COS_OEM, COS_STATE
+# Standard Kairos — expect labels: COS_ACTIVE, COS_PERSISTENT, COS_OEM, COS_STATE
+# Hadron — expect labels:          efi, oem, persistent, recovery, state
 sudo losetup -d /dev/loop0
 ```
 
-If `COS_ACTIVE` and `COS_PERSISTENT` are not present, the install did not complete — do not use this image.
+For standard Kairos: if `COS_ACTIVE` and `COS_PERSISTENT` are not present, the install did not complete.
+
+For Hadron: if `state` is not present (only `recovery` is visible), the image is an installer/live image, not a fully-installed disk. Do not use it with Ironic — the node will boot into recovery mode and k0s/k3s will never start.
 
 **Step 5: Generate checksums and serve over HTTP.**
 
@@ -351,6 +389,50 @@ If the node cannot reach the management API server, enable the opt-in [Air-gappe
 
 ---
 
+## Hadron on Metal3: operator notes
+
+This section collects lab-validated findings specific to Kairos Hadron images deployed via Metal3. Hadron is the musl-libc-based next-generation Kairos OS; it shares the same Metal3 provisioning flow but has a few differences from standard (glibc) Kairos images.
+
+### Pinning the control-plane IP
+
+The Metal3 config-drive `network_data` DHCPs the node's data-plane NIC. For single-node clusters where the `controlPlaneEndpoint` host must match a fixed IP, the DHCP-assigned address is non-deterministic and will not automatically match what you set in the manifest.
+
+Two approaches, in preference order:
+
+1. **DHCP reservation** — pin the IP at the network layer, tied to the `BareMetalHost.spec.bootMACAddress`. The IP is stable before first boot and requires no cloud-config changes. This is the most reliable approach.
+
+2. **`spec.files` + systemd-networkd** — write a `.network` unit file matching the data-plane NIC's MAC address and set a static address equal to the `controlPlaneEndpoint` host. The file is delivered via the cloud-config `write_files:` list (see [`KairosConfigTemplate.spec.template.spec.files`](API_REFERENCE.md#writing-files-to-nodes)).
+
+   Example `KairosConfigTemplate` snippet:
+
+   ```yaml
+   spec:
+     template:
+       spec:
+         files:
+           - path: /etc/systemd/network/10-cp.network
+             content: |
+               [Match]
+               MACAddress=aa:bb:cc:dd:ee:ff
+   
+               [Network]
+               Address=192.168.1.100/24
+               Gateway=192.168.1.1
+               DNS=192.168.1.1
+             permissions: "0644"
+             owner: "root:root"
+   ```
+
+   Replace `MACAddress`, `Address`, `Gateway`, and `DNS` with your network's values. The `MACAddress=` match key is more reliable than an interface name on bare metal where NIC names can vary by firmware.
+
+   **Caveat:** this is the same static-IP race condition described in the API reference. On a pre-installed disk image, systemd-networkd may already hold a DHCP lease when the file lands. The static IP takes effect after the next `networkctl reload`; if k0s or k3s has already bound the DHCP address, the running process will not switch addresses until the node is rebooted. The DHCP reservation approach avoids this race entirely. See [Writing files to nodes — Static IP via systemd-networkd](API_REFERENCE.md#static-ip-via-systemd-networkd--known-limitation-on-pre-installed-images) for the full explanation.
+
+### Hadron `write_files` file ownership (musl compatibility)
+
+Kairos Hadron uses musl-libc, which resolves file ownership by name rather than by numeric UID/GID. The provider emits `owner: root` (by name) in all `write_files:` entries, not `owner: 0` (by UID). This is the correct behavior for Hadron and is also accepted by glibc-based Kairos images. If you author your own `spec.files` entries, use `owner: "root:root"` (name form) — numeric owners such as `"0:0"` are rejected by the webhook and would fail on Hadron regardless. This behavior was confirmed in the lab (2026-06-18, commit 9ac886b).
+
+---
+
 ## Troubleshooting
 
 ### Node stays in provisioning; BareMetalHost stays in `provisioning` state
@@ -370,9 +452,34 @@ Common causes:
    ipmitool -I lanplus -H <bmc-ip> -U <user> -P <pass> chassis status
    ```
 
-### Node provisions but k3s never starts; logs show `overlay not supported as upperdir`
+### Node provisions but k3s/k0s never starts; logs show `overlay not supported as upperdir`
 
 This means an auroraboot auto-reset image was deployed instead of a fully-installed disk. Re-read the "Building the disk image" section. The `cos-recovery` partition is an ephemeral overlay and cannot host a persistent upper directory. Re-provision with a correctly-built image.
+
+### Node provisions (Hadron) but Machine stays `Provisioning`; `kairos-agent` reports `boot_mode=recovery_boot`
+
+This is the Hadron-specific form of the same root cause. On a Hadron image that has not been fully installed, `kairos-agent` reports `boot_mode=recovery_boot` at boot. The consequences:
+
+- `k0scontroller` stays `disabled`; `/etc/k0s` and `/var/lib/k0s` are never created.
+- k3s similarly does not start.
+- The CAPI Machine stays in `Provisioning` indefinitely with no further error.
+
+Check this condition on the node (via console or SSHFallback):
+
+```bash
+kairos-agent status | grep boot_mode
+# boot_mode=recovery_boot  →  wrong image
+# boot_mode=active_boot    →  correct image
+```
+
+Also check the partition table:
+
+```bash
+lsblk -o NAME,LABEL
+# "state" partition absent → image was not fully installed
+```
+
+Reprovision with a fully-installed Hadron disk. See the "Hadron images: additional failure mode" subsection under "Building the disk image" above for the build pipeline.
 
 ### Node provisions but `KubeconfigReadyCondition` stays `False(WaitingForNodePush)`
 

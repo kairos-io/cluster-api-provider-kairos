@@ -49,9 +49,17 @@
 # "overlay not supported as upperdir" loop — it never provisions a working
 # node.
 #
+# HADRON IMAGES: an auroraboot disk.raw or build-iso output for Hadron also
+# does not work. The node boots into recovery mode (kairos-agent reports
+# boot_mode=recovery_boot); k3s never starts. Build a fully-installed disk
+# using the QEMU procedure below. Quick check: losetup + blkid should show
+# a "state" partition. If only "recovery" appears, the image is not installed.
+#
 # You MUST supply a fully-installed disk image (COS_ACTIVE + COS_PERSISTENT
-# partitions already populated). See docs/QUICKSTART_CAPM3.md §
-# "Building the disk image" for the supported QEMU install-to-disk procedure.
+# for standard Kairos; "state" + "recovery" for Hadron). See
+# docs/QUICKSTART_CAPM3.md § "Building the disk image" for the QEMU
+# install-to-disk procedure and § "Hadron on Metal3: operator notes" for
+# Hadron-specific guidance including control-plane IP pinning.
 #
 # !! CRITICAL: KUBERNETES VERSION IS BAKED INTO THE DISK IMAGE !!
 #

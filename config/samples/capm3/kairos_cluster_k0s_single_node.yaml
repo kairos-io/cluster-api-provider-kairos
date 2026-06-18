@@ -47,6 +47,13 @@
 # config-drive partition. See docs/QUICKSTART_CAPM3.md and the k3s sample
 # header for the full explanation and the QEMU install-to-disk procedure.
 #
+# HADRON IMAGES: an auroraboot disk.raw or build-iso output for Hadron also
+# does not work. The node will boot into recovery mode (kairos-agent reports
+# boot_mode=recovery_boot) and k0s will never start. Build a fully-installed
+# disk using the QEMU procedure. See docs/QUICKSTART_CAPM3.md §
+# "Hadron images: additional failure mode" and § "Hadron on Metal3: operator
+# notes" for the build pipeline and IP-pinning guidance.
+#
 # !! CRITICAL: KUBERNETES VERSION IS BAKED INTO THE DISK IMAGE !!
 #
 # spec.version and kubernetesVersion are informational on the Metal3
