@@ -196,7 +196,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 
 2. **Management cluster**: A Kubernetes cluster with network access to the Ironic API and to the workload nodes.
 
-3. **Cluster API core**: v1.9+ installed (lab-validated against v1.12.x). CAPM3 v1.13 stores its CRDs at the `v1beta2` contract, so the management cluster's CAPI core must serve `v1beta2`. (This provider's typed client additionally relies on `cluster.x-k8s.io/v1beta1` still being served; CAPI continues to serve both, so no action is needed.) The manifests in this guide are authored in `v1beta2`. Verify:
+3. **Cluster API core**: v1.9+ required (v1beta2 wire contract); lab-validated against v1.12.x. CAPM3 v1.13 stores its CRDs at the `v1beta2` contract, so the management cluster's CAPI core must serve `v1beta2`. (This provider's typed client additionally relies on `cluster.x-k8s.io/v1beta1` still being served; CAPI continues to serve both, so no action is needed.) The manifests in this guide are authored in `v1beta2`. Verify:
    ```bash
    kubectl api-versions | grep cluster.x-k8s.io
    ```

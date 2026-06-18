@@ -1,6 +1,7 @@
 # Install Guide
 
-Last verified against: CAPI v1.8.x, cert-manager v1.15+, provider v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x),
+cert-manager v1.15+, provider v0.1.0-alpha.2.
 
 Two install paths: the released artifact (recommended for users) and a developer install from source.
 
@@ -20,9 +21,9 @@ Use this if you want to consume a tagged release.
    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.2/cert-manager.yaml
    kubectl wait --for=condition=Available --timeout=2m -n cert-manager deploy/cert-manager-webhook
    ```
-3. **Cluster API core** installed. Easiest path:
+3. **Cluster API core v1.9+** installed. Easiest path:
    ```bash
-   kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.8.0/cluster-api-components.yaml
+   kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.12.0/cluster-api-components.yaml
    ```
    Or use `clusterctl init --infrastructure docker` (or vsphere, kubevirt, ...) if you already have clusterctl configured — `clusterctl init` installs Cluster API core as a side effect of installing the infrastructure provider.
 4. `kubectl` configured to use the management cluster.
@@ -30,7 +31,7 @@ Use this if you want to consume a tagged release.
 ### Install
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
 ```
 
 This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace.
@@ -52,7 +53,7 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 ### Uninstall
 
 ```bash
-kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
 ```
 
 **Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:
@@ -128,8 +129,11 @@ Verify reachability from a sample workload node before deploying:
 curl -k https://<mgmt-api-server-host>:6443/api
 ```
 
-For air-gapped or strictly-segmented network environments, see the planned
-`SSHFallback` opt-in mechanism (post-alpha-2, PR-9).
+For air-gapped or strictly-segmented network environments, enable the opt-in
+`SSHFallback` mechanism on the `KairosControlPlane`. This requires a
+host-key-verified SSH identity Secret and a `known_hosts` Secret. See
+[QUICKSTART_CAPV.md §Air-gapped fallback](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
+for the full configuration steps.
 
 ---
 
@@ -140,4 +144,4 @@ For air-gapped or strictly-segmented network environments, see the planned
 - [CAPK Quickstart](QUICKSTART_CAPK.md) — create a cluster with KubeVirt.
 - [CAPM3 Quickstart](QUICKSTART_CAPM3.md) — create a cluster on bare metal via Metal3.
 
-For the current release status, known issues, and security caveats, read the [release notes](release-notes/v0.1.0-alpha.1.md).
+For the current release status, breaking changes, and security caveats, read the [v0.1.0-alpha.2 release notes](release-notes/v0.1.0-alpha.2.md).

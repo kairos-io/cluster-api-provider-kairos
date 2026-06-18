@@ -1,14 +1,49 @@
 # Upgrading Kairos CAPI Provider
 
-> This file is a stub. The canonical upgrade procedures land in a later PR
-> (`docs/kd-35-kd-36-install-upgrade`). For now this captures the
-> alpha-1 → alpha-2 KD-3b impact and the alpha-2 → alpha-3 KD-12 impact.
+## v0.1.0-alpha.1 → v0.1.0-alpha.2
 
-## v0.1.0-alpha.2 → v0.1.0-alpha.3
+### Credential migration: default credentials removed
+
+Alpha-2 removes the implicit `kairos:kairos` user/password and the
+`PasswordAuthentication yes` SSH setting. The validating webhook now **rejects**
+any `KairosConfig` or `KairosConfigTemplate` that carries no credential.
+
+**Before upgrading, add a credential to every `KairosConfig` and
+`KairosConfigTemplate` in your management cluster.** Recommended approach:
+
+1. Create the user-password Secret if it does not exist:
+   ```bash
+   kubectl create secret generic kairos-user-password \
+     --from-literal=password=$(openssl rand -base64 32)
+   ```
+
+2. Edit each `KairosConfig` (or `KairosConfigTemplate`) to include at least
+   one of:
+
+   ```yaml
+   spec:
+     userPasswordSecretRef:
+       name: kairos-user-password   # recommended
+   # or:
+     sshPublicKey: "ssh-rsa AAAA..."
+   # or:
+     githubUser: "your-github-username"
+   ```
+
+3. Apply the changes, then upgrade the provider:
+   ```bash
+   kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+   ```
+
+If you upgrade the provider first and then add credentials, any `KairosConfig`
+admission that fires in the gap (for example from a Machine rollout) will be
+rejected by the webhook.
+
+---
 
 ### KD-12: KCP no longer writes `Cluster.Spec.ControlPlaneEndpoint`
 
-The alpha-3 release removes the two blocks in `updateClusterStatus` that wrote
+Alpha-2 removes the two blocks in `updateClusterStatus` that wrote
 `Cluster.Spec.ControlPlaneEndpoint` from Machine IP addresses (CAPV/CAPD) or
 from the LoadBalancer Service Ingress IP (CAPK). `Cluster.Spec.ControlPlaneEndpoint`
 is now written exclusively by CAPI core, which copies it from the infra-cluster's
@@ -27,11 +62,9 @@ that treat unknown Reasons as opaque strings are unaffected.
 
 ---
 
-## v0.1.0-alpha.1 → v0.1.0-alpha.2
-
 ### KD-3b: SSH eliminated from controller normal operation
 
-The alpha-2 release removes synchronous SSH from the controller's hot path.
+Alpha-2 removes synchronous SSH from the controller's hot path.
 The bootstrap controller now writes a `push_kubeconfig()` shell function into
 every control-plane node's cloud-config. After k0s/k3s starts, the **node**
 POSTs its workload kubeconfig back to a Secret in the management cluster using
@@ -99,3 +132,10 @@ For air-gapped or strictly-segmented network environments, enable
 `Spec.SSHFallback` on the `KairosControlPlane`. See
 [Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
 for the full operator procedure.
+
+---
+
+## v0.1.0-alpha.2 → v0.1.0-alpha.3
+
+No upgrade guidance is published for this path yet — alpha.3 has not shipped.
+This section will be populated when the alpha.3 release branch is cut.

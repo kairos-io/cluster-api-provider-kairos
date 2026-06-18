@@ -1,8 +1,8 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.8.x (go.mod), provider branch feat/capm3-metal3-support.
+Last verified against: Kairos v3.6.0+, CAPI v1.9+ required (go.mod imports v1.8 types; see Notes §API Version Compatibility), provider v0.1.0-alpha.2.
 
-This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md).
+This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
 ## Table of Contents
 
@@ -419,7 +419,7 @@ This is a known limitation of post-boot file writes for network configuration on
 ### API Version Compatibility
 
 - **Kairos CAPI Provider APIs**: `bootstrap.cluster.x-k8s.io/v1beta2` and `controlplane.cluster.x-k8s.io/v1beta2`.
-- **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). However, the Go module currently imports `sigs.k8s.io/cluster-api/api/v1beta1` because the go.mod pins CAPI v1.8.0 which predates the v1beta2 Go package. Bumping to CAPI v1.11 is tracked as KD-13. This is a compile-time import detail; the CRD API group and version on the wire are not affected.
+- **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). The Go module currently imports `sigs.k8s.io/cluster-api/api/v1beta1` because go.mod pins CAPI v1.8 Go types — the v1beta2 Go package did not exist at that module version. This is a compile-time import detail only; the CRD API group and version on the wire are not affected. CAPI v1.9+ is required at runtime (the v1beta2 wire contract). Bumping go.mod to CAPI v1.11+ is tracked as KD-13.
 - **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK uses `infrastructure.cluster.x-k8s.io/v1alpha1`).
 
 ### Credential Requirements
