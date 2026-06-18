@@ -17,6 +17,9 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"regexp"
+	"strings"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -161,6 +164,49 @@ func (r *KairosConfig) validate() error {
 		))
 	}
 
+	// Validate spec.files entries.
+	for i, f := range r.Spec.Files {
+		fPath := field.NewPath("spec", "files").Index(i)
+		// Path must be absolute (kubebuilder marker covers the ^/ prefix; here we
+		// also catch ".." traversal that no declarative pattern can express).
+		if !strings.HasPrefix(f.Path, "/") {
+			allErrs = append(allErrs, field.Invalid(
+				fPath.Child("path"),
+				f.Path,
+				"path must be absolute (must begin with '/')",
+			))
+		} else {
+			// Check the ORIGINAL path for ".." segments — not the cleaned form,
+			// since filepath.Clean resolves ".." and would hide the traversal.
+			for _, seg := range strings.Split(f.Path, "/") {
+				if seg == ".." {
+					allErrs = append(allErrs, field.Invalid(
+						fPath.Child("path"),
+						f.Path,
+						"path must not contain '..' path traversal segments",
+					))
+					break
+				}
+			}
+		}
+		// Permissions: optional, must be octal if set.
+		if f.Permissions != "" && !webhookOctalPermissionsRe.MatchString(f.Permissions) {
+			allErrs = append(allErrs, field.Invalid(
+				fPath.Child("permissions"),
+				f.Permissions,
+				"permissions must be an octal string (e.g. \"0644\" or \"644\")",
+			))
+		}
+		// Owner: optional, must match POSIX username[:[group]] if set.
+		if f.Owner != "" && !webhookOwnerRe.MatchString(f.Owner) {
+			allErrs = append(allErrs, field.Invalid(
+				fPath.Child("owner"),
+				f.Owner,
+				"owner must be in user or user:group format using POSIX username characters (e.g. \"root\" or \"root:root\")",
+			))
+		}
+	}
+
 	if len(allErrs) > 0 {
 		return errors.NewInvalid(
 			schema.GroupKind{Group: GroupVersion.Group, Kind: "KairosConfig"},
@@ -171,3 +217,11 @@ func (r *KairosConfig) validate() error {
 
 	return nil
 }
+
+// webhookOctalPermissionsRe matches octal file-permission strings such as
+// "644", "0644", "1755". It mirrors the kubebuilder marker on File.Permissions.
+var webhookOctalPermissionsRe = regexp.MustCompile(`^0?[0-7]{3,4}$`)
+
+// webhookOwnerRe matches user or user:group strings with POSIX username
+// characters. It mirrors the kubebuilder marker on File.Owner.
+var webhookOwnerRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$`)

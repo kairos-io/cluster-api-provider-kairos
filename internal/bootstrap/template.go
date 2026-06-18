@@ -34,17 +34,27 @@ var templateFS embed.FS
 // MUST be emitted through the `quote` template func — never as raw `{{ .X }}`
 // interpolation. See internal/bootstrap/funcs.go and the
 // cloudconfig-rendering-safety skill for the rules.
+//
+// Files renders via `toYaml .Files | nindent 2` appended to the top-level
+// `write_files:` list in each template. yaml.v3 selects safe block-scalar
+// representation for Content automatically; per-field hand-assembly with
+// `quote` is NOT used for Files (KD-Files design).
 type TemplateData struct {
-	Role           string
-	SingleNode     bool
-	Hostname       string
-	UserName       string
-	UserPassword   string
-	UserGroups     []string
-	GitHubUser     string
-	SSHPublicKey   string
-	WorkerToken    string
-	Manifests      []bootstrapv1beta2.Manifest
+	Role         string
+	SingleNode   bool
+	Hostname     string
+	UserName     string
+	UserPassword string
+	UserGroups   []string
+	GitHubUser   string
+	SSHPublicKey string
+	WorkerToken  string
+	Manifests    []bootstrapv1beta2.Manifest
+	// Files are additional files written to the node via write_files:. Each
+	// entry is rendered as a whole slice by toYaml — never assembled per-field.
+	// Path/Permissions/Owner are validated by validateTemplateData and the
+	// webhook; Content may contain newlines (yaml.v3 picks a block scalar form).
+	Files          []bootstrapv1beta2.File
 	HostnamePrefix string
 	DNSServers     []string
 	PodCIDR        string

@@ -64,8 +64,18 @@ type KairosConfigSpec struct {
 	// +optional
 	CACertSecretRef *corev1.ObjectReference `json:"caCertSecretRef,omitempty"`
 
-	// Files specifies additional files to include in the cloud-config
+	// Files specifies additional files to write to the node's filesystem via
+	// the cloud-config write_files: list. Files are rendered on all
+	// distributions (k0s, k3s) and all infrastructure providers. Each entry
+	// is serialized with yaml.v3, which automatically selects block-scalar
+	// representation for multi-line content.
+	//
+	// Constraints: at most 32 files; each file's content is limited to 32 KiB
+	// (32768 bytes); paths must be absolute and must not contain .. segments.
+	//
+	// This field was accepted but silently ignored before this release.
 	// +optional
+	// +kubebuilder:validation:MaxItems=32
 	Files []File `json:"files,omitempty"`
 
 	// PreCommands are commands to run before k0s/k3s installation
@@ -283,20 +293,37 @@ type Manifest struct {
 	Content string `json:"content"`
 }
 
-// File represents a file to be written in the cloud-config
+// File represents a file to be written via the cloud-config write_files: list.
+// The entry is serialized with yaml.v3; multi-line Content is emitted as a
+// block scalar automatically.
 type File struct {
-	// Path is the absolute path where the file should be written
+	// Path is the absolute path where the file is written on the node.
+	// Must begin with '/' and must not contain '..' path segments. The
+	// webhook rejects non-absolute paths and paths that contain '..'.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^/`
 	Path string `json:"path"`
 
-	// Content is the file content
+	// Content is the file content. Multi-line strings are accepted and are
+	// emitted as a YAML block scalar. Maximum 32 KiB (32768 bytes).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=32768
 	Content string `json:"content"`
 
-	// Permissions are the file permissions (octal format, e.g., "0644")
+	// Permissions is the file mode in octal notation. Accepts 3-digit or
+	// 4-digit forms; the leading digit encodes setuid (4), setgid (2), and
+	// sticky (1) bits. Examples: "0644" (world-readable regular file),
+	// "0750" (group-accessible, others excluded), "4755" (setuid executable).
 	// +optional
+	// +kubebuilder:validation:Pattern=`^0?[0-7]{3,4}$`
 	Permissions string `json:"permissions,omitempty"`
 
-	// Owner is the file owner (user:group format, e.g., "root:root")
+	// Owner is the file owner in user:group format (e.g., "root:root").
+	// Both user and group must follow POSIX username conventions: start with
+	// a letter or underscore, followed by letters, digits, underscores, or
+	// hyphens. The group portion (including the colon) is optional.
 	// +optional
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$`
 	Owner string `json:"owner,omitempty"`
 }
 

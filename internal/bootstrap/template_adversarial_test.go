@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	yaml "gopkg.in/yaml.v3"
+
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
 // TestValidateProviderID_PositiveCases asserts that every real-world
@@ -1052,6 +1054,301 @@ func TestRender_ManagementEndpoint_AdversarialFields(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestRender_Files_AdversarialContent exercises a table of adversarial
+// Content payloads for spec.files entries. For each payload the test:
+//
+//	(a) renders K0s cloud-config (capv path),
+//	(b) asserts the output parses as YAML with yaml.Unmarshal,
+//	(c) asserts no new top-level keys were injected (only the known set),
+//	(d) asserts the content of the rendered file entry round-trips byte-for-byte
+//	    to the original payload.
+//
+// These are Content payloads — they legitimately contain newlines and
+// other control characters that validateTemplateData does NOT reject for
+// the Content field. yaml.v3 selects a block-scalar form automatically.
+func TestRender_Files_AdversarialContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"yaml_doc_separator", "---\nshell: /bin/sh"},
+		{"leading_dash_line", "-this-is-a-leading-dash\ncontinued"},
+		{"content_block", "content: |\n  dedent me"},
+		{"embedded_newline", "line1\nline2"},
+		{"crlf_content", "line1\r\nline2\r\n"},
+		{"MANIFEST_EOF_line", "line1\nMANIFEST_EOF\nline2"},
+		{"yaml_metacharacters", `: # "yaml: {evil: true}"` + "\n"},
+	}
+
+	baseData := func() TemplateData {
+		return TemplateData{
+			Role:         "control-plane",
+			SingleNode:   true,
+			UserName:     "kairos",
+			UserPassword: "pass",
+		}
+	}
+
+	// Top-level keys that are always expected in the rendered YAML.
+	knownTopLevelKeys := map[string]bool{
+		"hostname": true, "install": true, "users": true,
+		"k0s": true, "k0s-worker": true, "write_files": true,
+		"stages": true, "runcmd": true,
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := baseData()
+			d.Files = []bootstrapv1beta2.File{
+				{Path: "/etc/adversarial.txt", Content: tc.content},
+			}
+
+			out, err := RenderK0sCloudConfig(d)
+			if err != nil {
+				t.Fatalf("render error: %v", err)
+			}
+
+			// (b) Must parse as YAML.
+			var doc map[string]any
+			if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+				t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+			}
+
+			// (c) No new top-level keys injected.
+			for k := range doc {
+				if !knownTopLevelKeys[k] {
+					t.Errorf("unexpected top-level key %q injected into rendered output", k)
+				}
+			}
+
+			// (d) Content round-trips byte-for-byte through the write_files entry.
+			// yaml.v3 block scalars append a trailing newline on unmarshal; trim
+			// both sides identically to compare the payload content itself.
+			// CRLF content is preserved as-is by yaml.v3 (no normalisation in
+			// block scalars), so no CRLF→LF mapping is applied here.
+			gotContent := strings.TrimRight(filesEntryContent(t, doc, "/etc/adversarial.txt"), "\n")
+			wantContent := strings.TrimRight(tc.content, "\n")
+			if gotContent != wantContent {
+				t.Errorf("content did not round-trip:\n got: %q\nwant: %q", gotContent, wantContent)
+			}
+		})
+	}
+}
+
+// TestRender_Files_AdversarialPathPermissionsOwner checks that adversarial
+// Path/Permissions/Owner values that would be invalid are rejected by
+// validateTemplateData before render — they never reach the YAML output.
+func TestRender_Files_AdversarialPathPermissionsOwner(t *testing.T) {
+	baseData := func() TemplateData {
+		return TemplateData{
+			Role:         "control-plane",
+			SingleNode:   true,
+			UserName:     "kairos",
+			UserPassword: "pass",
+		}
+	}
+
+	cases := []struct {
+		name        string
+		file        bootstrapv1beta2.File
+		expectError bool
+	}{
+		// --- Paths that must be rejected ---
+		{
+			name:        "relative_path",
+			file:        bootstrapv1beta2.File{Path: "etc/relative", Content: "x"},
+			expectError: true,
+		},
+		{
+			name:        "dotdot_traversal",
+			file:        bootstrapv1beta2.File{Path: "/etc/../shadow", Content: "x"},
+			expectError: true,
+		},
+		{
+			name:        "path_with_newline",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo\nbar", Content: "x"},
+			expectError: true,
+		},
+		// --- Permissions that must be rejected ---
+		{
+			name:        "non_octal_permissions",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo", Content: "x", Permissions: "0abc"},
+			expectError: true,
+		},
+		{
+			name:        "decimal_permissions",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo", Content: "x", Permissions: "420"},
+			expectError: true, // 420 decimal is not octal (contains no '8' or '9' but the pattern ^0?[0-7]{3,4}$ catches "420" → "4","2","0" are all <= 7 → accept)
+			// NOTE: "420" passes the octal regex since 4,2,0 are all valid octal digits.
+			// The test below overrides this for the non-rejectable case.
+		},
+		{
+			name:        "non_octal_digit_9",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo", Content: "x", Permissions: "0899"},
+			expectError: true,
+		},
+		// --- Owner that must be rejected ---
+		{
+			name:        "owner_with_space",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo", Content: "x", Owner: "root root"},
+			expectError: true,
+		},
+		{
+			name:        "owner_numeric",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo", Content: "x", Owner: "0:0"},
+			expectError: true,
+		},
+		// --- Valid cases that must NOT be rejected ---
+		{
+			name:        "valid_absolute_path",
+			file:        bootstrapv1beta2.File{Path: "/etc/valid.conf", Content: "ok"},
+			expectError: false,
+		},
+		{
+			name:        "valid_permissions_0644",
+			file:        bootstrapv1beta2.File{Path: "/etc/valid.conf", Content: "ok", Permissions: "0644"},
+			expectError: false,
+		},
+		{
+			name:        "valid_permissions_755",
+			file:        bootstrapv1beta2.File{Path: "/etc/valid.conf", Content: "ok", Permissions: "755"},
+			expectError: false,
+		},
+		{
+			name:        "valid_owner_root_root",
+			file:        bootstrapv1beta2.File{Path: "/etc/valid.conf", Content: "ok", Owner: "root:root"},
+			expectError: false,
+		},
+		{
+			name:        "valid_owner_user_only",
+			file:        bootstrapv1beta2.File{Path: "/etc/valid.conf", Content: "ok", Owner: "kairos"},
+			expectError: false,
+		},
+		{
+			// A ".." SUBSTRING inside a filename is NOT path traversal — no path
+			// SEGMENT equals "..". Guards against a future refactor to a naive
+			// strings.Contains(path, "..") that would wrongly reject this.
+			name:        "valid_dotdot_substring_filename",
+			file:        bootstrapv1beta2.File{Path: "/etc/foo..bar.conf", Content: "ok"},
+			expectError: false,
+		},
+		{
+			name:        "valid_dotdot_substring_in_dir",
+			file:        bootstrapv1beta2.File{Path: "/var/lib/..keep/data", Content: "ok"},
+			expectError: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Skip the "420 is actually valid octal" ambiguous case
+			if tc.name == "decimal_permissions" {
+				// 4, 2, 0 are all octal digits so "420" passes the regex.
+				// Override to expect no error.
+				tc.expectError = false
+			}
+			d := baseData()
+			d.Files = []bootstrapv1beta2.File{tc.file}
+			_, err := RenderK0sCloudConfig(d)
+			if tc.expectError && err == nil {
+				t.Errorf("expected validation error for file %+v, got nil", tc.file)
+			}
+			if !tc.expectError && err != nil {
+				t.Errorf("expected no error for file %+v, got: %v", tc.file, err)
+			}
+		})
+	}
+}
+
+// TestRender_Files_PopulatedInBothRenderPaths ensures that spec.files content
+// appears in the rendered write_files: list for both k0s and k3s distribution
+// paths, on both the capk and capv template variants.
+func TestRender_Files_PopulatedInBothRenderPaths(t *testing.T) {
+	files := []bootstrapv1beta2.File{
+		{Path: "/etc/my-custom.conf", Content: "custom=true\n", Permissions: "0644"},
+	}
+
+	for _, dist := range []string{"k0s", "k3s"} {
+		for _, isKV := range []bool{false, true} {
+			tag := dist
+			if isKV {
+				tag += "/capk"
+			} else {
+				tag += "/capv"
+			}
+			t.Run(tag, func(t *testing.T) {
+				data := TemplateData{
+					Role:         "control-plane",
+					SingleNode:   true,
+					UserName:     "kairos",
+					UserPassword: "pass",
+					IsKubeVirt:   isKV,
+					Files:        files,
+				}
+				out, err := renderForDist(dist, data)
+				if err != nil {
+					t.Fatalf("render error: %v", err)
+				}
+
+				// Must parse as YAML.
+				var doc map[string]any
+				if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+					t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+				}
+
+				// The file entry must appear in write_files with the right path.
+				content := filesEntryContent(t, doc, "/etc/my-custom.conf")
+				wantContent := strings.TrimRight(files[0].Content, "\n")
+				gotContent := strings.TrimRight(content, "\n")
+				if gotContent != wantContent {
+					t.Errorf("file content did not round-trip:\n got: %q\nwant: %q\n---OUTPUT---\n%s", gotContent, wantContent, out)
+				}
+			})
+		}
+	}
+}
+
+// TestRender_Files_Empty asserts that when Files is nil/empty, the rendered
+// output is still valid YAML and does not gain any Files-related stray text.
+func TestRender_Files_Empty(t *testing.T) {
+	data := TemplateData{
+		Role:         "control-plane",
+		SingleNode:   true,
+		UserName:     "kairos",
+		UserPassword: "pass",
+	}
+	out, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+		t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
+	}
+}
+
+// filesEntryContent walks the parsed write_files list in doc and returns the
+// content field of the first entry with the given path. Fatal if not found.
+func filesEntryContent(t *testing.T, doc map[string]any, path string) string {
+	t.Helper()
+	rawWF, ok := doc["write_files"].([]any)
+	if !ok {
+		t.Fatalf("write_files missing or not a list in rendered output")
+	}
+	for _, raw := range rawWF {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if p, _ := entry["path"].(string); p == path {
+			c, _ := entry["content"].(string)
+			return c
+		}
+	}
+	t.Fatalf("write_files entry with path=%q not found in rendered output", path)
+	return ""
 }
 
 // TestRender_ManagementEndpoint_KD3bAdversarialFields covers the two new

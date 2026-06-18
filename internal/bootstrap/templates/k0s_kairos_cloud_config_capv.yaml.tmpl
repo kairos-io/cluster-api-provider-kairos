@@ -476,6 +476,9 @@ MANIFEST_EOF
       chmod 0644 /run/cluster-api/bootstrap-success.complete
 
       echo "k0s post-bootstrap tasks completed successfully"
+  {{- if .Files }}
+  {{ toYaml .Files | nindent 2 }}
+  {{- end }}
 
 {{- /* DNS overrides */}}
 stages:

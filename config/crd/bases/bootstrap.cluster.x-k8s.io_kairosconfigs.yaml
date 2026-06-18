@@ -119,29 +119,45 @@ spec:
                   type: string
                 type: array
               files:
-                description: Files specifies additional files to include in the cloud-config
+                description: |-
+                  Files specifies additional files to write to the node via cloud-config
+                  write_files:. Each file is rendered directly via toYaml into the
+                  write_files list; YAML escaping is handled by yaml.v3 automatically.
+                  Path must be absolute. At most 32 files may be specified.
                 items:
-                  description: File represents a file to be written in the cloud-config
+                  description: |-
+                    File represents a file to be written in the cloud-config write_files: list.
+                    The file is rendered as a whole entry via toYaml; yaml.v3 selects safe
+                    block-scalar representation for multi-line Content automatically.
                   properties:
                     content:
-                      description: Content is the file content
+                      description: |-
+                        Content is the file content. May contain newlines; yaml.v3 will emit
+                        a block scalar. Maximum 32 KiB.
+                      maxLength: 32768
                       type: string
                     owner:
-                      description: Owner is the file owner (user:group format, e.g.,
-                        "root:root")
+                      description: |-
+                        Owner is the file owner in user:group format (e.g., "root:root").
+                        Both user and group follow POSIX username conventions.
+                      pattern: ^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$
                       type: string
                     path:
-                      description: Path is the absolute path where the file should
-                        be written
+                      description: |-
+                        Path is the absolute path where the file should be written.
+                        Must begin with '/' and must not contain '..' path segments.
+                      pattern: ^/
                       type: string
                     permissions:
-                      description: Permissions are the file permissions (octal format,
-                        e.g., "0644")
+                      description: Permissions are the file permissions in octal notation
+                        (e.g., "0644").
+                      pattern: ^0?[0-7]{3,4}$
                       type: string
                   required:
                   - content
                   - path
                   type: object
+                maxItems: 32
                 type: array
               githubUser:
                 description: |-
