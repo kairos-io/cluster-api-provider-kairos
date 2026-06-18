@@ -1,3 +1,7 @@
+# Release/base pull policy: IfNotPresent so the published manifest is
+# reproducibly pinned and does not re-pull the image on every pod restart
+# (config/CLAUDE.md §3). The dev overlay (config/dev/) overrides image + policy
+# for kind-loaded local images.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,4 +11,4 @@ spec:
     spec:
       containers:
       - name: manager
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
