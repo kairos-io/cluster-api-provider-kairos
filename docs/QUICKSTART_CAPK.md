@@ -1,6 +1,6 @@
 # Quickstart: CAPK (KubeVirt)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.8.x, KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x), KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-alpha.2.
 
 This guide covers two paths:
 
@@ -161,13 +161,13 @@ Do not use `clusterctl init --bootstrap kairos` — clusterctl integration is de
 ### Prerequisites
 
 - Kubernetes management cluster with:
-  - CAPI v1.8.x installed
+  - CAPI v1.9+ installed (v1beta2 wire contract; lab-validated against v1.12.x)
   - CAPK (`infrastructure.cluster.x-k8s.io`) installed
   - CDI (Containerized Data Importer) installed
   - A LoadBalancer implementation (MetalLB or equivalent)
 - Kairos CAPI provider installed:
   ```bash
-  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/kairos-capi-provider.yaml
+  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
   ```
 - A Kairos image uploaded to CDI as a DataVolume named `kairos-rootdisk` (for k0s) or `kairos-k3s-rootdisk` (for k3s) in namespace `default`. The image must be a Kairos live-installer image — not a pre-installed disk image.
 

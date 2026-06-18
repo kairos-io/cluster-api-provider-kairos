@@ -28,9 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"os"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"strings"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/bootstrap"
@@ -199,6 +201,47 @@ func TestBootstrapIntegration(t *testing.T) {
 			Namespace: "test-namespace",
 		}, secret) == nil
 	}, 10*time.Second).Should(BeTrue())
+
+	// KD-48: the bootstrap Secret name is deterministic == kairosConfig.Name
+	// (no random suffix). This is required for infrastructure providers — notably
+	// CAPM3, which derives the userData Secret name from the Machine name — and it
+	// prevents the orphaned/duplicate Secrets a fresh random suffix produced on
+	// every regeneration. The Machine here carries no spec.bootstrap.dataSecretName,
+	// so this exercises the default naming path.
+	g.Expect(secretName).To(Equal("test-kairos-config"),
+		"bootstrap Secret must be named deterministically after the KairosConfig")
+
+	// And no random-suffixed duplicates accumulate for this KairosConfig: the only
+	// Secret whose name is prefixed with the KairosConfig name is the deterministic
+	// one. Consistently guards against churn that recreates the Secret under a new
+	// name on subsequent reconciles (KD-9 footgun).
+	g.Consistently(func() []string {
+		list := &corev1.SecretList{}
+		if err := mgr.GetClient().List(ctx, list, client.InNamespace("test-namespace")); err != nil {
+			return []string{"(list error)"}
+		}
+		var names []string
+		for i := range list.Items {
+			if strings.HasPrefix(list.Items[i].Name, "test-kairos-config") {
+				names = append(names, list.Items[i].Name)
+			}
+		}
+		return names
+	}, 5*time.Second, 1*time.Second).Should(ConsistOf("test-kairos-config"),
+		"exactly one bootstrap Secret, named deterministically, must exist (no random-suffixed duplicates)")
+
+	// KD-48a: the Secret must carry a well-formed controller owner reference to
+	// the KairosConfig so Kubernetes garbage-collects it when the KairosConfig is
+	// deleted. The previous hand-rolled ref left APIVersion/Kind empty (TypeMeta
+	// is not populated on a Get-fetched object), defeating GC. SetControllerReference
+	// derives the GVK from the scheme.
+	kc := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(mgr.GetClient().Get(ctx, types.NamespacedName{Name: "test-kairos-config", Namespace: "test-namespace"}, kc)).To(Succeed())
+	ownerRef := metav1.GetControllerOf(secret)
+	g.Expect(ownerRef).NotTo(BeNil(), "bootstrap Secret must have a controller owner reference")
+	g.Expect(ownerRef.Kind).To(Equal("KairosConfig"), "owner ref Kind must be resolved (non-empty) for GC")
+	g.Expect(ownerRef.APIVersion).To(Equal(bootstrapv1beta2.GroupVersion.String()), "owner ref APIVersion must be resolved for GC")
+	g.Expect(ownerRef.UID).To(Equal(kc.UID), "owner ref must point at this KairosConfig")
 
 	// Verify Secret contains cloud-config with k0s configuration
 	g.Expect(secret.Data).To(HaveKey("value"))

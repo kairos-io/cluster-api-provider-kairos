@@ -1,8 +1,8 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.8.x (go.mod), provider branch fix/kd-3b-eliminate-ssh-kubeconfig (pre-alpha-2).
+Last verified against: Kairos v3.6.0+, CAPI v1.9+ required (go.mod imports v1.8 types; see Notes §API Version Compatibility), provider v0.1.0-alpha.2.
 
-This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md).
+This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
 ## Table of Contents
 
@@ -53,7 +53,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `serviceCIDR` | `string` | No | — | Service network CIDR for k0s. Uses k0s defaults when unset. |
 | `primaryIP` | `string` | No | — | Overrides the detected node IP used for TLS certificate SANs and endpoint configuration (sets `KAIROS_PRIMARY_IP`). Useful in KubeVirt environments where the detected IP is a pod network address rather than the VM's accessible address. |
 | `install` | `InstallConfig` | No | — | Controls Kairos OS installation to disk. Required when using the 2-disk installer pattern (see `config/samples/capk/`). |
-| `files` | `[]File` | No | — | Additional files to write in the cloud-config. |
+| `files` | `[]File` | No | — | Files to write on the node via the cloud-config `write_files:` list. Rendered on all distributions and all infrastructure providers. At most 32 entries; each file content is limited to 32 KiB. See [File](#file) for the sub-type and [Writing files to nodes](#writing-files-to-nodes) for usage guidance and the static-IP caveat. |
 | `manifests` | `[]Manifest` | No | — | Kubernetes manifests placed in the distribution's auto-apply directory. k0s: `/var/lib/k0s/manifests/{name}/{file}`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/{file}`. Applied automatically by the distribution at cluster startup. |
 | `preCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
 | `postCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
@@ -87,10 +87,10 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | `string` | Yes | Absolute path where the file is written on the node. |
-| `content` | `string` | Yes | File content. |
-| `permissions` | `string` | No | Octal permission string (e.g., `"0644"`). |
-| `owner` | `string` | No | Owner in `user:group` format (e.g., `"root:root"`). |
+| `path` | `string` | Yes | Absolute path where the file is written on the node. Must begin with `/`. Must not contain `..` path segments. |
+| `content` | `string` | Yes | File content. Multi-line strings are accepted. Maximum 32 KiB (32768 bytes). |
+| `permissions` | `string` | No | File mode in octal notation. Accepts 3-digit or 4-digit forms; the leading digit encodes setuid (4), setgid (2), and sticky (1) bits. Examples: `"0644"`, `"0750"`, `"4755"`. |
+| `owner` | `string` | No | File owner in `user:group` format (e.g., `"root:root"`). The group portion including the colon is optional. |
 
 #### Manifest
 
@@ -349,12 +349,77 @@ Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence
 
 ---
 
+## Writing files to nodes
+
+`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on all distributions (k0s, k3s) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3).
+
+### Limits
+
+- At most 32 files per `KairosConfig`.
+- Content maximum: 32 KiB (32768 bytes) per file.
+- `path` must be absolute (begin with `/`) and must not contain `..` segments.
+- `permissions` must be a 3- or 4-digit octal string. 4-digit modes encode setuid/setgid/sticky: `"4755"` is valid. Leave unset to use the image default (typically `"0644"`).
+- `owner` must follow `user:group` POSIX convention. The group portion is optional (`"root"` is valid as well as `"root:root"`).
+
+The validating webhook rejects entries that violate path, permissions, or owner constraints. Validation errors appear in `KairosConfig.status.failureMessage`.
+
+### Example
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      distribution: k0s
+      kubernetesVersion: "v1.34.1+k0s.1"
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+      files:
+        - path: /etc/systemd/network/05-control-plane.network
+          content: |
+            [Match]
+            Name=ens192
+
+            [Network]
+            Address=192.168.100.10/24
+            Gateway=192.168.100.1
+            DNS=192.168.100.1
+          permissions: "0644"
+          owner: "root:root"
+```
+
+A worked CAPV example (including the static-IP caveat comments) is in
+`config/samples/capv/kairosconfig_files_static_ip.yaml`.
+
+### Static IP via systemd-networkd — known limitation on pre-installed images
+
+Writing `/etc/systemd/network/<name>.network` via `spec.files` is a common use case: a user wants to pin the control-plane node IP so it matches `Cluster.spec.controlPlaneEndpoint.host`. The file is written correctly. However, on a **pre-installed disk image** (such as a Hadron image deployed via CAPV), systemd-networkd may already hold a DHCP lease by the time the file lands in the filesystem. The new file does not take effect on its own: a `networkctl reload && networkctl reconfigure <iface>` must run before k0s or k3s starts.
+
+The problem is that once k0s or k3s has bound the DHCP-assigned IP for API server listeners and TLS certificates, reconfiguring the interface on the same boot does not change those bindings. The static IP will be active from the next reboot onward, but the running k0s/k3s process will still use the DHCP address it saw at startup.
+
+**Recommended approaches** (in preference order):
+
+1. **Use infrastructure-layer IP management.** CAPV supports IPAM via `VSphereMachineTemplate.spec.template.spec.network.devices[].addressesFromPools`, or use a DHCP reservation at the network layer. With either approach the IP is set before the first boot and is consistent from the start — no race with networkd.
+
+2. **If you write the `.network` file via `spec.files`**, pair it with an early reconfigure command. When `spec.preCommands` is rendered (currently not yet rendered — see API table), that field will be the right place. Until then, consider using a Kairos cloud-config `stages.initramfs` hook via an additional file in `spec.files` that calls `networkctl reload`. This is the user's responsibility; the provider does not perform the reload.
+
+This is a known limitation of post-boot file writes for network configuration on pre-installed images, not a defect in the `spec.files` implementation.
+
+---
+
 ## Notes
 
 ### API Version Compatibility
 
 - **Kairos CAPI Provider APIs**: `bootstrap.cluster.x-k8s.io/v1beta2` and `controlplane.cluster.x-k8s.io/v1beta2`.
-- **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). However, the Go module currently imports `sigs.k8s.io/cluster-api/api/v1beta1` because the go.mod pins CAPI v1.8.0 which predates the v1beta2 Go package. Bumping to CAPI v1.11 is tracked as KD-13. This is a compile-time import detail; the CRD API group and version on the wire are not affected.
+- **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). The Go module currently imports `sigs.k8s.io/cluster-api/api/v1beta1` because go.mod pins CAPI v1.8 Go types — the v1beta2 Go package did not exist at that module version. This is a compile-time import detail only; the CRD API group and version on the wire are not affected. CAPI v1.9+ is required at runtime (the v1beta2 wire contract). Bumping go.mod to CAPI v1.11+ is tracked as KD-13.
 - **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK uses `infrastructure.cluster.x-k8s.io/v1alpha1`).
 
 ### Credential Requirements

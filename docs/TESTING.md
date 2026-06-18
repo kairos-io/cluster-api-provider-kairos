@@ -44,3 +44,17 @@ This is the highest-confidence gate but requires Docker and a host with enough m
 ## Reboot survival test
 
 After the cluster is `Available=true`, drain a node via `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`, restart the underlying VM (`virtctl restart <vm>` for CAPK; vSphere "Restart Guest OS" for CAPV), uncordon, and verify `kubectl get nodes` shows `Ready` within 5 minutes. This validates KD-23's persistence injection — k0s/k3s state, SSH host keys, and CNI config must survive the reboot.
+
+## Validated configurations (v0.1.0-alpha.2)
+
+The following combinations were validated end-to-end before the alpha.2 release:
+
+| Infrastructure | Distribution | Image | Result |
+|---|---|---|---|
+| CAPV | k0s | Kairos Hadron v0.0.4 | PASS |
+| CAPV | k3s | Kairos Hadron v0.0.4 | PASS |
+| CAPM3 | k0s | Kairos Hadron v0.0.4 | PASS |
+| CAPM3 | k3s | Kairos Hadron v0.0.4 | PASS |
+| CAPK | k0s | standard Kairos v3.6.0 | Passed alpha-1; no code regression in alpha-2 |
+
+CAPD is exercised via unit/envtest rather than a live e2e run. Hadron is the musl-libc-based next-generation Kairos OS; validating it confirms compatibility with both glibc and musl targets.

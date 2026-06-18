@@ -59,13 +59,25 @@ users:
 {{- if eq .Role "control-plane" }}
 
 # Control-plane node configuration
-# Pass providerID at k3s startup so node registers with correct providerID (avoids k3s:// vs vsphere:// mismatch)
+{{- if .Metal3 }}
+# Metal3: the kubelet provider-id (metal3://<uuid>) and metal3.io/uuid node-label
+# are written to config.yaml.d by the kairos-k3s-metal3-providerid.sh
+# ExecStartPre BEFORE k3s starts (UUID read from the Ironic config-drive at boot).
+# We do NOT set a render-time providerID here — CAPM3 requires metal3://<uuid> at
+# first registration (ADR 0004, corrected after CAPM3 v1.13 lab validation).
+{{- else }}
+# Pass providerID at k3s startup so node registers with the correct providerID
+# (avoids the k3s default providerID vs infra providerID mismatch).
 # Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
 # ProviderID is regex-validated by validateTemplateData before rendering — see internal/bootstrap/validate.go.
+{{- end }}
 k3s:
   enabled: true
-  {{- if .ProviderID }}
+  {{- if and .ProviderID (not .Metal3) }}
   args:
+    # KD-3c: pass providerID at k3s startup so the Node registers with the
+    # correct providerID from the start (avoids k3s:// vs vsphere:// mismatch).
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-arg=provider-id={{ .ProviderID }}
   {{- end }}
 
@@ -84,8 +96,8 @@ k3s-agent:
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
 {{ persistencyOEM | indent 6 }}
   # systemd drop-in: skip k3s.service on the Kairos live installer.
@@ -93,18 +105,19 @@ write_files:
   # rationale. KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
   - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       ConditionKernelCommandLine=!cdroot
-  {{- if and (eq .Role "control-plane") .ProviderID }}
+  {{- if and (eq .Role "control-plane") .ProviderID (not .Metal3) }}
   - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
-      # ProviderID for CAPI/CAPV node matching (k3s loads this on every start)
+      # ProviderID for CAPI/CAPV node matching (k3s loads this on every start).
+      # Not written for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
       kubelet-arg:
         - provider-id={{ .ProviderID }}
   {{- end }}
@@ -119,8 +132,8 @@ write_files:
   # KD-3b finding from CAPK lab; applies equally to CAPV.
   - path: /etc/rancher/k3s/config.yaml.d/91-tls-san.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       tls-san:
         - {{ .ManagementEndpoint.ControlPlaneEndpointHost | quote }}
@@ -134,8 +147,8 @@ write_files:
   {{- if or .Hostname .HostnamePrefix }}
   - path: /usr/local/etc/hostname
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       {{- if .Hostname }}
       {{ .Hostname }}
@@ -145,8 +158,8 @@ write_files:
   {{- end }}
   - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Kairos k3s post-bootstrap tasks
@@ -172,14 +185,40 @@ write_files:
       
       [Install]
       WantedBy=multi-user.target
-  {{- if eq .Role "control-plane" }}
+  {{- if and (eq .Role "control-plane") .Metal3 }}
+  # Metal3 / CAPM3 providerID + node-label drop-in (ADR 0004, OQ-1 RESOLVED,
+  # corrected after CAPM3 v1.13 lab validation).
+  #
+  # CAPM3 v1.13 with cloudProviderEnabled:false does NOT patch
+  # Node.spec.providerID. It finds the Node by the metal3.io/uuid label and then
+  # REQUIRES the Node to ALREADY carry providerID=metal3://<uuid> (legacy) at
+  # first registration. providerID is immutable, so it must be correct the
+  # FIRST time the kubelet registers — a post-bootstrap label is too late
+  # (k3s would have already registered with its default k3s://<hostname>, which
+  # CAPM3 rejects as "unsupported providerID format").
+  #
+  # Mechanism: an ExecStartPre on k3s.service (runs BEFORE k3s starts) reads the
+  # BareMetalHost UUID from the Ironic config-drive and writes
+  # /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml with BOTH the kubelet
+  # provider-id (metal3://<uuid>) and the metal3.io/uuid node-label. k3s reads
+  # config.yaml.d at startup, so the kubelet registers the Node with the correct
+  # providerID + label on first registration. Use z-provider-id.conf so it loads
+  # after override.conf (Kairos/other configs).
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-metal3-providerid.sh || true'
+  {{- else if and (eq .Role "control-plane") (not .Metal3) }}
   # Systemd override: write providerID to k3s config before k3s starts.
   # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
   # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
   - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Service]
       {{- if .ProviderID }}
@@ -188,13 +227,95 @@ write_files:
       ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-discover-provider-id.sh || true'
       {{- end }}
   {{- end }}
-  {{- if and (eq .Role "control-plane") (not .ProviderID) }}
-  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre)
+  {{- if and (eq .Role "control-plane") .Metal3 }}
+  # Metal3 config-drive providerID discovery script (runs as the k3s
+  # ExecStartPre above, BEFORE k3s/kubelet starts).
+  #
+  # This block is STATIC shell except for the UUID, which is read from the
+  # config-drive at boot — there is NO render-time interpolation of the UUID,
+  # so there is no Go-template injection surface here. The only trusted source
+  # of the BareMetalHost UUID is the Ironic config-drive's
+  # /openstack/latest/meta_data.json; we mount it read-only (nodev,nosuid,noexec)
+  # and fail closed on any missing/malformed value rather than ever writing a
+  # garbage provider-id.
+  - path: /usr/local/bin/kairos-k3s-metal3-providerid.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      # Locate the Ironic config-drive by partition label "config-2".
+      cfgdev=""
+      if blkid -L config-2 &>/dev/null; then
+        cfgdev=$(blkid -L config-2)
+      elif [ -b /dev/disk/by-label/config-2 ]; then
+        cfgdev=/dev/disk/by-label/config-2
+      fi
+      cfgmount=/run/metal3-cfgdrive
+      mounted_here=false
+      if [ -n "${cfgdev}" ]; then
+        mkdir -p "${cfgmount}"
+        if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
+          mounted_here=true
+        fi
+      fi
+      # The Ironic config-drive (OpenStack layout) carries the instance UUID at
+      # /openstack/latest/meta_data.json. This is the ONLY trusted source: do
+      # NOT fall back to cloud-init paths — Kairos uses yip (not cloud-init),
+      # and a stale instance-data/pickle file would yield a WRONG-but-valid
+      # UUID and mis-register the Node. Fail closed if the config-drive is absent.
+      meta_json="${cfgmount}/openstack/latest/meta_data.json"
+      if [ ! -f "${meta_json}" ]; then
+        echo "ERROR: metal3-providerid: ${meta_json} not found (config-drive label 'config-2' present and mounted?); cannot determine BareMetalHost UUID — skipping (fail-closed)"
+        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+        exit 0
+      fi
+      # Extract .uuid — prefer jq if available, fall back to POSIX grep+sed.
+      uuid=""
+      if command -v jq &>/dev/null; then
+        uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
+      else
+        uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+      fi
+      [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+      # Strict UUID validation — fail closed on missing or malformed value.
+      # Whole-string validation: first reject any value with a character outside
+      # [hex,dash] (catches newlines, spaces, '=', ',', '/', shell metachars —
+      # closes both provider-id/label-value injection and the multi-line bypass
+      # where a jq-decoded "\n" escape would slip past a per-line grep anchor).
+      # Then enforce the exact UUID shape with bash =~ (string-anchored, not
+      # line-anchored).
+      uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+      case "${uuid}" in
+        "" | *[!0-9a-fA-F-]* )
+          echo "ERROR: metal3-providerid: extracted UUID is empty or contains illegal characters; skipping (fail-closed)"
+          exit 0 ;;
+      esac
+      if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
+        echo "ERROR: metal3-providerid: extracted UUID '${uuid}' does not match UUID pattern; skipping (fail-closed)"
+        exit 0
+      fi
+      # Write the providerID + node-label drop-in BEFORE k3s/kubelet starts.
+      # LEGACY metal3://<uuid> format: accepted by CAPM3 v1.13 (the new
+      # metal3://<ns>/<bmh>/<m3m> format is not derivable from config-drive
+      # metadata). The kubelet registers the Node with this providerID +
+      # label, and CAPM3 then matches by the label and accepts the providerID.
+      # Use printf (not an indented heredoc) so the written YAML file has no
+      # stray leading whitespace on its top-level keys — k3s rejects a
+      # config.yaml.d file whose keys are indented. ${uuid} is validated above.
+      mkdir -p /etc/rancher/k3s/config.yaml.d
+      printf 'kubelet-arg:\n  - provider-id=metal3://%s\nnode-label:\n  - metal3.io/uuid=%s\n' "${uuid}" "${uuid}" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+      echo "metal3-providerid: wrote provider-id=metal3://${uuid} and metal3.io/uuid=${uuid} for kubelet registration"
+  {{- end }}
+  {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
+  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre).
+  # Omitted for Metal3: discovery is done at post-bootstrap via config-drive read (ADR 0004).
   # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
   - path: /usr/local/bin/kairos-k3s-discover-provider-id.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e
@@ -218,8 +339,8 @@ write_files:
   {{- end }}
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e
@@ -248,8 +369,9 @@ MANIFEST_EOF
       {{- end }}
       {{- end }}
       
-      {{- if .ProviderID }}
-      # Fallback: post-bootstrap providerID patch (same approach as k0s CAPV single-node)
+      {{- if and .ProviderID (not .Metal3) }}
+      # Fallback: post-bootstrap providerID patch (same approach as k0s CAPV single-node).
+      # Not executed for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
       # If k3s registered with k3s://hostname, providerID is immutable and patch will fail - that's expected.
       # If node has empty providerID, patch will succeed and unblock Machine-to-Node matching.
       echo "Waiting for k3s node to be registered..."
@@ -265,7 +387,7 @@ MANIFEST_EOF
         sleep 5
         ELAPSED=$((ELAPSED + 5))
       done
-      
+
       if kubectl get node $(hostname) &>/dev/null; then
         echo "Attempting to set providerID={{ .ProviderID }} on node $(hostname)..."
         for i in $(seq 1 30); do
@@ -284,6 +406,15 @@ MANIFEST_EOF
         done
       fi
       {{- end }}
+
+      {{- /*
+        Metal3 / CAPM3 providerID is set PRE-START via the
+        kairos-k3s-metal3-providerid.sh ExecStartPre (see write_files above),
+        NOT post-bootstrap. CAPM3 v1.13 requires Node.spec.providerID to be
+        metal3://<uuid> at first registration (providerID is immutable), so a
+        post-bootstrap kubectl label/patch is too late. No Metal3 work happens
+        in this post-bootstrap script. (ADR 0004, corrected after lab validation.)
+      */ -}}
 
       {{- if .ManagementEndpoint }}
       # Push kubeconfig to management cluster without SSH (KD-3b).
@@ -367,11 +498,14 @@ MANIFEST_EOF
       chmod 0644 /run/cluster-api/bootstrap-success.complete
 
       echo "k3s post-bootstrap tasks completed successfully"
+  {{- if .Files }}
+  {{ toYaml .Files | nindent 2 }}
+  {{- end }}
 
 {{- /* DNS overrides and bootstrap stages */}}
 stages:
   boot:
-    {{- if and (eq .Role "control-plane") (not .ProviderID) }}
+    {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
     - name: "Discover providerID for k3s (VM self-discovery)"
       commands:
         - /usr/local/bin/kairos-k3s-discover-provider-id.sh || true

@@ -68,7 +68,7 @@ k0s:
   {{- if or .PodCIDR .ServiceCIDR }}
     - --config /etc/k0s/k0s.yaml
   {{- end }}
-  {{- if .ProviderID }}
+  {{- if and .ProviderID (not .Metal3) }}
     # KD-3c: tell kubelet the providerID BEFORE the Node is registered so it
     # appears in spec.providerID from first registration. The PR-8 audit
     # surfaced that k0s would otherwise register the Node and the
@@ -76,6 +76,7 @@ k0s:
     # ProviderID. Mirrors the k3s ExecStartPre pattern. Validator at
     # internal/bootstrap/validate.go pins ProviderID to a strict regex,
     # so direct interpolation here is safe (no shell injection surface).
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-extra-args=--provider-id={{ .ProviderID }}
   {{- end }}
   {{- end }}
@@ -87,8 +88,9 @@ k0s-worker:
   enabled: true
   args:
     - --token-file /etc/k0s/token
-    {{- if .ProviderID }}
+    {{- if and .ProviderID (not .Metal3) }}
     # KD-3c: same providerID-at-startup story as the control-plane block above.
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-extra-args=--provider-id={{ .ProviderID }}
     {{- end }}
 
@@ -97,8 +99,8 @@ k0s-worker:
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
 {{ persistencyOEM | indent 6 }}
   {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR) }}
@@ -140,8 +142,8 @@ write_files:
   {{- if or .Hostname .HostnamePrefix }}
   - path: /usr/local/etc/hostname
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       {{- if .Hostname }}
       {{ .Hostname }}
@@ -151,8 +153,8 @@ write_files:
   {{- end }}
   - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Kairos k0s post-bootstrap tasks
@@ -179,8 +181,8 @@ write_files:
       WantedBy=multi-user.target
   - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Enable kairos-k0s-post-bootstrap service
@@ -205,8 +207,8 @@ write_files:
       WantedBy=multi-user.target
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e
@@ -235,42 +237,234 @@ MANIFEST_EOF
       {{- end }}
       {{- end }}
 
-      {{- if .ProviderID }}
-      # Wait for k0s to be ready and Node to be registered
+      {{- if and .ProviderID (not .Metal3) }}
+      # Wait for k0s to be ready and the Node to be registered, then set providerID.
+      # KD-55: fail-OPEN. A providerID hiccup (API blip, slow registration) must NOT
+      # abort the rest of post-bootstrap — the kubeconfig push below MUST still run,
+      # or a transient failure strands the cluster in WaitingForNodePush forever.
+      # Warn and continue instead of `exit 1`; the Machine may briefly stay
+      # NodeNotFound until providerID is set, but the kubeconfig still reaches the
+      # management cluster (and the controller re-renders to retry providerID).
       echo "Waiting for k0s node to be registered..."
-      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      # Use `k0s kubectl` (resolves the local admin kubeconfig). The Hadron k0s
+      # image ships no standalone `kubectl` binary, so bare `kubectl` would fail
+      # `command not found` (swallowed by &>/dev/null) and silently never set the
+      # providerID — lab-confirmed. Mirrors the Metal3 path below.
+      node_registered=false
       MAX_WAIT=300
       ELAPSED=0
-      while ! kubectl get node $(hostname) &>/dev/null; do
-        if [ $ELAPSED -ge $MAX_WAIT ]; then
-          echo "ERROR: Timeout waiting for node to be registered"
-          exit 1
+      while [ $ELAPSED -lt $MAX_WAIT ]; do
+        if k0s kubectl get node $(hostname) &>/dev/null; then
+          node_registered=true
+          break
         fi
         echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
         sleep 5
         ELAPSED=$((ELAPSED + 5))
       done
-
-      # Set providerID on the Node
-      # Retry in case of temporary API server unavailability
-      echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
-      PROVIDER_ID_SET=false
-      for i in {1..30}; do
-        if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
-          echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
-          PROVIDER_ID_SET=true
-          break
+      if [ "$node_registered" != "true" ]; then
+        echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+      else
+        # Set providerID on the Node. Retry for transient API-server unavailability.
+        echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
+        PROVIDER_ID_SET=false
+        for i in {1..30}; do
+          if k0s kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
+            echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
+            PROVIDER_ID_SET=true
+            break
+          fi
+          echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+          sleep 5
+        done
+        if [ "$PROVIDER_ID_SET" != "true" ]; then
+          echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
         fi
-        echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
-        sleep 5
-      done
-
-      if [ "$PROVIDER_ID_SET" != "true" ]; then
-        echo "ERROR: Failed to set providerID after 30 attempts"
-        exit 1
       fi
+      {{- else if not .Metal3 }}
+      # CAPV self-discovery: ProviderID was not available at render time (assigned
+      # after VM clone), so compute vsphere://<uuid> from DMI at boot.
+      # KD-55: fail-OPEN. If the UUID is absent or malformed, warn and continue so
+      # the kubeconfig push below still runs. A missing providerID is recoverable;
+      # a stranded cluster is not.
+      # DMI uses mixed-endian byte order for the first three UUID groups; vSphere
+      # expects RFC/ISO big-endian. The byte-swap below is the same algorithm
+      # proven correct in the k3s CAPV template (lab-validated: discovered UUID
+      # matched VSphereMachine providerID and Machine reached Running).
+      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      PROVIDER_ID=""
+      if [ -f /sys/class/dmi/id/product_uuid ]; then
+        RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
+        HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
+          T0="${HEX:6:2}${HEX:4:2}${HEX:2:2}${HEX:0:2}"
+          T1="${HEX:10:2}${HEX:8:2}"
+          T2="${HEX:14:2}${HEX:12:2}"
+          REST="${HEX:16:16}"
+          FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
+          # Strict UUID validation before the kubectl patch. The validated value
+          # is interpolated into a JSON string in -p below; enforcing the regex
+          # here closes the injection surface (malformed input never reaches the
+          # patch). Whole-string match via bash =~ (not line-anchored grep).
+          UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if [[ "${FORMATTED}" =~ ${UUID_RE} ]]; then
+            PROVIDER_ID="vsphere://${FORMATTED}"
+            echo "Discovered providerID from DMI: ${PROVIDER_ID}"
+          else
+            echo "WARN: DMI UUID '${FORMATTED}' did not match UUID pattern; skipping providerID (continuing post-bootstrap)"
+          fi
+        else
+          echo "WARN: DMI product_uuid is absent or not 32 hex chars after strip; skipping providerID (continuing post-bootstrap)"
+        fi
+      else
+        echo "WARN: /sys/class/dmi/id/product_uuid not found; skipping providerID (continuing post-bootstrap)"
+      fi
+      if [ -n "${PROVIDER_ID}" ]; then
+        echo "Waiting for k0s node to be registered..."
+        node_registered=false
+        MAX_WAIT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # k0s kubectl: the Hadron k0s image has no standalone `kubectl` binary.
+          if k0s kubectl get node $(hostname) &>/dev/null; then
+            node_registered=true
+            break
+          fi
+          echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
+        done
+        if [ "$node_registered" != "true" ]; then
+          echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+        else
+          # Set the discovered providerID on the Node. Retry for transient API-server unavailability.
+          echo "Setting providerID=${PROVIDER_ID} on node $(hostname)..."
+          PROVIDER_ID_SET=false
+          for i in {1..30}; do
+            if k0s kubectl patch node $(hostname) --type=merge -p "{\"spec\":{\"providerID\":\"${PROVIDER_ID}\"}}" &>/dev/null; then
+              echo "Successfully set providerID=${PROVIDER_ID} on node $(hostname)"
+              PROVIDER_ID_SET=true
+              break
+            fi
+            echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+            sleep 5
+          done
+          if [ "$PROVIDER_ID_SET" != "true" ]; then
+            echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
+          fi
+        fi
+      fi
+      {{- end }}
+
+      {{- if .Metal3 }}
+      {{- if eq .Role "control-plane" }}
+      # Metal3 / CAPM3 providerID + node-label (post-bootstrap patch). REDESIGNED
+      # after the k0s lab e2e (ADR 0004): the previous pre-start ExecStart-injection
+      # oneshot is unworkable on k0s. k0scontroller is started by the Kairos provider
+      # BEFORE cloud-config runs, so a boot-stage `systemctl enable` only arms a
+      # WantedBy symlink for a k0s start that never comes (the unit never runs); and a
+      # Before=k0scontroller oneshot that restarts the k0s service to apply the change
+      # deadlocks (systemd ordering cycle — confirmed on the node, apiserver stuck down).
+      #
+      # CAPM3 v1.13 (cloudProviderEnabled:false) selects the Node by the metal3.io/uuid
+      # label and VALIDATES Node.spec.providerID == metal3://<uuid>; it does not set
+      # them. Setting a PREVIOUSLY-EMPTY providerID is permitted by the apiserver
+      # (immutability only guards a non-empty value), so we patch it here, reusing the
+      # same admin.conf-based post-bootstrap patch the non-Metal3 path above uses. This
+      # runs inside the already-enabled kairos-k0s-post-bootstrap.service: no extra
+      # unit, no Before=, no restart, no deadlock, no Node-registration race.
+      # Control-plane only — admin.conf is CP-only and Metal3 is single-node-CP this
+      # release (replicas > 1 is webhook-rejected; k0s Metal3 workers are a future item).
+      set_metal3_providerid() {
+        # Read + validate the BMH UUID from the Ironic config-drive (config-2 /
+        # /openstack/latest/meta_data.json). This is the ONLY trusted source; mount
+        # it read-only (nodev,nosuid,noexec) and FAIL-CLOSED (skip, leaving the Node
+        # unpatched) on any missing/malformed value rather than ever writing a garbage
+        # provider-id. Do NOT fall back to cloud-init paths (Kairos uses yip; a stale
+        # instance-data file would yield a WRONG-but-valid UUID).
+        local cfgdev="" cfgmount=/run/metal3-cfgdrive mounted_here=false meta_json uuid=""
+        if blkid -L config-2 &>/dev/null; then
+          cfgdev=$(blkid -L config-2)
+        elif [ -b /dev/disk/by-label/config-2 ]; then
+          cfgdev=/dev/disk/by-label/config-2
+        fi
+        if [ -n "${cfgdev}" ]; then
+          mkdir -p "${cfgmount}"
+          if mount -o ro,nodev,nosuid,noexec "${cfgdev}" "${cfgmount}" 2>/dev/null; then
+            mounted_here=true
+          fi
+        fi
+        meta_json="${cfgmount}/openstack/latest/meta_data.json"
+        if [ ! -f "${meta_json}" ]; then
+          echo "WARN: metal3-providerid: ${meta_json} not found (config-drive 'config-2' present+mounted?); skipping (fail-closed)"
+          [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+          return 0
+        fi
+        if command -v jq &>/dev/null; then
+          uuid=$(jq -r '.uuid // empty' "${meta_json}" 2>/dev/null || true)
+        else
+          uuid=$(grep -oE '"uuid"[[:space:]]*:[[:space:]]*"[^"]+"' "${meta_json}" 2>/dev/null | head -1 | sed 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+        fi
+        [ "${mounted_here}" = true ] && umount "${cfgmount}" 2>/dev/null || true
+        # Whole-string validation: reject any value with a character outside [hex,dash]
+        # (newlines, spaces, '=', ',', '/', shell/JSON metachars — closes provider-id/
+        # label-value injection and the multi-line bypass), then enforce the exact UUID
+        # shape (string-anchored, not line-anchored).
+        local uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+        case "${uuid}" in
+          "" | *[!0-9a-fA-F-]* )
+            echo "WARN: metal3-providerid: extracted UUID is empty or contains illegal characters; skipping (fail-closed)"
+            return 0 ;;
+        esac
+        if ! [[ "${uuid}" =~ ${uuid_re} ]]; then
+          echo "WARN: metal3-providerid: extracted UUID '${uuid}' does not match UUID pattern; skipping (fail-closed)"
+          return 0
+        fi
+        # Wait for the Node to register, then set provider-id + the metal3.io/uuid
+        # label. LEGACY metal3://<uuid> format (accepted by CAPM3 v1.13; the new
+        # metal3://<ns>/<bmh>/<m3m> form is not derivable from config-drive metadata).
+        # ${uuid} is a validated bare hex/dash UUID, so interpolation into the patch
+        # JSON is injection-safe. Use `k0s kubectl` (resolves the local admin kubeconfig).
+        local desired="metal3://${uuid}" w=0 cur
+        while ! k0s kubectl get node "$(hostname)" &>/dev/null; do
+          if [ ${w} -ge 300 ]; then
+            echo "WARN: metal3-providerid: timed out waiting for Node registration; skipping"
+            return 0
+          fi
+          sleep 5; w=$((w + 5))
+        done
+        for i in $(seq 1 30); do
+          cur=$(k0s kubectl get node "$(hostname)" -o jsonpath='{.spec.providerID}' 2>/dev/null || true)
+          if [ "${cur}" = "${desired}" ]; then
+            echo "metal3-providerid: Node $(hostname) already has provider-id=${desired}; ensuring label"
+            k0s kubectl label node "$(hostname)" "metal3.io/uuid=${uuid}" --overwrite &>/dev/null || true
+            return 0
+          fi
+          if [ -n "${cur}" ]; then
+            echo "WARN: metal3-providerid: Node $(hostname) has a different non-empty provider-id '${cur}'; not overwriting (immutable)"
+            return 0
+          fi
+          if k0s kubectl patch node "$(hostname)" --type=merge \
+               -p "{\"spec\":{\"providerID\":\"${desired}\"},\"metadata\":{\"labels\":{\"metal3.io/uuid\":\"${uuid}\"}}}" &>/dev/null; then
+            echo "metal3-providerid: set provider-id=${desired} + metal3.io/uuid=${uuid} on Node $(hostname)"
+            return 0
+          fi
+          echo "metal3-providerid: attempt ${i}/30 to patch Node failed; retrying in 5s..."
+          sleep 5
+        done
+        echo "WARN: metal3-providerid: failed to set provider-id after 30 attempts; CAPM3 will not bind until it is set"
+        return 0
+      }
+      # Called with `|| true` so a failure here never aborts the rest of post-bootstrap
+      # (kubeconfig push etc.). bash also suppresses `set -e` inside a function invoked
+      # in a `||` list, so the function's internal fail-closed `return 0`s are the
+      # control flow and a stray command error cannot kill the node bring-up.
+      set_metal3_providerid || echo "WARN: metal3-providerid: step errored; continuing post-bootstrap"
       {{- else }}
-      echo "No providerID to set"
+      # Metal3 k0s WORKER providerID is not supported in this release: a worker has no
+      # local admin.conf to patch and k0s has no config.yaml.d kubelet-arg drop-in.
+      # Metal3 is single-node control-plane only (replicas > 1 is webhook-rejected).
+      {{- end }}
       {{- end }}
 
       {{- if .ManagementEndpoint }}
@@ -356,6 +550,9 @@ MANIFEST_EOF
       chmod 0644 /run/cluster-api/bootstrap-success.complete
 
       echo "k0s post-bootstrap tasks completed successfully"
+  {{- if .Files }}
+  {{ toYaml .Files | nindent 2 }}
+  {{- end }}
 
 {{- /* DNS overrides */}}
 stages:

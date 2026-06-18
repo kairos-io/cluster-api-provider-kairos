@@ -153,6 +153,92 @@ func TestKairosConfig_Default_DoesNotSetUserPassword(t *testing.T) {
 	}
 }
 
+// TestKairosConfig_Validate_Files exercises the Files loop in validate().
+// Each subcase mutates a single KairosConfig with one bad File and checks that
+// validate() returns an error containing the field name.
+func TestKairosConfig_Validate_Files(t *testing.T) {
+	cases := []struct {
+		name        string
+		files       []File
+		wantErrText string // substring that must appear in the error; empty means no error
+	}{
+		// --- Valid entries must not be rejected ---
+		{
+			name:        "valid file: absolute path, no extras",
+			files:       []File{{Path: "/etc/foo.conf", Content: "x"}},
+			wantErrText: "",
+		},
+		{
+			name:        "valid file: absolute path + octal perms + user:group owner",
+			files:       []File{{Path: "/etc/foo.conf", Content: "x", Permissions: "0644", Owner: "root:root"}},
+			wantErrText: "",
+		},
+		{
+			name:        "valid file: permissions without leading zero",
+			files:       []File{{Path: "/etc/foo.conf", Content: "x", Permissions: "755"}},
+			wantErrText: "",
+		},
+		{
+			name:        "valid file: owner without group",
+			files:       []File{{Path: "/etc/foo.conf", Content: "x", Owner: "kairos"}},
+			wantErrText: "",
+		},
+		// --- Path validation ---
+		{
+			name:        "relative path rejected",
+			files:       []File{{Path: "etc/relative", Content: "x"}},
+			wantErrText: "path",
+		},
+		{
+			name:        "dotdot traversal rejected",
+			files:       []File{{Path: "/etc/../shadow", Content: "x"}},
+			wantErrText: "path",
+		},
+		// --- Permissions validation ---
+		{
+			name:        "non-octal permissions rejected",
+			files:       []File{{Path: "/etc/foo", Content: "x", Permissions: "0abc"}},
+			wantErrText: "permissions",
+		},
+		{
+			name:        "permissions with digit 8 rejected",
+			files:       []File{{Path: "/etc/foo", Content: "x", Permissions: "0888"}},
+			wantErrText: "permissions",
+		},
+		// --- Owner validation ---
+		{
+			name:        "owner with space rejected",
+			files:       []File{{Path: "/etc/foo", Content: "x", Owner: "root root"}},
+			wantErrText: "owner",
+		},
+		{
+			name:        "owner starting with digit rejected",
+			files:       []File{{Path: "/etc/foo", Content: "x", Owner: "0:0"}},
+			wantErrText: "owner",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kc := newValidKairosConfig()
+			kc.Spec.Files = tc.files
+			err := kc.validate()
+			if tc.wantErrText == "" {
+				if err != nil {
+					t.Fatalf("validate() returned unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate() returned nil; expected error containing %q", tc.wantErrText)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("validate() error %q does not contain expected substring %q", err.Error(), tc.wantErrText)
+			}
+		})
+	}
+}
+
 func TestKairosConfig_Default_StillSetsOtherDefaults(t *testing.T) {
 	// Default() should still default UserName, UserGroups, Distribution, Role.
 	kc := &KairosConfig{

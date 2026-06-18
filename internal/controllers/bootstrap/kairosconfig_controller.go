@@ -18,7 +18,6 @@ package bootstrap
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -75,7 +74,19 @@ type KairosConfigReconciler struct {
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs/finalizers,verbs=update
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;clusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines/status;clusters/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines,verbs=get;list;watch
+// Infrastructure-provider access (KD-6: enumerated, no resource wildcard).
+// getProviderID/reconcileBootstrapData read the infra Machine to discover the
+// providerID and provisioning readiness — VSphereMachine, KubevirtMachine,
+// DockerMachine (get). optionalInfraWatches sets up a Watch on VSphereMachine,
+// KubevirtMachine, and Metal3Machine (list/watch) so a providerID update
+// re-reconciles the owning KairosConfig — NOT DockerMachine (no Docker watch,
+// so DockerMachine gets `get` only and no list/watch in the aggregated role).
+// Metal3Machine is list/watched but never Get-ed by this controller: CAPM3 owns
+// providerID, so getProviderID has no Metal3 case (ADR 0004); the control-plane
+// getNodeIP path is what Gets Metal3Machine. No create/update/patch/delete on
+// infra Machines from this controller.
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines,verbs=get
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;metal3machines,verbs=list;watch
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status,verbs=get
 //+kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
 //+kubebuilder:rbac:groups="",resources=secrets;events,verbs=get;list;watch;create;update;patch;delete
@@ -221,8 +232,14 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (ctrl.Result, error) {
 	// Get providerID - it may not be available initially (before VM is created)
-	// We allow bootstrap secret creation without providerID initially, then regenerate when providerID becomes available
+	// We allow bootstrap secret creation without providerID initially, then regenerate when providerID becomes available.
+	// Metal3 (CAPM3) is an explicit exception: CAPM3 owns providerID end-to-end; we never embed it in the bootstrap
+	// secret. Zeroing it here prevents the reconcile loop from treating CAPM3's post-registration providerID as a
+	// "missing from secret" signal and triggering infinite regeneration. (ADR 0004.)
 	currentProviderID := r.getProviderID(ctx, log, machine)
+	if isMetal3Machine(machine) {
+		currentProviderID = ""
+	}
 
 	// For VSphere: Only wait for providerID if VSphereMachine is Ready (VM already provisioned)
 	// If VSphereMachine is not Ready yet, allow secret creation so VM can be provisioned
@@ -359,9 +376,10 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 				return ctrl.Result{}, fmt.Errorf("failed to get bootstrap secret: %w", err)
 			}
 		} else {
-			// Secret exists, check if we need to regenerate it due to providerID availability
+			// Secret exists, check if we need to regenerate it due to providerID availability.
+			// Note: currentProviderID is already zeroed for Metal3 at the top of this function
+			// so the regeneration-check below is a no-op for Metal3 machines.
 			needsRegeneration := false
-			currentProviderID := r.getProviderID(ctx, log, machine)
 
 			if currentProviderID != "" {
 				// Machine has providerID, check if the secret contains it
@@ -471,18 +489,33 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// correctly, so this error is non-blocking and the cluster will function properly.
 	// Do NOT base64 encode it ourselves - let CAPV handle the encoding
 
-	// Create Secret with bootstrap data
+	// Create Secret with bootstrap data.
+	//
+	// Naming (KD-48): the bootstrap Secret is named deterministically after the
+	// KairosConfig — which our KCP names identically to the owning Machine
+	// (fmt.Sprintf("%s-%d", kcp.Name, index)). This mirrors CABPK, where the
+	// KubeadmConfig's data Secret is named after the config, and is REQUIRED for
+	// correctness with infrastructure providers that derive the userData Secret
+	// name from the Machine name rather than from Machine.spec.bootstrap.dataSecretName.
+	// CAPM3 (Metal3) is the concrete case: it caches Metal3Machine.status.userData
+	// to the Machine name (write-once) during the window before CAPI propagates
+	// dataSecretName, then writes that name into BareMetalHost.spec.userData. A
+	// random suffix here produced a Secret name CAPM3 never referenced, leaving
+	// BMH.userData pointing at a non-existent Secret (provisioning stalled until
+	// the Secret was created out-of-band). A stable name == kairosConfig.Name makes
+	// the names coincide for every provider and also eliminates the duplicate /
+	// orphaned Secrets that a fresh random suffix produced on every regeneration.
+	//
+	// Precedence still honors an already-set Machine.spec.bootstrap.dataSecretName
+	// (immutable once CAPI sets it) so Machines created before this change keep
+	// their original (possibly random-suffixed) Secret name across an upgrade.
 	secretName := ""
 	if machine != nil && machine.Spec.Bootstrap.DataSecretName != nil && *machine.Spec.Bootstrap.DataSecretName != "" {
 		secretName = *machine.Spec.Bootstrap.DataSecretName
 	} else if kairosConfig.Status.DataSecretName != nil && *kairosConfig.Status.DataSecretName != "" {
 		secretName = *kairosConfig.Status.DataSecretName
 	} else {
-		randomSuffix, err := randomString(6)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to generate random string: %w", err)
-		}
-		secretName = fmt.Sprintf("%s-%s", kairosConfig.Name, randomSuffix)
+		secretName = kairosConfig.Name
 	}
 
 	secretKey := types.NamespacedName{
@@ -496,20 +529,21 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			Labels: map[string]string{
 				clusterv1.ClusterNameLabel: cluster.Name,
 			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: kairosConfig.APIVersion,
-					Kind:       kairosConfig.Kind,
-					Name:       kairosConfig.Name,
-					UID:        kairosConfig.UID,
-					Controller: func() *bool { b := true; return &b }(),
-				},
-			},
 		},
 		Type: clusterv1.ClusterSecretType,
 		Data: map[string][]byte{
 			"value": []byte(cloudConfig),
 		},
+	}
+	// KD-48a: set the controller owner reference via the scheme instead of
+	// hand-rolling it. A KairosConfig fetched with r.Get carries an empty
+	// TypeMeta, so the previous hand-rolled reference had empty APIVersion/Kind
+	// and the garbage collector could not resolve the owner — the bootstrap
+	// Secret (which holds root userdata) was never GC'd when its KairosConfig
+	// was deleted. SetControllerReference derives the GVK from the scheme,
+	// producing a well-formed, GC-able reference (area CLAUDE.md non-negotiable #3).
+	if err := controllerutil.SetControllerReference(kairosConfig, secret, r.Scheme); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to set controller reference on bootstrap secret %q: %w", secretName, err)
 	}
 
 	// Create or update the secret in-place to preserve the name referenced by Machine
@@ -523,6 +557,18 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			return ctrl.Result{}, err
 		}
 	} else {
+		// KD-48b: the bootstrap Secret name is now deterministic, hence
+		// predictable. Before overwriting a pre-existing Secret of that name,
+		// confirm it is ours — otherwise a Secret pre-seeded by another actor
+		// would be silently adopted. (Its content is corrected here, but a node
+		// could read it in the window before this runs.) Ownership is proven by
+		// an owner reference carrying this KairosConfig's UID, or the cluster-name
+		// label this controller always sets (covers Secrets written before KD-48a).
+		if !bootstrapSecretBelongsTo(existingSecret, kairosConfig, cluster.Name) {
+			return ctrl.Result{}, fmt.Errorf(
+				"refusing to overwrite bootstrap secret %q: not owned by KairosConfig %q (foreign Secret with the same name)",
+				secretName, kairosConfig.Name)
+		}
 		existingSecret.Type = secret.Type
 		existingSecret.Labels = secret.Labels
 		existingSecret.OwnerReferences = secret.OwnerReferences
@@ -606,9 +652,9 @@ func isKubevirtMachine(machine *clusterv1.Machine) bool {
 // supportsManagementEndpoint returns true for infrastructure kinds whose
 // control-plane Machines run the in-node kubeconfig-push block (KD-3b).
 //
-// Today: KubeVirt (CAPK) and vSphere (CAPV). When CAPM3 / Tinkerbell / etc.
-// gain Kairos support, they're added here once the rendered templates support
-// the push block on their cloud-config layout.
+// Today: KubeVirt (CAPK), vSphere (CAPV), and Metal3 (CAPM3). Bare-metal
+// nodes have real routable IPs and real management-cluster reachability,
+// making the node-push pattern a natural fit for CAPM3.
 //
 // KD-46 (post-alpha-2): the resolver's RBAC currently grants
 // `kubevirt.io/virtualmachineinstances:get` on every cluster that uses this
@@ -621,10 +667,19 @@ func supportsManagementEndpoint(machine *clusterv1.Machine) bool {
 		return false
 	}
 	switch machine.Spec.InfrastructureRef.Kind {
-	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine":
+	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine", "Metal3Machine":
 		return true
 	}
 	return false
+}
+
+// isMetal3Machine reports whether machine is backed by CAPM3 (Metal3Machine).
+// Used as a detection seam for Metal3-specific rendering decisions (Phase 1b).
+func isMetal3Machine(machine *clusterv1.Machine) bool {
+	if machine == nil {
+		return false
+	}
+	return machine.Spec.InfrastructureRef.Kind == "Metal3Machine"
 }
 
 func (r *KairosConfigReconciler) sanitizeCapkUserdataSecret(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) (bool, bool, error) {
@@ -953,9 +1008,14 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		log.Info("No install configuration provided; install block will be omitted")
 	}
 
-	// Get providerID from Machine's infrastructure reference
-	// This is needed to set the Node's providerID so the Machine controller can match Nodes to Machines
-	providerID := r.getProviderID(ctx, log, machine)
+	// Get providerID from Machine's infrastructure reference.
+	// CAPM3 owns Node.spec.providerID for Metal3 machines — suppress it here so
+	// the template does not emit --provider-id args or the kubectl patch block.
+	// (ADR 0004, OQ-1 RESOLVED.)
+	var providerID string
+	if !isMetal3Machine(machine) {
+		providerID = r.getProviderID(ctx, log, machine)
+	}
 
 	// Control-plane: ask the resolver for the management-endpoint bundle
 	// the node needs to push its kubeconfig back without SSH. KD-3b broadened
@@ -985,6 +1045,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
 		WorkerToken:                    workerToken,
 		Manifests:                      kairosConfig.Spec.Manifests,
+		Files:                          kairosConfig.Spec.Files,
 		HostnamePrefix:                 hostnamePrefix,
 		DNSServers:                     kairosConfig.Spec.DNSServers,
 		PodCIDR:                        kairosConfig.Spec.PodCIDR,
@@ -993,6 +1054,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		MachineName:                    "",
 		ClusterNS:                      "",
 		IsKubeVirt:                     isKubevirtMachine(machine),
+		Metal3:                         isMetal3Machine(machine),
 		Install:                        installConfig,
 		ProviderID:                     providerID,
 		ControlPlaneLBServiceName:      "",
@@ -1197,8 +1259,14 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		log.Info("No install configuration provided; install block will be omitted")
 	}
 
-	// Get providerID from Machine's infrastructure reference
-	providerID := r.getProviderID(ctx, log, machine)
+	// Get providerID from Machine's infrastructure reference.
+	// CAPM3 owns Node.spec.providerID for Metal3 machines — suppress it here so
+	// the template does not emit --provider-id args or the kubectl patch block.
+	// (ADR 0004, OQ-1 RESOLVED.)
+	var providerID string
+	if !isMetal3Machine(machine) {
+		providerID = r.getProviderID(ctx, log, machine)
+	}
 
 	// Control-plane: same routing as the k0s path above. KD-3b broadened
 	// the gate from CAPK-only to any supported infrastructure kind.
@@ -1222,12 +1290,14 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		GitHubUser:                     kairosConfig.Spec.GitHubUser,
 		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
 		Manifests:                      kairosConfig.Spec.Manifests,
+		Files:                          kairosConfig.Spec.Files,
 		HostnamePrefix:                 hostnamePrefix,
 		DNSServers:                     kairosConfig.Spec.DNSServers,
 		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
 		MachineName:                    "",
 		ClusterNS:                      "",
 		IsKubeVirt:                     isKubevirtMachine(machine),
+		Metal3:                         isMetal3Machine(machine),
 		Install:                        installConfig,
 		ProviderID:                     providerID,
 		K3sServerURL:                   serverAddress,
@@ -1343,21 +1413,6 @@ func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.L
 // is normally near-instant; long enough not to hammer the apiserver.
 const bootstrapDeleteRequeueAfter = 5 * time.Second
 
-// randomString generates a random lowercase alphanumeric string of the given length
-// This ensures the string is RFC 1123 compliant for Kubernetes resource names
-func randomString(length int) (string, error) {
-	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		randomByte := make([]byte, 1)
-		if _, err := rand.Read(randomByte); err != nil {
-			return "", err
-		}
-		b[i] = charset[randomByte[0]%byte(len(charset))]
-	}
-	return string(b), nil
-}
-
 // kubeconfigPushConfig + ensureKubeconfigPushConfig were moved out to
 // management_endpoint_resolver.go's kubeVirtTokenResolver implementation as
 // part of KD-33. The reconciler now holds an interface-typed
@@ -1391,6 +1446,7 @@ func kubeconfigWriterName(clusterName string) string {
 var optionalInfraWatches = []schema.GroupVersionKind{
 	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta1", Kind: "VSphereMachine"},
 	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "KubevirtMachine"},
+	{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "Metal3Machine"},
 }
 
 func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -1646,4 +1702,29 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 	}
 
 	return ""
+}
+
+// bootstrapSecretBelongsTo reports whether an existing bootstrap data Secret
+// (found under the deterministic name == kairosConfig.Name) belongs to the
+// given KairosConfig and may therefore be safely overwritten in place.
+//
+// KD-48b: with a deterministic, predictable Secret name, the controller must
+// not blindly adopt a same-named Secret it did not create. Ownership is proven
+// by either:
+//   - an owner reference carrying this KairosConfig's UID (the authoritative
+//     signal — the UID was set correctly even by the pre-KD-48a hand-rolled
+//     reference, so this also covers Secrets written before that fix), or
+//   - the cluster-name label this controller always stamps on the Secret.
+//
+// A Secret matching neither is foreign (operator error or a pre-seed attempt)
+// and the caller refuses to overwrite it.
+func bootstrapSecretBelongsTo(s *corev1.Secret, kc *bootstrapv1beta2.KairosConfig, clusterName string) bool {
+	if kc.UID != "" {
+		for _, or := range s.OwnerReferences {
+			if or.UID == kc.UID {
+				return true
+			}
+		}
+	}
+	return clusterName != "" && s.Labels[clusterv1.ClusterNameLabel] == clusterName
 }

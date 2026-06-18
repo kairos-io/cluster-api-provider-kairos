@@ -197,7 +197,7 @@ func TestKairosControlPlane_Validate_SSHFallback(t *testing.T) {
 			name: "disabled-is-always-valid-even-with-bogus-fields",
 			sshFallback: &SSHFallback{
 				Enabled:       false,
-				User:          "ROOT!", // invalid pattern, ignored when Enabled=false
+				User:          "ROOT!",                       // invalid pattern, ignored when Enabled=false
 				ActivateAfter: &metav1.Duration{Duration: 1}, // too small, ignored when Enabled=false
 			},
 		},
@@ -356,11 +356,11 @@ func TestKairosControlPlane_Validate_SSHFallback(t *testing.T) {
 
 func TestKairosControlPlane_Default_SSHFallback(t *testing.T) {
 	cases := []struct {
-		name             string
-		in               *SSHFallback
-		wantUser         string
-		wantPort         int32
-		wantActivateNNS  bool // ActivateAfter should be non-nil after defaulting
+		name            string
+		in              *SSHFallback
+		wantUser        string
+		wantPort        int32
+		wantActivateNNS bool // ActivateAfter should be non-nil after defaulting
 	}{
 		{
 			name: "nil block stays nil",

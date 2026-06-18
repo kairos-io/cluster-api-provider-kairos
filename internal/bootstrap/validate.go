@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // providerIDPattern restricts ProviderID to the shape every CAPI infrastructure
@@ -128,8 +129,50 @@ func validateTemplateData(d *TemplateData) error {
 			errs = append(errs, err)
 		}
 	}
+	// Files: validate path/permissions/owner for control characters and absolute path
+	// requirement. Content is deliberately NOT checked for control characters —
+	// file content legitimately contains newlines. yaml.v3 picks a safe block-scalar
+	// form for multi-line Content, so there is no injection surface in the YAML output.
+	for i, f := range d.Files {
+		fIdx := fmt.Sprintf("files[%d]", i)
+		if err := rejectControlChars(fIdx+".path", f.Path); err != nil {
+			errs = append(errs, err)
+		} else if !strings.HasPrefix(f.Path, "/") {
+			errs = append(errs, fmt.Errorf("%s.path: must be absolute (starts with '/'): %q", fIdx, f.Path))
+		} else {
+			// Belt-and-braces ".." traversal check behind the webhook.
+			for _, seg := range strings.Split(f.Path, "/") {
+				if seg == ".." {
+					errs = append(errs, fmt.Errorf("%s.path: must not contain '..' path segments: %q", fIdx, f.Path))
+					break
+				}
+			}
+		}
+		if f.Permissions != "" {
+			if err := rejectControlChars(fIdx+".permissions", f.Permissions); err != nil {
+				errs = append(errs, err)
+			} else if !filePermissionsPattern.MatchString(f.Permissions) {
+				errs = append(errs, fmt.Errorf("%s.permissions: must be an octal string (e.g. \"0644\"): %q", fIdx, f.Permissions))
+			}
+		}
+		if f.Owner != "" {
+			if err := rejectControlChars(fIdx+".owner", f.Owner); err != nil {
+				errs = append(errs, err)
+			} else if !fileOwnerPattern.MatchString(f.Owner) {
+				errs = append(errs, fmt.Errorf("%s.owner: must be user or user:group with POSIX username chars (e.g. \"root:root\"): %q", fIdx, f.Owner))
+			}
+		}
+	}
 	return errors.Join(errs...)
 }
+
+// filePermissionsPattern matches octal file-permission strings.
+// Mirrors the kubebuilder marker on File.Permissions.
+var filePermissionsPattern = regexp.MustCompile(`^0?[0-7]{3,4}$`)
+
+// fileOwnerPattern matches POSIX user or user:group strings.
+// Mirrors the kubebuilder marker on File.Owner.
+var fileOwnerPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$`)
 
 // rejectControlChars returns an error if s contains any character that would
 // break the YAML or shell embed of s downstream: `\n`, `\r`, or NUL. Every

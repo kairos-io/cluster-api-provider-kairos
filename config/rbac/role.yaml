@@ -164,29 +164,35 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
-  - '*'
+  - dockermachines
   verbs:
   - create
-  - delete
   - get
-  - list
-  - patch
-  - update
-  - watch
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
+  - dockermachines/status
+  - dockermachinetemplates
+  - kubevirtmachines/status
+  - kubevirtmachinetemplates
+  - metal3machines/status
+  - metal3machinetemplates
+  - vspheremachines/status
+  - vspheremachinetemplates
+  - vspherevms
+  verbs:
+  - get
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - kubevirtmachines
+  - metal3machines
   - vspheremachines
   verbs:
+  - create
   - get
   - list
   - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vspheremachines/status
-  verbs:
-  - get
 - apiGroups:
   - kubevirt.io
   resources:
