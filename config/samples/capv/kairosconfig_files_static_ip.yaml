@@ -1,0 +1,110 @@
+# ============================================================================
+# CAPV Sample: KairosConfigTemplate with spec.files — static IP via networkd
+# ============================================================================
+#
+# Usage:
+#   kubectl apply -f config/samples/capv/kairosconfig_files_static_ip.yaml
+#
+# What this shows:
+#   spec.files writes arbitrary files into the node via the cloud-config
+#   write_files: list. The motivating use case here is writing a systemd-networkd
+#   unit file to assign a static IP to the node's primary interface.
+#
+# PREREQUISITES:
+#   1. Kairos CAPI provider installed (docs/INSTALL.md).
+#   2. CAPV installed and a VSphereClusterIdentity configured
+#      (see config/samples/capv/kairos_cluster_k0s_single_node.yaml).
+#   3. A user-password Secret created in the same namespace:
+#        kubectl create secret generic kairos-user-password \
+#          --from-literal=password=$(openssl rand -base64 32)
+#   4. This template is not self-contained. Combine it with a Cluster,
+#      VSphereCluster, VSphereMachineTemplate, and KairosControlPlane from
+#      config/samples/capv/kairos_cluster_k0s_single_node.yaml. The template
+#      name below (kairos-config-template-control-plane) matches that sample;
+#      replace it if your cluster uses a different name.
+#
+# IMPORTANT — STATIC IP CAVEAT:
+#   Writing a systemd-networkd .network file via spec.files works, but on a
+#   pre-installed (disk-image) node, systemd-networkd may already hold a DHCP
+#   lease by the time the file is applied. The new file takes effect after the
+#   next networkd reload, not at the moment of writing. If k0s or k3s has
+#   already bound the DHCP address before the reload occurs, the static IP will
+#   not be the address those processes listen on for this boot.
+#
+#   Recommended approaches (in preference order):
+#     1. Use CAPV IPAM (spec.network.devices[].addressesFromPools) or a DHCP
+#        reservation managed outside Kairos so the IP is set at the VM layer
+#        before first boot. This is the most reliable method.
+#     2. If you do use spec.files for the .network file, pair it with a command
+#        (in spec.preCommands, when that field is rendered) or a dedicated
+#        cloud-config stage that runs:
+#          networkctl reload && networkctl reconfigure <iface>
+#        before the distribution starts. This is the user's responsibility;
+#        the Kairos CAPI provider does not perform the reload automatically.
+#
+#   Single-node only: multi-node control planes are not yet supported (KD-5).
+# ============================================================================
+
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      distribution: k0s
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.34.1+k0s.1"
+      userName: kairos
+      # Password comes from a Secret. Inline userPassword is discouraged.
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+
+      # spec.files writes files into the node at bootstrap time via the
+      # cloud-config write_files: list. Files are rendered on all distributions
+      # (k0s, k3s) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3).
+      #
+      # Limits:
+      #   - At most 32 files per KairosConfig.
+      #   - Content maximum: 32 KiB per file (32768 bytes).
+      #   - path must be absolute (begins with /) and must not contain ..
+      #   - permissions must be an octal string: 3 or 4 digits (e.g., "0644",
+      #     "4755"). 4-digit modes (setuid/setgid/sticky) are accepted.
+      #   - owner must follow user:group POSIX convention (e.g., "root:root").
+      #
+      # Read "IMPORTANT — STATIC IP CAVEAT" at the top of this file before
+      # using spec.files for network configuration on pre-installed images.
+      files:
+        - path: /etc/systemd/network/05-control-plane.network
+          # This file assigns a static IP to the node's primary interface.
+          # Replace the Address, Gateway, and DNS values with your network's
+          # actual settings. The interface name (ens192 here) must match what
+          # the guest OS assigns to the VMXNET3 or E1000 adapter in vSphere.
+          #
+          # WARNING: See the caveat at the top of this file. Writing this file
+          # is not sufficient to guarantee the static IP is used by k0s/k3s on
+          # the first boot if networkd already holds a DHCP lease.
+          content: |
+            [Match]
+            Name=ens192
+
+            [Network]
+            Address=192.168.100.10/24
+            Gateway=192.168.100.1
+            DNS=192.168.100.1
+            DNS=8.8.8.8
+          permissions: "0644"
+          owner: "root:root"
+
+        # Example: write a custom /etc/hosts entry alongside the network file.
+        # Useful when the cluster controlPlaneEndpoint hostname must resolve
+        # on the node before cluster DNS is available.
+        - path: /etc/hosts.d/kairos-cluster.conf
+          content: |
+            192.168.100.10  kairos-cp.example.com
+          permissions: "0644"
+          owner: "root:root"
