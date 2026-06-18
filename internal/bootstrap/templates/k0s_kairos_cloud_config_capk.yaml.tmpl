@@ -97,8 +97,8 @@ k0s-worker:
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
 {{ persistencyOEM | indent 6 }}
   {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR .IsKubeVirt) }}
@@ -138,8 +138,8 @@ write_files:
   {{- if and .IsKubeVirt (eq .Role "control-plane") }}
   - path: /etc/systemd/system/kairos-k0s-lb-sans.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Ensure k0s apiserver SANs include LoadBalancer endpoint
@@ -159,8 +159,8 @@ write_files:
       WantedBy=multi-user.target
   - path: /etc/systemd/system/kairos-k0s-lb-sans.path
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Watch for k0s config to update SANs
@@ -173,8 +173,8 @@ write_files:
       WantedBy=multi-user.target
   - path: /usr/local/bin/kairos-k0s-lb-sans.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e
@@ -247,8 +247,8 @@ write_files:
   {{- if or .Hostname .HostnamePrefix }}
   - path: /usr/local/etc/hostname
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       {{- if .Hostname }}
       {{ .Hostname }}
@@ -258,8 +258,8 @@ write_files:
   {{- end }}
   - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Kairos k0s post-bootstrap tasks
@@ -286,8 +286,8 @@ write_files:
       WantedBy=multi-user.target
   - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Enable kairos-k0s-post-bootstrap service
@@ -312,8 +312,8 @@ write_files:
       WantedBy=multi-user.target
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e

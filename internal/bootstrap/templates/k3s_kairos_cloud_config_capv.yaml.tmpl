@@ -96,8 +96,8 @@ k3s-agent:
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
 {{ persistencyOEM | indent 6 }}
   # systemd drop-in: skip k3s.service on the Kairos live installer.
@@ -105,16 +105,16 @@ write_files:
   # rationale. KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
   - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       ConditionKernelCommandLine=!cdroot
   {{- if and (eq .Role "control-plane") .ProviderID (not .Metal3) }}
   - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       # ProviderID for CAPI/CAPV node matching (k3s loads this on every start).
       # Not written for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
@@ -132,8 +132,8 @@ write_files:
   # KD-3b finding from CAPK lab; applies equally to CAPV.
   - path: /etc/rancher/k3s/config.yaml.d/91-tls-san.yaml
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       tls-san:
         - {{ .ManagementEndpoint.ControlPlaneEndpointHost | quote }}
@@ -147,8 +147,8 @@ write_files:
   {{- if or .Hostname .HostnamePrefix }}
   - path: /usr/local/etc/hostname
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       {{- if .Hostname }}
       {{ .Hostname }}
@@ -158,8 +158,8 @@ write_files:
   {{- end }}
   - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Unit]
       Description=Kairos k3s post-bootstrap tasks
@@ -206,8 +206,8 @@ write_files:
   # after override.conf (Kairos/other configs).
   - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Service]
       ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-metal3-providerid.sh || true'
@@ -217,8 +217,8 @@ write_files:
   # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
   - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
     permissions: "0644"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       [Service]
       {{- if .ProviderID }}
@@ -240,8 +240,8 @@ write_files:
   # garbage provider-id.
   - path: /usr/local/bin/kairos-k3s-metal3-providerid.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -euo pipefail
@@ -314,8 +314,8 @@ write_files:
   # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
   - path: /usr/local/bin/kairos-k3s-discover-provider-id.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e
@@ -339,8 +339,8 @@ write_files:
   {{- end }}
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
     permissions: "0755"
-    owner: 0
-    group: 0
+    owner: root
+    group: root
     content: |
       #!/bin/bash
       set -e
