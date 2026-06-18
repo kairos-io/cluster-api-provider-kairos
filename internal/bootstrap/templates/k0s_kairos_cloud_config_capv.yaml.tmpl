@@ -246,12 +246,15 @@ MANIFEST_EOF
       # NodeNotFound until providerID is set, but the kubeconfig still reaches the
       # management cluster (and the controller re-renders to retry providerID).
       echo "Waiting for k0s node to be registered..."
-      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      # Use `k0s kubectl` (resolves the local admin kubeconfig). The Hadron k0s
+      # image ships no standalone `kubectl` binary, so bare `kubectl` would fail
+      # `command not found` (swallowed by &>/dev/null) and silently never set the
+      # providerID — lab-confirmed. Mirrors the Metal3 path below.
       node_registered=false
       MAX_WAIT=300
       ELAPSED=0
       while [ $ELAPSED -lt $MAX_WAIT ]; do
-        if kubectl get node $(hostname) &>/dev/null; then
+        if k0s kubectl get node $(hostname) &>/dev/null; then
           node_registered=true
           break
         fi
@@ -266,7 +269,7 @@ MANIFEST_EOF
         echo "Setting providerID={{ .ProviderID }} on node $(hostname)..."
         PROVIDER_ID_SET=false
         for i in {1..30}; do
-          if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
+          if k0s kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"{{ .ProviderID }}"}}' &>/dev/null; then
             echo "Successfully set providerID={{ .ProviderID }} on node $(hostname)"
             PROVIDER_ID_SET=true
             break
@@ -279,7 +282,78 @@ MANIFEST_EOF
         fi
       fi
       {{- else if not .Metal3 }}
-      echo "No providerID to set"
+      # CAPV self-discovery: ProviderID was not available at render time (assigned
+      # after VM clone), so compute vsphere://<uuid> from DMI at boot.
+      # KD-55: fail-OPEN. If the UUID is absent or malformed, warn and continue so
+      # the kubeconfig push below still runs. A missing providerID is recoverable;
+      # a stranded cluster is not.
+      # DMI uses mixed-endian byte order for the first three UUID groups; vSphere
+      # expects RFC/ISO big-endian. The byte-swap below is the same algorithm
+      # proven correct in the k3s CAPV template (lab-validated: discovered UUID
+      # matched VSphereMachine providerID and Machine reached Running).
+      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      PROVIDER_ID=""
+      if [ -f /sys/class/dmi/id/product_uuid ]; then
+        RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
+        HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
+          T0="${HEX:6:2}${HEX:4:2}${HEX:2:2}${HEX:0:2}"
+          T1="${HEX:10:2}${HEX:8:2}"
+          T2="${HEX:14:2}${HEX:12:2}"
+          REST="${HEX:16:16}"
+          FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
+          # Strict UUID validation before the kubectl patch. The validated value
+          # is interpolated into a JSON string in -p below; enforcing the regex
+          # here closes the injection surface (malformed input never reaches the
+          # patch). Whole-string match via bash =~ (not line-anchored grep).
+          UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if [[ "${FORMATTED}" =~ ${UUID_RE} ]]; then
+            PROVIDER_ID="vsphere://${FORMATTED}"
+            echo "Discovered providerID from DMI: ${PROVIDER_ID}"
+          else
+            echo "WARN: DMI UUID '${FORMATTED}' did not match UUID pattern; skipping providerID (continuing post-bootstrap)"
+          fi
+        else
+          echo "WARN: DMI product_uuid is absent or not 32 hex chars after strip; skipping providerID (continuing post-bootstrap)"
+        fi
+      else
+        echo "WARN: /sys/class/dmi/id/product_uuid not found; skipping providerID (continuing post-bootstrap)"
+      fi
+      if [ -n "${PROVIDER_ID}" ]; then
+        echo "Waiting for k0s node to be registered..."
+        node_registered=false
+        MAX_WAIT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # k0s kubectl: the Hadron k0s image has no standalone `kubectl` binary.
+          if k0s kubectl get node $(hostname) &>/dev/null; then
+            node_registered=true
+            break
+          fi
+          echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
+        done
+        if [ "$node_registered" != "true" ]; then
+          echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+        else
+          # Set the discovered providerID on the Node. Retry for transient API-server unavailability.
+          echo "Setting providerID=${PROVIDER_ID} on node $(hostname)..."
+          PROVIDER_ID_SET=false
+          for i in {1..30}; do
+            if k0s kubectl patch node $(hostname) --type=merge -p "{\"spec\":{\"providerID\":\"${PROVIDER_ID}\"}}" &>/dev/null; then
+              echo "Successfully set providerID=${PROVIDER_ID} on node $(hostname)"
+              PROVIDER_ID_SET=true
+              break
+            fi
+            echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+            sleep 5
+          done
+          if [ "$PROVIDER_ID_SET" != "true" ]; then
+            echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
+          fi
+        fi
+      fi
       {{- end }}
 
       {{- if .Metal3 }}
