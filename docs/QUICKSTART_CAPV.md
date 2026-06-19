@@ -11,7 +11,7 @@ This guide walks you through creating a single-node k0s or k3s cluster on Kairos
 1. **vSphere Environment**:
    - vCenter Server access (FQDN or IP, no URL prefix).
    - Datacenter, Datastore, Network configured.
-   - A Kairos VM template uploaded to vSphere with Kairos OS.
+   - A Kairos VM template uploaded to vSphere with Kairos OS (see [Building the Kairos VM template](#building-the-kairos-vm-template) below).
    - Resource Pool (optional).
 
 2. **Management Cluster**: A Kubernetes cluster with network access to vSphere.
@@ -81,6 +81,117 @@ make deploy
 
 See [INSTALL.md](INSTALL.md) for the full developer install process.
 
+## Building the Kairos VM template
+
+This guide uses **Kairos Hadron**, the OS validated end-to-end with this
+provider (k0s and k3s on CAPV).
+
+CAPV discovers a VM's IP address through VMware Tools (`vmtoolsd`). The
+published Hadron images do not ship open-vm-tools — Hadron is a minimal,
+musl-libc system with no open-vm-tools package — so a stock Hadron image
+boots, but vCenter never reports the guest IP. CAPV then cannot determine the
+node address and the Machine never transitions out of `Provisioning`. The
+template image must therefore include **open-vm-tools**, compiled from source
+and layered onto the Hadron base. Kairos starts open-vm-tools automatically on
+VMware guests once the `vmtoolsd.service` unit is present in the image; no
+manual service enablement is needed.
+
+#### 1. Build a Hadron image with open-vm-tools
+
+Start from a published Hadron base image — for example the standard k3s build:
+
+```
+quay.io/kairos/hadron:v0.4.0-standard-amd64-generic-v4.1.2-k3s-v1.34.8-k3s1
+```
+
+(the k0s build is `...-k0s-v1.34.8-k0s.0`). The Kubernetes version encoded in
+the tag must match `KairosConfigTemplate.spec.kubernetesVersion` — the tag
+above corresponds to `kubernetesVersion: "v1.34.8+k3s1"`. See the
+[Kairos image matrix](https://kairos.io/docs/reference/image_matrix/) for the
+published Hadron tags.
+
+A complete, pinned multi-stage Dockerfile that compiles open-vm-tools and
+layers it onto a Hadron base is provided at
+[`docs/examples/vsphere/Dockerfile`](examples/vsphere/Dockerfile) — this is the
+exact build used for the CAPV end-to-end validation. It builds open-vm-tools
+(and its glib/pcre2/libffi/libmspack/libtirpc dependencies) with the Hadron
+toolchain, patches it to recognise Hadron as a guest OS, and writes the
+`vmtoolsd.service` unit (the source build ships none).
+
+Build it, selecting the Hadron base with `BASE_IMAGE`, and push to a registry
+you control:
+
+```bash
+docker build \
+  --build-arg BASE_IMAGE=quay.io/kairos/hadron:v0.4.0-standard-amd64-generic-v4.1.2-k3s-v1.34.8-k3s1 \
+  -t <your-registry>/hadron-vsphere:v0.4.0-k3s \
+  -f docs/examples/vsphere/Dockerfile .
+docker push <your-registry>/hadron-vsphere:v0.4.0-k3s
+```
+
+#### 2. Produce a raw disk image with AuroraBoot
+
+Turn the container image into a bootable raw disk:
+
+```bash
+docker run --rm --privileged \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD"/build:/output \
+  quay.io/kairos/auroraboot:v0.24.0 \
+  --set container_image=docker:<your-registry>/hadron-vsphere:v0.4.0-k3s \
+  --set disable_http_server=true \
+  --set disable_netboot=true \
+  --set state_dir=/output \
+  --set disk.raw=true
+```
+
+This writes `build/*.raw`. See the
+[AuroraBoot docs](https://kairos.io/docs/advanced/creating_custom_cloud_images/)
+for additional options.
+
+#### 3. Convert to VMDK and import as a vSphere template
+
+These commands use `govc`; the vCenter UI produces the same result. Substitute
+the placeholder values for your environment:
+
+```bash
+# Convert raw disk to a streamOptimized VMDK (AuroraBoot wrote one *.raw)
+qemu-img convert -f raw -O vmdk -o subformat=streamOptimized build/*.raw hadron-vsphere.vmdk
+
+# Import the VMDK to a datastore folder
+govc import.vmdk -dc=<datacenter> -ds=<datastore> hadron-vsphere.vmdk hadron-vsphere-seed
+
+# Create the VM shell — EFI firmware is required for Kairos
+govc vm.create -dc=<datacenter> -ds=<datastore> \
+  -pool=<resource-pool> -folder=<vm-folder> \
+  -g=ubuntu64Guest -firmware=efi -c=4 -m=4096 \
+  -net="VM Network" -net.adapter=e1000 \
+  -disk="hadron-vsphere-seed/hadron-vsphere.vmdk" -disk.controller=lsilogic \
+  -on=false hadron-vsphere
+
+# Convert the VM to a template
+govc vm.markastemplate -dc=<datacenter> hadron-vsphere
+```
+
+#### 4. Template configuration reference
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Firmware | **EFI (UEFI)** | Kairos boots via UEFI; BIOS firmware will not boot the image. |
+| Guest OS | Linux — Other Linux (64-bit) / `ubuntu64Guest` | Generic 64-bit Linux. |
+| vCPU / RAM | 4 vCPU / 4096 MiB (example; size to workload) | Control-plane baseline. |
+| NIC adapter | `e1000` or `vmxnet3` | Either works once open-vm-tools is present. |
+| Disk controller | LSI Logic (`lsilogic`) | Matches the imported VMDK. |
+| VMware Tools | **open-vm-tools present in the image** | Required so vCenter reports the guest IP to CAPV. |
+
+The template name you assign here — `hadron-vsphere` in the commands above —
+is the value to set in `VSphereMachineTemplate.spec.template.spec.template`
+later in this guide. AuroraBoot can alternatively output a cloud image
+directly; an OVA can be produced with `govc export.ovf` if you prefer to
+distribute or archive the template in OVA form, but the raw→VMDK→template
+path above is the simplest path from a Kairos container image to a vSphere
+template.
+
 ## Creating a Cluster
 
 ### Step 1: Create the user-password Secret
@@ -133,7 +244,8 @@ spec:
       numCPUs: 2
       memoryMiB: 4096
       diskGiB: 50
-      template: "kairos-template"
+      # Use the template name from "Building the Kairos VM template" above.
+      template: "hadron-vsphere"
       cloneMode: "fullClone"
 ```
 
