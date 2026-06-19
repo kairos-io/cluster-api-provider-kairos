@@ -1,5 +1,10 @@
-# Build stage
-FROM golang:1.26-alpine AS builder
+# Build stage — run the builder on the native build platform and cross-compile
+# to the requested target arch (TARGETOS/TARGETARCH are supplied by buildx).
+# CGO is disabled, so Go cross-compiles without an emulated toolchain.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /workspace
 
@@ -18,8 +23,8 @@ COPY main.go main.go
 COPY api/ api/
 COPY internal/ internal/
 
-# Build
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager main.go
+# Build for the target platform (multi-arch safe).
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o manager main.go
 
 # Runtime stage
 FROM gcr.io/distroless/static:nonroot
