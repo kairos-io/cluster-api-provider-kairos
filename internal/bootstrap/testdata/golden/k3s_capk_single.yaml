@@ -1,0 +1,164 @@
+#cloud-config
+
+hostname: kairos-cp-0
+
+users:
+- name: kairos
+  groups:
+    - admin
+  ssh_authorized_keys:
+    - github:testuser
+- name: capk
+  groups: [users, admin]
+
+# Control-plane node configuration
+# Pass providerID at k3s startup so node registers with correct providerID (avoids k3s:// vs kubevirt:// mismatch)
+# Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
+# Add --tls-san for LB endpoint so management cluster can connect via LoadBalancer
+# ProviderID is regex-validated before render (see internal/bootstrap/validate.go).
+k3s:
+  enabled: true
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # systemd drop-in: skip k3s.service on the Kairos live installer.
+  # The k3s.enabled: true cloud-config primitive (below) issues
+  # `systemctl start k3s.service`. On the live installer, k3s's bundled
+  # containerd cannot use the overlayfs snapshotter on the live tmpfs
+  # overlay (cannot nest overlayfs), so k3s.service stays in retry
+  # forever — blocking provider-kairos's k3s primitive from returning
+  # and hanging the userdata cloud-config stage indefinitely. The
+  # ConditionKernelCommandLine=!cdroot gate makes systemd treat the
+  # start as a no-op on the live installer; the install proceeds, then
+  # the installed-system boot has /var/lib/rancher on a real
+  # filesystem (no overlay nesting) and k3s starts normally.
+  # KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
+  - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      ConditionKernelCommandLine=!cdroot
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-cp-0
+  - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k3s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k3s
+      # node registration that never happens on the installer (overlayfs
+      # snapshotter cannot nest on the live tmpfs overlay), holding up
+      # cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      After=k3s.service
+      Wants=k3s.service
+      
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k3s-post-bootstrap.sh
+      
+      [Install]
+      WantedBy=multi-user.target
+  # Systemd override: write providerID to k3s config before k3s starts.
+  # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
+  # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-discover-provider-id.sh || true'
+  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre)
+  # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
+  - path: /usr/local/bin/kairos-k3s-discover-provider-id.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      PROVIDER_ID=""
+      # Prefer hostname: CAPK uses kubevirt://<vm-name> and hostname matches KubevirtMachine/VM name
+      # Hostname is shquote'd into POSIX single quotes to prevent shell injection
+      # (KD-43): the static "kubevirt://" prefix is in double quotes (safe — no
+      # template expansion), and the user-controlled .Hostname is concatenated as
+      # a single-quoted literal that bash cannot reinterpret.
+      PROVIDER_ID="kubevirt://"'kairos-cp-0'
+      echo "Discovered providerID: $PROVIDER_ID (hostname)"
+      # Fallback: DMI product_uuid (KubeVirt VMs may expose UUID; only if hostname not available)
+      if [ -z "$PROVIDER_ID" ] && [ -f /sys/class/dmi/id/product_uuid ]; then
+        RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
+        HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
+          FORMATTED="${HEX:0:8}-${HEX:8:4}-${HEX:12:4}-${HEX:16:4}-${HEX:20:12}"
+          PROVIDER_ID="kubevirt://${FORMATTED}"
+          echo "Discovered providerID: $PROVIDER_ID (DMI)"
+        fi
+      fi
+      if [ -n "$PROVIDER_ID" ]; then
+        mkdir -p /etc/rancher/k3s/config.yaml.d
+        printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+      fi
+  - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # CAPK: always mark bootstrap success on script exit
+      mark_bootstrap_success() {
+        mkdir -p /run/cluster-api
+        echo "success" > /run/cluster-api/bootstrap-success.complete
+        chmod 0644 /run/cluster-api/bootstrap-success.complete
+      }
+      trap mark_bootstrap_success EXIT
+      
+      # Mark bootstrap success for CAPI/CAPK consumers
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+      
+      echo "k3s post-bootstrap tasks completed successfully"
+stages:
+  boot:
+    - name: "Discover providerID for k3s (VM self-discovery)"
+      commands:
+        - /usr/local/bin/kairos-k3s-discover-provider-id.sh || true
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    - name: "Ensure k3s directories exist"
+      commands:
+        - mkdir -p /etc/rancher/k3s
+        - mkdir -p /etc/rancher/k3s/config.yaml.d
+
+runcmd:
+  # `enable --now`: create the multi-user.target.wants/ symlink AND start
+  # the unit on this boot. Plain `enable` only creates the symlink; the
+  # service would only auto-start on the NEXT boot — too late for the
+  # KD-3b push pattern, which needs to fire on the first installed-system
+  # boot. Same fix the k0s templates use via the helper service.
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true
