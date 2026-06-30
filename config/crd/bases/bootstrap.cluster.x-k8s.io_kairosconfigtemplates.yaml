@@ -106,6 +106,31 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-map-type: atomic
+                      controlPlaneRole:
+                        allOf:
+                        - enum:
+                          - single
+                          - init
+                          - join
+                        - enum:
+                          - single
+                          - init
+                          - join
+                        description: |-
+                          ControlPlaneRole is the init/join/single discriminator for this
+                          control-plane machine. Set by the KairosControlPlane controller;
+                          must not be set directly by end users.
+
+                          The zero value ("") is treated as equivalent to "single" by the
+                          bootstrap controller for backward compatibility with KairosConfig
+                          objects that predate this field. Do not rely on the zero value in
+                          new code — the controller sets an explicit value on every machine it
+                          creates.
+
+                          Rendered into the cloud-config in Phase 2; ignored by the bootstrap
+                          controller until Phase 2 ships (the SingleNode field covers the
+                          single-node case in the interim).
+                        type: string
                       distribution:
                         default: k0s
                         description: Distribution specifies the Kubernetes distribution
@@ -333,8 +358,15 @@ spec:
                         type: string
                       singleNode:
                         description: |-
-                          SingleNode indicates this is a single-node control plane cluster
-                          When true, k0s will be configured with --single flag
+                          SingleNode indicates this is a single-node control plane cluster.
+                          When true, k0s will be configured with --single flag.
+
+                          Deprecated: SingleNode is derived by the KairosControlPlane controller
+                          from spec.replicas (true when replicas==1) and will be removed in a
+                          future v1beta3 revision (KD-39). New code should read ControlPlaneRole
+                          instead. Both fields coexist during the transition period; the controller
+                          sets both for backward compatibility with templates that branch on
+                          SingleNode.
                         type: boolean
                       sshPublicKey:
                         description: SSHPublicKey is a raw SSH public key (alternative

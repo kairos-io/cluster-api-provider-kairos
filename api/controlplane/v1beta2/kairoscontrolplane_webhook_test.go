@@ -61,42 +61,65 @@ func TestKairosControlPlane_Validate_Replicas(t *testing.T) {
 		wantErr     bool
 		wantMessage string
 	}{
+		// === valid: odd values 1, 3, 5 and nil (default 1) ===
 		{
-			name:     "valid: replicas=1",
+			name:     "valid: replicas=1 (single-node, backward-compat)",
 			replicas: ptr(int32(1)),
 			wantErr:  false,
 		},
 		{
-			name:     "valid: replicas=nil (defaulter sets to 1, validate sees nil)",
-			replicas: nil,
+			name:     "valid: replicas=3 (HA)",
+			replicas: ptr(int32(3)),
 			wantErr:  false,
 		},
 		{
-			name:        "invalid: replicas=0 (lower bound)",
+			name:     "valid: replicas=5 (HA)",
+			replicas: ptr(int32(5)),
+			wantErr:  false,
+		},
+		{
+			name:     "valid: replicas=nil (defaulter fills to 1)",
+			replicas: nil,
+			wantErr:  false,
+		},
+		// === invalid: below minimum ===
+		{
+			name:        "invalid: replicas=0 (below minimum)",
 			replicas:    ptr(int32(0)),
 			wantErr:     true,
-			wantMessage: "must be greater than or equal to 1",
+			wantMessage: "at least 1",
 		},
 		{
 			name:        "invalid: negative replicas",
 			replicas:    ptr(int32(-3)),
 			wantErr:     true,
-			wantMessage: "must be greater than or equal to 1",
+			wantMessage: "at least 1",
+		},
+		// === invalid: above maximum ===
+		{
+			name:        "invalid: replicas=6 (above maximum of 5)",
+			replicas:    ptr(int32(6)),
+			wantErr:     true,
+			wantMessage: "above 5 are not supported",
 		},
 		{
-			// KD-5a: the public, reputational change. The error message must
-			// explain *why* — pointing at the open HA implementation, not
-			// just saying "must be <= 1".
-			name:        "invalid: replicas=2 (HA not yet supported)",
+			name:        "invalid: replicas=7 (above maximum of 5)",
+			replicas:    ptr(int32(7)),
+			wantErr:     true,
+			wantMessage: "above 5 are not supported",
+		},
+		// === invalid: even counts (etcd quorum message) ===
+		{
+			name:        "invalid: replicas=2 (even count rejected)",
 			replicas:    ptr(int32(2)),
 			wantErr:     true,
-			wantMessage: "spec.replicas > 1 is not supported in this release",
+			wantMessage: "odd number",
 		},
 		{
-			name:        "invalid: replicas=3",
-			replicas:    ptr(int32(3)),
+			name:        "invalid: replicas=4 (even count rejected)",
+			replicas:    ptr(int32(4)),
 			wantErr:     true,
-			wantMessage: "spec.replicas > 1 is not supported in this release",
+			wantMessage: "odd number",
 		},
 	}
 	for _, tc := range cases {
@@ -414,5 +437,225 @@ func TestKairosControlPlane_Default_SSHFallback(t *testing.T) {
 				t.Errorf("ActivateAfter: got nil, want non-nil after defaulting")
 			}
 		})
+	}
+}
+
+// TestKairosControlPlane_Validate_HA covers the optional HA block validation
+// (VIP address shape, interface name regex, nil block, and combinations).
+func TestKairosControlPlane_Validate_HA(t *testing.T) {
+	cases := []struct {
+		name       string
+		ha         *HAConfig
+		wantErrStr string // non-empty: error must contain; empty: must validate cleanly
+	}{
+		// --- nil block is always valid (single-node or unset HA) ---
+		{
+			name: "nil ha block is valid",
+			ha:   nil,
+		},
+		// --- nil VIP within a non-nil HA block is valid ---
+		{
+			name: "ha block with nil vip is valid",
+			ha:   &HAConfig{VIP: nil},
+		},
+		// --- valid VIP configurations ---
+		{
+			name: "valid: IPv4 address ARP mode",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "eth0",
+				Mode:      KubeVIPModeARP,
+			}},
+		},
+		{
+			name: "valid: IPv4 address BGP mode",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "10.0.0.5",
+				Interface: "ens3",
+				Mode:      KubeVIPModeBGP,
+			}},
+		},
+		{
+			name: "valid: IPv6 address",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "2001:db8::1",
+				Interface: "eth0",
+			}},
+		},
+		{
+			name: "valid: RFC-1123 hostname",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "cp.example.com",
+				Interface: "ens3",
+			}},
+		},
+		{
+			name: "valid: interface with dot (VLAN-style)",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "eth0.1",
+			}},
+		},
+		{
+			name: "valid: bond interface",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "bond0",
+			}},
+		},
+		// --- invalid address ---
+		{
+			name: "invalid: address contains exclamation mark",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "not-a-valid-addr!!",
+				Interface: "eth0",
+			}},
+			wantErrStr: "vip.address",
+		},
+		{
+			name: "invalid: address is empty string",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "",
+				Interface: "eth0",
+			}},
+			wantErrStr: "vip.address",
+		},
+		{
+			name: "invalid: address with spaces",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1 .10",
+				Interface: "eth0",
+			}},
+			wantErrStr: "vip.address",
+		},
+		// --- invalid interface ---
+		{
+			name: "invalid: interface name too long (>15 chars)",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "averylongiface0", // 15 chars — valid
+			}},
+			// exactly 15 chars is allowed; test a 16-char one below
+		},
+		{
+			name: "invalid: interface name 16 chars (>15 limit)",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "averylongiface00", // 16 chars — invalid
+			}},
+			wantErrStr: "vip.interface",
+		},
+		{
+			name: "invalid: interface starts with digit",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "0eth",
+			}},
+			wantErrStr: "vip.interface",
+		},
+		{
+			name: "invalid: interface with space",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "eth 0",
+			}},
+			wantErrStr: "vip.interface",
+		},
+		{
+			name: "invalid: interface empty string",
+			ha: &HAConfig{VIP: &KubeVIPConfig{
+				Address:   "192.168.1.10",
+				Interface: "",
+			}},
+			wantErrStr: "vip.interface",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			kcp := newValidKCP()
+			kcp.Spec.HA = tc.ha
+			err := kcp.validate()
+			if tc.wantErrStr == "" {
+				if err != nil {
+					t.Fatalf("validate() returned unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate() returned nil; expected error containing %q", tc.wantErrStr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrStr) {
+				t.Errorf("validate() error %q does not contain %q", err.Error(), tc.wantErrStr)
+			}
+		})
+	}
+}
+
+// TestKairosControlPlane_ValidateWithWarnings_VIPOnSingleNode asserts that
+// setting spec.ha.vip when spec.replicas==1 produces an admission Warning
+// (not an error) — the resource is admitted but the operator is informed that
+// the VIP block will be ignored.
+func TestKairosControlPlane_ValidateWithWarnings_VIPOnSingleNode(t *testing.T) {
+	kcp := newValidKCP()
+	kcp.Spec.Replicas = ptr(int32(1))
+	kcp.Spec.HA = &HAConfig{VIP: &KubeVIPConfig{
+		Address:   "192.168.1.10",
+		Interface: "eth0",
+	}}
+
+	warnings, err := kcp.validateWithWarnings()
+	if err != nil {
+		t.Fatalf("validateWithWarnings() returned error %v; expected nil (VIP on single-node is a warning, not an error)", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("validateWithWarnings() returned no warnings; expected at least one warning about VIP being ignored for single-node")
+	}
+	if !strings.Contains(warnings[0], "spec.ha.vip") {
+		t.Errorf("warning[0] = %q; expected it to mention spec.ha.vip", warnings[0])
+	}
+}
+
+// TestKairosControlPlane_ValidateWithWarnings_HAOnSingleNodeNilVIP asserts that
+// a non-nil HA block with nil VIP on a single-node cluster does NOT produce a
+// warning — only a non-nil VIP triggers the warning.
+func TestKairosControlPlane_ValidateWithWarnings_HAOnSingleNodeNilVIP(t *testing.T) {
+	kcp := newValidKCP()
+	kcp.Spec.Replicas = ptr(int32(1))
+	kcp.Spec.HA = &HAConfig{VIP: nil}
+
+	warnings, err := kcp.validateWithWarnings()
+	if err != nil {
+		t.Fatalf("validateWithWarnings() returned unexpected error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("validateWithWarnings() returned %d warnings; expected 0 for nil VIP: %v", len(warnings), warnings)
+	}
+}
+
+// TestKairosControlPlane_Validate_HANilOnReplicas3 asserts that replicas=3
+// with no HA block (nil) is valid — VIP is not required at admission time.
+func TestKairosControlPlane_Validate_HANilOnReplicas3(t *testing.T) {
+	kcp := newValidKCP()
+	kcp.Spec.Replicas = ptr(int32(3))
+	kcp.Spec.HA = nil
+
+	if err := kcp.validate(); err != nil {
+		t.Fatalf("validate() returned %v; expected nil (VIP is not required at admission)", err)
+	}
+}
+
+// TestKairosControlPlane_Validate_SingleNodeNoHAField is the backward-compat
+// proof: an existing KairosControlPlane with replicas:1 and no HA field
+// behaves identically after Phase 1 — admitted with no error and no warning.
+func TestKairosControlPlane_Validate_SingleNodeNoHAField(t *testing.T) {
+	kcp := newValidKCP() // replicas=1, ha=nil — the current default shape
+	warnings, err := kcp.validateWithWarnings()
+	if err != nil {
+		t.Fatalf("validateWithWarnings() returned %v; expected nil for single-node default config", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("validateWithWarnings() returned %d warnings; expected 0 for clean single-node config", len(warnings))
 	}
 }

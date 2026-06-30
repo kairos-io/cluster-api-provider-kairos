@@ -33,15 +33,18 @@ type KairosControlPlaneSpec struct {
 	// Replicas is the number of control plane machines.
 	// Contract: ControlPlane MUST expose replicas.
 	//
-	// Only `replicas: 1` is supported in this release. With `replicas: 1`,
-	// k0s/k3s is configured with `--single` and the control plane operates in
-	// single-node mode. HA control planes (both classic and P2P/decentralized)
-	// are planned for a future release; until then, the validating webhook
-	// rejects values greater than 1 because the current bootstrap logic would
-	// otherwise produce N independent single-node clusters instead of an HA
-	// cluster (see foundational-review item KD-5).
+	// Allowed values are 1, 3, and 5 — odd numbers only. Even counts provide
+	// the same etcd fault tolerance as the next-lower odd count while increasing
+	// the quorum requirement, so they are rejected at admission. Values above 5
+	// are also rejected; beyond 5 etcd members the quorum cost outweighs the
+	// additional fault tolerance for a control plane.
+	//
+	// replicas: 1 configures a single-node control plane (k0s --single /
+	// k3s single-server). replicas: 3 or 5 configure an HA control plane using
+	// the classic join path (ADR 0005, Phase 3+); kube-vip (ARP/L2 by default)
+	// provides the stable VIP — configure spec.ha.vip for the VIP parameters.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1
+	// +kubebuilder:validation:Maximum=5
 	// +kubebuilder:default=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
@@ -67,6 +70,15 @@ type KairosControlPlaneSpec struct {
 	// RolloutStrategy defines the strategy for rolling out updates
 	// +optional
 	RolloutStrategy *RolloutStrategy `json:"rolloutStrategy,omitempty"`
+
+	// HA holds configuration for high-availability control planes
+	// (spec.replicas in {3, 5}). Ignored when spec.replicas is 1.
+	//
+	// For single-node clusters (replicas: 1) this field must be left unset or
+	// nil; kube-vip is not rendered for single-node control planes, and a
+	// non-nil VIP block will trigger a validation warning.
+	// +optional
+	HA *HAConfig `json:"ha,omitempty"`
 
 	// SSHFallback configures an opt-in SSH-pull fallback used to retrieve the
 	// workload-cluster kubeconfig when the in-VM node-push path is unreachable
@@ -237,6 +249,81 @@ type RollingUpdate struct {
 	// desired number of machines
 	// +optional
 	MaxSurge *int32 `json:"maxSurge,omitempty"`
+}
+
+// HAConfig configures high-availability behaviour for a KairosControlPlane
+// with spec.replicas > 1.
+type HAConfig struct {
+	// VIP configures the virtual IP (kube-vip) used as the stable control-plane
+	// endpoint across HA nodes. Required when the infrastructure provider does
+	// not supply a load-balanced endpoint automatically.
+	//
+	// CAPK exception: CAPK mints its own LoadBalancer Service and reflects the
+	// IP into KubevirtCluster.Spec.ControlPlaneEndpoint. Do NOT set VIP for
+	// CAPK clusters — it is redundant and will produce a conflicting ARP
+	// announcement.
+	//
+	// For CAPV, CAPM3, and CAPD, set VIP.Address to the IP (or hostname)
+	// pre-reserved for the control-plane endpoint. The same value must be set
+	// on the InfraCluster's ControlPlaneEndpoint so that CAPI core copies it
+	// into Cluster.Spec.ControlPlaneEndpoint. The controller does not enforce
+	// this constraint at admission; a mismatch will cause the cluster endpoint
+	// to point at the wrong address.
+	// +optional
+	VIP *KubeVIPConfig `json:"vip,omitempty"`
+}
+
+// KubeVIPMode is the kube-vip VIP advertisement mode.
+// +kubebuilder:validation:Enum=ARP;BGP
+type KubeVIPMode string
+
+const (
+	// KubeVIPModeARP uses ARP-based VIP advertisement (L2).
+	// Requires the control-plane nodes to share an L2 network segment.
+	KubeVIPModeARP KubeVIPMode = "ARP"
+
+	// KubeVIPModeBGP uses BGP-based VIP advertisement (L3).
+	// Requires BGP peering on the fabric; intended for routed bare-metal
+	// deployments.
+	KubeVIPModeBGP KubeVIPMode = "BGP"
+)
+
+// KubeVIPConfig holds the kube-vip parameters rendered into the
+// control-plane cloud-config by the bootstrap provider (Phase 2).
+// Security: Address and Interface are validated at admission (IP/hostname
+// shape and interface-name regex) and must be further shquote'd at template
+// render time (Phase 2 work, security-architect pre-merge required).
+type KubeVIPConfig struct {
+	// Address is the virtual IP address or DNS hostname for the control-plane
+	// endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123
+	// hostname. For ARP mode this must be an IP address reachable on the
+	// same L2 segment as the control-plane nodes.
+	//
+	// The value must match the host portion of the InfraCluster's
+	// ControlPlaneEndpoint so that CAPI core copies the correct address into
+	// Cluster.Spec.ControlPlaneEndpoint.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Address string `json:"address"`
+
+	// Interface is the Linux network interface name on which kube-vip
+	// advertises the VIP (e.g. "eth0", "ens3", "bond0").
+	//
+	// Must be a valid Linux interface name: 1–15 characters, starting with a
+	// letter, followed by letters, digits, dots, underscores, or hyphens.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=15
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9._-]{0,14}$`
+	Interface string `json:"interface"`
+
+	// Mode selects the VIP advertisement mechanism.
+	// ARP (default) requires the control-plane nodes to share an L2 segment.
+	// BGP requires a BGP peer and is intended for routed bare-metal fabrics.
+	// +kubebuilder:default=ARP
+	// +optional
+	Mode KubeVIPMode `json:"mode,omitempty"`
 }
 
 // KairosControlPlaneStatus defines the observed state of KairosControlPlane
