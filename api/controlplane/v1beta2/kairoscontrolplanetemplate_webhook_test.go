@@ -61,12 +61,20 @@ func TestKairosControlPlaneTemplate_Validate_Replicas(t *testing.T) {
 	cases := []struct {
 		name       string
 		replicas   *int32
-		wantSubstr string
+		wantSubstr string // non-empty: error must contain; empty: validate cleanly
 	}{
+		// === valid ===
 		{"nil-replicas-valid", nil, ""},
 		{"one-replica-valid", ptr(int32(1)), ""},
-		{"zero-replica-rejected", ptr(int32(0)), "must be greater than or equal to 1"},
-		{"two-replicas-rejected", ptr(int32(2)), "not supported in this release"},
+		{"three-replicas-valid", ptr(int32(3)), ""},
+		{"five-replicas-valid", ptr(int32(5)), ""},
+		// === invalid: below minimum ===
+		{"zero-replica-rejected", ptr(int32(0)), "at least 1"},
+		// === invalid: above maximum ===
+		{"six-replicas-rejected", ptr(int32(6)), "above 5 are not supported"},
+		// === invalid: even counts ===
+		{"two-replicas-rejected", ptr(int32(2)), "odd number"},
+		{"four-replicas-rejected", ptr(int32(4)), "odd number"},
 	}
 	for _, tc := range cases {
 		tc := tc

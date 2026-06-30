@@ -262,3 +262,70 @@ func TestKairosConfig_Default_StillSetsOtherDefaults(t *testing.T) {
 		t.Errorf("Default() Role = %q; expected worker", kc.Spec.Role)
 	}
 }
+
+// TestKairosConfig_Validate_ControlPlaneRole checks that the ControlPlaneRole
+// field is accepted at its three valid values, accepted when empty (zero value),
+// and that existing KairosConfig objects without the field continue to validate
+// (backward-compat guarantee for Phase 1).
+//
+// Note: the enum constraint (single/init/join) is enforced declaratively by the
+// kubebuilder marker at the CRD level. The webhook does not add a separate
+// enum-guard — this test confirms the zero value and all valid constants pass
+// validation without error so that the controller can set the field post-create
+// via patch without triggering an admission rejection.
+func TestKairosConfig_Validate_ControlPlaneRole(t *testing.T) {
+	cases := []struct {
+		name    string
+		role    ControlPlaneRole
+		wantErr bool
+	}{
+		{
+			name:    "zero value (empty string) is valid — backward compat for pre-Phase-1 objects",
+			role:    "",
+			wantErr: false,
+		},
+		{
+			name:    "single is valid",
+			role:    ControlPlaneRoleSingle,
+			wantErr: false,
+		},
+		{
+			name:    "init is valid",
+			role:    ControlPlaneRoleInit,
+			wantErr: false,
+		},
+		{
+			name:    "join is valid",
+			role:    ControlPlaneRoleJoin,
+			wantErr: false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			kc := newValidKairosConfig()
+			kc.Spec.ControlPlaneRole = tc.role
+			err := kc.validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("validate() returned nil; expected an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validate() returned unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestKairosConfig_Validate_BackwardCompat_SingleNodeNoRole confirms that a
+// KairosConfig with SingleNode=true and ControlPlaneRole="" (the state of all
+// existing objects before Phase 1 was deployed) continues to pass validation.
+// This is the critical backward-compat test for Phase 1.
+func TestKairosConfig_Validate_BackwardCompat_SingleNodeNoRole(t *testing.T) {
+	kc := newValidKairosConfig()
+	kc.Spec.SingleNode = true
+	kc.Spec.ControlPlaneRole = "" // zero value — not set by pre-Phase-1 controller
+
+	if err := kc.validate(); err != nil {
+		t.Fatalf("validate() returned %v; existing single-node KairosConfig (SingleNode=true, ControlPlaneRole empty) must continue to validate cleanly", err)
+	}
+}

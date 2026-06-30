@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"net"
 	"regexp"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -36,6 +38,12 @@ import (
 // because CRD-level pattern validation is not a substitute for admission
 // validation (older API servers, defaulting paths, custom storage versions).
 var sshFallbackUserRegex = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// vipInterfaceRe matches valid Linux network interface names: 1–15 characters,
+// starting with a letter, followed by letters, digits, dots, underscores, or
+// hyphens. Mirrors the kubebuilder marker on KubeVIPConfig.Interface; the
+// webhook adds a second line of defense for older API servers.
+var vipInterfaceRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]{0,14}$`)
 
 // log is for logging in this package.
 var kairoscontrolplaneLog = logf.Log.WithName("kairoscontrolplane-resource")
@@ -102,13 +110,33 @@ var _ webhook.Validator = &KairosControlPlane{}
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
 func (r *KairosControlPlane) ValidateCreate() (admission.Warnings, error) {
 	kairoscontrolplaneLog.Info("validate create", "name", r.Name)
-	return nil, r.validate()
+	return r.validateWithWarnings()
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
 func (r *KairosControlPlane) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
 	kairoscontrolplaneLog.Info("validate update", "name", r.Name)
-	return nil, r.validate()
+	return r.validateWithWarnings()
+}
+
+// validateWithWarnings runs validate() and also collects non-blocking warnings.
+func (r *KairosControlPlane) validateWithWarnings() (admission.Warnings, error) {
+	var warnings admission.Warnings
+
+	// Warn (but do not reject) when a VIP block is set on a single-node
+	// control plane. The VIP configuration will be silently ignored by the
+	// controller until replicas is increased to 3 or 5, so surfacing this as a
+	// warning lets operators catch configuration drift early.
+	if r.Spec.HA != nil && r.Spec.HA.VIP != nil &&
+		r.Spec.Replicas != nil && *r.Spec.Replicas == 1 {
+		warnings = append(warnings,
+			"spec.ha.vip is set but spec.replicas is 1: kube-vip is not "+
+				"rendered for single-node control planes. Remove spec.ha.vip "+
+				"or set spec.replicas to 3 or 5.",
+		)
+	}
+
+	return warnings, r.validate()
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type
@@ -119,34 +147,44 @@ func (r *KairosControlPlane) ValidateDelete() (admission.Warnings, error) {
 
 // validate performs validation on the KairosControlPlane spec.
 //
-// The replicas bounds check is duplicated declaratively via
-// kubebuilder:validation:Minimum=1 / Maximum=1 markers on the type. The webhook
-// remains as a second line of defense and to surface a clearer message when
-// users hit the upper bound — the CRD-level message ("spec.replicas in body
-// should be less than or equal to 1") tells them WHAT is wrong but not WHY.
+// The replica bounds (Minimum=1, Maximum=5) are also enforced declaratively
+// via kubebuilder markers on the type. The webhook is a second line of defense
+// and provides the etcd-quorum explanation that the CRD-level message omits.
 func (r *KairosControlPlane) validate() error {
 	var allErrs field.ErrorList
 
-	// Validate replicas. Lower bound: must be >= 1 (control plane with zero
-	// machines is nonsensical). Upper bound: must be <= 1 in this release —
-	// see the field doc-comment and foundational-review item KD-5 for context.
+	// Validate replicas. Three rejection arms:
+	//   1. below minimum — a control plane with zero machines is nonsensical.
+	//   2. above maximum — beyond 5 etcd members the quorum cost outweighs
+	//      the additional fault tolerance for a control plane.
+	//   3. even count — provides the same etcd fault tolerance as the
+	//      next-lower odd count while increasing the quorum requirement;
+	//      always replace an even count with the next-higher odd count.
 	if r.Spec.Replicas != nil {
+		n := *r.Spec.Replicas
+		replicasPath := field.NewPath("spec", "replicas")
 		switch {
-		case *r.Spec.Replicas < 1:
+		case n < 1:
 			allErrs = append(allErrs, field.Invalid(
-				field.NewPath("spec", "replicas"),
-				*r.Spec.Replicas,
-				"spec.replicas must be greater than or equal to 1",
+				replicasPath, n,
+				"spec.replicas must be at least 1",
 			))
-		case *r.Spec.Replicas > 1:
+		case n > 5:
 			allErrs = append(allErrs, field.Invalid(
-				field.NewPath("spec", "replicas"),
-				*r.Spec.Replicas,
-				"spec.replicas > 1 is not supported in this release: the current "+
-					"control-plane implementation would produce N independent "+
-					"single-node clusters instead of an HA cluster. HA support "+
-					"(both classic and P2P/decentralized) is planned for a "+
-					"future release. Use spec.replicas: 1 for now.",
+				replicasPath, n,
+				"spec.replicas must be 1, 3, or 5; values above 5 are not "+
+					"supported. etcd fault tolerance is (N-1)/2 failures; beyond "+
+					"5 members the quorum cost outweighs the additional fault "+
+					"tolerance for a control plane.",
+			))
+		case n%2 == 0:
+			allErrs = append(allErrs, field.Invalid(
+				replicasPath, n,
+				"spec.replicas must be an odd number (1, 3, or 5). Even replica "+
+					"counts give the same etcd fault tolerance as the next-lower "+
+					"odd count (e.g. 4 tolerates 1 failure, the same as 3) while "+
+					"increasing the quorum requirement. Use 3 instead of 2 or 4, "+
+					"and 5 instead of 6.",
 			))
 		}
 	}
@@ -160,6 +198,7 @@ func (r *KairosControlPlane) validate() error {
 		))
 	}
 
+	allErrs = append(allErrs, validateHA(r.Spec.HA, field.NewPath("spec", "ha"))...)
 	allErrs = append(allErrs, validateSSHFallback(r.Spec.SSHFallback, r.Namespace, field.NewPath("spec", "sshFallback"))...)
 
 	if len(allErrs) > 0 {
@@ -171,6 +210,49 @@ func (r *KairosControlPlane) validate() error {
 	}
 
 	return nil
+}
+
+// validateHA validates the optional HA configuration block. When ha is nil
+// (single-node or unset HA), it is a no-op. Shape validation of the VIP
+// address and interface name runs unconditionally when VIP is non-nil;
+// the controller enforces operational constraints (e.g., CAPK exception)
+// at runtime.
+func validateHA(ha *HAConfig, base *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	if ha == nil || ha.VIP == nil {
+		return errs
+	}
+	v := ha.VIP
+	addrPath := base.Child("vip", "address")
+
+	// Address: try net.ParseIP first (authoritative for IPv4 + IPv6); fall
+	// back to IsDNS1123Subdomain for hostnames. net.ParseIP is the canonical
+	// IP parser so it handles all valid IPv4 and IPv6 forms including
+	// compressed IPv6. IsDNS1123Subdomain covers hostname forms like
+	// "cp.example.com" or bare single-label names like "cp-vip".
+	if net.ParseIP(v.Address) == nil {
+		if msgs := validation.IsDNS1123Subdomain(v.Address); len(msgs) > 0 {
+			errs = append(errs, field.Invalid(
+				addrPath, v.Address,
+				"vip.address must be a valid IPv4 address, IPv6 address, or "+
+					"RFC-1123 hostname (e.g. \"192.168.1.10\", \"2001:db8::1\", "+
+					"or \"cp.example.com\")",
+			))
+		}
+	}
+
+	// Interface: mirrors the kubebuilder marker; belt-and-suspenders for
+	// older API servers that may skip CRD-level pattern validation.
+	if !vipInterfaceRe.MatchString(v.Interface) {
+		errs = append(errs, field.Invalid(
+			base.Child("vip", "interface"), v.Interface,
+			"vip.interface must be a valid Linux network interface name: "+
+				"1–15 characters, starting with a letter, followed by "+
+				"letters, digits, '.', '_', or '-' (e.g. \"eth0\", \"ens3\", \"bond0\")",
+		))
+	}
+
+	return errs
 }
 
 // validateSSHFallback enforces the cross-field invariants of the opt-in

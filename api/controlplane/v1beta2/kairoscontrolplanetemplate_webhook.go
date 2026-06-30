@@ -94,10 +94,10 @@ func (r *KairosControlPlaneTemplate) ValidateDelete() (admission.Warnings, error
 
 // validate mirrors the KairosControlPlane webhook's validate() against
 // the nested template spec. The two validation functions share the same
-// per-field rules and the SSHFallback helper; the field paths in error
-// messages differ (`spec.template.spec.*` vs. `spec.*`) so operators
-// reading admission errors can tell which resource type the rejection
-// came from.
+// per-field rules and the SSHFallback / HA helpers; the field paths in
+// error messages differ (`spec.template.spec.*` vs. `spec.*`) so
+// operators reading admission errors can tell which resource type the
+// rejection came from.
 //
 // Per CAPI convention, anything invalid in the controlled KCP type
 // MUST be invalid in the template too — otherwise an operator can
@@ -108,25 +108,30 @@ func (r *KairosControlPlaneTemplate) validate() error {
 	s := &r.Spec.Template.Spec
 	base := field.NewPath("spec", "template", "spec")
 
-	// Replicas: same bounds as KCP (min 1, max 1 in this release; see
-	// KD-5 for the HA roadmap).
+	// Replicas: same three-arm validation as KCP — odd-only, 1–5.
 	if s.Replicas != nil {
+		n := *s.Replicas
+		replicasPath := base.Child("replicas")
 		switch {
-		case *s.Replicas < 1:
+		case n < 1:
 			allErrs = append(allErrs, field.Invalid(
-				base.Child("replicas"),
-				*s.Replicas,
-				"spec.template.spec.replicas must be greater than or equal to 1",
+				replicasPath, n,
+				"spec.template.spec.replicas must be at least 1",
 			))
-		case *s.Replicas > 1:
+		case n > 5:
 			allErrs = append(allErrs, field.Invalid(
-				base.Child("replicas"),
-				*s.Replicas,
-				"spec.template.spec.replicas > 1 is not supported in this release: the current "+
-					"control-plane implementation would produce N independent "+
-					"single-node clusters instead of an HA cluster. HA support "+
-					"(both classic and P2P/decentralized) is planned for a "+
-					"future release. Use spec.template.spec.replicas: 1 for now.",
+				replicasPath, n,
+				"spec.template.spec.replicas must be 1, 3, or 5; values above 5 are not "+
+					"supported. etcd fault tolerance is (N-1)/2 failures; beyond "+
+					"5 members the quorum cost outweighs the additional fault "+
+					"tolerance for a control plane.",
+			))
+		case n%2 == 0:
+			allErrs = append(allErrs, field.Invalid(
+				replicasPath, n,
+				"spec.template.spec.replicas must be an odd number (1, 3, or 5). "+
+					"Even replica counts give the same etcd fault tolerance as the "+
+					"next-lower odd count while increasing the quorum requirement.",
 			))
 		}
 	}
@@ -139,6 +144,9 @@ func (r *KairosControlPlaneTemplate) validate() error {
 			"spec.template.spec.distribution must be one of [k0s, k3s]",
 		))
 	}
+
+	// HA: shared helper with KCP.
+	allErrs = append(allErrs, validateHA(s.HA, base.Child("ha"))...)
 
 	// SSHFallback: shared helper with KCP. The helper takes the owner
 	// namespace because cross-namespace Secret refs are rejected and

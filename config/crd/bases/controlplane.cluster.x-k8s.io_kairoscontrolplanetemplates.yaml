@@ -64,6 +64,72 @@ spec:
                         - k0s
                         - k3s
                         type: string
+                      ha:
+                        description: |-
+                          HA holds configuration for high-availability control planes
+                          (spec.replicas in {3, 5}). Ignored when spec.replicas is 1.
+
+                          For single-node clusters (replicas: 1) this field must be left unset or
+                          nil; kube-vip is not rendered for single-node control planes, and a
+                          non-nil VIP block will trigger a validation warning.
+                        properties:
+                          vip:
+                            description: |-
+                              VIP configures the virtual IP (kube-vip) used as the stable control-plane
+                              endpoint across HA nodes. Required when the infrastructure provider does
+                              not supply a load-balanced endpoint automatically.
+
+                              CAPK exception: CAPK mints its own LoadBalancer Service and reflects the
+                              IP into KubevirtCluster.Spec.ControlPlaneEndpoint. Do NOT set VIP for
+                              CAPK clusters — it is redundant and will produce a conflicting ARP
+                              announcement.
+
+                              For CAPV, CAPM3, and CAPD, set VIP.Address to the IP (or hostname)
+                              pre-reserved for the control-plane endpoint. The same value must be set
+                              on the InfraCluster's ControlPlaneEndpoint so that CAPI core copies it
+                              into Cluster.Spec.ControlPlaneEndpoint. The controller does not enforce
+                              this constraint at admission; a mismatch will cause the cluster endpoint
+                              to point at the wrong address.
+                            properties:
+                              address:
+                                description: |-
+                                  Address is the virtual IP address or DNS hostname for the control-plane
+                                  endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123
+                                  hostname. For ARP mode this must be an IP address reachable on the
+                                  same L2 segment as the control-plane nodes.
+
+                                  The value must match the host portion of the InfraCluster's
+                                  ControlPlaneEndpoint so that CAPI core copies the correct address into
+                                  Cluster.Spec.ControlPlaneEndpoint.
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                              interface:
+                                description: |-
+                                  Interface is the Linux network interface name on which kube-vip
+                                  advertises the VIP (e.g. "eth0", "ens3", "bond0").
+
+                                  Must be a valid Linux interface name: 1–15 characters, starting with a
+                                  letter, followed by letters, digits, dots, underscores, or hyphens.
+                                maxLength: 15
+                                minLength: 1
+                                pattern: ^[a-zA-Z][a-zA-Z0-9._-]{0,14}$
+                                type: string
+                              mode:
+                                default: ARP
+                                description: |-
+                                  Mode selects the VIP advertisement mechanism.
+                                  ARP (default) requires the control-plane nodes to share an L2 segment.
+                                  BGP requires a BGP peer and is intended for routed bare-metal fabrics.
+                                enum:
+                                - ARP
+                                - BGP
+                                type: string
+                            required:
+                            - address
+                            - interface
+                            type: object
+                        type: object
                       kairosConfigTemplate:
                         description: |-
                           KairosConfigTemplate is a reference to a KairosConfigTemplate resource
@@ -169,15 +235,18 @@ spec:
                           Replicas is the number of control plane machines.
                           Contract: ControlPlane MUST expose replicas.
 
-                          Only `replicas: 1` is supported in this release. With `replicas: 1`,
-                          k0s/k3s is configured with `--single` and the control plane operates in
-                          single-node mode. HA control planes (both classic and P2P/decentralized)
-                          are planned for a future release; until then, the validating webhook
-                          rejects values greater than 1 because the current bootstrap logic would
-                          otherwise produce N independent single-node clusters instead of an HA
-                          cluster (see foundational-review item KD-5).
+                          Allowed values are 1, 3, and 5 — odd numbers only. Even counts provide
+                          the same etcd fault tolerance as the next-lower odd count while increasing
+                          the quorum requirement, so they are rejected at admission. Values above 5
+                          are also rejected; beyond 5 etcd members the quorum cost outweighs the
+                          additional fault tolerance for a control plane.
+
+                          replicas: 1 configures a single-node control plane (k0s --single /
+                          k3s single-server). replicas: 3 or 5 configure an HA control plane using
+                          the classic join path (ADR 0005, Phase 3+); kube-vip (ARP/L2 by default)
+                          provides the stable VIP — configure spec.ha.vip for the VIP parameters.
                         format: int32
-                        maximum: 1
+                        maximum: 5
                         minimum: 1
                         type: integer
                       rolloutStrategy:

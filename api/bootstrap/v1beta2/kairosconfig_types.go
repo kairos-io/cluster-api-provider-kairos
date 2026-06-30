@@ -28,6 +28,34 @@ const (
 	KairosConfigFinalizer = "kairosconfig.bootstrap.cluster.x-k8s.io"
 )
 
+// ControlPlaneRole is the per-machine role discriminator for control-plane
+// nodes. It is assigned by the KairosControlPlane controller and must not be
+// set by end users directly; the value drives which cloud-config shape the
+// bootstrap provider renders (Phase 2+).
+//
+// +kubebuilder:validation:Enum=single;init;join
+type ControlPlaneRole string
+
+const (
+	// ControlPlaneRoleSingle is the role for a single-node control plane.
+	// The bootstrap provider renders the distribution's single-node mode
+	// (k0s --single / k3s single-server). Assigned when spec.replicas == 1
+	// on the owning KairosControlPlane.
+	ControlPlaneRoleSingle ControlPlaneRole = "single"
+
+	// ControlPlaneRoleInit is the role for the first (initialising) node of
+	// an HA control plane. The bootstrap provider renders the distribution's
+	// cluster-init path (k0s managed-etcd init / k3s --cluster-init).
+	// Assigned to the oldest CP machine when spec.replicas > 1.
+	ControlPlaneRoleInit ControlPlaneRole = "init"
+
+	// ControlPlaneRoleJoin is the role for subsequent nodes of an HA control
+	// plane. The bootstrap provider renders the distribution's join path
+	// (k0s controller-join / k3s --server). Assigned to all CP machines
+	// other than the init node when spec.replicas > 1.
+	ControlPlaneRoleJoin ControlPlaneRole = "join"
+)
+
 // KairosConfigSpec defines the desired state of KairosConfig
 type KairosConfigSpec struct {
 	// Role indicates whether this is a control-plane or worker node
@@ -90,10 +118,34 @@ type KairosConfigSpec struct {
 	// +optional
 	Pause bool `json:"pause,omitempty"`
 
-	// SingleNode indicates this is a single-node control plane cluster
-	// When true, k0s will be configured with --single flag
+	// SingleNode indicates this is a single-node control plane cluster.
+	// When true, k0s will be configured with --single flag.
+	//
+	// Deprecated: SingleNode is derived by the KairosControlPlane controller
+	// from spec.replicas (true when replicas==1) and will be removed in a
+	// future v1beta3 revision (KD-39). New code should read ControlPlaneRole
+	// instead. Both fields coexist during the transition period; the controller
+	// sets both for backward compatibility with templates that branch on
+	// SingleNode.
 	// +optional
 	SingleNode bool `json:"singleNode,omitempty"`
+
+	// ControlPlaneRole is the init/join/single discriminator for this
+	// control-plane machine. Set by the KairosControlPlane controller;
+	// must not be set directly by end users.
+	//
+	// The zero value ("") is treated as equivalent to "single" by the
+	// bootstrap controller for backward compatibility with KairosConfig
+	// objects that predate this field. Do not rely on the zero value in
+	// new code — the controller sets an explicit value on every machine it
+	// creates.
+	//
+	// Rendered into the cloud-config in Phase 2; ignored by the bootstrap
+	// controller until Phase 2 ships (the SingleNode field covers the
+	// single-node case in the interim).
+	// +kubebuilder:validation:Enum=single;init;join
+	// +optional
+	ControlPlaneRole ControlPlaneRole `json:"controlPlaneRole,omitempty"`
 
 	// UserName is the username for the default user
 	// +kubebuilder:default=kairos
