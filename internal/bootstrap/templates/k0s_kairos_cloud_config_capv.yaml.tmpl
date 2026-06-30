@@ -58,15 +58,30 @@ users:
 {{- if eq .Role "control-plane" }}
 
 # Control-plane node configuration
+{{- if .IsInitControlPlane }}
+# ADR 0005 (HA) init node: k0s controller with managed etcd (no --single). The
+# api.sans in /etc/k0s/k0s.yaml MUST include the stable control-plane endpoint
+# so the apiserver serving cert is valid for the VIP / InfraCluster endpoint.
+{{- else if .IsJoinControlPlane }}
+# ADR 0005 (HA) join node: k0s controller-join via --token-file. The token is
+# produced on the init controller (k0s token create --role=controller) and
+# delivered by the Phase-3 controller through .JoinToken (TOKEN-INV). The join
+# target is k0s's own gossip/etcd peer discovery seeded by the token, NOT the
+# VIP block.
+{{- end }}
 k0s:
   enabled: true
-  {{- if or .SingleNode .PodCIDR .ServiceCIDR .ProviderID }}
+  {{- if or .SingleNode .PodCIDR .ServiceCIDR .ProviderID .IsHAControlPlane }}
   args:
   {{- if .SingleNode }}
     - --single
   {{- end }}
-  {{- if or .PodCIDR .ServiceCIDR }}
+  {{- if or .PodCIDR .ServiceCIDR .IsInitControlPlane }}
     - --config /etc/k0s/k0s.yaml
+  {{- end }}
+  {{- if .IsJoinControlPlane }}
+    # Controller-join: --token-file carries the controller-role join token.
+    - --token-file=/etc/k0s/controller-token
   {{- end }}
   {{- if and .ProviderID (not .Metal3) }}
     # KD-3c: tell kubelet the providerID BEFORE the Node is registered so it
@@ -103,7 +118,14 @@ write_files:
     group: root
     content: |
 {{ persistencyOEM | indent 6 }}
-  {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR) }}
+  {{- /*
+    HA-init nodes always emit /etc/k0s/k0s.yaml so the apiserver cert covers the
+    stable control-plane endpoint (api.sans). The pre-existing CIDR-only path is
+    preserved byte-for-byte: when not an init node, the gate and body are exactly
+    as before (.IsInitControlPlane is false for single/join/worker/empty role).
+  */ -}}
+  {{- $haSans := and .IsInitControlPlane .ManagementEndpoint .ManagementEndpoint.ControlPlaneEndpointHost }}
+  {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR $haSans) }}
   - path: /etc/k0s/k0s.yaml
     permissions: "0644"
     content: |
@@ -111,8 +133,14 @@ write_files:
       kind: ClusterConfig
       metadata:
         name: k0s
-      {{- if or .PodCIDR .ServiceCIDR }}
+      {{- if or .PodCIDR .ServiceCIDR $haSans }}
       spec:
+      {{- if $haSans }}
+        api:
+          sans:
+            - {{ .ManagementEndpoint.ControlPlaneEndpointHost | quote }}
+      {{- end }}
+      {{- if or .PodCIDR .ServiceCIDR }}
         network:
       {{ if .PodCIDR }}
           podCIDR: {{ .PodCIDR | quote }}
@@ -120,9 +148,37 @@ write_files:
       {{ if .ServiceCIDR }}
           serviceCIDR: {{ .ServiceCIDR | quote }}
       {{ end }}
+      {{- end }}
       {{- else }}
       spec: {}
       {{- end }}
+  {{- end }}
+  {{- if .IsJoinControlPlane }}
+  # ADR 0005 (HA) join node: k0s controller-role join token. Sourced from
+  # .JoinToken, which the Phase-3 controller produces on the init controller
+  # (k0s token create --role=controller) and delivers over the node-push channel
+  # (TOKEN-INV). Phase 2 renders it given the input; empty until Phase 3.
+  # 0600: this is a controller-join secret on disk.
+  - path: /etc/k0s/controller-token
+    permissions: "0600"
+    owner: root
+    group: root
+    content: |
+      {{ .JoinToken }}
+  {{- end }}
+  {{- if .RenderKubeVIP }}
+  # ADR 0005 (HA) kube-vip static-pod manifest (CAPV/CAPM3 only; CAPK uses its
+  # built-in LoadBalancer Service per OQ-5 and never reaches this block).
+  # k0s applies manifests under /var/lib/k0s/manifests/<dir>/ via its
+  # manifest-deployer (stack applier), so kube-vip comes up to own the floating
+  # control-plane VIP. The manifest is produced by kubeVIPManifest (marshaled
+  # YAML, VIP-INV-2) — no operator string is concatenated into the YAML.
+  - path: /var/lib/k0s/manifests/kube-vip/kube-vip.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+{{ kubeVIPManifest .VIP | indent 6 }}
   {{- end }}
   {{- if and (ne .Role "control-plane") .WorkerToken }}
   - path: /etc/k0s/token

@@ -1,0 +1,144 @@
+#cloud-config
+
+hostname: kairos-cp-0
+
+users:
+- name: kairos
+  groups:
+    - admin
+  ssh_authorized_keys:
+    - github:testuser
+- name: capk
+  groups: [users, admin]
+
+# Control-plane node configuration
+# Pass providerID at k3s startup so node registers with the correct providerID
+# (avoids the k3s default providerID vs infra providerID mismatch).
+# Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
+# ProviderID is regex-validated by validateTemplateData before rendering — see internal/bootstrap/validate.go.
+k3s:
+  enabled: true
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # systemd drop-in: skip k3s.service on the Kairos live installer.
+  # See the same drop-in in k3s_kairos_cloud_config_capk.yaml.tmpl for
+  # rationale. KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
+  - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      ConditionKernelCommandLine=!cdroot
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-cp-0
+  - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k3s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k3s
+      # node registration that never happens on the installer (overlayfs
+      # snapshotter cannot nest on the live tmpfs overlay), holding up
+      # cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      After=k3s.service
+      Wants=k3s.service
+      
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k3s-post-bootstrap.sh
+      
+      [Install]
+      WantedBy=multi-user.target
+  # Systemd override: write providerID to k3s config before k3s starts.
+  # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
+  # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-discover-provider-id.sh || true'
+  # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre).
+  # Omitted for Metal3: discovery is done at post-bootstrap via config-drive read (ADR 0004).
+  # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
+  - path: /usr/local/bin/kairos-k3s-discover-provider-id.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # Read DMI product_uuid (vSphere VMs expose VM UUID here)
+      # DMI uses mixed-endian for first 3 groups; vSphere expects RFC/ISO (big-endian) - convert byte order
+      if [ -f /sys/class/dmi/id/product_uuid ]; then
+        RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
+        HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
+          T0="${HEX:6:2}${HEX:4:2}${HEX:2:2}${HEX:0:2}"
+          T1="${HEX:10:2}${HEX:8:2}"
+          T2="${HEX:14:2}${HEX:12:2}"
+          REST="${HEX:16:16}"
+          FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
+          PROVIDER_ID="vsphere://${FORMATTED}"
+          mkdir -p /etc/rancher/k3s/config.yaml.d
+          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+          echo "Discovered providerID: $PROVIDER_ID"
+        fi
+      fi
+  - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+
+      echo "k3s post-bootstrap tasks completed successfully"
+stages:
+  boot:
+    - name: "Discover providerID for k3s (VM self-discovery)"
+      commands:
+        - /usr/local/bin/kairos-k3s-discover-provider-id.sh || true
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    - name: "Ensure k3s directories exist"
+      commands:
+        - mkdir -p /etc/rancher/k3s
+        - mkdir -p /etc/rancher/k3s/config.yaml.d
+
+runcmd:
+  # `enable --now`: create the multi-user.target.wants/ symlink AND start
+  # the unit on this boot. Plain `enable` only creates the symlink; the
+  # service would only auto-start on the NEXT boot — too late for the
+  # KD-3b push pattern, which needs to fire on the first installed-system
+  # boot. Same fix the k0s templates use via the helper service.
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true

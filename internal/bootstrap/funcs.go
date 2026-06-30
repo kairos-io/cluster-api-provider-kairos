@@ -18,6 +18,7 @@ package bootstrap
 
 import (
 	"bufio"
+	"fmt"
 	"strings"
 	"text/template"
 
@@ -40,14 +41,171 @@ import (
 //   - quotes scalars containing YAML metacharacters (`:`, `#`, `---`, etc.).
 func newFuncMap() template.FuncMap {
 	return template.FuncMap{
-		"quote":          quote,
-		"toYaml":         toYaml,
-		"shquote":        shquote,
-		"indent":         safeIndent,
-		"nindent":        nindent,
-		"trimSuffix":     trimSuffix,
-		"persistencyOEM": persistencyOEM,
+		"quote":           quote,
+		"toYaml":          toYaml,
+		"shquote":         shquote,
+		"indent":          safeIndent,
+		"nindent":         nindent,
+		"trimSuffix":      trimSuffix,
+		"persistencyOEM":  persistencyOEM,
+		"kubeVIPManifest": kubeVIPManifest,
 	}
+}
+
+// kubeVIPImage is the kube-vip image rendered into the static-pod manifest.
+// Pinned by digest-bearing tag (root CLAUDE.md rule 4: no `latest`, pin
+// versions). Bump deliberately in a reviewed change.
+const kubeVIPImage = "ghcr.io/kube-vip/kube-vip:v0.8.7"
+
+// kubeVIPManifest renders the kube-vip static-pod manifest for the supplied
+// VIP config as a marshaled YAML document.
+//
+// SECURITY (ADR 0005 §C, VIP-INV-2): the manifest is built as a typed Go value
+// tree and serialized with gopkg.in/yaml.v3 — there is NO string concatenation
+// or interpolation of the operator-controlled Address/Interface/Mode into YAML.
+// yaml.v3 emits each value as a properly-quoted scalar, so a value containing
+// `:`, `#`, `---`, quotes, `$()`, backticks, or a leading `-` cannot break out
+// of its scalar and inject structure. The caller (validate.go) additionally
+// re-validates Address and Interface at render time (VIP-INV-3), so a
+// semantically-invalid value never reaches this function in the first place.
+//
+// The returned document is the full Pod object (no leading/trailing newline)
+// so callers embed it with `| nindent N` into the write_files content block,
+// matching how Manifest.Content is handled elsewhere. v is required non-nil;
+// templates gate the call on .RenderKubeVIP so it is never invoked with nil.
+func kubeVIPManifest(v *VIPConfig) (string, error) {
+	if v == nil {
+		// Defensive: templates gate on .RenderKubeVIP, but never panic on a
+		// nil deref inside the template engine if a future caller slips.
+		return "", fmt.Errorf("kubeVIPManifest called with nil VIP config")
+	}
+	mode := v.Mode
+	if mode == "" {
+		mode = "ARP" // empty Mode defaults to ARP (matches the CRD default).
+	}
+	// kube-vip control-plane env. The arp-vs-bgp toggle is a pair of string
+	// booleans; everything else is passed verbatim as scalars marshaled by
+	// yaml.v3. We deliberately keep this to the documented control-plane VIP
+	// envelope (ADR 0005 §C: "not operator-injectable beyond the bounded VIP
+	// block") — no operator field becomes an arbitrary kube-vip flag.
+	arpEnabled := "true"
+	bgpEnabled := "false"
+	if mode == "BGP" {
+		arpEnabled = "false"
+		bgpEnabled = "true"
+	}
+
+	env := []kvEnvVar{
+		{Name: "vip_arp", Value: arpEnabled},
+		{Name: "vip_interface", Value: v.Interface},
+		{Name: "address", Value: v.Address},
+		{Name: "port", Value: "6443"},
+		{Name: "cp_enable", Value: "true"},
+		{Name: "svc_enable", Value: "false"},
+		{Name: "vip_leaderelection", Value: "true"},
+		{Name: "vip_leaseduration", Value: "5"},
+		{Name: "vip_renewdeadline", Value: "3"},
+		{Name: "vip_retryperiod", Value: "1"},
+		{Name: "bgp_enable", Value: bgpEnabled},
+	}
+
+	pod := kvPod{
+		APIVersion: "v1",
+		Kind:       "Pod",
+		Metadata: kvMeta{
+			Name:      "kube-vip",
+			Namespace: "kube-system",
+		},
+		Spec: kvPodSpec{
+			HostNetwork: true,
+			Containers: []kvContainer{{
+				Name:            "kube-vip",
+				Image:           kubeVIPImage,
+				ImagePullPolicy: "IfNotPresent",
+				Args:            []string{"manager"},
+				Env:             env,
+				SecurityContext: kvSecurityContext{
+					Capabilities: kvCapabilities{
+						Add: []string{"NET_ADMIN", "NET_RAW"},
+					},
+				},
+				VolumeMounts: []kvVolumeMount{{
+					MountPath: "/etc/kubernetes/admin.conf",
+					Name:      "kubeconfig",
+				}},
+			}},
+			Volumes: []kvVolume{{
+				Name: "kubeconfig",
+				HostPath: kvHostPath{
+					Path: "/etc/kubernetes/admin.conf",
+				},
+			}},
+		},
+	}
+	b, err := yaml.Marshal(pod)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(b), "\n"), nil
+}
+
+// kube-vip static-pod manifest types. These are a minimal, purpose-built
+// schema (not the full k8s core/v1 types) so the rendered manifest is a fixed,
+// auditable shape with only the bounded VIP fields flowing through it. The yaml
+// tags reproduce the k8s field names with their standard ordering.
+type kvPod struct {
+	APIVersion string    `yaml:"apiVersion"`
+	Kind       string    `yaml:"kind"`
+	Metadata   kvMeta    `yaml:"metadata"`
+	Spec       kvPodSpec `yaml:"spec"`
+}
+
+type kvMeta struct {
+	Name      string `yaml:"name"`
+	Namespace string `yaml:"namespace"`
+}
+
+type kvPodSpec struct {
+	Containers  []kvContainer `yaml:"containers"`
+	HostNetwork bool          `yaml:"hostNetwork"`
+	Volumes     []kvVolume    `yaml:"volumes"`
+}
+
+type kvContainer struct {
+	Name            string            `yaml:"name"`
+	Image           string            `yaml:"image"`
+	ImagePullPolicy string            `yaml:"imagePullPolicy"`
+	Args            []string          `yaml:"args"`
+	Env             []kvEnvVar        `yaml:"env"`
+	SecurityContext kvSecurityContext `yaml:"securityContext"`
+	VolumeMounts    []kvVolumeMount   `yaml:"volumeMounts"`
+}
+
+type kvEnvVar struct {
+	Name  string `yaml:"name"`
+	Value string `yaml:"value"`
+}
+
+type kvSecurityContext struct {
+	Capabilities kvCapabilities `yaml:"capabilities"`
+}
+
+type kvCapabilities struct {
+	Add []string `yaml:"add"`
+}
+
+type kvVolumeMount struct {
+	MountPath string `yaml:"mountPath"`
+	Name      string `yaml:"name"`
+}
+
+type kvVolume struct {
+	Name     string     `yaml:"name"`
+	HostPath kvHostPath `yaml:"hostPath"`
+}
+
+type kvHostPath struct {
+	Path string `yaml:"path"`
 }
 
 // quote marshals a scalar as a single YAML node and returns it without the

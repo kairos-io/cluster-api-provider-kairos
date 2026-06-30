@@ -19,8 +19,11 @@ package bootstrap
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // providerIDPattern restricts ProviderID to the shape every CAPI infrastructure
@@ -96,6 +99,12 @@ func validateTemplateData(d *TemplateData) error {
 		{"controlPlaneLBServiceName", d.ControlPlaneLBServiceName},
 		{"controlPlaneLBServiceNamespace", d.ControlPlaneLBServiceNamespace},
 		{"controlPlaneLBEndpoint", d.ControlPlaneLBEndpoint},
+		{"controlPlaneRole", d.ControlPlaneRole},
+		// JoinToken is embedded in a YAML block scalar (the 0600 token file via
+		// write_files), not a shell context. A literal newline/CR/NUL would
+		// break that block-scalar embed, so reject control chars here — this
+		// (not shquote) is the load-bearing protection for the token.
+		{"joinToken", d.JoinToken},
 	}
 	for _, f := range stringFields {
 		if err := rejectControlChars(f.name, f.value); err != nil {
@@ -162,6 +171,62 @@ func validateTemplateData(d *TemplateData) error {
 				errs = append(errs, fmt.Errorf("%s.owner: must be user or user:group with POSIX username chars (e.g. \"root:root\"): %q", fIdx, f.Owner))
 			}
 		}
+	}
+	// VIP (kube-vip) is render-time re-validated (VIP-INV-3): older API servers
+	// may skip CRD pattern validation, and the renderer is the last line of
+	// defense before root-privileged userdata. Only validated when set; a nil
+	// VIP is a valid (external-LB or single-node) topology.
+	if d.VIP != nil {
+		if err := validateVIP(d.VIP); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// vipInterfacePattern mirrors the kubebuilder marker + webhook regex on
+// KubeVIPConfig.Interface (api/controlplane/v1beta2): a valid Linux interface
+// name, 1–15 chars, starting with a letter then letters/digits/'.'/'_'/'-'.
+// Re-asserted here at render time (VIP-INV-3) so a value that bypassed
+// admission still cannot reach the shell/manifest context.
+var vipInterfacePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]{0,14}$`)
+
+// vipModePattern restricts Mode to the two accepted values (plus empty, which
+// the renderer defaults to ARP). Belt-and-braces against an out-of-enum value
+// reaching the kube-vip env.
+var vipModePattern = regexp.MustCompile(`^(ARP|BGP)?$`)
+
+// validateVIP re-applies the kube-vip Address/Interface/Mode validation at
+// render time (ADR 0005 §C, VIP-INV-3). The checks mirror the KCP webhook
+// (api/controlplane/v1beta2/kairoscontrolplane_webhook.go validateHA):
+//
+//   - Address must be a valid IPv4/IPv6 address (net.ParseIP) OR an RFC-1123
+//     subdomain (IsDNS1123Subdomain). This rejects shell/YAML-injection
+//     payloads outright — `$()`, backticks, `;`, `|`, `&`, quotes, newlines,
+//     and `---` all fail both checks — so the value reaching shquote/yaml.v3 is
+//     already constrained to address shapes.
+//   - Interface must match the Linux interface-name regex.
+//   - Mode must be empty, "ARP", or "BGP".
+//
+// Returns a single joined error so all VIP problems surface at once.
+func validateVIP(v *VIPConfig) error {
+	var errs []error
+	if v.Address == "" {
+		errs = append(errs, fmt.Errorf("vip.address: must not be empty"))
+	} else if net.ParseIP(v.Address) == nil {
+		if msgs := validation.IsDNS1123Subdomain(v.Address); len(msgs) > 0 {
+			errs = append(errs, fmt.Errorf(
+				"vip.address %q must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname: %s",
+				v.Address, strings.Join(msgs, "; ")))
+		}
+	}
+	if !vipInterfacePattern.MatchString(v.Interface) {
+		errs = append(errs, fmt.Errorf(
+			"vip.interface %q must be a valid Linux network interface name (1-15 chars, letter then letters/digits/'.'/'_'/'-')",
+			v.Interface))
+	}
+	if !vipModePattern.MatchString(v.Mode) {
+		errs = append(errs, fmt.Errorf("vip.mode %q must be one of \"ARP\", \"BGP\", or empty", v.Mode))
 	}
 	return errors.Join(errs...)
 }

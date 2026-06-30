@@ -1,0 +1,331 @@
+#cloud-config
+
+hostname: kairos-cp-0
+
+users:
+- name: kairos
+  groups:
+    - admin
+  ssh_authorized_keys:
+    - github:testuser
+- name: capk
+  groups: [users, admin]
+
+# Control-plane node configuration
+# ADR 0005 (HA) join node: k0s controller-join via --token-file. The token is
+# produced on the init controller (k0s token create --role=controller) and
+# delivered by the Phase-3 controller through .JoinToken (TOKEN-INV). The join
+# target is k0s's own gossip/etcd peer discovery seeded by the token, NOT the
+# VIP block.
+k0s:
+  enabled: true
+  args:
+    # Controller-join: --token-file carries the controller-role join token.
+    - --token-file=/etc/k0s/controller-token
+
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # ADR 0005 (HA) join node: k0s controller-role join token. Sourced from
+  # .JoinToken, which the Phase-3 controller produces on the init controller
+  # (k0s token create --role=controller) and delivers over the node-push channel
+  # (TOKEN-INV). Phase 2 renders it given the input; empty until Phase 3.
+  # 0600: this is a controller-join secret on disk.
+  - path: /etc/k0s/controller-token
+    permissions: "0600"
+    owner: root
+    group: root
+    content: |
+      K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::server:bbbbbbbbbbbbbbbbbbbbbbbb
+  # ADR 0005 (HA) kube-vip static-pod manifest (CAPV/CAPM3 only; CAPK uses its
+  # built-in LoadBalancer Service per OQ-5 and never reaches this block).
+  # k0s applies manifests under /var/lib/k0s/manifests/<dir>/ via its
+  # manifest-deployer (stack applier), so kube-vip comes up to own the floating
+  # control-plane VIP. The manifest is produced by kubeVIPManifest (marshaled
+  # YAML, VIP-INV-2) — no operator string is concatenated into the YAML.
+  - path: /var/lib/k0s/manifests/kube-vip/kube-vip.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+          name: kube-vip
+          namespace: kube-system
+      spec:
+          containers:
+              - name: kube-vip
+                image: ghcr.io/kube-vip/kube-vip:v0.8.7
+                imagePullPolicy: IfNotPresent
+                args:
+                  - manager
+                env:
+                  - name: vip_arp
+                    value: "true"
+                  - name: vip_interface
+                    value: eth0
+                  - name: address
+                    value: 192.168.1.240
+                  - name: port
+                    value: "6443"
+                  - name: cp_enable
+                    value: "true"
+                  - name: svc_enable
+                    value: "false"
+                  - name: vip_leaderelection
+                    value: "true"
+                  - name: vip_leaseduration
+                    value: "5"
+                  - name: vip_renewdeadline
+                    value: "3"
+                  - name: vip_retryperiod
+                    value: "1"
+                  - name: bgp_enable
+                    value: "false"
+                securityContext:
+                  capabilities:
+                      add:
+                          - NET_ADMIN
+                          - NET_RAW
+                volumeMounts:
+                  - mountPath: /etc/kubernetes/admin.conf
+                    name: kubeconfig
+          hostNetwork: true
+          volumes:
+              - name: kubeconfig
+                hostPath:
+                  path: /etc/kubernetes/admin.conf
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-cp-0
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k0s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k0s
+      # node registration that never happens on the installer, holding
+      # up cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      After=k0s.service
+      Wants=k0s.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k0s-post-bootstrap.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Enable kairos-k0s-post-bootstrap service
+      # Skip on live installer; pairs with the same gate on the main
+      # post-bootstrap service. (KD-3b.)
+      ConditionKernelCommandLine=!cdroot
+      After=systemd-udev-settle.service
+      Before=multi-user.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/systemctl daemon-reload
+      # `enable --now`: create the multi-user.target.wants/ symlink AND
+      # start the unit on this boot. After the KD-3b write_files move,
+      # the main service file lands on disk during cloud-init early boot;
+      # this helper runs once multi-user.target is set up and triggers
+      # both enablement and immediate start of the post-bootstrap service.
+      ExecStart=/bin/systemctl enable --now kairos-k0s-post-bootstrap.service
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # CAPV self-discovery: ProviderID was not available at render time (assigned
+      # after VM clone), so compute vsphere://<uuid> from DMI at boot.
+      # KD-55: fail-OPEN. If the UUID is absent or malformed, warn and continue so
+      # the kubeconfig push below still runs. A missing providerID is recoverable;
+      # a stranded cluster is not.
+      # DMI uses mixed-endian byte order for the first three UUID groups; vSphere
+      # expects RFC/ISO big-endian. The byte-swap below is the same algorithm
+      # proven correct in the k3s CAPV template (lab-validated: discovered UUID
+      # matched VSphereMachine providerID and Machine reached Running).
+      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      PROVIDER_ID=""
+      if [ -f /sys/class/dmi/id/product_uuid ]; then
+        RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
+        HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
+          T0="${HEX:6:2}${HEX:4:2}${HEX:2:2}${HEX:0:2}"
+          T1="${HEX:10:2}${HEX:8:2}"
+          T2="${HEX:14:2}${HEX:12:2}"
+          REST="${HEX:16:16}"
+          FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
+          # Strict UUID validation before the kubectl patch. The validated value
+          # is interpolated into a JSON string in -p below; enforcing the regex
+          # here closes the injection surface (malformed input never reaches the
+          # patch). Whole-string match via bash =~ (not line-anchored grep).
+          UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if [[ "${FORMATTED}" =~ ${UUID_RE} ]]; then
+            PROVIDER_ID="vsphere://${FORMATTED}"
+            echo "Discovered providerID from DMI: ${PROVIDER_ID}"
+          else
+            echo "WARN: DMI UUID '${FORMATTED}' did not match UUID pattern; skipping providerID (continuing post-bootstrap)"
+          fi
+        else
+          echo "WARN: DMI product_uuid is absent or not 32 hex chars after strip; skipping providerID (continuing post-bootstrap)"
+        fi
+      else
+        echo "WARN: /sys/class/dmi/id/product_uuid not found; skipping providerID (continuing post-bootstrap)"
+      fi
+      if [ -n "${PROVIDER_ID}" ]; then
+        echo "Waiting for k0s node to be registered..."
+        node_registered=false
+        MAX_WAIT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # k0s kubectl: the Hadron k0s image has no standalone `kubectl` binary.
+          if k0s kubectl get node $(hostname) &>/dev/null; then
+            node_registered=true
+            break
+          fi
+          echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
+        done
+        if [ "$node_registered" != "true" ]; then
+          echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+        else
+          # Set the discovered providerID on the Node. Retry for transient API-server unavailability.
+          echo "Setting providerID=${PROVIDER_ID} on node $(hostname)..."
+          PROVIDER_ID_SET=false
+          for i in {1..30}; do
+            if k0s kubectl patch node $(hostname) --type=merge -p "{\"spec\":{\"providerID\":\"${PROVIDER_ID}\"}}" &>/dev/null; then
+              echo "Successfully set providerID=${PROVIDER_ID} on node $(hostname)"
+              PROVIDER_ID_SET=true
+              break
+            fi
+            echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+            sleep 5
+          done
+          if [ "$PROVIDER_ID_SET" != "true" ]; then
+            echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
+          fi
+        fi
+      fi
+      # Push kubeconfig to management cluster without SSH (KD-3b).
+      # Mirrors the CAPK push block; CAPV has no LB Service so the
+      # `server:` URL is rewritten to the cluster's controlPlaneEndpoint
+      # host (set by the infrastructure provider) instead of an LB IP.
+      push_kubeconfig() {
+        local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
+        # Wait up to 5min for k0s to write admin.conf. After=k0s.service only
+        # orders against service activation, not bootstrap completion, so on
+        # slower hosts (Hadron+CAPV lab finding) the file is not yet present
+        # when this unit fires. Without this wait the unit silently abandons
+        # the push and KCP stays in WaitingForNodePush forever (KD-3b).
+        local _wait_budget=300
+        local _wait_elapsed=0
+        while [ ! -f "${kubeconfig_file}" ] && [ ${_wait_elapsed} -lt ${_wait_budget} ]; do
+          sleep 5
+          _wait_elapsed=$((_wait_elapsed + 5))
+        done
+        if [ ! -f "${kubeconfig_file}" ]; then
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file} after ${_wait_budget}s"
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push kubeconfig"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push kubeconfig"
+          return 1
+        fi
+        local kubeconfig_b64
+        local tmp_kubeconfig
+        tmp_kubeconfig=$(mktemp)
+        local cp_endpoint_host='192.168.1.240'
+        sed "s|https://[^[:space:]]*:6443|https://${cp_endpoint_host}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
+        kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
+        rm -f "${tmp_kubeconfig}"
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local name='cluster-kubeconfig'
+        local token='mgmt-token'
+        local cluster_name='ha-cluster'
+        local payload
+        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" \
+          -X PUT \
+          --data "${payload}" \
+          "${url}" || true)
+        if [ "${status}" = "404" ]; then
+          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "${payload}" \
+            "${api}/api/v1/namespaces/${ns}/secrets" || true)
+        fi
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed kubeconfig to management secret ${ns}/${name}"
+          return 0
+        fi
+        echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
+        return 1
+      }
+      if ! push_kubeconfig; then
+        echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      # This file is used by Cluster API to determine bootstrap completion
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+
+      echo "k0s post-bootstrap tasks completed successfully"
+stages:
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+runcmd:
+  # Enable + start the helper service explicitly. `enable --now` both
+  # creates the multi-user.target.wants/ symlink for next boot AND starts
+  # the unit on this boot. Required after KD-3b moved unit writes from
+  # stages.initramfs.files to top-level write_files (runcmd is now too
+  # late in boot for ln-only symlink creation to be honored by systemd).
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k0s-post-bootstrap-enable.service || true

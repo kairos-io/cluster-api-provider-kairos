@@ -1,0 +1,356 @@
+#cloud-config
+
+hostname: kairos-cp-0
+
+users:
+- name: kairos
+  groups:
+    - admin
+  ssh_authorized_keys:
+    - github:testuser
+- name: capk
+  groups: [users, admin]
+
+# Control-plane node configuration
+k0s:
+  enabled: true
+  args:
+    - --single
+    - --config /etc/k0s/k0s.yaml
+
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  - path: /etc/k0s/k0s.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: k0s.k0sproject.io/v1beta1
+      kind: ClusterConfig
+      metadata:
+        name: k0s
+      spec: {}
+  - path: /etc/systemd/system/kairos-k0s-lb-sans.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Ensure k0s apiserver SANs include LoadBalancer endpoint
+      After=k0s.service
+      Wants=k0s.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k0s-lb-sans.sh
+      Restart=on-failure
+      RestartSec=15s
+      StartLimitInterval=300s
+      StartLimitBurst=40
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/kairos-k0s-lb-sans.path
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Watch for k0s config to update SANs
+
+      [Path]
+      PathExists=/etc/k0s/k0s.yaml
+      PathChanged=/etc/k0s/k0s.yaml
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/bin/kairos-k0s-lb-sans.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+
+      if [ -z "${KAIROS_LB_ENDPOINT}" ]; then
+        echo "LB SAN updater disabled: LoadBalancer endpoint not provided"
+        exit 0
+      fi
+
+      ensure_k0s_api_sans() {
+        local api_ip="$1"
+        if [ -z "${api_ip}" ]; then
+          echo "Waiting for LoadBalancer endpoint..."
+          return 1
+        fi
+        local cfg="/etc/k0s/k0s.yaml"
+        if [ ! -f "${cfg}" ]; then
+          echo "WARN: ${cfg} not found yet"
+          return 1
+        fi
+        if grep -qE '^[[:space:]]*api:' "${cfg}"; then
+          if grep -qE '^[[:space:]]*sans:' "${cfg}"; then
+            if ! grep -qE '^[[:space:]]*-[[:space:]]*'"${api_ip}"'([[:space:]]|$)' "${cfg}"; then
+              sed -i "/^[[:space:]]*sans:/a\\    - ${api_ip}" "${cfg}"
+            fi
+            return 0
+          fi
+          sed -i "/^[[:space:]]*api:/a\\    sans:\\\n    - ${api_ip}" "${cfg}"
+          return 0
+        fi
+
+        if grep -qE '^[[:space:]]*spec:' "${cfg}"; then
+          sed -i "/^[[:space:]]*spec:/a\\  api:\\\n    sans:\\\n    - ${api_ip}" "${cfg}"
+          return 0
+        fi
+
+        printf '%s\n' \
+          "spec:" \
+          "  api:" \
+          "    sans:" \
+          "    - ${api_ip}" >> "${cfg}"
+        return 0
+      }
+
+      if ensure_k0s_api_sans "${KAIROS_LB_ENDPOINT}"; then
+        echo "Updated k0s api.sans with LoadBalancer endpoint: ${KAIROS_LB_ENDPOINT}"
+        rm -f /var/lib/k0s/pki/apiserver.crt /var/lib/k0s/pki/apiserver.key || true
+        if systemctl is-active --quiet k0scontroller; then
+          systemctl restart k0scontroller || true
+        else
+          systemctl restart k0s || true
+        fi
+        exit 0
+      fi
+      exit 1
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-cp-0
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k0s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k0s
+      # node registration that never happens on the installer, holding
+      # up cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      After=k0s.service
+      Wants=k0s.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k0s-post-bootstrap.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Enable kairos-k0s-post-bootstrap service
+      # Skip on live installer; pairs with the same gate on the main
+      # post-bootstrap service. (KD-3b.)
+      ConditionKernelCommandLine=!cdroot
+      After=systemd-udev-settle.service
+      Before=multi-user.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/systemctl daemon-reload
+      # `enable --now`: create the multi-user.target.wants/ symlink AND
+      # start the unit on this boot. After the KD-3b write_files move,
+      # the main service file lands on disk during cloud-init early boot;
+      # this helper runs once multi-user.target is set up and triggers
+      # both enablement and immediate start of the post-bootstrap service.
+      ExecStart=/bin/systemctl enable --now kairos-k0s-post-bootstrap.service
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # CAPK: always mark bootstrap success on script exit
+      mark_bootstrap_success() {
+        mkdir -p /run/cluster-api
+        echo "success" > /run/cluster-api/bootstrap-success.complete
+        chmod 0644 /run/cluster-api/bootstrap-success.complete
+      }
+      trap mark_bootstrap_success EXIT
+      # KubeVirt: ensure the API server cert includes the node IP (pod or bridged)
+      # This prevents TLS SAN mismatch when CAPI connects to the workload cluster.
+      fetch_vmi_ip_from_management() {
+        if [ -z "${KAIROS_MGMT_API}" ] || [ -z "${KAIROS_MGMT_TOKEN}" ] || [ -z "${KAIROS_VMI_NAME}" ] || [ -z "${KAIROS_VMI_NAMESPACE}" ]; then
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          return 1
+        fi
+        local url="${KAIROS_MGMT_API}/apis/kubevirt.io/v1/namespaces/${KAIROS_VMI_NAMESPACE}/virtualmachineinstances/${KAIROS_VMI_NAME}"
+        local json
+        json=$(curl -k -sS -H "Authorization: Bearer ${KAIROS_MGMT_TOKEN}" "${url}" 2>/dev/null || true)
+        if [ -z "${json}" ]; then
+          return 1
+        fi
+        local ip
+        ip=$(echo "${json}" | sed -n 's/.*"ipAddress":"\\([^"]*\\)".*/\\1/p' | head -n1)
+        if [ -n "${ip}" ]; then
+          echo "${ip}"
+          return 0
+        fi
+        return 1
+      }
+      detect_primary_ip_once() {
+        if [ -n "${KAIROS_PRIMARY_IP}" ]; then
+          echo "Using primary IP override: ${KAIROS_PRIMARY_IP}"
+          echo "${KAIROS_PRIMARY_IP}"
+          return 0
+        fi
+        local mgmt_ip=""
+        mgmt_ip=$(fetch_vmi_ip_from_management || true)
+        if [ -n "${mgmt_ip}" ]; then
+          echo "Using VMI IP from management API: ${mgmt_ip}"
+          echo "${mgmt_ip}"
+          return 0
+        fi
+        local dev=""
+        local ip=""
+        dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+        if [ -n "${dev}" ]; then
+          ip=$(ip -4 -o addr show dev "${dev}" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+        fi
+        if [ -z "${ip}" ]; then
+          ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+        fi
+        if [ -n "${ip}" ]; then
+          echo "Using detected guest IP: ${ip}"
+        fi
+        echo "${ip}"
+      }
+      detect_primary_ip() {
+        local ip=""
+        for i in {1..30}; do
+          ip="$(detect_primary_ip_once)"
+          if [ -n "${ip}" ]; then
+            echo "${ip}"
+            return 0
+          fi
+          echo "Waiting for primary IP... (${i}/30)"
+          sleep 5
+        done
+        return 1
+      }
+
+      KAIROS_SANS_CHANGED=0
+      ensure_k0s_api_sans() {
+        local api_ip="$1"
+        if [ -z "${api_ip}" ]; then
+          echo "WARN: unable to detect node IP for k0s api.sans"
+          return 1
+        fi
+
+        local cfg="/etc/k0s/k0s.yaml"
+        if [ ! -f "${cfg}" ]; then
+          printf '%s\n' \
+            "apiVersion: k0s.k0sproject.io/v1beta1" \
+            "kind: ClusterConfig" \
+            "metadata:" \
+            "  name: k0s" \
+            "spec:" \
+            "  api:" \
+            "    sans:" \
+            "    - ${api_ip}" > "${cfg}"
+          KAIROS_SANS_CHANGED=1
+          return 0
+        fi
+
+        if grep -qE '^[[:space:]]*api:' "${cfg}"; then
+          if grep -qE '^[[:space:]]*sans:' "${cfg}"; then
+            if ! grep -qE '^[[:space:]]*-[[:space:]]*'"${api_ip}"'([[:space:]]|$)' "${cfg}"; then
+              sed -i "/^[[:space:]]*sans:/a\\    - ${api_ip}" "${cfg}"
+              KAIROS_SANS_CHANGED=1
+            fi
+            return 0
+          fi
+          sed -i "/^[[:space:]]*api:/a\\    sans:\\\n    - ${api_ip}" "${cfg}"
+          KAIROS_SANS_CHANGED=1
+          return 0
+        fi
+
+        if grep -qE '^[[:space:]]*spec:' "${cfg}"; then
+          sed -i "/^[[:space:]]*spec:/a\\  api:\\\n    sans:\\\n    - ${api_ip}" "${cfg}"
+          KAIROS_SANS_CHANGED=1
+          return 0
+        fi
+
+        printf '%s\n' \
+          "spec:" \
+          "  api:" \
+          "    sans:" \
+          "    - ${api_ip}" >> "${cfg}"
+        KAIROS_SANS_CHANGED=1
+        return 0
+      }
+
+      API_IP="$(detect_primary_ip || true)"
+      ensure_k0s_api_sans "${API_IP}" || true
+
+      if [ "${KAIROS_SANS_CHANGED}" = "1" ]; then
+        echo "Updated k0s api.sans entries"
+        KAIROS_REPUSH_KUBECONFIG=true
+        # Force apiserver cert regeneration with updated SANs
+        rm -f /var/lib/k0s/pki/apiserver.crt /var/lib/k0s/pki/apiserver.key || true
+        if systemctl is-active --quiet k0scontroller; then
+          systemctl restart k0scontroller || true
+        else
+          systemctl restart k0s || true
+        fi
+      fi
+      echo "No providerID to set"
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      # This file is used by Cluster API to determine bootstrap completion
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+
+      echo "k0s post-bootstrap tasks completed successfully"
+stages:
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+runcmd:
+  # Enable + start the helper service explicitly. `enable --now` both
+  # creates the multi-user.target.wants/ symlink for next boot AND starts
+  # the unit on this boot. Required after KD-3b moved unit writes from
+  # stages.initramfs.files to top-level write_files (runcmd is now too
+  # late in boot for ln-only symlink creation to be honored by systemd).
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k0s-post-bootstrap-enable.service || true
+  - /bin/systemctl enable kairos-k0s-lb-sans.path || true
+  - /bin/systemctl start kairos-k0s-lb-sans.path || true

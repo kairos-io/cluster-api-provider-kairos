@@ -76,6 +76,47 @@ type TemplateData struct {
 	ControlPlaneLBServiceName      string
 	ControlPlaneLBServiceNamespace string
 	ControlPlaneLBEndpoint         string
+	// ControlPlaneRole is the init/join/single discriminator for an HA control
+	// plane (ADR 0005, Phase 2). It mirrors KairosConfig.Spec.ControlPlaneRole.
+	//
+	// The zero value ("") MUST behave exactly as "single" — the existing
+	// single-node render path — so configs that predate the field (and every
+	// render until the Phase-3 controller assigns roles) keep their current
+	// output byte-for-byte. Use IsSingleControlPlane / IsInitControlPlane /
+	// IsJoinControlPlane rather than comparing the raw string; those helpers
+	// encode the empty-equals-single rule in one place.
+	//
+	// Only consulted on the control-plane path. On worker renders this field is
+	// ignored entirely (CPR-INV-1/2 are the controller's enforcement that a
+	// worker config never carries a control-plane role; the renderer simply does
+	// not branch on ControlPlaneRole when Role != "control-plane").
+	ControlPlaneRole string
+	// JoinToken is the cluster join token for an HA "join" node (k0s
+	// controller-join token / shared k3s server token). It is written to a
+	// 0600 token file via a write_files YAML block scalar — NOT a shell
+	// context — so its protection is literal-block-scalar embedding plus the
+	// rejectControlChars check in validate.go (no newline/CR/NUL), NOT shquote.
+	// Do not relocate it into a runcmd/ExecStart line without adding shquote.
+	//
+	// PHASE-3 SEAM: where this value comes from (controller-generated k3s token,
+	// or k0s token retrieved over the node-push channel post-init, stored in a
+	// management-cluster Secret and resolved via *SecretRef) is owned by Phase 3
+	// (ADR 0005 §3, TOKEN-INV). Phase 2 only renders it given the input; the
+	// controller does NOT populate it yet, so it is empty in practice until
+	// Phase 3. A join render with an empty JoinToken still produces valid YAML
+	// (the join node simply cannot authenticate until Phase 3 wires the token).
+	JoinToken string
+	// VIP, when non-nil AND ControlPlaneRole is init or join, drives the kube-vip
+	// static-pod manifest rendered into the distribution's manifests directory
+	// (ADR 0005, OQ-1). It is the mechanism that MAKES the control-plane endpoint
+	// floatable; it is NOT the join target. The join server URL is the stable
+	// ControlPlaneEndpointHost (from KD-12 / the InfraCluster), never the VIP.
+	//
+	// VIP is rendered ONLY for the CAPV/CAPM3 (generic, non-KubeVirt) templates.
+	// CAPK uses its built-in LoadBalancer Service as the endpoint and MUST NOT
+	// render kube-vip (OQ-5); the CAPK templates ignore this field. When VIP is
+	// nil, no kube-vip is rendered (external-LB HA is a valid topology).
+	VIP *VIPConfig
 	// ManagementEndpoint, if non-nil, enables the in-node kubeconfig-push path
 	// (CAPK today; other infra providers under KD-3b). The renderer treats the
 	// pointer as the single gate for emitting the push block — when nil, no
@@ -117,6 +158,71 @@ type InstallConfig struct {
 	Auto   bool
 	Device string
 	Reboot bool
+}
+
+// VIPConfig is the normalized, render-ready view of
+// KairosControlPlane.Spec.HA.VIP (kube-vip). The controller marshals the CRD
+// type into this flat struct; the renderer stays CAPI-type-unaware
+// (internal/bootstrap/CLAUDE.md §4).
+//
+// Security (ADR 0005 §C, VIP-INV-1/2/3):
+//   - Address/Interface/Mode are operator-influenced. Every shell-context use
+//     is routed through shquote (VIP-INV-1).
+//   - The kube-vip static-pod manifest is produced via marshaled YAML, never
+//     string concatenation (VIP-INV-2) — see kubeVIPManifest in funcs.go.
+//   - Address (net.ParseIP || DNS-1123) and Interface (interface-name regex)
+//     are re-validated at render time, not just at admission (VIP-INV-3) —
+//     see validateVIP in validate.go.
+type VIPConfig struct {
+	// Address is the virtual IP or hostname the control-plane endpoint floats
+	// on. Validated as an IPv4/IPv6 address or RFC-1123 hostname at render time.
+	Address string
+	// Interface is the Linux NIC name kube-vip advertises the VIP on (ARP/BGP).
+	// Validated against the interface-name regex at render time.
+	Interface string
+	// Mode is "ARP" (L2, default) or "BGP" (L3). Empty is treated as ARP.
+	Mode string
+}
+
+// IsControlPlane reports whether this render is for a control-plane node. The
+// ControlPlaneRole field is only meaningful (and only consulted) when this is
+// true; worker renders ignore ControlPlaneRole entirely.
+func (d TemplateData) IsControlPlane() bool {
+	return d.Role == "control-plane"
+}
+
+// IsSingleControlPlane reports whether the control plane should render in
+// single-node mode. The zero value ("") is treated as "single" so configs that
+// predate ControlPlaneRole keep their exact current output (ADR 0005, CPR-INV-2).
+// Only true on the control-plane path.
+func (d TemplateData) IsSingleControlPlane() bool {
+	return d.IsControlPlane() && (d.ControlPlaneRole == "" || d.ControlPlaneRole == "single")
+}
+
+// IsInitControlPlane reports whether this is the HA first (init) control-plane
+// node. Only true on the control-plane path.
+func (d TemplateData) IsInitControlPlane() bool {
+	return d.IsControlPlane() && d.ControlPlaneRole == "init"
+}
+
+// IsJoinControlPlane reports whether this is an HA joining control-plane node.
+// Only true on the control-plane path.
+func (d TemplateData) IsJoinControlPlane() bool {
+	return d.IsControlPlane() && d.ControlPlaneRole == "join"
+}
+
+// IsHAControlPlane reports whether this is an HA control-plane node (init or
+// join). Single-node (and the empty zero value) is NOT HA.
+func (d TemplateData) IsHAControlPlane() bool {
+	return d.IsInitControlPlane() || d.IsJoinControlPlane()
+}
+
+// RenderKubeVIP reports whether the kube-vip static-pod manifest should be
+// emitted for this render. True only for an HA control-plane node (init/join)
+// with a non-nil VIP block on a NON-KubeVirt (CAPV/CAPM3) template. CAPK uses
+// its built-in LoadBalancer Service and never renders kube-vip (ADR 0005, OQ-5).
+func (d TemplateData) RenderKubeVIP() bool {
+	return d.IsHAControlPlane() && d.VIP != nil && !d.IsKubeVirt
 }
 
 // RenderK0sCloudConfig renders the k0s Kairos cloud-config template.
