@@ -100,7 +100,7 @@ func goldenCases() []goldenCase {
 		{"k3s_capk_single", RenderK3sCloudConfig, base(bootstrapv1beta2.ControlPlaneRoleSingle, true, true, false)},
 
 		// --- init (HA first node, CAPV: kube-vip rendered) ---
-		{"k0s_capv_init", RenderK0sCloudConfig, withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240")},
+		{"k0s_capv_init", RenderK0sCloudConfig, withJoinTokenSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-control-plane-join-token")},
 		{"k3s_capv_init", RenderK3sCloudConfig, withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240")},
 
 		// --- join (HA subsequent node, CAPV: kube-vip rendered) ---
@@ -108,7 +108,7 @@ func goldenCases() []goldenCase {
 		{"k3s_capv_join", RenderK3sCloudConfig, withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240"))},
 
 		// --- CAPK HA (NO kube-vip; OQ-5): init/join still branch, LB Service is the endpoint ---
-		{"k0s_capk_init", RenderK0sCloudConfig, capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false))},
+		{"k0s_capk_init", RenderK0sCloudConfig, withJoinTokenSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-control-plane-join-token")},
 		{"k3s_capk_init", RenderK3sCloudConfig, capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false))},
 		{"k0s_capk_join", RenderK0sCloudConfig, withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false)))},
 		{"k3s_capk_join", RenderK3sCloudConfig, withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false)))},
@@ -117,6 +117,15 @@ func goldenCases() []goldenCase {
 
 func withJoinToken(d TemplateData) TemplateData {
 	d.JoinToken = "K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::server:bbbbbbbbbbbbbbbbbbbbbbbb"
+	return d
+}
+
+// withJoinTokenSecretName stamps the k0s HA init-node push-block gate
+// (ManagementEndpoint.JoinTokenSecretName). Only the k0s init render mints
+// `k0s token create` and pushes the token; this makes the golden snapshot
+// exercise that highest-blast-radius block. Requires ManagementEndpoint set.
+func withJoinTokenSecretName(d TemplateData, name string) TemplateData {
+	d.ManagementEndpoint.JoinTokenSecretName = name
 	return d
 }
 

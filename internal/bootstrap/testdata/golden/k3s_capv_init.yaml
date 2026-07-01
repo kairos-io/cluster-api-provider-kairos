@@ -25,7 +25,14 @@ k3s:
     # block, which only drives the kube-vip manifest that makes that endpoint
     # floatable. ControlPlaneEndpointHost is shquote-safe (validated, no shell
     # context here — it lands in a YAML list item) and quote'd accordingly.
+    #
+    # --token-file pins the shared K3S_TOKEN on the init node from the SAME token
+    # file the joiners read (written below for every HA role from .JoinToken).
+    # Without this, k3s --cluster-init auto-generates a random server token that
+    # the joiners can never match, so the cluster never forms. (ADR 0005 Phase 3,
+    # BLOCKER-1.)
     - --cluster-init
+    - --token-file=/etc/rancher/k3s/server-token
     - --tls-san=192.168.1.240
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml
@@ -64,6 +71,20 @@ write_files:
     content: |
       tls-san:
         - 192.168.1.240
+  # ADR 0005 (HA): shared k3s server token, written on BOTH init and join nodes
+  # (IsHAControlPlane) so every HA control-plane member uses the same K3S_TOKEN —
+  # the init node from --token-file (above) and joiners from --server+--token-file.
+  # Sourced from .JoinToken, which the Phase-3 controller generates once
+  # (crypto/rand) and resolves from a management-cluster Secret via *SecretRef
+  # (TOKEN-INV). The value lands here as a YAML block scalar guarded by
+  # rejectControlChars (no shquote — this is not a shell context). 0600: this is
+  # a cluster-join secret on disk.
+  - path: /etc/rancher/k3s/server-token
+    permissions: "0600"
+    owner: root
+    group: root
+    content: |
+      
   # ADR 0005 (HA) kube-vip static-pod manifest (CAPV/CAPM3 only; CAPK uses its
   # built-in LoadBalancer Service per OQ-5 and never reaches this block).
   # k3s auto-applies manifests under /var/lib/rancher/k3s/server/manifests at

@@ -76,10 +76,13 @@ write_files:
       # the management cluster (KD-3b push pattern).
       tls-san:
         - 10.96.0.10
-  # ADR 0005 (HA) join node on CAPK: shared k3s server token. Sourced from
-  # .JoinToken, resolved by the Phase-3 controller from a management-cluster
-  # Secret (TOKEN-INV). Empty until Phase 3 wires the token. 0600: cluster-join
-  # secret on disk. No kube-vip is rendered for CAPK (OQ-5).
+  # ADR 0005 (HA) on CAPK: shared k3s server token, written on BOTH init and join
+  # (IsHAControlPlane) so every HA member uses the same K3S_TOKEN — init via
+  # --token-file, joiners via --server+--token-file. Sourced from .JoinToken,
+  # which the Phase-3 controller generates once (crypto/rand) and resolves from a
+  # management-cluster Secret via *SecretRef (TOKEN-INV). Block-scalar guarded by
+  # rejectControlChars (not a shell context). 0600: cluster-join secret on disk.
+  # No kube-vip is rendered for CAPK (OQ-5).
   - path: /etc/rancher/k3s/server-token
     permissions: "0600"
     owner: root

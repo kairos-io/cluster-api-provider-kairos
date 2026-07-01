@@ -166,6 +166,96 @@ func TestHA_JoinTokenFile(t *testing.T) {
 	}
 }
 
+// TestHA_K3sInitWritesAndUsesServerToken is the BLOCKER-1 regression guard
+// (ADR 0005 Phase 3): the k3s INIT node must BOTH write the shared server-token
+// file AND pass --token-file, otherwise --cluster-init auto-generates a random
+// K3S_TOKEN the joiners can never match and the cluster never forms. The k0s
+// init node has no such requirement (managed-etcd init mints the controller-join
+// token post-init), so this guard is k3s-only.
+func TestHA_K3sInitWritesAndUsesServerToken(t *testing.T) {
+	const tokenPath = "/etc/rancher/k3s/server-token"
+	const tokenArg = "--token-file=/etc/rancher/k3s/server-token"
+
+	for _, kv := range []bool{false, true} { // CAPV, CAPK
+		name := "capv"
+		if kv {
+			name = "capk"
+		}
+		t.Run(name, func(t *testing.T) {
+			d := haCPData("init", kv)
+			d.JoinToken = "K10shared::server:tokenvalue" // init must carry the shared token too
+			out, err := RenderK3sCloudConfig(d)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			if !strings.Contains(out, "--cluster-init") {
+				t.Errorf("k3s init render missing --cluster-init")
+			}
+			if !strings.Contains(out, tokenArg) {
+				t.Errorf("k3s init render missing %q — init would auto-generate a random token (BLOCKER-1)", tokenArg)
+			}
+			content := extractWriteFile(t, out, tokenPath)
+			if content == "" {
+				t.Fatalf("k3s init render missing server-token file %q (BLOCKER-1)", tokenPath)
+			}
+			if strings.TrimSpace(content) != d.JoinToken {
+				t.Errorf("k3s init server-token did not round-trip: got %q want %q", strings.TrimSpace(content), d.JoinToken)
+			}
+		})
+	}
+}
+
+// TestHA_JoinTokenAdversarialRoundTrip asserts that adversarial-but-legal join
+// tokens (containing YAML-significant characters but no control chars) survive
+// the write_files block-scalar embed byte-for-byte, and that tokens carrying
+// newline/CR/NUL are REJECTED at render time (rejectControlChars is the
+// load-bearing protection for JoinToken — it is a YAML block scalar, not a shell
+// context, so shquote does not apply). (internal/bootstrap/CLAUDE.md HA section.)
+func TestHA_JoinTokenAdversarialRoundTrip(t *testing.T) {
+	roundTrip := []string{
+		`K10::server:token`,
+		`a"b#c`,
+		`---leading-dashes`,
+		`-startsWithDash`,
+		`tok:with:colons`,
+		`tok with spaces`,
+		`$(reboot)` + "`id`" + `${HOME}`, // shell metas: inert in a YAML block scalar
+	}
+	rejected := []string{
+		"tok\nwith-newline",
+		"tok\rwith-cr",
+		"tok\x00nul",
+	}
+
+	for _, render := range []func(TemplateData) (string, error){RenderK0sCloudConfig, RenderK3sCloudConfig} {
+		tokenPath := "/etc/k0s/controller-token"
+		for _, tok := range roundTrip {
+			d := haCPData("join", false)
+			d.JoinToken = tok
+			out, err := render(d)
+			if err != nil {
+				t.Fatalf("render with token %q: %v", tok, err)
+			}
+			// Determine which token file this distro wrote.
+			path := tokenPath
+			if strings.Contains(out, "/etc/rancher/k3s/server-token") {
+				path = "/etc/rancher/k3s/server-token"
+			}
+			content := extractWriteFile(t, out, path)
+			if strings.TrimSpace(content) != tok {
+				t.Errorf("token %q did not round-trip in %q: got %q", tok, path, strings.TrimSpace(content))
+			}
+		}
+		for _, tok := range rejected {
+			d := haCPData("join", false)
+			d.JoinToken = tok
+			if _, err := render(d); err == nil {
+				t.Errorf("token %q with control char must be rejected at render", tok)
+			}
+		}
+	}
+}
+
 // TestHA_JoinServerURLIsEndpointNotVIP is the explicit guard for the ADR
 // invariant: the k3s join --server URL is the stable ControlPlaneEndpointHost,
 // NOT the VIP block (even though, in a correctly-configured cluster, the two

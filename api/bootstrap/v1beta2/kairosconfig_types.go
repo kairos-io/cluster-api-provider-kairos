@@ -26,7 +26,29 @@ const (
 	// KairosConfigFinalizer allows the reconciler to clean up resources associated with KairosConfig before
 	// removing it from the API server.
 	KairosConfigFinalizer = "kairosconfig.bootstrap.cluster.x-k8s.io"
+
+	// ControlPlaneJoinTokenSecretSuffix is appended to the cluster name to form
+	// the per-cluster HA control-plane join-token Secret name (ADR 0005 Phase 3).
+	// Shared here so the controlplane controller (which creates + owns it) and
+	// the bootstrap controller (which resolves + pushes into it) agree on one
+	// name.
+	ControlPlaneJoinTokenSecretSuffix = "control-plane-join-token"
+
+	// ControlPlaneJoinTokenSecretTypeLabel + Value mark the join-token Secret so
+	// controllers' Secret-watch predicates match it by label (KD-15), never by
+	// name suffix.
+	ControlPlaneJoinTokenSecretTypeLabel = "controlplane.cluster.x-k8s.io/secret-type"
+	ControlPlaneJoinTokenSecretTypeValue = "control-plane-join-token"
+
+	// ControlPlaneJoinTokenSecretDataKey is the data key holding the join token.
+	ControlPlaneJoinTokenSecretDataKey = "token"
 )
+
+// ControlPlaneJoinTokenSecretName returns the per-cluster HA join-token Secret
+// name for the given cluster.
+func ControlPlaneJoinTokenSecretName(clusterName string) string {
+	return clusterName + "-" + ControlPlaneJoinTokenSecretSuffix
+}
 
 // ControlPlaneRole is the per-machine role discriminator for control-plane
 // nodes. It is assigned by the KairosControlPlane controller and must not be
@@ -211,6 +233,36 @@ type KairosConfigSpec struct {
 	// +optional
 	K3sTokenSecretRef *WorkerTokenSecretReference `json:"k3sTokenSecretRef,omitempty"`
 
+	// ControlPlaneJoinTokenSecretRef references a Secret holding the k0s
+	// control-plane (controller-role) join token used by an HA "join" node
+	// (ADR 0005 Phase 3). The token is minted on the init node via
+	// `k0s token create --role=controller`, pushed back to the management cluster
+	// over the node-push channel, and stored in an owner-ref'd Secret that the
+	// KairosControlPlane controller points this ref at.
+	//
+	// Set by the KairosControlPlane controller; not user-set. There is NO inline
+	// counterpart (TOKEN-INV / no new inline-secret fields): the controller-join
+	// token is secret material and must live in a Secret, never in this spec.
+	// The Secret must contain a key specified by Key (defaults to "token").
+	//
+	// k3s HA reuses K3sTokenSecretRef for the shared server token; this field is
+	// k0s-specific.
+	// +optional
+	ControlPlaneJoinTokenSecretRef *WorkerTokenSecretReference `json:"controlPlaneJoinTokenSecretRef,omitempty"`
+
+	// ControlPlaneVIP is the kube-vip configuration the KairosControlPlane
+	// controller copies down from KairosControlPlane.Spec.HA.VIP so the bootstrap
+	// renderer can emit the kube-vip static-pod manifest on HA control-plane nodes
+	// (ADR 0005 Phase 3). It is consulted by the renderer ONLY on init/join
+	// control-plane roles on non-KubeVirt infrastructure (RenderKubeVIP gate).
+	//
+	// Set by the KairosControlPlane controller; not user-set. Keeping a flat copy
+	// here (rather than having the bootstrap controller reach into the
+	// controlplane API group) preserves internal/bootstrap's API-server-unaware
+	// contract: the controller marshals it into TemplateData.VIP.
+	// +optional
+	ControlPlaneVIP *ControlPlaneVIP `json:"controlPlaneVIP,omitempty"`
+
 	// Manifests are Kubernetes manifests to be placed in the distribution manifests directory.
 	// These will be automatically applied by the distribution at cluster startup.
 	// k0s: /var/lib/k0s/manifests/{Name}/{File}
@@ -316,6 +368,39 @@ type UserPasswordSecretReference struct {
 	// If not specified, defaults to the same namespace as the KairosConfig.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
+}
+
+// ControlPlaneVIP is the flat, render-ready view of the kube-vip configuration
+// (KairosControlPlane.Spec.HA.VIP) propagated onto a control-plane KairosConfig
+// by the KairosControlPlane controller (ADR 0005 Phase 3). The bootstrap
+// controller converts it into internal/bootstrap.VIPConfig so the renderer
+// stays unaware of CAPI/controlplane types.
+//
+// Address and Interface mirror the validation on
+// controlplane/v1beta2.KubeVIPConfig and are re-validated at render time
+// (VIP-INV-3). This field is set by the controller, not by end users.
+type ControlPlaneVIP struct {
+	// Address is the virtual IP address or DNS hostname for the control-plane
+	// endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Address string `json:"address"`
+
+	// Interface is the Linux network interface name on which kube-vip advertises
+	// the VIP (e.g. "eth0", "ens3", "bond0").
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=15
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9._-]{0,14}$`
+	Interface string `json:"interface"`
+
+	// Mode selects the VIP advertisement mechanism: "ARP" (default, L2) or
+	// "BGP" (L3). Empty is treated as ARP.
+	// +kubebuilder:validation:Enum=ARP;BGP
+	// +kubebuilder:default=ARP
+	// +optional
+	Mode string `json:"mode,omitempty"`
 }
 
 // Manifest represents a Kubernetes manifest file to be deployed by the

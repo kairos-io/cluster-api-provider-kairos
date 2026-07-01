@@ -60,6 +60,25 @@ type KairosControlPlaneReconciler struct {
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
+// joinerGateRequeueAfter is the backstop requeue interval while waiting for the
+// HA init machine to become joinable (NodeRef + KubeconfigReady, plus the k0s
+// join-token Secret) before creating the next join machine (ADR 0005 Phase 3,
+// OQ-A). The Machine and Secret watches normally wake the reconcile on the
+// relevant transitions; this is the safety net for the k0s-token-Secret-appears
+// case until that Secret lands.
+const joinerGateRequeueAfter = 15 * time.Second
+
+// The HA join-token Secret name/labels/data-key are defined once in the
+// bootstrap API package (bootstrapv1beta2) so this controller (which creates +
+// owns the Secret) and the bootstrap controller (which resolves + pushes into
+// it) agree on one name/label. Local aliases keep the call sites terse and the
+// KCP Secret-watch predicate can match by the type label (KD-15) rather than by
+// name suffix, keeping it distinct from the kubeconfig Secret.
+const (
+	controlPlaneJoinTokenSecretTypeLabel = bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel
+	controlPlaneJoinTokenSecretTypeValue = bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue
+)
+
 // kubeconfigReadyTimeout is a package-local alias for the canonical
 // constant in the API package. The API package owns it (single source of
 // truth) because the validating webhook needs the same value to enforce
@@ -94,6 +113,13 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
 //+kubebuilder:rbac:groups="",resources=services;endpoints,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// Secrets: the KCP controller reads the workload kubeconfig Secret (KD-3b node
+// push) and rewrites its server URL, and creates/owns the HA join-token Secret
+// (ADR 0005 Phase 3) and the CAPK kubeconfig rewrite. It previously relied on
+// verbs borrowed from the sibling bootstrap controller's grant; declared here
+// explicitly. (KD-46 minimization: no delete — the join-token/kubeconfig Secrets
+// cascade via owner references, not direct deletes.)
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 //
@@ -230,8 +256,12 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	// Reconcile control plane machines
-	if err := r.reconcileMachines(ctx, log, kcp, cluster); err != nil {
+	// Reconcile control plane machines. machinesResult carries a requeue when
+	// the HA joiner-sequencing gate is holding back the next join machine
+	// (ADR 0005 Phase 3) — it is applied at the end of Reconcile so status is
+	// still refreshed while we wait for the init machine to become joinable.
+	machinesResult, err := r.reconcileMachines(ctx, log, kcp, cluster)
+	if err != nil {
 		// Use "%s" as format string and pass error as argument to satisfy linter
 		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.ControlPlaneInitializationFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.ControlPlaneInitializationFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
@@ -331,6 +361,9 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
 	}
 
+	// HA conditions (ADR 0005 Phase 3): join progress + the VIP/endpoint warning.
+	r.setHAConditions(kcp, cluster, endpointReady)
+
 	// Failure fields were cleared above immediately after reconcileMachines
 	// returned nil (KD-14, maintainer-confirmed decision #3). The previous
 	// `if ReadyReplicas > 0` gate at this location is intentionally removed.
@@ -367,7 +400,10 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	return ctrl.Result{}, nil
+	// machinesResult carries the joiner-sequencing-gate requeue (if any). All
+	// other paths above leave it zero-valued, so this is a no-op outside the HA
+	// gate case.
+	return machinesResult, nil
 }
 
 // findClusterForControlPlane searches for a Cluster that references this KairosControlPlane
@@ -417,7 +453,7 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 	return nil, nil
 }
 
-func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
+func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (ctrl.Result, error) {
 	// Get desired replica count
 	desiredReplicas := int32(1)
 	if kcp.Spec.Replicas != nil {
@@ -427,7 +463,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// List existing control plane machines
 	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
 	if err != nil {
-		return fmt.Errorf("failed to list control plane machines: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to list control plane machines: %w", err)
 	}
 
 	// Sort machines by creation timestamp (oldest first) for stable operations
@@ -438,6 +474,16 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	currentReplicas := int32(len(machines))
 
 	log.Info("Reconciling control plane machines", "desired", desiredReplicas, "current", currentReplicas)
+
+	// HA: ensure the per-cluster join-token Secret exists before any joiner is
+	// created (ADR 0005 Phase 3). For k3s the controller generates the shared
+	// server token up front; for k0s the Secret is created empty and the init
+	// node fills it over the node-push channel. Single-node clusters skip this.
+	if desiredReplicas > 1 {
+		if err := r.ensureJoinTokenSecret(ctx, log, kcp, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure join-token secret: %w", err)
+		}
+	}
 
 	maxSurge := int32(1)
 	if kcp.Spec.RolloutStrategy != nil && kcp.Spec.RolloutStrategy.RollingUpdate != nil && kcp.Spec.RolloutStrategy.RollingUpdate.MaxSurge != nil {
@@ -459,11 +505,11 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// Rolling update behavior when machines are outdated
 	if len(outdatedMachines) > 0 {
 		if currentReplicas < desiredReplicas+maxSurge {
-			nextIndex := r.nextMachineIndex(machines, kcp.Name)
-			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, nextIndex); err != nil {
-				return fmt.Errorf("failed to create control plane machine during rollout: %w", err)
+			role := r.controlPlaneRoleForNewMachine(desiredReplicas, machines)
+			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
 			}
-			return nil
+			return ctrl.Result{}, nil
 		}
 
 		// If we are above desired replicas and have enough updated/ready replicas, delete one outdated machine
@@ -471,23 +517,36 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 			target := outdatedMachines[0]
 			log.Info("Deleting outdated control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
-				return fmt.Errorf("failed to delete outdated control plane machine: %w", err)
+				return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
 			}
-			return nil
+			return ctrl.Result{}, nil
 		}
 	}
 
 	// Create machines if needed
 	if currentReplicas < desiredReplicas {
-		toCreate := desiredReplicas - currentReplicas
-		if toCreate > 0 {
-			nextIndex := r.nextMachineIndex(machines, kcp.Name)
-			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, nextIndex); err != nil {
-				return fmt.Errorf("failed to create control plane machine: %w", err)
+		role := r.controlPlaneRoleForNewMachine(desiredReplicas, machines)
+
+		// HA joiner-sequencing gate (ADR 0005 Phase 3, OQ-A): a join machine is
+		// not created until the init machine is joinable — NodeRef set,
+		// KubeconfigReady, and (k0s) the controller-join token Secret populated.
+		// Creating a joiner before the init endpoint exists would fail the join.
+		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
+			joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
-			// Only create one per reconcile to avoid over-scaling
-			return nil
+			if !joinable {
+				log.Info("Holding back join machine until init machine is joinable", "reason", reason)
+				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+			}
 		}
+
+		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine: %w", err)
+		}
+		// Only create one per reconcile to avoid over-scaling
+		return ctrl.Result{}, nil
 	}
 
 	// Delete machines if needed (scale down)
@@ -496,15 +555,73 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		if target != nil {
 			log.Info("Scaling down control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
-				return fmt.Errorf("failed to delete control plane machine: %w", err)
+				return ctrl.Result{}, fmt.Errorf("failed to delete control plane machine: %w", err)
 			}
 		}
 	}
 
-	return nil
+	return ctrl.Result{}, nil
 }
 
-func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32) error {
+// controlPlaneRoleForNewMachine decides the ControlPlaneRole for the next
+// control-plane machine to be created (ADR 0005 Phase 3, scope §1):
+//   - replicas == 1 → single (no etcd cluster).
+//   - replicas > 1 and no machine exists yet → init (the oldest CP machine).
+//   - replicas > 1 and at least one machine exists → join.
+//
+// The decision resolves against the EXISTING sorted machine set, not the name
+// index, so a deleted-and-recreated machine-0 cannot accidentally yield two
+// init nodes.
+func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredReplicas int32, existing []*clusterv1.Machine) bootstrapv1beta2.ControlPlaneRole {
+	if desiredReplicas <= 1 {
+		return bootstrapv1beta2.ControlPlaneRoleSingle
+	}
+	if len(existing) == 0 {
+		return bootstrapv1beta2.ControlPlaneRoleInit
+	}
+	return bootstrapv1beta2.ControlPlaneRoleJoin
+}
+
+// initMachineJoinable reports whether the HA init machine (the oldest CP
+// machine) is ready to accept joiners. The gate is (ADR 0005 Phase 3, OQ-A):
+//   - the init machine has Status.NodeRef set (it registered as a Node), AND
+//   - KubeconfigReadyCondition is True on the KCP (the node pushed its
+//     kubeconfig — KD-3b), AND
+//   - for k0s only, the join-token Secret has a non-empty token (the init node
+//     minted `k0s token create` and pushed it back). For k3s the token is
+//     controller-generated up front, so this clause is skipped.
+//
+// Real etcd-member health is deferred to Phase 4. reason is a short
+// human-readable explanation when not joinable (for logging/conditions).
+func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) (bool, string, error) {
+	if len(machines) == 0 {
+		return false, "init machine not created yet", nil
+	}
+	init := machines[0] // oldest-first sorted by caller
+	if init.Status.NodeRef == nil {
+		return false, "init machine has no NodeRef yet", nil
+	}
+	if !conditions.IsTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition) {
+		return false, "kubeconfig not yet observed (KubeconfigReady not True)", nil
+	}
+
+	distribution := kcp.Spec.Distribution
+	if distribution == "" {
+		distribution = "k0s"
+	}
+	if distribution == "k0s" {
+		token, err := r.joinTokenSecretValue(ctx, cluster)
+		if err != nil {
+			return false, "", err
+		}
+		if token == "" {
+			return false, "k0s controller-join token not yet pushed by init node", nil
+		}
+	}
+	return true, "", nil
+}
+
+func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole) error {
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
 	// Create KairosConfig
@@ -531,15 +648,9 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		},
 	}
 
-	// Determine single-node mode from replicas
-	replicas := int32(1)
-	if kcp.Spec.Replicas != nil {
-		replicas = *kcp.Spec.Replicas
-	}
-	kairosConfig.Spec.SingleNode = (replicas == 1)
-	log.Info("Setting SingleNode flag", "singleNode", kairosConfig.Spec.SingleNode, "replicas", replicas)
-
-	// If there's a template, merge its spec
+	// If there's a template, merge its spec. This replaces kairosConfig.Spec
+	// wholesale, so the HA wiring below (role, SingleNode, token ref, VIP) MUST
+	// run AFTER this block to stay authoritative.
 	if kcp.Spec.KairosConfigTemplate.Name != "" {
 		template := &bootstrapv1beta2.KairosConfigTemplate{}
 		templateKey := types.NamespacedName{
@@ -554,9 +665,14 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		kairosConfig.Spec.Role = "control-plane"
 		kairosConfig.Spec.Distribution = distribution
 		kairosConfig.Spec.KubernetesVersion = kcp.Spec.Version
-		// Override SingleNode based on replicas (replicas takes precedence)
-		kairosConfig.Spec.SingleNode = (replicas == 1)
 	}
+
+	// HA wiring (ADR 0005 Phase 3). The role decides single/init/join; SingleNode
+	// is kept in sync for back-compat with templates that still branch on it
+	// (KD-39 retires it in v1beta3). The bootstrap renderer reads ControlPlaneRole
+	// only when Role == "control-plane" (CPR-INV-1), which holds here.
+	r.applyControlPlaneHASpec(&kairosConfig.Spec, kcp, cluster, role)
+	log.Info("Assigned control-plane role", "role", role, "singleNode", kairosConfig.Spec.SingleNode)
 
 	if err := r.Create(ctx, kairosConfig); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
@@ -726,6 +842,47 @@ func (r *KairosControlPlaneReconciler) selectMachineForDeletion(machines []*clus
 	return machines[len(machines)-1]
 }
 
+// setHAConditions surfaces the two HA-specific conditions (ADR 0005 Phase 3) on
+// a multi-replica control plane. They are no-ops for single-node clusters.
+//
+//   - ControlPlaneJoinedCondition: True once readyReplicas == desiredReplicas;
+//     False(Info, "n/N joined") while scaling up.
+//   - AvailableCondition: marked False(Warning, WaitingForVIPOrExternalEndpoint)
+//     when an HA control plane on non-KubeVirt infra has neither a spec.ha.vip
+//     block nor an already-populated control-plane endpoint — it then has no
+//     stable floatable endpoint. CAPK is exempt (its LB Service is the
+//     endpoint). This does not block reconciliation; it is operator guidance.
+func (r *KairosControlPlaneReconciler) setHAConditions(kcp *controlplanev1beta2.KairosControlPlane, _ *clusterv1.Cluster, endpointReady bool) {
+	desiredReplicas := int32(1)
+	if kcp.Spec.Replicas != nil {
+		desiredReplicas = *kcp.Spec.Replicas
+	}
+	if desiredReplicas <= 1 {
+		return // single-node: no HA conditions.
+	}
+
+	if kcp.Status.ReadyReplicas >= desiredReplicas {
+		conditions.MarkTrue(kcp, controlplanev1beta2.ControlPlaneJoinedCondition)
+	} else {
+		conditions.MarkFalse(kcp, controlplanev1beta2.ControlPlaneJoinedCondition,
+			controlplanev1beta2.ControlPlaneJoiningReason, clusterv1.ConditionSeverityInfo,
+			"%d/%d control-plane members joined", kcp.Status.ReadyReplicas, desiredReplicas)
+	}
+
+	// VIP/endpoint warning: the controller CAN see the infra kind here (unlike
+	// the webhook), so it gates on it. CAPK uses its built-in LoadBalancer
+	// Service and is exempt. A populated endpoint (operator chose external LB)
+	// also satisfies the requirement.
+	hasVIP := kcp.Spec.HA != nil && kcp.Spec.HA.VIP != nil
+	if !isKubevirtControlPlane(kcp) && !hasVIP && !endpointReady {
+		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition,
+			controlplanev1beta2.WaitingForVIPOrExternalEndpointReason, clusterv1.ConditionSeverityWarning,
+			"HA control plane (replicas=%d) has no spec.ha.vip and no control-plane endpoint yet; "+
+				"set spec.ha.vip for kube-vip, or point the InfraCluster endpoint at an external load balancer",
+			desiredReplicas)
+	}
+}
+
 func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
 	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
 	if err != nil {
@@ -738,6 +895,7 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	updatedReplicas := int32(0)
 	unavailableReplicas := int32(0)
 
+	availableReplicas := int32(0)
 	for _, machine := range machines {
 		// Check if machine is ready (has NodeRef)
 		if machine.Status.NodeRef != nil {
@@ -753,6 +911,13 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 		if machine.Status.Phase != string(clusterv1.MachinePhaseRunning) {
 			unavailableReplicas++
 		}
+
+		// Available = ready (NodeRef set), Running phase, and not being deleted.
+		if machine.Status.NodeRef != nil &&
+			machine.Status.Phase == string(clusterv1.MachinePhaseRunning) &&
+			machine.DeletionTimestamp.IsZero() {
+			availableReplicas++
+		}
 	}
 
 	// ReadyReplicas should only be counted when NodeRef is actually set
@@ -765,6 +930,7 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	kcp.Status.ReadyReplicas = readyReplicas
 	kcp.Status.UpdatedReplicas = updatedReplicas
 	kcp.Status.UnavailableReplicas = unavailableReplicas
+	kcp.Status.AvailableReplicas = availableReplicas
 
 	selector := labels.SelectorFromSet(map[string]string{
 		clusterv1.ClusterNameLabel:         cluster.Name,

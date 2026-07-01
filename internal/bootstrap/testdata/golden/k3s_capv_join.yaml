@@ -64,11 +64,14 @@ write_files:
     content: |
       tls-san:
         - 192.168.1.240
-  # ADR 0005 (HA) join node: shared k3s server token. Sourced from .JoinToken,
-  # which the Phase-3 controller resolves from a management-cluster Secret
-  # (TOKEN-INV). Phase 2 renders it given the input; until Phase 3 wires the
-  # token this is empty and the join node cannot authenticate (valid YAML, no
-  # render-time failure). 0600: this is a cluster-join secret on disk.
+  # ADR 0005 (HA): shared k3s server token, written on BOTH init and join nodes
+  # (IsHAControlPlane) so every HA control-plane member uses the same K3S_TOKEN —
+  # the init node from --token-file (above) and joiners from --server+--token-file.
+  # Sourced from .JoinToken, which the Phase-3 controller generates once
+  # (crypto/rand) and resolves from a management-cluster Secret via *SecretRef
+  # (TOKEN-INV). The value lands here as a YAML block scalar guarded by
+  # rejectControlChars (no shquote — this is not a shell context). 0600: this is
+  # a cluster-join secret on disk.
   - path: /etc/rancher/k3s/server-token
     permissions: "0600"
     owner: root

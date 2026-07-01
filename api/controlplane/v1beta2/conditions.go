@@ -37,12 +37,36 @@ const (
 	//     to Warning past that threshold so operators see the stall in the
 	//     condition surface.
 	KubeconfigReadyCondition = "KubeconfigReady"
+
+	// ControlPlaneJoinedCondition reports HA join progress (ADR 0005 Phase 3).
+	// True once readyReplicas == desiredReplicas (all configured CP members have
+	// joined and registered a Node). False(Info) with an "n/N joined" message
+	// while scaling up. Not surfaced for single-node control planes.
+	ControlPlaneJoinedCondition = "ControlPlaneJoined"
 )
 
 // Condition reasons
 const (
 	// WaitingForMachinesReason indicates that the control plane is waiting for machines
 	WaitingForMachinesReason = "WaitingForMachines"
+
+	// WaitingForVIPOrExternalEndpointReason is a Warning-severity reason on
+	// AvailableCondition for an HA control plane (replicas > 1) that has neither
+	// a spec.ha.vip block nor an already-populated Cluster control-plane endpoint
+	// on non-KubeVirt infrastructure (ADR 0005 Phase 3). Without one of these the
+	// HA control plane has no stable, floatable endpoint and joiners cannot reach
+	// a durable --server URL. CAPK is exempt (its LoadBalancer Service is the
+	// endpoint). External-LB HA is valid: populate the InfraCluster endpoint and
+	// this clears without a VIP.
+	WaitingForVIPOrExternalEndpointReason = "WaitingForVIPOrExternalEndpoint"
+
+	// ControlPlaneJoiningReason is the False(Info) reason on
+	// ControlPlaneJoinedCondition while HA members are still joining.
+	ControlPlaneJoiningReason = "ControlPlaneJoining"
+
+	// ControlPlaneJoinedReason is the True reason on ControlPlaneJoinedCondition
+	// once all configured HA members have joined.
+	ControlPlaneJoinedReason = "ControlPlaneJoined"
 
 	// WaitingForMachinesReadyReason indicates that the control plane is waiting for machines to be ready
 	WaitingForMachinesReadyReason = "WaitingForMachinesReady"

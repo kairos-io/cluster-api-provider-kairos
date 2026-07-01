@@ -425,6 +425,17 @@ spec:
               KairosControlPlaneStatus defines the observed state of KairosControlPlane
               Contract: ControlPlane v1beta2 MUST expose initialized, readyReplicas, updatedReplicas, unavailableReplicas
             properties:
+              availableReplicas:
+                description: |-
+                  AvailableReplicas is the number of control plane machines that are
+                  available (ready and not being deleted). Contract: ControlPlane MUST
+                  expose availableReplicas (api/CLAUDE.md rule 1). For this provider a
+                  machine counts as available when it has a NodeRef and is in the Running
+                  phase; the value mirrors readyReplicas today but is surfaced as a distinct
+                  field per the v1beta2 contract and to give HA (replicas > 1) a clean
+                  available-vs-ready signal. (ADR 0005 Phase 3.)
+                format: int32
+                type: integer
               conditions:
                 description: |-
                   Conditions defines current service state of the KairosControlPlane
