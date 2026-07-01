@@ -44,6 +44,11 @@ type ManagementEndpoint struct {
 	KubeconfigSecretNamespace string
 	ClusterName               string
 	ControlPlaneEndpointHost  string
+	// JoinTokenSecretName is the name of the per-cluster HA control-plane
+	// join-token Secret the k0s init node pushes its `k0s token create` output
+	// into (ADR 0005 Phase 3). Stamped by the bootstrap controller only for k0s
+	// init control-plane renders; the renderer's twin drives the push block.
+	JoinTokenSecretName string
 }
 
 // ManagementEndpointResolver materialises the management-cluster contact info

@@ -599,6 +599,74 @@ MANIFEST_EOF
       fi
       {{- end }}
 
+      {{- if and .IsInitControlPlane .ManagementEndpoint .ManagementEndpoint.JoinTokenSecretName }}
+      # ADR 0005 (HA) k0s init node: mint the controller-role join token and push
+      # it to the management cluster over the SAME node-push channel as the
+      # kubeconfig (NOT SSH — KD-3b / OQ-2). The k0s controller-join token does
+      # not exist until k0s is up, so the controller cannot pre-generate it (as it
+      # does for k3s); the init node creates it here and PUTs it into the
+      # pre-created, owner-ref'd join-token Secret. Joiners then resolve it via
+      # ControlPlaneJoinTokenSecretRef and the controller's joiner gate opens.
+      #
+      # SECURITY (TOKEN-INV): the token is captured into a shell var and
+      # base64-enveloped into the Secret data — it is NEVER interpolated through
+      # text/template, NEVER echoed, and NEVER logged. All management-endpoint
+      # values are shquote'd (single-quoted POSIX literals; no shell evaluation),
+      # identical to the kubeconfig push above.
+      push_join_token() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push join token"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push join token"
+          return 1
+        fi
+        local jt
+        # Long expiry so the token stays valid across the whole HA join window.
+        jt=$(k0s token create --role=controller --expiry=24h 2>/dev/null || true)
+        if [ -z "${jt}" ]; then
+          echo "WARN: k0s token create returned empty; will retry on next boot"
+          return 1
+        fi
+        local jt_b64
+        jt_b64=$(printf '%s' "${jt}" | base64 -w 0 2>/dev/null || printf '%s' "${jt}" | base64 | tr -d '\n')
+        # Scrub the plaintext token from the shell as soon as it is enveloped.
+        unset jt
+        local api={{ .ManagementEndpoint.APIServer | shquote }}
+        local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
+        local jt_name={{ .ManagementEndpoint.JoinTokenSecretName | shquote }}
+        local token={{ .ManagementEndpoint.Token | shquote }}
+        local cluster_name={{ .ManagementEndpoint.ClusterName | shquote }}
+        # PATCH the pre-existing (controller-created, owner-ref'd) Secret's
+        # data.token via a strategic-merge patch. The Secret already exists and is
+        # owned by the KCP, so we only ever update data — never create — which is
+        # exactly the RBAC the node SA is granted (update/patch on the named
+        # join-token Secret, no create).
+        local patch
+        patch="{\"data\":{\"token\":\"${jt_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${jt_name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-jointoken-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH \
+          --data "${patch}" \
+          "${url}" || true)
+        # Scrub the enveloped token too.
+        unset jt_b64 patch
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed controller-join token to management secret ${ns}/${jt_name}"
+          return 0
+        fi
+        echo "WARN: failed to push controller-join token (status ${status})"
+        return 1
+      }
+      if ! push_join_token; then
+        echo "WARN: controller-join token push failed; joiners will wait until it succeeds"
+      fi
+      {{- end }}
+
       # Mark bootstrap success for CAPI/CAPK consumers
       # This file is used by Cluster API to determine bootstrap completion
       mkdir -p /run/cluster-api

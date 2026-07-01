@@ -123,6 +123,7 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 		kcp,
 		cluster,
 		0,
+		bootstrapv1beta2.ControlPlaneRoleSingle,
 	)
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -137,6 +138,7 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(kairosConfig.Spec.SingleNode).To(BeTrue())
 	g.Expect(kairosConfig.Spec.Role).To(Equal("control-plane"))
+	g.Expect(kairosConfig.Spec.ControlPlaneRole).To(Equal(bootstrapv1beta2.ControlPlaneRoleSingle))
 	g.Expect(kairosConfig.Spec.Distribution).To(Equal("k3s"))
 }
 
@@ -222,6 +224,7 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 		kcp,
 		cluster,
 		0,
+		bootstrapv1beta2.ControlPlaneRoleInit,
 	)
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -236,6 +239,7 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(kairosConfig.Spec.SingleNode).To(BeFalse())
 	g.Expect(kairosConfig.Spec.Role).To(Equal("control-plane"))
+	g.Expect(kairosConfig.Spec.ControlPlaneRole).To(Equal(bootstrapv1beta2.ControlPlaneRoleInit))
 }
 
 func TestGetNodeIP_KubevirtVMIFallback(t *testing.T) {

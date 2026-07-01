@@ -103,6 +103,40 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              controlPlaneJoinTokenSecretRef:
+                description: |-
+                  ControlPlaneJoinTokenSecretRef references a Secret holding the k0s
+                  control-plane (controller-role) join token used by an HA "join" node
+                  (ADR 0005 Phase 3). The token is minted on the init node via
+                  `k0s token create --role=controller`, pushed back to the management cluster
+                  over the node-push channel, and stored in an owner-ref'd Secret that the
+                  KairosControlPlane controller points this ref at.
+
+                  Set by the KairosControlPlane controller; not user-set. There is NO inline
+                  counterpart (TOKEN-INV / no new inline-secret fields): the controller-join
+                  token is secret material and must live in a Secret, never in this spec.
+                  The Secret must contain a key specified by Key (defaults to "token").
+
+                  k3s HA reuses K3sTokenSecretRef for the shared server token; this field is
+                  k0s-specific.
+                properties:
+                  key:
+                    default: token
+                    description: |-
+                      Key is the key within the Secret that contains the token
+                      Defaults to "token" if not specified
+                    type: string
+                  name:
+                    description: Name is the name of the Secret
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the Secret
+                      If not specified, defaults to the same namespace as the KairosConfig
+                    type: string
+                required:
+                - name
+                type: object
               controlPlaneRole:
                 allOf:
                 - enum:
@@ -128,6 +162,47 @@ spec:
                   controller until Phase 2 ships (the SingleNode field covers the
                   single-node case in the interim).
                 type: string
+              controlPlaneVIP:
+                description: |-
+                  ControlPlaneVIP is the kube-vip configuration the KairosControlPlane
+                  controller copies down from KairosControlPlane.Spec.HA.VIP so the bootstrap
+                  renderer can emit the kube-vip static-pod manifest on HA control-plane nodes
+                  (ADR 0005 Phase 3). It is consulted by the renderer ONLY on init/join
+                  control-plane roles on non-KubeVirt infrastructure (RenderKubeVIP gate).
+
+                  Set by the KairosControlPlane controller; not user-set. Keeping a flat copy
+                  here (rather than having the bootstrap controller reach into the
+                  controlplane API group) preserves internal/bootstrap's API-server-unaware
+                  contract: the controller marshals it into TemplateData.VIP.
+                properties:
+                  address:
+                    description: |-
+                      Address is the virtual IP address or DNS hostname for the control-plane
+                      endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  interface:
+                    description: |-
+                      Interface is the Linux network interface name on which kube-vip advertises
+                      the VIP (e.g. "eth0", "ens3", "bond0").
+                    maxLength: 15
+                    minLength: 1
+                    pattern: ^[a-zA-Z][a-zA-Z0-9._-]{0,14}$
+                    type: string
+                  mode:
+                    default: ARP
+                    description: |-
+                      Mode selects the VIP advertisement mechanism: "ARP" (default, L2) or
+                      "BGP" (L3). Empty is treated as ARP.
+                    enum:
+                    - ARP
+                    - BGP
+                    type: string
+                required:
+                - address
+                - interface
+                type: object
               distribution:
                 default: k0s
                 description: Distribution specifies the Kubernetes distribution to

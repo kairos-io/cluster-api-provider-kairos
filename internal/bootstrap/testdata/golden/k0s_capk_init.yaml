@@ -413,6 +413,55 @@ write_files:
       if ! push_kubeconfig; then
         echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
       fi
+      # ADR 0005 (HA) k0s init node: mint the controller-role join token and push
+      # it to the management cluster over the SAME node-push channel as the
+      # kubeconfig (NOT SSH — KD-3b / OQ-2). See the CAPV twin for the full
+      # rationale. SECURITY (TOKEN-INV): the token is captured into a shell var,
+      # base64-enveloped, scrubbed, and NEVER interpolated through text/template
+      # nor logged; management-endpoint values are shquote'd.
+      push_join_token() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push join token"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push join token"
+          return 1
+        fi
+        local jt
+        jt=$(k0s token create --role=controller --expiry=24h 2>/dev/null || true)
+        if [ -z "${jt}" ]; then
+          echo "WARN: k0s token create returned empty; will retry on next boot"
+          return 1
+        fi
+        local jt_b64
+        jt_b64=$(printf '%s' "${jt}" | base64 -w 0 2>/dev/null || printf '%s' "${jt}" | base64 | tr -d '\n')
+        unset jt
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local jt_name='ha-cluster-control-plane-join-token'
+        local token='mgmt-token'
+        local patch
+        patch="{\"data\":{\"token\":\"${jt_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${jt_name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-jointoken-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH \
+          --data "${patch}" \
+          "${url}" || true)
+        unset jt_b64 patch
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed controller-join token to management secret ${ns}/${jt_name}"
+          return 0
+        fi
+        echo "WARN: failed to push controller-join token (status ${status})"
+        return 1
+      }
+      if ! push_join_token; then
+        echo "WARN: controller-join token push failed; joiners will wait until it succeeds"
+      fi
 
       # Mark bootstrap success for CAPI/CAPK consumers
       # This file is used by Cluster API to determine bootstrap completion

@@ -366,6 +366,16 @@ type KairosControlPlaneStatus struct {
 	// +optional
 	UnavailableReplicas int32 `json:"unavailableReplicas,omitempty"`
 
+	// AvailableReplicas is the number of control plane machines that are
+	// available (ready and not being deleted). Contract: ControlPlane MUST
+	// expose availableReplicas (api/CLAUDE.md rule 1). For this provider a
+	// machine counts as available when it has a NodeRef and is in the Running
+	// phase; the value mirrors readyReplicas today but is surfaced as a distinct
+	// field per the v1beta2 contract and to give HA (replicas > 1) a clean
+	// available-vs-ready signal. (ADR 0005 Phase 3.)
+	// +optional
+	AvailableReplicas int32 `json:"availableReplicas,omitempty"`
+
 	// Conditions defines current service state of the KairosControlPlane
 	// Contract: ControlPlane SHOULD expose Conditions
 	// Standard CAPI conditions: Ready, Available, Initialized

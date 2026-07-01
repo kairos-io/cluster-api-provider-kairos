@@ -151,6 +151,18 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		//   services:get                          — REMOVED. No template path
 		//                                            reads Services with the node
 		//                                            SA token; it was a dead grant.
+		//   secrets get/update/patch (join-token) — ADR 0005 Phase 3: the k0s HA
+		//                                            init node PATCHes the
+		//                                            controller-created,
+		//                                            owner-ref'd join-token Secret
+		//                                            with its `k0s token create`
+		//                                            output over the node-push
+		//                                            channel. No create verb: the
+		//                                            controller pre-creates the
+		//                                            Secret, so the node only
+		//                                            updates it. Named Secret only;
+		//                                            deliberate, bounded widening.
+		joinTokenSecretName := bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
 		role.Rules = []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
@@ -160,7 +172,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"secrets"},
-				ResourceNames: []string{secretName},
+				ResourceNames: []string{secretName, joinTokenSecretName},
 				Verbs:         []string{"get", "update", "patch"},
 			},
 		}
