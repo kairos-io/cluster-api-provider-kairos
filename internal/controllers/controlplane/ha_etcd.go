@@ -18,11 +18,14 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -82,4 +85,54 @@ func (r *KairosControlPlaneReconciler) ensureEtcdStatusSecret(ctx context.Contex
 	log.V(4).Info("Ensured HA etcd-status secret",
 		"secret", etcdStatusSecretName(cluster.Name), "namespace", cluster.Namespace)
 	return nil
+}
+
+// etcdMemberStatus is the per-member health record a control-plane node reports
+// into the etcd-status Secret (ADR 0005 §E.1). It is non-secret cluster
+// metadata. The wire form is the compact JSON the node-side reporter builds; the
+// controller only READS it (it is never authored controller-side).
+type etcdMemberStatus struct {
+	Name       string `json:"name"`
+	Healthy    bool   `json:"healthy"`
+	Voting     bool   `json:"voting"`
+	Members    int    `json:"members"`
+	ReportedAt string `json:"reportedAt"`
+}
+
+// readEtcdStatus loads the per-cluster etcd-status Secret and parses each
+// member's reported status, keyed by member key (the reporting node's sanitized
+// hostname == its Node name). A missing Secret returns an empty map (the cluster
+// is pre-HA or no node has reported yet), not an error. Malformed entries (a
+// node wrote garbage, or a future schema) are skipped rather than failing the
+// whole read — a single bad key must not blind the controller to healthy peers.
+func (r *KairosControlPlaneReconciler) readEtcdStatus(ctx context.Context, cluster *clusterv1.Cluster) (map[string]etcdMemberStatus, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}
+	if err := r.Client.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return map[string]etcdMemberStatus{}, nil
+		}
+		return nil, fmt.Errorf("read etcd-status secret %s/%s: %w", key.Namespace, key.Name, err)
+	}
+	out := make(map[string]etcdMemberStatus, len(secret.Data))
+	for member, raw := range secret.Data {
+		var st etcdMemberStatus
+		if err := json.Unmarshal(raw, &st); err != nil {
+			continue
+		}
+		out[member] = st
+	}
+	return out, nil
+}
+
+// etcdVotingHealthyCount returns the number of members reporting BOTH healthy and
+// voting — the population that counts toward etcd quorum (ADR 0005 §E.2/§E.4).
+func etcdVotingHealthyCount(status map[string]etcdMemberStatus) int {
+	n := 0
+	for _, st := range status {
+		if st.Healthy && st.Voting {
+			n++
+		}
+	}
+	return n
 }

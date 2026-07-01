@@ -361,8 +361,9 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "Waiting for control plane initialization")
 	}
 
-	// HA conditions (ADR 0005 Phase 3): join progress + the VIP/endpoint warning.
-	r.setHAConditions(kcp, cluster, endpointReady)
+	// HA conditions (ADR 0005 Phase 3 + §E.4): join progress, the VIP/endpoint
+	// warning, and etcd health.
+	r.setHAConditions(ctx, kcp, cluster, endpointReady)
 
 	// Failure fields were cleared above immediately after reconcileMachines
 	// returned nil (KD-14, maintainer-confirmed decision #3). The previous
@@ -625,6 +626,30 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 			return false, "k0s controller-join token not yet pushed by init node", nil
 		}
 	}
+
+	// ADR 0005 §E.1: gate joiners on the init node having reported a healthy,
+	// voting etcd member into the etcd-status Secret (node-push; no etcd dial).
+	// This prevents cutting a joiner loose to `--server` into an init whose etcd
+	// is not yet a stable quorum member.
+	etcdStatus, err := r.readEtcdStatus(ctx, cluster)
+	if err != nil {
+		return false, "", err
+	}
+	initMember, reported := etcdStatus[init.Status.NodeRef.Name]
+	if distribution == "k0s" {
+		// k0s is authoritative (`k0s etcd member-list`): require a healthy voting
+		// report before opening the gate.
+		if !reported || !initMember.Healthy || !initMember.Voting {
+			return false, "init node has not yet reported a healthy voting etcd member", nil
+		}
+	} else {
+		// k3s is health-only best-effort (KD-5d): only block if the init HAS
+		// reported and explicitly says unhealthy. A missing report falls through
+		// so k3s bring-up is never regressed by the reporter's best-effort nature.
+		if reported && (!initMember.Healthy || !initMember.Voting) {
+			return false, "init node reported an unhealthy etcd member", nil
+		}
+	}
 	return true, "", nil
 }
 
@@ -859,7 +884,7 @@ func (r *KairosControlPlaneReconciler) selectMachineForDeletion(machines []*clus
 //     block nor an already-populated control-plane endpoint — it then has no
 //     stable floatable endpoint. CAPK is exempt (its LB Service is the
 //     endpoint). This does not block reconciliation; it is operator guidance.
-func (r *KairosControlPlaneReconciler) setHAConditions(kcp *controlplanev1beta2.KairosControlPlane, _ *clusterv1.Cluster, endpointReady bool) {
+func (r *KairosControlPlaneReconciler) setHAConditions(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, endpointReady bool) {
 	desiredReplicas := int32(1)
 	if kcp.Spec.Replicas != nil {
 		desiredReplicas = *kcp.Spec.Replicas
@@ -888,6 +913,30 @@ func (r *KairosControlPlaneReconciler) setHAConditions(kcp *controlplanev1beta2.
 				"set spec.ha.vip for kube-vip, or point the InfraCluster endpoint at an external load balancer",
 			desiredReplicas)
 	}
+
+	// EtcdHealthyCondition (ADR 0005 §E.4): derived from the node-reported
+	// etcd-status Secret's healthy+voting member count against the quorum
+	// minimum. Best-effort — a transient Secret read error leaves the condition
+	// unchanged rather than failing the reconcile.
+	etcdStatus, err := r.readEtcdStatus(ctx, cluster)
+	if err != nil {
+		return
+	}
+	voting := etcdVotingHealthyCount(etcdStatus)
+	quorum := desiredReplicas/2 + 1
+	switch {
+	case int32(voting) >= desiredReplicas:
+		conditions.MarkTrue(kcp, controlplanev1beta2.EtcdHealthyCondition)
+	case int32(voting) > quorum:
+		conditions.MarkFalse(kcp, controlplanev1beta2.EtcdHealthyCondition,
+			controlplanev1beta2.EtcdQuorumDegradedReason, clusterv1.ConditionSeverityInfo,
+			"%d/%d etcd members healthy", voting, desiredReplicas)
+	default: // at or below the (N/2)+1 quorum minimum (also the not-yet-formed window)
+		conditions.MarkFalse(kcp, controlplanev1beta2.EtcdHealthyCondition,
+			controlplanev1beta2.EtcdQuorumAtRiskReason, clusterv1.ConditionSeverityWarning,
+			"%d/%d etcd members healthy — at or below the quorum minimum ((N/2)+1=%d)",
+			voting, desiredReplicas, quorum)
+	}
 }
 
 func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
@@ -900,8 +949,6 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 
 	readyReplicas := int32(0)
 	updatedReplicas := int32(0)
-	unavailableReplicas := int32(0)
-
 	availableReplicas := int32(0)
 	for _, machine := range machines {
 		// Check if machine is ready (has NodeRef)
@@ -914,17 +961,26 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 			updatedReplicas++
 		}
 
-		// Check if machine is unavailable
-		if machine.Status.Phase != string(clusterv1.MachinePhaseRunning) {
-			unavailableReplicas++
-		}
-
 		// Available = ready (NodeRef set), Running phase, and not being deleted.
 		if machine.Status.NodeRef != nil &&
 			machine.Status.Phase == string(clusterv1.MachinePhaseRunning) &&
 			machine.DeletionTimestamp.IsZero() {
 			availableReplicas++
 		}
+	}
+
+	// unavailableReplicas is measured against DESIRED, not the actual machine
+	// count (ADR 0005 §E.4). During an add-before-remove surge the actual count
+	// transiently exceeds desired; counting every non-Running machine then
+	// double-counted the surge node as unavailable. Contract semantics:
+	// unavailable = replicas not available toward the desired spec, floored at 0.
+	desiredReplicas := int32(1)
+	if kcp.Spec.Replicas != nil {
+		desiredReplicas = *kcp.Spec.Replicas
+	}
+	unavailableReplicas := desiredReplicas - availableReplicas
+	if unavailableReplicas < 0 {
+		unavailableReplicas = 0
 	}
 
 	// ReadyReplicas should only be counted when NodeRef is actually set

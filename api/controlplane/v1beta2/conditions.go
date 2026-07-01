@@ -43,6 +43,13 @@ const (
 	// joined and registered a Node). False(Info) with an "n/N joined" message
 	// while scaling up. Not surfaced for single-node control planes.
 	ControlPlaneJoinedCondition = "ControlPlaneJoined"
+
+	// EtcdHealthyCondition reports control-plane etcd membership health for an HA
+	// control plane (ADR 0005 §E.4), derived from the node-reported etcd-status
+	// Secret. True when all desired members report healthy + voting; False(Info)
+	// when quorum holds but a member is degraded; False(Warning) at or below the
+	// (N/2)+1 quorum minimum. Not surfaced for single-node control planes.
+	EtcdHealthyCondition = "EtcdHealthy"
 )
 
 // Condition reasons
@@ -67,6 +74,26 @@ const (
 	// ControlPlaneJoinedReason is the True reason on ControlPlaneJoinedCondition
 	// once all configured HA members have joined.
 	ControlPlaneJoinedReason = "ControlPlaneJoined"
+
+	// EtcdHealthyReason is the True reason on EtcdHealthyCondition when all
+	// desired etcd members report healthy and voting (ADR 0005 §E.4).
+	EtcdHealthyReason = "EtcdHealthy"
+
+	// EtcdQuorumDegradedReason is the False(Info) reason on EtcdHealthyCondition
+	// when etcd quorum still holds but fewer than all desired members are
+	// healthy+voting.
+	EtcdQuorumDegradedReason = "EtcdQuorumDegraded"
+
+	// EtcdQuorumAtRiskReason is the False(Warning) reason on EtcdHealthyCondition
+	// when the healthy+voting member count is at or below the (N/2)+1 quorum
+	// minimum — one more loss breaks quorum. Also covers the not-yet-formed
+	// bring-up window (before members have reported).
+	EtcdQuorumAtRiskReason = "EtcdQuorumAtRisk"
+
+	// WaitingForEtcdMemberReason is the False(Info) reason surfaced while the
+	// init node has not yet reported a healthy voting etcd member (ADR 0005 §E.1,
+	// k0s joiner gate).
+	WaitingForEtcdMemberReason = "WaitingForEtcdMember"
 
 	// WaitingForMachinesReadyReason indicates that the control plane is waiting for machines to be ready
 	WaitingForMachinesReadyReason = "WaitingForMachinesReady"
