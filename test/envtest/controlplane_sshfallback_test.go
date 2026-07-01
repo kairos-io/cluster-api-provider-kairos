@@ -245,6 +245,13 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 
 	// Eventually the worker fires, fails fast on the missing Secrets, and
 	// the result drain sets the Reason to SSHFallbackMisconfigured.
+	//
+	// Determinism: the sibling reconciler's time-based backstop is
+	// collapsed to EvalRequeue=2s in startKCPEnvtest, so once the gate is
+	// open the eligibility re-check fires within a couple of seconds
+	// rather than racing the 1-minute production cadence. The 90s window
+	// (well above that 2s cadence) is generous headroom so envtest
+	// start-up cost on a slow/contended CI runner cannot eat into it.
 	g.Eventually(func() string {
 		got := &controlplanev1beta2.KairosControlPlane{}
 		if err := c.Get(ctx, types.NamespacedName{Name: kcp.Name, Namespace: kcp.Namespace}, got); err != nil {
@@ -255,7 +262,7 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 			return ""
 		}
 		return cond.Reason
-	}, 60*time.Second, 2*time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
+	}, 90*time.Second, 2*time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
 		"missing SSHFallback Secrets MUST surface SSHFallbackMisconfigured on KubeconfigReadyCondition")
 }
 

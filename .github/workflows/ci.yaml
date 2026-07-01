@@ -130,9 +130,6 @@ jobs:
 
   test-envtest:
     runs-on: ubuntu-latest
-    # Skip envtest tests for now - they require kubebuilder tools
-    # Uncomment when ready to run integration tests in CI
-    if: false
     strategy:
       fail-fast: false
       matrix:

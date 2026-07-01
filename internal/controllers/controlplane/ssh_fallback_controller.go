@@ -92,6 +92,26 @@ type SSHFallbackReconciler struct {
 	// reconciler enqueues jobs via Worker.Enqueue and uses
 	// Worker.IsInFlight as the dedup gate.
 	Worker *SSHFallbackWorker
+
+	// EvalRequeue overrides the time-based re-evaluation cadence used
+	// when the eligibility gate has not yet fired. Zero means use the
+	// production default (sshFallbackEvalRequeue, 1 minute). Tests set a
+	// short cadence so the gate is re-checked promptly instead of racing
+	// the 1-minute backstop; production leaves it unset. Read via
+	// evalRequeue(), never directly.
+	EvalRequeue time.Duration
+}
+
+// evalRequeue returns the cadence for the time-based eligibility
+// backstop: an explicit EvalRequeue override when set (envtest keeps the
+// gate responsive), otherwise the production sshFallbackEvalRequeue
+// default. This is the only backstop cadence source the reconciler
+// consults; watch events remain the primary wake path either way.
+func (r *SSHFallbackReconciler) evalRequeue() time.Duration {
+	if r.EvalRequeue > 0 {
+		return r.EvalRequeue
+	}
+	return sshFallbackEvalRequeue
 }
 
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=get;list;watch
@@ -140,7 +160,7 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if r.Worker.IsInFlight(req.NamespacedName) {
 		// Re-check on the next cadence; do NOT block.
-		return ctrl.Result{RequeueAfter: sshFallbackEvalRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
 	// Initialize the patch helper BEFORE any returns so condition
@@ -169,7 +189,7 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, kcp.ObjectMeta)
 	if err != nil {
 		log.Info("could not resolve owning Cluster; will retry", "error", err.Error())
-		return ctrl.Result{RequeueAfter: sshFallbackEvalRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
 	// Resolve the host IP from the first control-plane Machine.
@@ -178,7 +198,7 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		log.Info("could not resolve control-plane host; will retry", "error", err.Error())
 		// Soft retry: no condition change, no job enqueue. The next
 		// reconcile (woken by Machine status update) will retry.
-		return ctrl.Result{RequeueAfter: sshFallbackEvalRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
 	// Mark the condition Dialing and enqueue.
@@ -203,11 +223,11 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Note: we deliberately do NOT downgrade the condition back
 		// from Dialing here — the in-flight job (if any) will produce
 		// its own outcome shortly.
-		return ctrl.Result{RequeueAfter: sshFallbackEvalRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
 	log.Info("SSH fallback job enqueued", "host", host)
-	return ctrl.Result{RequeueAfter: sshFallbackEvalRequeue}, nil
+	return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 }
 
 // evaluateEligibility returns (true, 0) when the KCP is eligible for an
@@ -228,7 +248,7 @@ func (r *SSHFallbackReconciler) evaluateEligibility(ctx context.Context, log log
 	if cond == nil || cond.Status != corev1.ConditionFalse {
 		// Condition is either unset (main reconciler hasn't run) or
 		// True (kubeconfig already ready). Nothing for us to do.
-		return false, sshFallbackEvalRequeue
+		return false, r.evalRequeue()
 	}
 	switch cond.Reason {
 	case controlplanev1beta2.WaitingForNodePushReason,
@@ -238,17 +258,17 @@ func (r *SSHFallbackReconciler) evaluateEligibility(ctx context.Context, log log
 	case controlplanev1beta2.SSHFallbackDialingReason:
 		// A job is in flight (or just enqueued); the worker's result
 		// envelope will wake us. Don't re-enqueue.
-		return false, sshFallbackEvalRequeue
+		return false, r.evalRequeue()
 	default:
 		// Some other Reason (operator-set?) — be conservative and
 		// don't fire.
-		return false, sshFallbackEvalRequeue
+		return false, r.evalRequeue()
 	}
 
 	if kcp.Status.LastNodePushObserved == nil {
 		// Main reconciler hasn't anchored the timestamp yet; not our
 		// turn.
-		return false, sshFallbackEvalRequeue
+		return false, r.evalRequeue()
 	}
 
 	activateAfter := 15 * time.Minute
@@ -261,8 +281,8 @@ func (r *SSHFallbackReconciler) evaluateEligibility(ctx context.Context, log log
 		// activation). Halfway is a heuristic that keeps the
 		// requeue cadence loose far from the gate and tight near it.
 		next := (activateAfter - elapsed) / 2
-		if next < sshFallbackEvalRequeue {
-			next = sshFallbackEvalRequeue
+		if next < r.evalRequeue() {
+			next = r.evalRequeue()
 		}
 		log.V(2).Info("SSH fallback gate not yet open",
 			"elapsed", elapsed.Round(time.Second).String(),

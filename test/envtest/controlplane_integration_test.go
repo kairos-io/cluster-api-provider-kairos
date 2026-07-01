@@ -267,6 +267,13 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 	)
 	sshReconciler := &controlplane.SSHFallbackReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Worker: sshWorker,
+		// Collapse the 1-minute production re-evaluation backstop to a
+		// short cadence so the eligibility gate is re-checked promptly
+		// under envtest. Without this, TestSSHFallback_* races the
+		// 1-minute requeue: a watch event that arrives before the gate
+		// is open leaves the next re-check up to a full minute away,
+		// which exceeds the tests' ~60s Eventually windows and flakes.
+		EvalRequeue: 2 * time.Second,
 	}
 	g.Expect(sshReconciler.SetupWithManager(mgr)).To(Succeed())
 	g.Expect(mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
