@@ -83,6 +83,17 @@ k0s:
     # Controller-join: --token-file carries the controller-role join token.
     - --token-file=/etc/k0s/controller-token
   {{- end }}
+  {{- if .RenderKubeVIP }}
+    # ADR 0005 § D.3 (HA): run the k0s controller as a schedulable worker too, so
+    # the kube-vip DaemonSet — which selects control-plane Nodes — has a Node to
+    # land on. A controller-only k0s node registers no kubelet/Node, so the
+    # DaemonSet would stay Pending and the VIP would never float (Phase-4 lab
+    # finding). k0s auto-applies the node-role.kubernetes.io/control-plane:NoSchedule
+    # taint with --enable-worker; the DaemonSet tolerates it and general workloads
+    # stay off. HA + CAPV/CAPM3 only — single-node (RenderKubeVIP=false) and CAPK
+    # (OQ-5) never reach this, so their rendering is byte-for-byte unchanged.
+    - --enable-worker
+  {{- end }}
   {{- if and .ProviderID (not .Metal3) }}
     # KD-3c: tell kubelet the providerID BEFORE the Node is registered so it
     # appears in spec.providerID from first registration. The PR-8 audit
@@ -167,12 +178,16 @@ write_files:
       {{ .JoinToken }}
   {{- end }}
   {{- if .RenderKubeVIP }}
-  # ADR 0005 (HA) kube-vip static-pod manifest (CAPV/CAPM3 only; CAPK uses its
+  # ADR 0005 § D.1 (HA) kube-vip DaemonSet + RBAC (CAPV/CAPM3 only; CAPK uses its
   # built-in LoadBalancer Service per OQ-5 and never reaches this block).
   # k0s applies manifests under /var/lib/k0s/manifests/<dir>/ via its
-  # manifest-deployer (stack applier), so kube-vip comes up to own the floating
-  # control-plane VIP. The manifest is produced by kubeVIPManifest (marshaled
-  # YAML, VIP-INV-2) — no operator string is concatenated into the YAML.
+  # manifest-deployer (stack applier). The manifest is a multi-document set
+  # (ServiceAccount + ClusterRole + ClusterRoleBinding + DaemonSet) produced by
+  # kubeVIPManifest (marshaled YAML, VIP-INV-2) — no operator string is
+  # concatenated into the YAML. The DaemonSet runs one kube-vip per control-plane
+  # Node; the instances leader-elect on the plndr-cp-lock Lease (hence the RBAC)
+  # and the leader ARPs the floating control-plane VIP, so VIP ownership fails
+  # over when the leader's Node dies.
   - path: /var/lib/k0s/manifests/kube-vip/kube-vip.yaml
     permissions: "0644"
     owner: root

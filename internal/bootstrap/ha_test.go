@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package bootstrap
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -312,13 +313,71 @@ func TestHA_KubeVIP_OnlyCAPV(t *testing.T) {
 				t.Errorf("kube-vip manifest present=%v, want %v", has, c.expect)
 			}
 			if c.expect {
-				// VIP-INV-2: the manifest must itself be valid YAML and a kube-vip Pod.
-				var pod map[string]any
-				if err := yaml.Unmarshal([]byte(manifest), &pod); err != nil {
-					t.Fatalf("kube-vip manifest is not valid YAML: %v\n%s", err, manifest)
+				// VIP-INV-2 + ADR 0005 § D.1: the manifest must be a valid
+				// multi-document set — ServiceAccount + ClusterRole +
+				// ClusterRoleBinding + DaemonSet (not a single bare Pod).
+				docs := decodeKubeVIPDocs(t, manifest)
+				for _, wantKind := range []string{"ServiceAccount", "ClusterRole", "ClusterRoleBinding", "DaemonSet"} {
+					if _, ok := docs[wantKind]; !ok {
+						t.Errorf("kube-vip manifest missing %s document", wantKind)
+					}
 				}
-				if pod["kind"] != "Pod" {
-					t.Errorf("kube-vip manifest kind=%v, want Pod", pod["kind"])
+				if _, ok := docs["Pod"]; ok {
+					t.Errorf("kube-vip manifest still renders a bare Pod; expected a DaemonSet (ADR 0005 § D.1)")
+				}
+				// The ClusterRole must grant the load-bearing leader-election
+				// lease verbs — the exact grant whose absence stalled the VIP in
+				// the Phase-4 lab.
+				var cr struct {
+					Rules []struct {
+						APIGroups []string `yaml:"apiGroups"`
+						Resources []string `yaml:"resources"`
+						Verbs     []string `yaml:"verbs"`
+					} `yaml:"rules"`
+				}
+				remarshalInto(t, docs["ClusterRole"], &cr)
+				leaseRule := false
+				for _, r := range cr.Rules {
+					if strSliceHas(r.APIGroups, "coordination.k8s.io") && strSliceHas(r.Resources, "leases") &&
+						strSliceHas(r.Verbs, "get") && strSliceHas(r.Verbs, "create") {
+						leaseRule = true
+					}
+				}
+				if !leaseRule {
+					t.Error("kube-vip ClusterRole missing the coordination.k8s.io/leases get+create rule (leader election)")
+				}
+				// The DaemonSet must run as the kube-vip SA, select control-plane
+				// Nodes, and tolerate the control-plane NoSchedule taint.
+				var ds struct {
+					Spec struct {
+						Template struct {
+							Spec struct {
+								ServiceAccountName string            `yaml:"serviceAccountName"`
+								NodeSelector       map[string]string `yaml:"nodeSelector"`
+								Tolerations        []struct {
+									Key    string `yaml:"key"`
+									Effect string `yaml:"effect"`
+								} `yaml:"tolerations"`
+							} `yaml:"spec"`
+						} `yaml:"template"`
+					} `yaml:"spec"`
+				}
+				remarshalInto(t, docs["DaemonSet"], &ds)
+				ps := ds.Spec.Template.Spec
+				if ps.ServiceAccountName != "kube-vip" {
+					t.Errorf("DaemonSet serviceAccountName=%q, want kube-vip", ps.ServiceAccountName)
+				}
+				if ps.NodeSelector["node-role.kubernetes.io/control-plane"] != "true" {
+					t.Errorf("DaemonSet nodeSelector missing node-role.kubernetes.io/control-plane=true; got %v", ps.NodeSelector)
+				}
+				cpTolerated := false
+				for _, tol := range ps.Tolerations {
+					if tol.Key == "node-role.kubernetes.io/control-plane" && tol.Effect == "NoSchedule" {
+						cpTolerated = true
+					}
+				}
+				if !cpTolerated {
+					t.Error("DaemonSet missing toleration for node-role.kubernetes.io/control-plane:NoSchedule")
 				}
 			}
 		})
@@ -356,31 +415,97 @@ func TestHA_KubeVIP_Mode(t *testing.T) {
 	}
 }
 
-// kubeVIPEnv parses the kube-vip Pod manifest and returns its container env as
-// a name->value map.
+// kubeVIPEnv parses the kube-vip DaemonSet document out of the multi-document
+// manifest (ADR 0005 § D.1) and returns its container env as a name->value map.
 func kubeVIPEnv(t *testing.T, manifest string) map[string]string {
 	t.Helper()
-	var pod struct {
-		Spec struct {
-			Containers []struct {
-				Env []struct {
-					Name  string `yaml:"name"`
-					Value string `yaml:"value"`
-				} `yaml:"env"`
-			} `yaml:"containers"`
-		} `yaml:"spec"`
+	dec := yaml.NewDecoder(strings.NewReader(manifest))
+	for {
+		var doc struct {
+			Kind string `yaml:"kind"`
+			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Env []struct {
+								Name  string `yaml:"name"`
+								Value string `yaml:"value"`
+							} `yaml:"env"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		err := dec.Decode(&doc)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("parse kube-vip manifest document: %v", err)
+		}
+		if doc.Kind != "DaemonSet" {
+			continue
+		}
+		if len(doc.Spec.Template.Spec.Containers) == 0 {
+			t.Fatalf("kube-vip DaemonSet has no containers")
+		}
+		m := map[string]string{}
+		for _, e := range doc.Spec.Template.Spec.Containers[0].Env {
+			m[e.Name] = e.Value
+		}
+		return m
 	}
-	if err := yaml.Unmarshal([]byte(manifest), &pod); err != nil {
-		t.Fatalf("parse kube-vip manifest: %v", err)
+	t.Fatalf("kube-vip manifest has no DaemonSet document:\n%s", manifest)
+	return nil
+}
+
+// decodeKubeVIPDocs decodes every YAML document in the multi-document kube-vip
+// manifest into a generic map, keyed by kind (ADR 0005 § D.1). Every document
+// must be valid YAML — this is the VIP-INV-2 "the whole set parses" guard.
+func decodeKubeVIPDocs(t *testing.T, manifest string) map[string]map[string]any {
+	t.Helper()
+	byKind := map[string]map[string]any{}
+	dec := yaml.NewDecoder(strings.NewReader(manifest))
+	for {
+		var m map[string]any
+		err := dec.Decode(&m)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("kube-vip manifest document is not valid YAML: %v\n%s", err, manifest)
+		}
+		if m == nil {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		byKind[kind] = m
 	}
-	if len(pod.Spec.Containers) == 0 {
-		t.Fatalf("kube-vip manifest has no containers")
+	return byKind
+}
+
+// remarshalInto re-serializes a generic decoded document and unmarshals it into
+// the typed out, so a test can make typed assertions on one document of a
+// multi-document manifest.
+func remarshalInto(t *testing.T, m map[string]any, out any) {
+	t.Helper()
+	b, err := yaml.Marshal(m)
+	if err != nil {
+		t.Fatalf("re-marshal document: %v", err)
 	}
-	m := map[string]string{}
-	for _, e := range pod.Spec.Containers[0].Env {
-		m[e.Name] = e.Value
+	if err := yaml.Unmarshal(b, out); err != nil {
+		t.Fatalf("unmarshal document into %T: %v", out, err)
 	}
-	return m
+}
+
+// strSliceHas reports whether s contains v.
+func strSliceHas(s []string, v string) bool {
+	for _, e := range s {
+		if e == v {
+			return true
+		}
+	}
+	return false
 }
 
 // vipInjectionPayloads are shell/YAML-injection strings an operator could try
@@ -500,9 +625,12 @@ func TestVIP_ManifestMarshalEnvelopeHolds(t *testing.T) {
 			if err != nil {
 				t.Fatalf("kubeVIPManifest: %v", err)
 			}
-			var pod map[string]any
-			if err := yaml.Unmarshal([]byte(out), &pod); err != nil {
-				t.Fatalf("kube-vip manifest not valid YAML with hostile value %q: %v\n%s", h, err, out)
+			// Every document in the multi-document set must be valid YAML — a
+			// hostile value must not break out of its scalar and split/inject a
+			// document. decodeKubeVIPDocs fails if any doc fails to parse.
+			docs := decodeKubeVIPDocs(t, out)
+			if _, ok := docs["DaemonSet"]; !ok {
+				t.Fatalf("kube-vip manifest missing DaemonSet document with hostile value %q:\n%s", h, out)
 			}
 			env := kubeVIPEnv(t, out)
 			if env["address"] != h {
