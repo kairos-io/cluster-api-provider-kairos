@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
 )
 
 // etcdStatusSecretName returns the name of the per-cluster HA etcd-status Secret.
@@ -135,4 +136,69 @@ func etcdVotingHealthyCount(status map[string]etcdMemberStatus) int {
 		}
 	}
 	return n
+}
+
+// canRemoveMember reports whether deleting `target` (a control-plane Machine) is
+// safe for etcd quorum (ADR 0005 §E.2). It guards every NON-teardown CP-Machine
+// delete site (rollout replacement, scale-down); reconcileDelete does NOT call it
+// (whole-cluster teardown is the bypass).
+//
+// SECURITY (ADR 0005 §E.5, security-architect ruling — must-honor constraints):
+//   - FAILS CLOSED: a transient read error, or a live Running target with NO
+//     etcd-status report, refuses the delete ("cannot prove quorum safety") — a
+//     missing report on a live node may be a silent voting member.
+//   - BYPASS is EXACT: only whole-cluster teardown (kcp.DeletionTimestamp set)
+//     bypasses. A per-Machine deletion timestamp, rollout, or scale-down never
+//     reaches the bypass.
+//   - The failed-node fast path (allow the delete of a presumed-dead member) is
+//     gated on the OBJECTIVE Machine phase / NodeRef — never on the
+//     attacker-influenceable etcd self-report.
+//   - The quorum population is the healthy+voting REPORTERS (etcdVotingHealthyCount),
+//     never the node-reported `members` list length (unvalidated, forgeable).
+func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, target *clusterv1.Machine) (bool, string, error) {
+	// Whole-cluster teardown must never deadlock on quorum (the single bypass).
+	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+		return true, "", nil
+	}
+	desiredReplicas := int32(1)
+	if kcp.Spec.Replicas != nil {
+		desiredReplicas = *kcp.Spec.Replicas
+	}
+	// Single-node (or unset) control planes have no etcd quorum to protect.
+	if desiredReplicas <= 1 {
+		return true, "", nil
+	}
+	// Failed-node fast path — OBJECTIVE liveness only (Machine phase / NodeRef),
+	// NOT the etcd self-report: a target that never registered a Node or is not
+	// Running is presumed dead/failed, is not a healthy voting member, and cannot
+	// reduce the healthy-voting count — allow. This is the primary replacement
+	// case for an unreachable node.
+	if target.Status.NodeRef == nil || target.Status.Phase != string(clusterv1.MachinePhaseRunning) {
+		return true, "", nil
+	}
+	// The target is a live, Running control-plane node. Prove that removing it
+	// keeps etcd quorum from the node-reported etcd-status Secret.
+	status, err := r.readEtcdStatus(ctx, cluster)
+	if err != nil {
+		return false, "", err // transient read error: caller requeues, delete withheld
+	}
+	targetKey := target.Status.NodeRef.Name
+	st, reported := status[targetKey]
+	if !reported {
+		// A live CP node with no etcd report may be a silent voting member whose
+		// report is stale — cannot prove safety, fail closed.
+		return false, "target is a live control-plane node with no etcd-status report; cannot prove quorum safety", nil
+	}
+	voting := etcdVotingHealthyCount(status)
+	postRemoval := voting
+	if st.Healthy && st.Voting {
+		postRemoval = voting - 1 // removing a member currently counted toward quorum
+	}
+	quorum := int(desiredReplicas/2 + 1)
+	if postRemoval < quorum {
+		return false, fmt.Sprintf(
+			"removing this member would leave %d healthy voting etcd members, below the quorum minimum ((N/2)+1=%d)",
+			postRemoval, quorum), nil
+	}
+	return true, "", nil
 }

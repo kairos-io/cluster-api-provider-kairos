@@ -18,6 +18,7 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -26,9 +27,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/cluster-api/util/conditions"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -210,4 +212,76 @@ func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 	joinable, _, err = r2.initMachineJoinable(context.Background(), kcp, cluster, []*clusterv1.Machine{init})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(joinable).To(BeTrue())
+}
+
+// TestCanRemoveMember pins the ADR 0005 §E.2/§E.5 quorum guard: exact teardown
+// bypass, objective failed-node fast path (Machine phase, not the etcd
+// self-report), fail-closed on a live-but-unreported target, and correct quorum
+// arithmetic over healthy+voting reporters.
+func TestCanRemoveMember(t *testing.T) {
+	mkMachine := func(name, node, phase string) *clusterv1.Machine {
+		m := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
+		m.Status.Phase = phase
+		if node != "" {
+			m.Status.NodeRef = &corev1.ObjectReference{Name: node}
+		}
+		return m
+	}
+	type member struct{ healthy, voting bool }
+	running := string(clusterv1.MachinePhaseRunning)
+	for _, tc := range []struct {
+		name        string
+		desired     int32
+		members     map[string]member
+		target      *clusterv1.Machine
+		deleting    bool
+		wantAllowed bool
+	}{
+		{"teardown bypass allows even at zero quorum", 3, nil, mkMachine("cp-0", "cp-0", running), true, true},
+		{"single-node has no quorum to guard", 1, nil, mkMachine("cp-0", "cp-0", running), false, true},
+		{"failed node (no NodeRef) fast-path allows", 3,
+			map[string]member{"cp-1": {true, true}, "cp-2": {true, true}}, mkMachine("cp-0", "", "Provisioning"), false, true},
+		{"not-Running node fast-path allows", 3,
+			map[string]member{"cp-1": {true, true}, "cp-2": {true, true}}, mkMachine("cp-0", "cp-0", "Deleting"), false, true},
+		{"3-node all healthy, remove one keeps quorum", 3,
+			map[string]member{"cp-0": {true, true}, "cp-1": {true, true}, "cp-2": {true, true}}, mkMachine("cp-0", "cp-0", running), false, true},
+		{"3-node one down, removing a healthy one breaks quorum", 3,
+			map[string]member{"cp-0": {true, true}, "cp-1": {true, true}, "cp-2": {false, true}}, mkMachine("cp-0", "cp-0", running), false, false},
+		{"live node with no etcd report fails closed", 3,
+			map[string]member{"cp-1": {true, true}, "cp-2": {true, true}}, mkMachine("cp-0", "cp-0", running), false, false},
+		{"removing an unhealthy member keeps quorum", 3,
+			map[string]member{"cp-0": {false, true}, "cp-1": {true, true}, "cp-2": {true, true}}, mkMachine("cp-0", "cp-0", running), false, true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := haTestScheme(g)
+			cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"}}
+			kcp := &controlplanev1beta2.KairosControlPlane{
+				ObjectMeta: metav1.ObjectMeta{Name: "kcp", Namespace: "default"},
+				Spec:       controlplanev1beta2.KairosControlPlaneSpec{Replicas: ptr.To(tc.desired)},
+			}
+			if tc.deleting {
+				now := metav1.Now()
+				kcp.DeletionTimestamp = &now
+			}
+			objs := []client.Object{}
+			if tc.members != nil {
+				data := map[string][]byte{}
+				for name, m := range tc.members {
+					data[name] = []byte(fmt.Sprintf(`{"name":%q,"healthy":%t,"voting":%t,"members":3,"reportedAt":"t"}`, name, m.healthy, m.voting))
+				}
+				objs = append(objs, &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: etcdStatusSecretName("c"), Namespace: "default"},
+					Data:       data,
+				})
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+			allowed, reason, err := r.canRemoveMember(context.Background(), kcp, cluster, tc.target)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(allowed).To(Equal(tc.wantAllowed), "reason=%q", reason)
+		})
+	}
 }

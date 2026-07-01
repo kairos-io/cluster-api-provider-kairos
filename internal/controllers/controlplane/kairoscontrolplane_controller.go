@@ -523,6 +523,14 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		// If we are above desired replicas and have enough updated/ready replicas, delete one outdated machine
 		if currentReplicas > desiredReplicas && updatedReadyReplicas >= desiredReplicas {
 			target := outdatedMachines[0]
+			// ADR 0005 §E.2: refuse a quorum-breaking rollout delete. The guard
+			// fails closed and is bypassed only under whole-cluster teardown.
+			if ok, reason, err := r.canRemoveMember(ctx, kcp, cluster, target); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to evaluate etcd quorum safety: %w", err)
+			} else if !ok {
+				log.Info("Holding back outdated-machine rollout — etcd quorum would break", "machine", target.Name, "reason", reason)
+				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+			}
 			log.Info("Deleting outdated control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
@@ -561,6 +569,14 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	if currentReplicas > desiredReplicas {
 		target := r.selectMachineForDeletion(machines, outdatedMachines)
 		if target != nil {
+			// ADR 0005 §E.2: refuse a quorum-breaking scale-down. The guard fails
+			// closed and is bypassed only under whole-cluster teardown.
+			if ok, reason, err := r.canRemoveMember(ctx, kcp, cluster, target); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to evaluate etcd quorum safety: %w", err)
+			} else if !ok {
+				log.Info("Holding back control-plane scale-down — etcd quorum would break", "machine", target.Name, "reason", reason)
+				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+			}
 			log.Info("Scaling down control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to delete control plane machine: %w", err)
