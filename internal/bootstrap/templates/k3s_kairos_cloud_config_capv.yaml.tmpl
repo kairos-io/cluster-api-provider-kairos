@@ -187,12 +187,17 @@ write_files:
       {{ .JoinToken }}
   {{- end }}
   {{- if .RenderKubeVIP }}
-  # ADR 0005 (HA) kube-vip static-pod manifest (CAPV/CAPM3 only; CAPK uses its
+  # ADR 0005 § D.1 (HA) kube-vip DaemonSet + RBAC (CAPV/CAPM3 only; CAPK uses its
   # built-in LoadBalancer Service per OQ-5 and never reaches this block).
   # k3s auto-applies manifests under /var/lib/rancher/k3s/server/manifests at
-  # server start, so kube-vip comes up to own the floating control-plane VIP.
-  # The manifest is produced by kubeVIPManifest (marshaled YAML, VIP-INV-2) —
-  # no operator string is concatenated into the YAML.
+  # server start. The manifest is a multi-document set (ServiceAccount +
+  # ClusterRole + ClusterRoleBinding + DaemonSet) produced by kubeVIPManifest
+  # (marshaled YAML, VIP-INV-2) — no operator string is concatenated into the
+  # YAML. The DaemonSet runs one kube-vip per control-plane Node (k3s servers are
+  # schedulable and carry node-role.kubernetes.io/control-plane, so no
+  # --enable-worker is needed as on k0s); the instances leader-elect on the
+  # plndr-cp-lock Lease (hence the RBAC) and the leader ARPs the floating
+  # control-plane VIP, so VIP ownership fails over when the leader's Node dies.
   - path: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
     permissions: "0644"
     owner: root

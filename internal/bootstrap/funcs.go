@@ -57,10 +57,18 @@ func newFuncMap() template.FuncMap {
 // versions). Bump deliberately in a reviewed change.
 const kubeVIPImage = "ghcr.io/kube-vip/kube-vip:v0.8.7"
 
-// kubeVIPManifest renders the kube-vip static-pod manifest for the supplied
-// VIP config as a marshaled YAML document.
+// kubeVIPManifest renders the kube-vip manifest set for the supplied VIP config
+// as a multi-document marshaled YAML string.
 //
-// SECURITY (ADR 0005 §C, VIP-INV-2): the manifest is built as a typed Go value
+// TOPOLOGY (ADR 0005 § D.1): the output is FOUR `---`-separated documents — a
+// ServiceAccount, a ClusterRole, a ClusterRoleBinding, and a DaemonSet. kube-vip
+// runs as a DaemonSet (one instance per control-plane Node), not a single bare
+// Pod: the instances leader-elect on the kube-system/plndr-cp-lock Lease (the
+// reason the RBAC exists) and the leader ARPs the floating control-plane VIP, so
+// VIP ownership fails over when the current leader's Node dies. A single Pod
+// would be a SPOF that never reschedules — HA theatre (Phase-4 lab finding).
+//
+// SECURITY (ADR 0005 §C, VIP-INV-2): every document is built as a typed Go value
 // tree and serialized with gopkg.in/yaml.v3 — there is NO string concatenation
 // or interpolation of the operator-controlled Address/Interface/Mode into YAML.
 // yaml.v3 emits each value as a properly-quoted scalar, so a value containing
@@ -69,10 +77,11 @@ const kubeVIPImage = "ghcr.io/kube-vip/kube-vip:v0.8.7"
 // re-validates Address and Interface at render time (VIP-INV-3), so a
 // semantically-invalid value never reaches this function in the first place.
 //
-// The returned document is the full Pod object (no leading/trailing newline)
-// so callers embed it with `| nindent N` into the write_files content block,
-// matching how Manifest.Content is handled elsewhere. v is required non-nil;
-// templates gate the call on .RenderKubeVIP so it is never invoked with nil.
+// The returned string has no leading/trailing newline so callers embed it with
+// `| indent N` into the write_files content block. Multi-document YAML under a
+// single `content: |` block scalar is applied doc-by-doc by both the k0s stack
+// applier and the k3s deploy controller. v is required non-nil; templates gate
+// the call on .RenderKubeVIP so it is never invoked with nil.
 func kubeVIPManifest(v *VIPConfig) (string, error) {
 	if v == nil {
 		// Defensive: templates gate on .RenderKubeVIP, but never panic on a
@@ -83,18 +92,123 @@ func kubeVIPManifest(v *VIPConfig) (string, error) {
 	if mode == "" {
 		mode = "ARP" // empty Mode defaults to ARP (matches the CRD default).
 	}
-	// kube-vip control-plane env. The arp-vs-bgp toggle is a pair of string
-	// booleans; everything else is passed verbatim as scalars marshaled by
-	// yaml.v3. We deliberately keep this to the documented control-plane VIP
-	// envelope (ADR 0005 §C: "not operator-injectable beyond the bounded VIP
-	// block") — no operator field becomes an arbitrary kube-vip flag.
+	container, volume := kubeVIPContainer(v, mode)
+
+	const (
+		saName  = "kube-vip"
+		crName  = "system:kube-vip-role"
+		crbName = "system:kube-vip-binding"
+		ns      = "kube-system"
+	)
+	appLabels := map[string]string{"app.kubernetes.io/name": "kube-vip"}
+
+	sa := kvServiceAccount{
+		APIVersion: "v1",
+		Kind:       "ServiceAccount",
+		Metadata:   kvMeta{Name: saName, Namespace: ns},
+	}
+	// ClusterRole. The `leases` grant is load-bearing: kube-vip's leader
+	// election acquires the kube-system/plndr-cp-lock Lease, and without it the
+	// VIP never binds — the exact failure root-caused live in the Phase-4 lab
+	// (the rendered Pod ran as the `default` SA, which cannot get leases). The
+	// services/services-status/nodes/endpoints grants mirror kube-vip's own
+	// published ClusterRole and are the validated-working set. With
+	// svc_enable=false a least-privilege trim to leases+nodes is plausible but
+	// is deferred to a security-architect-adjudicated follow-up rather than
+	// gambled here against a costly lab regression (ADR 0005 § D.1).
+	cr := kvClusterRole{
+		APIVersion: "rbac.authorization.k8s.io/v1",
+		Kind:       "ClusterRole",
+		Metadata:   kvMeta{Name: crName},
+		Rules: []kvPolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"services", "services/status", "nodes", "endpoints"},
+				Verbs:     []string{"get", "list", "watch", "update"},
+			},
+			{
+				APIGroups: []string{"coordination.k8s.io"},
+				Resources: []string{"leases"},
+				Verbs:     []string{"get", "list", "watch", "update", "create"},
+			},
+		},
+	}
+	crb := kvClusterRoleBinding{
+		APIVersion: "rbac.authorization.k8s.io/v1",
+		Kind:       "ClusterRoleBinding",
+		Metadata:   kvMeta{Name: crbName},
+		RoleRef: kvRoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     crName,
+		},
+		Subjects: []kvSubject{{
+			Kind:      "ServiceAccount",
+			Name:      saName,
+			Namespace: ns,
+		}},
+	}
+	// DaemonSet: one kube-vip per control-plane Node. nodeSelector
+	// node-role.kubernetes.io/control-plane is the cross-distro union (k3s
+	// servers carry it; k0s controllers carry it once they run with
+	// --enable-worker), and the tolerations clear the control-plane NoSchedule
+	// taint so it lands on the CP Nodes while general workloads stay off.
+	ds := kvDaemonSet{
+		APIVersion: "apps/v1",
+		Kind:       "DaemonSet",
+		Metadata:   kvMeta{Name: saName, Namespace: ns, Labels: appLabels},
+		Spec: kvDaemonSetSpec{
+			Selector: kvLabelSelector{MatchLabels: appLabels},
+			Template: kvPodTemplate{
+				Metadata: kvPodTemplateMeta{Labels: appLabels},
+				Spec: kvPodSpec{
+					ServiceAccountName: saName,
+					HostNetwork:        true,
+					NodeSelector:       map[string]string{"node-role.kubernetes.io/control-plane": "true"},
+					Tolerations: []kvToleration{
+						{Key: "node-role.kubernetes.io/control-plane", Operator: "Exists", Effect: "NoSchedule"},
+						{Key: "node-role.kubernetes.io/master", Operator: "Exists", Effect: "NoSchedule"},
+					},
+					Containers: []kvContainer{container},
+					Volumes:    []kvVolume{volume},
+				},
+			},
+			UpdateStrategy: kvDaemonSetUpdateStrategy{Type: "RollingUpdate"},
+		},
+	}
+
+	var sb strings.Builder
+	for i, obj := range []any{sa, cr, crb, ds} {
+		if i > 0 {
+			sb.WriteString("---\n")
+		}
+		b, err := yaml.Marshal(obj)
+		if err != nil {
+			return "", err
+		}
+		sb.Write(b)
+	}
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// kubeVIPContainer builds the kube-vip control-plane container and its
+// admin.conf host-path volume from the VIP config. Extracted so the container
+// envelope (env, capabilities, image, mount) has a single definition; it is
+// byte-identical to the pre-DaemonSet Pod container (ADR 0005 § D.1 keeps the
+// container spec unchanged — only the enclosing workload kind changed).
+//
+// The arp-vs-bgp toggle is a pair of string booleans; everything else is passed
+// verbatim as scalars marshaled by yaml.v3. We deliberately keep this to the
+// documented control-plane VIP envelope (ADR 0005 §C: "not operator-injectable
+// beyond the bounded VIP block") — no operator field becomes an arbitrary
+// kube-vip flag.
+func kubeVIPContainer(v *VIPConfig, mode string) (kvContainer, kvVolume) {
 	arpEnabled := "true"
 	bgpEnabled := "false"
 	if mode == "BGP" {
 		arpEnabled = "false"
 		bgpEnabled = "true"
 	}
-
 	env := []kvEnvVar{
 		{Name: "vip_arp", Value: arpEnabled},
 		{Name: "vip_interface", Value: v.Interface},
@@ -108,67 +222,124 @@ func kubeVIPManifest(v *VIPConfig) (string, error) {
 		{Name: "vip_retryperiod", Value: "1"},
 		{Name: "bgp_enable", Value: bgpEnabled},
 	}
-
-	pod := kvPod{
-		APIVersion: "v1",
-		Kind:       "Pod",
-		Metadata: kvMeta{
-			Name:      "kube-vip",
-			Namespace: "kube-system",
+	container := kvContainer{
+		Name:            "kube-vip",
+		Image:           kubeVIPImage,
+		ImagePullPolicy: "IfNotPresent",
+		Args:            []string{"manager"},
+		Env:             env,
+		SecurityContext: kvSecurityContext{
+			Capabilities: kvCapabilities{
+				Add: []string{"NET_ADMIN", "NET_RAW"},
+			},
 		},
-		Spec: kvPodSpec{
-			HostNetwork: true,
-			Containers: []kvContainer{{
-				Name:            "kube-vip",
-				Image:           kubeVIPImage,
-				ImagePullPolicy: "IfNotPresent",
-				Args:            []string{"manager"},
-				Env:             env,
-				SecurityContext: kvSecurityContext{
-					Capabilities: kvCapabilities{
-						Add: []string{"NET_ADMIN", "NET_RAW"},
-					},
-				},
-				VolumeMounts: []kvVolumeMount{{
-					MountPath: "/etc/kubernetes/admin.conf",
-					Name:      "kubeconfig",
-				}},
-			}},
-			Volumes: []kvVolume{{
-				Name: "kubeconfig",
-				HostPath: kvHostPath{
-					Path: "/etc/kubernetes/admin.conf",
-				},
-			}},
+		VolumeMounts: []kvVolumeMount{{
+			MountPath: "/etc/kubernetes/admin.conf",
+			Name:      "kubeconfig",
+		}},
+	}
+	volume := kvVolume{
+		Name: "kubeconfig",
+		HostPath: kvHostPath{
+			Path: "/etc/kubernetes/admin.conf",
 		},
 	}
-	b, err := yaml.Marshal(pod)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimRight(string(b), "\n"), nil
+	return container, volume
 }
 
-// kube-vip static-pod manifest types. These are a minimal, purpose-built
-// schema (not the full k8s core/v1 types) so the rendered manifest is a fixed,
-// auditable shape with only the bounded VIP fields flowing through it. The yaml
-// tags reproduce the k8s field names with their standard ordering.
-type kvPod struct {
-	APIVersion string    `yaml:"apiVersion"`
-	Kind       string    `yaml:"kind"`
-	Metadata   kvMeta    `yaml:"metadata"`
-	Spec       kvPodSpec `yaml:"spec"`
+// kube-vip manifest types. These are a minimal, purpose-built schema (not the
+// full k8s core/v1 / apps/v1 / rbac/v1 types) so the rendered manifest set is a
+// fixed, auditable shape with only the bounded VIP fields flowing through it.
+// The yaml tags reproduce the k8s field names with their standard ordering.
+
+type kvServiceAccount struct {
+	APIVersion string `yaml:"apiVersion"`
+	Kind       string `yaml:"kind"`
+	Metadata   kvMeta `yaml:"metadata"`
 }
 
-type kvMeta struct {
+type kvClusterRole struct {
+	APIVersion string         `yaml:"apiVersion"`
+	Kind       string         `yaml:"kind"`
+	Metadata   kvMeta         `yaml:"metadata"`
+	Rules      []kvPolicyRule `yaml:"rules"`
+}
+
+type kvPolicyRule struct {
+	APIGroups []string `yaml:"apiGroups"`
+	Resources []string `yaml:"resources"`
+	Verbs     []string `yaml:"verbs"`
+}
+
+type kvClusterRoleBinding struct {
+	APIVersion string      `yaml:"apiVersion"`
+	Kind       string      `yaml:"kind"`
+	Metadata   kvMeta      `yaml:"metadata"`
+	RoleRef    kvRoleRef   `yaml:"roleRef"`
+	Subjects   []kvSubject `yaml:"subjects"`
+}
+
+type kvRoleRef struct {
+	APIGroup string `yaml:"apiGroup"`
+	Kind     string `yaml:"kind"`
+	Name     string `yaml:"name"`
+}
+
+type kvSubject struct {
+	Kind      string `yaml:"kind"`
 	Name      string `yaml:"name"`
 	Namespace string `yaml:"namespace"`
 }
 
+type kvDaemonSet struct {
+	APIVersion string          `yaml:"apiVersion"`
+	Kind       string          `yaml:"kind"`
+	Metadata   kvMeta          `yaml:"metadata"`
+	Spec       kvDaemonSetSpec `yaml:"spec"`
+}
+
+type kvDaemonSetSpec struct {
+	Selector       kvLabelSelector           `yaml:"selector"`
+	Template       kvPodTemplate             `yaml:"template"`
+	UpdateStrategy kvDaemonSetUpdateStrategy `yaml:"updateStrategy"`
+}
+
+type kvDaemonSetUpdateStrategy struct {
+	Type string `yaml:"type"`
+}
+
+type kvLabelSelector struct {
+	MatchLabels map[string]string `yaml:"matchLabels"`
+}
+
+type kvPodTemplate struct {
+	Metadata kvPodTemplateMeta `yaml:"metadata"`
+	Spec     kvPodSpec         `yaml:"spec"`
+}
+
+type kvPodTemplateMeta struct {
+	Labels map[string]string `yaml:"labels"`
+}
+
+type kvMeta struct {
+	Name      string            `yaml:"name"`
+	Namespace string            `yaml:"namespace,omitempty"`
+	Labels    map[string]string `yaml:"labels,omitempty"`
+}
+
 type kvPodSpec struct {
-	Containers  []kvContainer `yaml:"containers"`
-	HostNetwork bool          `yaml:"hostNetwork"`
-	Volumes     []kvVolume    `yaml:"volumes"`
+	ServiceAccountName string            `yaml:"serviceAccountName,omitempty"`
+	HostNetwork        bool              `yaml:"hostNetwork"`
+	NodeSelector       map[string]string `yaml:"nodeSelector,omitempty"`
+	Tolerations        []kvToleration    `yaml:"tolerations,omitempty"`
+	Containers         []kvContainer     `yaml:"containers"`
+	Volumes            []kvVolume        `yaml:"volumes"`
+}
+
+type kvToleration struct {
+	Key      string `yaml:"key"`
+	Operator string `yaml:"operator"`
+	Effect   string `yaml:"effect"`
 }
 
 type kvContainer struct {
