@@ -559,6 +559,80 @@ MANIFEST_EOF
       fi
       {{- end }}
 
+      {{- if and .IsHAControlPlane .ManagementEndpoint .ManagementEndpoint.EtcdStatusSecretName }}
+      # ADR 0005 §E.1 (HA) etcd-health reporter — k3s HEALTH-ONLY variant (KD-5d).
+      # Every k3s server reports its own membership into the per-cluster
+      # etcd-status Secret over the node-push channel, feeding the joiner gate,
+      # EtcdHealthyCondition, and the quorum guard. k3s embedded etcd has no clean
+      # member-remove CLI, so member REMOVAL is unsupported (documented KD-5d);
+      # this reporter is read-only + best-effort. Member count is queried via
+      # etcdctl against the local embedded etcd IF etcdctl + the server certs are
+      # present; otherwise it reports healthy from server readiness (the
+      # post-bootstrap script only reaches here after k3s is up) with members=0.
+      #
+      # SECURITY: identical discipline to the k0s reporter — non-secret metadata,
+      # JSON built on-node, all management-endpoint values shquote'd, bearer token
+      # never logged, PATCHes only this node's own member key.
+      push_etcd_status() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot report etcd status"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot report etcd status"
+          return 1
+        fi
+        local member_key
+        member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+        # Best-effort member count via etcdctl against the local embedded etcd.
+        local healthy=true voting=true members=0
+        local etcd_dir=/var/lib/rancher/k3s/server/tls/etcd
+        if command -v etcdctl >/dev/null 2>&1 && [ -f "${etcd_dir}/server-client.crt" ]; then
+          local ml
+          ml=$(ETCDCTL_API=3 etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert="${etcd_dir}/server-ca.crt" \
+            --cert="${etcd_dir}/server-client.crt" \
+            --key="${etcd_dir}/server-client.key" \
+            member list 2>/dev/null || true)
+          if [ -n "${ml}" ]; then
+            members=$(printf '%s\n' "${ml}" | grep -c 'started' | tr -d ' ')
+          fi
+        fi
+        local reported_at
+        reported_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        local status_json
+        status_json=$(printf '{"name":"%s","healthy":%s,"voting":%s,"members":%s,"reportedAt":"%s"}' \
+          "${member_key}" "${healthy}" "${voting}" "${members}" "${reported_at}")
+        local status_b64
+        status_b64=$(printf '%s' "${status_json}" | base64 -w 0 2>/dev/null || printf '%s' "${status_json}" | base64 | tr -d '\n')
+        local api={{ .ManagementEndpoint.APIServer | shquote }}
+        local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
+        local es_name={{ .ManagementEndpoint.EtcdStatusSecretName | shquote }}
+        local token={{ .ManagementEndpoint.Token | shquote }}
+        local patch
+        patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH \
+          --data "${patch}" \
+          "${url}" || true)
+        unset token
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
+          return 0
+        fi
+        echo "WARN: failed to report etcd status (status ${status})"
+        return 1
+      }
+      if ! push_etcd_status; then
+        echo "WARN: etcd-status report failed; will retry on next boot"
+      fi
+      {{- end }}
+
       # Mark bootstrap success for CAPI/CAPK consumers
       mkdir -p /run/cluster-api
       echo "success" > /run/cluster-api/bootstrap-success.complete

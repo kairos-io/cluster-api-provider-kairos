@@ -99,13 +99,13 @@ func goldenCases() []goldenCase {
 		{"k0s_capk_single", RenderK0sCloudConfig, base(bootstrapv1beta2.ControlPlaneRoleSingle, true, true, false)},
 		{"k3s_capk_single", RenderK3sCloudConfig, base(bootstrapv1beta2.ControlPlaneRoleSingle, true, true, false)},
 
-		// --- init (HA first node, CAPV: kube-vip rendered) ---
-		{"k0s_capv_init", RenderK0sCloudConfig, withJoinTokenSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-control-plane-join-token")},
-		{"k3s_capv_init", RenderK3sCloudConfig, withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240")},
+		// --- init (HA first node, CAPV: kube-vip + etcd-health reporter rendered) ---
+		{"k0s_capv_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinTokenSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-control-plane-join-token"), "ha-cluster-etcd-status")},
+		{"k3s_capv_init", RenderK3sCloudConfig, withEtcdStatusSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-etcd-status")},
 
-		// --- join (HA subsequent node, CAPV: kube-vip rendered) ---
-		{"k0s_capv_join", RenderK0sCloudConfig, withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240"))},
-		{"k3s_capv_join", RenderK3sCloudConfig, withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240"))},
+		// --- join (HA subsequent node, CAPV: kube-vip + etcd-health reporter rendered) ---
+		{"k0s_capv_join", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240")), "ha-cluster-etcd-status")},
+		{"k3s_capv_join", RenderK3sCloudConfig, withEtcdStatusSecretName(withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240")), "ha-cluster-etcd-status")},
 
 		// --- CAPK HA (NO kube-vip; OQ-5): init/join still branch, LB Service is the endpoint ---
 		{"k0s_capk_init", RenderK0sCloudConfig, withJoinTokenSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-control-plane-join-token")},
@@ -126,6 +126,16 @@ func withJoinToken(d TemplateData) TemplateData {
 // exercise that highest-blast-radius block. Requires ManagementEndpoint set.
 func withJoinTokenSecretName(d TemplateData, name string) TemplateData {
 	d.ManagementEndpoint.JoinTokenSecretName = name
+	return d
+}
+
+// withEtcdStatusSecretName stamps the HA etcd-health reporter gate
+// (ManagementEndpoint.EtcdStatusSecretName, ADR 0005 §E.1). Set for every HA
+// control-plane node (init AND join, both distros) on the CAPV path so the
+// golden snapshots exercise the node-push reporter block. Requires
+// ManagementEndpoint set.
+func withEtcdStatusSecretName(d TemplateData, name string) TemplateData {
+	d.ManagementEndpoint.EtcdStatusSecretName = name
 	return d
 }
 

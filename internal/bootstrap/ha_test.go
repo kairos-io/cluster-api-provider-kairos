@@ -668,13 +668,24 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := tc.render(haCPData(tc.role, tc.kv))
+			d := haCPData(tc.role, tc.kv)
+			// CAPV HA nodes render the etcd-health reporter (ADR 0005 §E.1); set
+			// the gate so its shell body is included in the bash -n syntax check.
+			// CAPK (kubevirt) does not render it.
+			if !tc.kv && d.ManagementEndpoint != nil {
+				d.ManagementEndpoint.EtcdStatusSecretName = "ha-cluster-etcd-status"
+			}
+			out, err := tc.render(d)
 			if err != nil {
 				t.Fatalf("render: %v", err)
 			}
 			script := extractWriteFile(t, out, tc.script)
 			if script == "" {
 				t.Fatalf("post-bootstrap script %q not found", tc.script)
+			}
+			// The etcd-health reporter must render on the CAPV path (and only there).
+			if hasReporter := strings.Contains(script, "push_etcd_status"); hasReporter != !tc.kv {
+				t.Errorf("etcd-health reporter present=%v, want %v (CAPV renders it, CAPK does not)", hasReporter, !tc.kv)
 			}
 			f := filepathJoinTemp(t, strings.ReplaceAll(tc.name, "/", "_")+".sh")
 			if err := os.WriteFile(f, []byte(script), 0o600); err != nil {

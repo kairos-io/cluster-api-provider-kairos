@@ -390,6 +390,77 @@ write_files:
       if ! push_kubeconfig; then
         echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
       fi
+      # ADR 0005 §E.1 (HA) etcd-health reporter: every control-plane node (init
+      # AND join) reports its own etcd member health into the per-cluster
+      # etcd-status Secret over the SAME node-push channel as the kubeconfig/join
+      # token (NOT SSH, NOT a controller etcd dial — KD-10). The controller reads
+      # it for the joiner gate (init must be a healthy voting member),
+      # EtcdHealthyCondition, and the quorum-safe-replacement guard.
+      #
+      # SECURITY: etcd membership (name/count) is non-sensitive cluster metadata —
+      # NO secret material is written into this Secret. The status JSON is built
+      # ON-NODE (never interpolated through text/template); every
+      # management-endpoint value is shquote'd; the bearer token is never logged.
+      # The node PATCHes ONLY its own member key (keyed by hostname).
+      push_etcd_status() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot report etcd status"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot report etcd status"
+          return 1
+        fi
+        # This member's Secret data key = the node hostname, sanitized to the
+        # allowed Secret-key charset [a-zA-Z0-9._-] so it is safe both as a
+        # Secret key and inside the strategic-merge patch JSON.
+        local member_key
+        member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+        # Query k0s etcd membership. k0s controllers join as full voting members
+        # (no learners), so "present in member-list" == "healthy voting member".
+        local ml healthy=false voting=false members=0
+        ml=$(k0s etcd member-list 2>/dev/null || true)
+        if [ -n "${ml}" ]; then
+          healthy=true
+          voting=true
+          members=$(printf '%s' "${ml}" | grep -oE 'https?://' | wc -l | tr -d ' ')
+        fi
+        local reported_at
+        reported_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        # Compact, non-secret status JSON for THIS member, built on-node.
+        local status_json
+        status_json=$(printf '{"name":"%s","healthy":%s,"voting":%s,"members":%s,"reportedAt":"%s"}' \
+          "${member_key}" "${healthy}" "${voting}" "${members}" "${reported_at}")
+        local status_b64
+        status_b64=$(printf '%s' "${status_json}" | base64 -w 0 2>/dev/null || printf '%s' "${status_json}" | base64 | tr -d '\n')
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local es_name='ha-cluster-etcd-status'
+        local token='mgmt-token'
+        # Strategic-merge PATCH only this member's own data key in the pre-created,
+        # Cluster-owned etcd-status Secret. update/patch on the named Secret is
+        # exactly the node SA's RBAC (no create).
+        local patch
+        patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH \
+          --data "${patch}" \
+          "${url}" || true)
+        unset token
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
+          return 0
+        fi
+        echo "WARN: failed to report etcd status (status ${status})"
+        return 1
+      }
+      if ! push_etcd_status; then
+        echo "WARN: etcd-status report failed; will retry on next boot"
+      fi
 
       # Mark bootstrap success for CAPI/CAPK consumers
       # This file is used by Cluster API to determine bootstrap completion
