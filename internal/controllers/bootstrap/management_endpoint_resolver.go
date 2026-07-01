@@ -59,7 +59,9 @@ type kubeVirtTokenResolver struct {
 	SubResource func(string) client.SubResourceClient
 
 	// Scheme is needed by controllerutil.SetControllerReference on the SA /
-	// Role / RoleBinding. Must include core/v1 and rbac/v1.
+	// Role / RoleBinding. Must include core/v1, rbac/v1, and
+	// cluster.x-k8s.io/v1beta1 (the shared objects are owned by the Cluster —
+	// see the ownership note in Resolve).
 	Scheme *runtime.Scheme
 
 	// ManagementAPIServer is the URL nodes will dial back to. Production
@@ -92,6 +94,19 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
 	saName := kubeconfigWriterName(cluster.Name)
 
+	// OWNERSHIP (ADR 0005 § D.2): the SA/Role/RoleBinding are a single
+	// per-CLUSTER object set (named by cluster.Name) shared by every
+	// control-plane Machine's KairosConfig. They are owned by the *Cluster*,
+	// not by the per-Machine KairosConfig `kc`. An object gets exactly one
+	// controller owner, so owning by kc made the first config (the init node)
+	// the controller owner and every joiner's Resolve fail with
+	// "already owned by another controller" — the multi-node bring-up blocker
+	// found in the Phase-4 lab. Owning by the Cluster is idempotent across all
+	// KairosConfigs (they set the same owner) and GCs the RBAC when the Cluster
+	// is deleted. NOTE (migration): a cluster provisioned before this change
+	// has these objects controller-owned by the init KairosConfig; delete the
+	// three `kairos-kubeconfig-writer-<cluster>` objects once so they are
+	// recreated Cluster-owned. Pre-1.0; not otherwise handled.
 	serviceAccount := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      saName,
@@ -103,7 +118,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 			serviceAccount.Labels = map[string]string{}
 		}
 		serviceAccount.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-		return controllerutil.SetControllerReference(kc, serviceAccount, r.Scheme)
+		return controllerutil.SetControllerReference(cluster, serviceAccount, r.Scheme)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure kubeconfig writer serviceaccount: %w", err)
@@ -194,7 +209,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 			role.Labels = map[string]string{}
 		}
 		role.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-		return controllerutil.SetControllerReference(kc, role, r.Scheme)
+		return controllerutil.SetControllerReference(cluster, role, r.Scheme)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure kubeconfig writer role: %w", err)
@@ -223,7 +238,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 			roleBinding.Labels = map[string]string{}
 		}
 		roleBinding.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-		return controllerutil.SetControllerReference(kc, roleBinding, r.Scheme)
+		return controllerutil.SetControllerReference(cluster, roleBinding, r.Scheme)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure kubeconfig writer rolebinding: %w", err)
