@@ -42,12 +42,31 @@ const (
 
 	// ControlPlaneJoinTokenSecretDataKey is the data key holding the join token.
 	ControlPlaneJoinTokenSecretDataKey = "token"
+
+	// EtcdStatusSecretSuffix is appended to the cluster name to form the
+	// per-cluster HA etcd-health Secret name (ADR 0005 §E.1). Every control-plane
+	// node PATCHes its own member key over the node-push channel; the controlplane
+	// controller pre-creates the (empty) Secret. Unlike the KCP-owned single-writer
+	// join-token Secret above, the etcd-status Secret is owned by the CLUSTER
+	// (multi-writer — one data key per etcd member).
+	EtcdStatusSecretSuffix = "etcd-status"
+
+	// EtcdStatusSecretTypeLabel + Value mark the etcd-status Secret so controllers'
+	// Secret-watch predicates match it by label (KD-15), never by name suffix.
+	EtcdStatusSecretTypeLabel = "controlplane.cluster.x-k8s.io/secret-type"
+	EtcdStatusSecretTypeValue = "etcd-status"
 )
 
 // ControlPlaneJoinTokenSecretName returns the per-cluster HA join-token Secret
 // name for the given cluster.
 func ControlPlaneJoinTokenSecretName(clusterName string) string {
 	return clusterName + "-" + ControlPlaneJoinTokenSecretSuffix
+}
+
+// EtcdStatusSecretName returns the per-cluster HA etcd-status Secret name for the
+// given cluster.
+func EtcdStatusSecretName(clusterName string) string {
+	return clusterName + "-" + EtcdStatusSecretSuffix
 }
 
 // ControlPlaneRole is the per-machine role discriminator for control-plane

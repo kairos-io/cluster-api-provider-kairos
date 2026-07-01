@@ -178,6 +178,13 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		//                                            updates it. Named Secret only;
 		//                                            deliberate, bounded widening.
 		joinTokenSecretName := bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
+		// ADR 0005 §E.1: HA control-plane nodes also PATCH their own member key
+		// into the per-cluster etcd-status Secret over this same node-push
+		// channel. Add it to the resourceNames-scoped get/update/patch rule (no
+		// create — the controller pre-creates it, Cluster-owned). Named Secret
+		// only; deliberate, bounded widening, identical in shape to the join-token
+		// grant. Non-HA clusters never create the Secret, so the grant is inert.
+		etcdStatusSecretName := bootstrapv1beta2.EtcdStatusSecretName(cluster.Name)
 		role.Rules = []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
@@ -187,7 +194,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"secrets"},
-				ResourceNames: []string{secretName, joinTokenSecretName},
+				ResourceNames: []string{secretName, joinTokenSecretName, etcdStatusSecretName},
 				Verbs:         []string{"get", "update", "patch"},
 			},
 		}

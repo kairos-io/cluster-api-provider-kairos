@@ -483,6 +483,13 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		if err := r.ensureJoinTokenSecret(ctx, log, kcp, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to ensure join-token secret: %w", err)
 		}
+		// HA: ensure the per-cluster etcd-status Secret exists (Cluster-owned,
+		// empty) so every control-plane node can PATCH its own member health over
+		// the node-push channel (ADR 0005 §E.1). Consumed by the joiner gate,
+		// EtcdHealthyCondition, and the quorum-safe-replacement guard.
+		if err := r.ensureEtcdStatusSecret(ctx, log, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure etcd-status secret: %w", err)
+		}
 	}
 
 	maxSurge := int32(1)
