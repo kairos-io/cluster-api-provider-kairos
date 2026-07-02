@@ -669,10 +669,10 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			d := haCPData(tc.role, tc.kv)
-			// CAPV HA nodes render the etcd-health reporter (ADR 0005 §E.1); set
-			// the gate so its shell body is included in the bash -n syntax check.
-			// CAPK (kubevirt) does not render it.
-			if !tc.kv && d.ManagementEndpoint != nil {
+			// Every HA control-plane node (CAPV and CAPK, both distros) renders the
+			// etcd-health reporter (ADR 0005 §E.1); set the gate so its shell body
+			// is included in the bash -n syntax check.
+			if d.ManagementEndpoint != nil {
 				d.ManagementEndpoint.EtcdStatusSecretName = "ha-cluster-etcd-status"
 			}
 			out, err := tc.render(d)
@@ -683,9 +683,10 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 			if script == "" {
 				t.Fatalf("post-bootstrap script %q not found", tc.script)
 			}
-			// The etcd-health reporter must render on the CAPV path (and only there).
-			if hasReporter := strings.Contains(script, "push_etcd_status"); hasReporter != !tc.kv {
-				t.Errorf("etcd-health reporter present=%v, want %v (CAPV renders it, CAPK does not)", hasReporter, !tc.kv)
+			// The etcd-health reporter must render on every HA control-plane path
+			// (CAPV and CAPK, both distros — ADR 0005 §E.1 ported to CAPK).
+			if !strings.Contains(script, "push_etcd_status") {
+				t.Error("etcd-health reporter (push_etcd_status) must render on every HA control-plane path")
 			}
 			f := filepathJoinTemp(t, strings.ReplaceAll(tc.name, "/", "_")+".sh")
 			if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
@@ -699,57 +700,100 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 }
 
 // TestHA_EtcdLeaveResponder_k0sOnly asserts the ADR 0005 §E.3 etcd-leave
-// responder renders on k0s CAPV HA nodes (valid bash; gates on the fixed
-// leave-requested sentinel via string equality; runs `k0s etcd leave` with NO
-// externally-supplied argument), and does NOT render for k0s single-node or for
-// k3s (no clean member-remove, KD-5d).
+// responder renders on k0s HA nodes on BOTH infra backends (valid bash; gates
+// on the fixed leave-requested sentinel via string equality; runs `k0s etcd
+// leave` with NO externally-supplied argument), and does NOT render for k0s
+// single-node or for k3s on either backend (no clean member-remove, KD-5d).
+// CAPV acks via the VIP; CAPK has no VIP and acks via the stable
+// ControlPlaneLBEndpoint instead (there is no VIP to front the surviving
+// apiservers) — the CAPK sub-test asserts that split explicitly.
 func TestHA_EtcdLeaveResponder_k0sOnly(t *testing.T) {
 	bashPath, err := exec.LookPath("bash")
 	if err != nil {
 		t.Skip("bash not available; skipping rendered-script syntax check")
 	}
-	out, err := RenderK0sCloudConfig(haCPData("init", false))
-	if err != nil {
-		t.Fatalf("render k0s init: %v", err)
-	}
-	script := extractWriteFile(t, out, "kairos-etcd-leave.sh")
-	if script == "" {
-		t.Fatal("k0s HA control-plane must render the etcd-leave responder script")
-	}
-	if !strings.Contains(script, `[ "${val}" = "leave-requested" ]`) {
-		t.Error("leave script must gate on the fixed sentinel via string equality (security constraint #4)")
-	}
-	if !strings.Contains(script, "k0s etcd leave") {
-		t.Error("leave script must run `k0s etcd leave`")
-	}
-	if strings.Contains(script, "etcd leave --peer-address") {
-		t.Error("leave script must NOT pass --peer-address (node leaves itself; no external arg — security constraint #5)")
-	}
-	f := filepathJoinTemp(t, "k0s-etcd-leave.sh")
-	if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
-		t.Fatalf("write temp script: %v", werr)
-	}
-	if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
-		t.Fatalf("etcd-leave script is not valid bash: %v\n%s", berr, b)
+	assertResponder := func(t *testing.T, script string) {
+		t.Helper()
+		if !strings.Contains(script, `[ "${val}" = "leave-requested" ]`) {
+			t.Error("leave script must gate on the fixed sentinel via string equality (security constraint #4)")
+		}
+		if !strings.Contains(script, "k0s etcd leave") {
+			t.Error("leave script must run `k0s etcd leave`")
+		}
+		if strings.Contains(script, "etcd leave --peer-address") {
+			t.Error("leave script must NOT pass --peer-address (node leaves itself; no external arg — security constraint #5)")
+		}
+		f := filepathJoinTemp(t, "k0s-etcd-leave.sh")
+		if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
+			t.Fatalf("write temp script: %v", werr)
+		}
+		if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
+			t.Fatalf("etcd-leave script is not valid bash: %v\n%s", berr, b)
+		}
 	}
 
-	// k0s single-node must NOT render it (no etcd quorum).
-	single := haCPData("single", false)
-	single.SingleNode = true
-	sout, err := RenderK0sCloudConfig(single)
-	if err != nil {
-		t.Fatalf("render k0s single: %v", err)
-	}
-	if extractWriteFile(t, sout, "kairos-etcd-leave.sh") != "" {
-		t.Error("k0s single-node must NOT render the etcd-leave responder")
+	t.Run("capv", func(t *testing.T) {
+		out, err := RenderK0sCloudConfig(haCPData("init", false))
+		if err != nil {
+			t.Fatalf("render k0s init: %v", err)
+		}
+		script := extractWriteFile(t, out, "kairos-etcd-leave.sh")
+		if script == "" {
+			t.Fatal("k0s CAPV HA control-plane must render the etcd-leave responder script")
+		}
+		assertResponder(t, script)
+		if !strings.Contains(script, `srv=(--server="https://${vip_addr}:6443")`) {
+			t.Error("k0s CAPV etcd-leave responder must ack via the VIP")
+		}
+		if strings.Contains(script, "ControlPlaneLBEndpoint") || strings.Contains(script, "lb_addr") {
+			t.Error("k0s CAPV etcd-leave responder must NOT reference the CAPK LB endpoint")
+		}
+	})
+
+	t.Run("capk", func(t *testing.T) {
+		out, err := RenderK0sCloudConfig(haCPData("init", true))
+		if err != nil {
+			t.Fatalf("render k0s init: %v", err)
+		}
+		script := extractWriteFile(t, out, "kairos-etcd-leave.sh")
+		if script == "" {
+			t.Fatal("k0s CAPK HA control-plane must render the etcd-leave responder script")
+		}
+		assertResponder(t, script)
+		// CAPK has no VIP (OQ-5): the responder must ack via the stable
+		// ControlPlaneLBEndpoint, and must NOT leak any VIP/vip_addr reference.
+		if !strings.Contains(script, `lb_addr='10.96.0.10'`) {
+			t.Error("k0s CAPK etcd-leave responder must shquote ControlPlaneLBEndpoint into lb_addr")
+		}
+		if !strings.Contains(script, `srv=(--server="https://${lb_addr}:6443")`) {
+			t.Error("k0s CAPK etcd-leave responder must ack via the ControlPlaneLBEndpoint (--server)")
+		}
+		if strings.Contains(script, "vip_addr") || strings.Contains(script, "VIP.Address") {
+			t.Error("k0s CAPK etcd-leave responder must NOT reference a VIP (CAPK has no VIP, OQ-5)")
+		}
+	})
+
+	// k0s single-node must NOT render it (no etcd quorum), on either backend.
+	for _, kv := range []bool{false, true} {
+		single := haCPData("single", kv)
+		single.SingleNode = true
+		sout, err := RenderK0sCloudConfig(single)
+		if err != nil {
+			t.Fatalf("render k0s single (kubevirt=%v): %v", kv, err)
+		}
+		if extractWriteFile(t, sout, "kairos-etcd-leave.sh") != "" {
+			t.Errorf("k0s single-node (kubevirt=%v) must NOT render the etcd-leave responder", kv)
+		}
 	}
 
-	// k3s HA must NOT render it (KD-5d: no clean member-remove).
-	kout, err := RenderK3sCloudConfig(haCPData("init", false))
-	if err != nil {
-		t.Fatalf("render k3s init: %v", err)
-	}
-	if extractWriteFile(t, kout, "kairos-etcd-leave.sh") != "" {
-		t.Error("k3s must NOT render the etcd-leave responder (KD-5d)")
+	// k3s HA must NOT render it on either backend (KD-5d: no clean member-remove).
+	for _, kv := range []bool{false, true} {
+		kout, err := RenderK3sCloudConfig(haCPData("init", kv))
+		if err != nil {
+			t.Fatalf("render k3s init (kubevirt=%v): %v", kv, err)
+		}
+		if extractWriteFile(t, kout, "kairos-etcd-leave.sh") != "" {
+			t.Errorf("k3s (kubevirt=%v) must NOT render the etcd-leave responder (KD-5d)", kv)
+		}
 	}
 }

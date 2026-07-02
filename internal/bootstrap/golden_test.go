@@ -107,11 +107,15 @@ func goldenCases() []goldenCase {
 		{"k0s_capv_join", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240")), "ha-cluster-etcd-status")},
 		{"k3s_capv_join", RenderK3sCloudConfig, withEtcdStatusSecretName(withJoinToken(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, false, false)), "192.168.1.240")), "ha-cluster-etcd-status")},
 
-		// --- CAPK HA (NO kube-vip; OQ-5): init/join still branch, LB Service is the endpoint ---
-		{"k0s_capk_init", RenderK0sCloudConfig, withJoinTokenSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-control-plane-join-token")},
-		{"k3s_capk_init", RenderK3sCloudConfig, capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false))},
-		{"k0s_capk_join", RenderK0sCloudConfig, withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false)))},
-		{"k3s_capk_join", RenderK3sCloudConfig, withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false)))},
+		// --- CAPK HA (NO kube-vip; OQ-5): init/join still branch, LB Service is the
+		// endpoint. Both distros also carry EtcdStatusSecretName so the golden
+		// snapshots exercise the etcd-health reporter block (ADR 0005 §E.1 port to
+		// CAPK); k0s additionally carries the etcd-leave responder (ADR 0005 §E.3),
+		// gated only on IsHAControlPlane, acking via ControlPlaneLBEndpoint (no VIP).
+		{"k0s_capk_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinTokenSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-control-plane-join-token"), "ha-cluster-etcd-status")},
+		{"k3s_capk_init", RenderK3sCloudConfig, withEtcdStatusSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-etcd-status")},
+		{"k0s_capk_join", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
+		{"k3s_capk_join", RenderK3sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
 	}
 }
 
