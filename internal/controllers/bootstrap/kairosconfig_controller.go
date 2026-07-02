@@ -881,6 +881,17 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 		distribution = "k0s"
 	}
 
+	// ADR 0005 §E.1: every HA control-plane node (init AND join) reports its own
+	// etcd member health into the per-cluster etcd-status Secret over the
+	// node-push channel. The renderer needs the target Secret name to build that
+	// reporter block. Not for single-node (no quorum to report) or workers.
+	if td.ManagementEndpoint != nil && cluster != nil {
+		switch kairosConfig.Spec.ControlPlaneRole {
+		case bootstrapv1beta2.ControlPlaneRoleInit, bootstrapv1beta2.ControlPlaneRoleJoin:
+			td.ManagementEndpoint.EtcdStatusSecretName = bootstrapv1beta2.EtcdStatusSecretName(cluster.Name)
+		}
+	}
+
 	// The join token is only meaningful for init/join nodes. single needs none.
 	switch kairosConfig.Spec.ControlPlaneRole {
 	case bootstrapv1beta2.ControlPlaneRoleInit:

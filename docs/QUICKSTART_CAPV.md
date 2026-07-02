@@ -1,8 +1,8 @@
 # Quick Start Guide - CAPV (vSphere)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x), CAPV v1.11.x, provider v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x), CAPV v1.11.x, provider v0.1.0-alpha.3 (provisional — HA control-plane support, unreleased at time of writing).
 
-This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV).
+This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV). For a 3-node highly-available k0s control plane, see [High-Availability: 3-node k0s control plane](#high-availability-3-node-k0s-control-plane) below.
 
 **Note on `controlPlaneEndpoint`**: both the k0s and k3s flavors require `Cluster.spec.controlPlaneEndpoint` (or `VSphereCluster.spec.controlPlaneEndpoint`) to be set to a stable LoadBalancer IP or VIP before applying the manifest. The provider does not auto-discover the endpoint. Standard CAPV practice is to pre-allocate an IP via your load-balancer solution and reference it in the sample before applying. If you apply without a valid endpoint, `KairosControlPlane` will stall with `Available=False(WaitingForInfrastructureControlPlaneEndpoint)` until the endpoint is set.
 
@@ -313,6 +313,97 @@ enable the opt-in
 [Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback)
 on the `KairosControlPlane`.
 
+## High-Availability: 3-node k0s control plane
+
+This section walks through a 3-node HA k0s control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capv/kairos_cluster_k0s_ha.yaml`](../config/samples/capv/kairos_cluster_k0s_ha.yaml). Read the [single-node walkthrough](#creating-a-cluster) above first — the vSphere template, credentials Secret, and `userPasswordSecretRef` steps are identical. This section covers only what's different for HA.
+
+k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup — see [README.md § High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 explanation (KD-5d).
+
+### HA prerequisites
+
+In addition to the [single-node prerequisites](#prerequisites):
+
+1. **A free VIP address.** Reserve an IP on the control-plane nodes' subnet that is outside any DHCP range and not otherwise in use. This is the kube-vip virtual IP — the stable API endpoint the cluster (and every kubeconfig) will target.
+2. **The NIC name on your Kairos template.** kube-vip advertises the VIP on a specific interface (ARP mode broadcasts on that NIC). Boot a VM from your Hadron/Kairos template and run `ip link` to confirm the interface name (commonly `ens192` on vSphere with the `e1000`/`vmxnet3` adapter types used in this guide).
+3. **A flat L2 subnet for the default `ARP` mode.** All three control-plane nodes and the VIP must share an L2 segment so ARP-based failover works. If your fabric is routed instead, use `mode: BGP` and configure BGP peering separately — this guide covers ARP only.
+
+### Customizing the HA sample
+
+Open `config/samples/capv/kairos_cluster_k0s_ha.yaml` and fill in the `TODO` placeholders, same pattern as the single-node sample (see [Step 3](#step-3-customize-the-manifest) above), plus these HA-specific fields:
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+spec:
+  controlPlaneEndpoint:
+    host: "192.168.1.50"   # the VIP address; MUST equal spec.ha.vip.address below
+    port: 6443
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+spec:
+  replicas: 3               # 3 or 5 only — odd counts for etcd quorum
+  ha:
+    vip:
+      address: "192.168.1.50"   # must equal Cluster.spec.controlPlaneEndpoint.host
+      interface: "ens192"       # NIC name from `ip link` on your template
+      mode: ARP                 # ARP for a flat L2 subnet (default)
+```
+
+`Cluster.spec.controlPlaneEndpoint.host` and `KairosControlPlane.spec.ha.vip.address` must match exactly. The webhook does not enforce this cross-object constraint — a mismatch will not be rejected, but the cluster endpoint will point at the wrong address and the workload kubeconfig will not reach a floating VIP.
+
+### Apply and verify
+
+```bash
+kubectl apply -f config/samples/capv/kairos_cluster_k0s_ha.yaml
+```
+
+Watch the control plane come up:
+
+```bash
+kubectl get kairoscontrolplane kairos-control-plane -w
+```
+
+HA comes up successfully when:
+
+```bash
+kubectl get kairoscontrolplane kairos-control-plane \
+  -o jsonpath='{.status.readyReplicas}/{.status.replicas}'
+# expect: 3/3
+```
+
+Check the `EtcdHealthy` condition — it should be `True` once all three etcd members are healthy and voting:
+
+```bash
+kubectl get kairoscontrolplane kairos-control-plane -o yaml | grep -A4 "type: EtcdHealthy"
+```
+
+Confirm the VIP is reachable and answers the Kubernetes API:
+
+```bash
+curl -k https://192.168.1.50:6443/livez
+```
+
+Retrieve the kubeconfig (same node-push path as single-node) and confirm all three nodes registered:
+
+```bash
+kubectl get secret kairos-cluster-kubeconfig \
+  -o jsonpath='{.data.value}' | base64 -d > kairos-kubeconfig.yaml
+kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
+```
+
+### HA troubleshooting
+
+| Symptom | Cause | Action |
+|---|---|---|
+| `KairosControlPlane` create is rejected with a message about `spec.replicas` | Even replica count or a value above 5 | Use `1`, `3`, or `5`. Even counts give the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement — always round up to the next odd number. |
+| Admission succeeds but returns a warning about `spec.ha.vip` | `spec.ha.vip` is set while `spec.replicas` is `1` | kube-vip is not rendered for single-node control planes. Either remove `spec.ha.vip` or set `replicas` to `3`/`5`. |
+| `EtcdHealthy` condition is `False(Info)` with an "at risk" or degraded reason | One or more control-plane nodes have not yet reported healthy etcd membership, or a member is down | Check `kubectl describe kairoscontrolplane` Events and confirm all three Machines are `Running`. Transient during bring-up; investigate if it persists past a few minutes once all Machines are `Ready`. |
+| VIP does not respond, but all three nodes are `Ready` | `spec.ha.vip.interface` does not match the node's actual NIC name, or the nodes are not on a shared L2 segment (ARP mode) | Re-verify the interface name with `ip link` on a live node. For routed fabrics, use `mode: BGP` with correct peering instead of `ARP`. |
+| Deleting/replacing a control-plane Machine is refused or stalls | The quorum-safe delete guard is blocking a delete that would drop etcd below `(N/2)+1` healthy members | Do not force it. Wait for a degraded member to recover, or scale up before scaling down. Check the `EtcdHealthy` condition and Events for the specific blocking reason. |
+| A k3s control-plane replacement leaves an extra etcd member registered | Expected k3s limitation (KD-5d) — k3s embedded etcd has no supported clean member-remove | Run `etcdctl member remove` manually against the embedded etcd. Watch for the `EtcdMemberRemoveUnsupportedForK3s` warning event. Prefer k0s for HA if you need automatic clean removal. |
+| A k0s node is deleted but its etcd member is still registered | The node never acknowledged its `k0s etcd leave` request within the ~5-minute timeout | Watch for the `EtcdMemberLeaveTimedOut` warning event; remove the member manually with `k0s etcdctl member remove` if it fires. The delete itself was already quorum-safe. |
+
 ## Field Reference
 
 ### Required Fields to Customize
@@ -383,7 +474,7 @@ If `KairosConfig.status.failureMessage` is set, the issue is transient — it cl
 
 - Configure additional worker nodes via `MachineDeployment`.
 - Add custom Kubernetes manifests via `spec.manifests` in `KairosConfigTemplate`.
-- Multi-node control planes are tracked for a future release (KD-5b / KD-25).
+- For a highly-available control plane, see [High-Availability: 3-node k0s control plane](#high-availability-3-node-k0s-control-plane) above.
 
 ## Air-gapped fallback (SSHFallback)
 
@@ -491,3 +582,5 @@ kubectl get events -n <cluster-namespace> \
 kubectl delete -f config/samples/capv/kairos_cluster_k0s_single_node.yaml
 # Note: This deletes VMs in vSphere.
 ```
+
+For the HA sample: `kubectl delete -f config/samples/capv/kairos_cluster_k0s_ha.yaml`. Deletion is quorum-safe — the controller drains control-plane Machines one at a time and will not proceed past the point where etcd quorum would break; expect cluster teardown to take longer than the single-node case.

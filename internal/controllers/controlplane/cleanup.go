@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -94,6 +95,59 @@ func drainOwnedMachines(ctx context.Context, c client.Client, kcp *controlplanev
 		}
 	}
 	return remaining, nil
+}
+
+// stripEtcdLeaveHooks removes the etcd-leave pre-terminate lifecycle hook
+// (ADR 0005 §E.3) from every Machine owned by this KairosControlPlane. It MUST
+// run before drainOwnedMachines on the whole-cluster teardown path: the hook
+// pauses CAPI termination after drain, and nothing on the delete path drives the
+// per-member leave handshake, so leaving the hook in place would deadlock
+// teardown (load-bearing). It strips UNCONDITIONALLY — including Machines already
+// mid-deletion and paused at the hook — so a scale-down that was in flight when
+// the cluster was deleted is unblocked too. Whole-cluster teardown discards etcd
+// entirely, so a clean per-member leave is pointless here.
+//
+// Selection mirrors drainOwnedMachines (cluster-name label + controller-UID
+// ownership). Idempotent: Machines without the hook are skipped; an IsNotFound on
+// patch (reaped between List and Patch) is treated as success.
+func stripEtcdLeaveHooks(ctx context.Context, c client.Client, kcp *controlplanev1beta2.KairosControlPlane) error {
+	clusterName, ok := kcp.Labels[clusterv1.ClusterNameLabel]
+	if !ok || clusterName == "" {
+		return nil
+	}
+	selector := labels.SelectorFromSet(labels.Set{
+		clusterv1.ClusterNameLabel: clusterName,
+	})
+	machineList := &clusterv1.MachineList{}
+	if err := c.List(ctx, machineList,
+		client.InNamespace(kcp.Namespace),
+		client.MatchingLabelsSelector{Selector: selector},
+	); err != nil {
+		return err
+	}
+
+	hook := etcdLeaveHookAnnotation()
+	for i := range machineList.Items {
+		m := &machineList.Items[i]
+		if !ownedByKCP(m, kcp.UID) {
+			continue
+		}
+		if _, has := m.Annotations[hook]; !has {
+			continue
+		}
+		helper, err := patch.NewHelper(m, c)
+		if err != nil {
+			return err
+		}
+		delete(m.Annotations, hook)
+		if err := helper.Patch(ctx, m); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // ownedByKCP reports whether machine is owned (controller=true) by a

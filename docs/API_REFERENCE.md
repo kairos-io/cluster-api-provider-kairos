@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.9+ required (go.mod imports v1.8 types; see Notes §API Version Compatibility), provider v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.9+ required (go.mod imports v1.8 types; see Notes §API Version Compatibility), provider v0.1.0-alpha.3 (provisional — HA control-plane support, unreleased at time of writing).
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
@@ -222,12 +222,13 @@ spec:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `replicas` | `*int32` | No | `1` | Number of control plane machines. Must be exactly `1`. The validating webhook rejects values greater than 1 — the current bootstrap logic would otherwise produce N independent single-node clusters. HA control planes are tracked for a future release (KD-5b / KD-25). |
+| `replicas` | `*int32` | No | `1` | Number of control plane machines. One of `1`, `3`, or `5` — the validating webhook rejects even counts (they provide the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance). `1` configures a single-node control plane. `3` or `5` configure a highly-available control plane; set `ha.vip` for infrastructure providers that do not supply a load-balanced endpoint (CAPV, CAPM3, CAPD). |
 | `version` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. |
+| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d — see [Multi-Node Control Planes](#multi-node-control-planes)). |
 | `machineTemplate` | `KairosControlPlaneMachineTemplate` | Yes | — | Template for creating control plane Machines. |
 | `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | — | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
 | `rolloutStrategy` | `RolloutStrategy` | No | — | Strategy for rolling out updates. |
+| `ha` | `HAConfig` | No | — | High-availability configuration, used when `replicas` is `3` or `5`. Ignored when `replicas` is `1`; setting it on a single-node control plane produces a non-blocking admission warning. See [HAConfig](#haconfig). |
 
 #### KairosControlPlaneMachineTemplate
 
@@ -260,6 +261,20 @@ The `namespace` field is not part of this reference. The namespace defaults to t
 |-------|------|----------|-------------|
 | `maxSurge` | `*int32` | No | Maximum number of machines that can be created above the desired count during a rollout. |
 
+#### HAConfig
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `vip` | `KubeVIPConfig` | No | The virtual IP (kube-vip) used as the stable control-plane endpoint across HA nodes. Required on CAPV, CAPM3, and CAPD when the infrastructure provider does not supply a load-balanced endpoint automatically. **Do not set on CAPK** — CAPK provisions its own LoadBalancer Service and reflects its IP into the control-plane endpoint; a VIP alongside it produces a conflicting ARP announcement. |
+
+#### KubeVIPConfig
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `address` | `string` | Yes | — | The virtual IP address or DNS hostname for the control-plane endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname (max 253 characters). For `mode: ARP`, must be an IP address reachable on the same L2 segment as the control-plane nodes. Must equal the host portion of the InfraCluster's `controlPlaneEndpoint` (e.g., `VSphereCluster.spec.controlPlaneEndpoint.host`) so that CAPI core copies the correct address into `Cluster.spec.controlPlaneEndpoint`. This cross-object match is not enforced at admission — a mismatch will not be rejected, but the cluster endpoint will point at the wrong address. |
+| `interface` | `string` | Yes | — | The Linux network interface name on which kube-vip advertises the VIP (e.g., `"eth0"`, `"ens192"`, `"bond0"`). Must be 1-15 characters, starting with a letter, followed by letters, digits, dots, underscores, or hyphens. Verify the interface name against your Kairos image with `ip link` before setting this field. |
+| `mode` | `string` | No | `"ARP"` | VIP advertisement mode: `"ARP"` (L2, requires the control-plane nodes to share an L2 segment) or `"BGP"` (L3, requires a BGP peer; intended for routed bare-metal fabrics). |
+
 ### Status Fields
 
 | Field | Type | Description |
@@ -270,7 +285,7 @@ The `namespace` field is not part of this reference. The namespace defaults to t
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
 | `updatedReplicas` | `int32` | Number of Machines running the desired version. |
 | `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) below. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
@@ -296,6 +311,46 @@ spec:
   kairosConfigTemplate:
     name: kairos-config-template-control-plane
 ```
+
+A 3-node HA example with a kube-vip VIP:
+
+```yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-control-plane
+  namespace: default
+spec:
+  replicas: 3
+  version: "v1.34.1+k0s.1"
+  ha:
+    vip:
+      address: "192.168.1.50"   # must equal Cluster.spec.controlPlaneEndpoint.host
+      interface: "ens192"
+      mode: ARP
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: VSphereMachineTemplate
+      name: control-plane-template
+  kairosConfigTemplate:
+    name: kairos-config-template-control-plane
+```
+
+See the full worked sample at `config/samples/capv/kairos_cluster_k0s_ha.yaml` and the [CAPV HA quickstart](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane).
+
+### EtcdHealthy condition
+
+Surfaced on `KairosControlPlane.status.conditions` for HA control planes only (`replicas` is `3` or `5`); absent for single-node control planes.
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `True` | `EtcdHealthy` | All desired etcd members report healthy and voting. |
+| `False` (Info) | `EtcdQuorumDegraded` | Quorum still holds, but fewer than all desired members are healthy and voting. |
+| `False` (Warning) | `EtcdQuorumAtRisk` | The healthy+voting member count is at or below the `(N/2)+1` quorum minimum — one more member loss breaks quorum. Also covers the bring-up window before any member has reported. |
+| `False` (Info) | `WaitingForEtcdMember` | The init node has not yet reported a healthy voting etcd member. |
+
+The condition is derived from a per-cluster, node-reported etcd-status Secret (see [Security Considerations](#security-considerations) for the trust model of this signal). The controller uses this condition, together with the desired replica count, to refuse control-plane Machine deletions that would drop etcd below the quorum minimum — this quorum-safety decision is made independently of, and before, any single node's self-reported signal.
 
 ---
 
@@ -446,10 +501,13 @@ When `KairosControlPlane.spec.replicas == 1`, the controller automatically sets 
 
 ### Multi-Node Control Planes
 
-`KairosControlPlane.spec.replicas > 1` is currently rejected by the validating webhook. HA control planes are tracked for a future release (KD-5b / KD-25). Do not attempt to work around the webhook — setting replicas to 1 is the correct configuration for all current deployments.
+`KairosControlPlane.spec.replicas` accepts `1`, `3`, or `5`. The validating webhook rejects even counts (they give the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement — always use the next-higher odd number instead) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance for a control plane).
+
+`3` and `5` configure a highly-available control plane. Set `spec.ha.vip` on CAPV, CAPM3, and CAPD clusters so kube-vip provides a stable, failover-capable endpoint — do not set it on CAPK, which supplies its own LoadBalancer-backed endpoint. See [HAConfig](#haconfig) and [EtcdHealthy condition](#etcdhealthy-condition) above, and [README.md § High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 behavior (quorum-safe replacement, k0s clean etcd-leave, and the k3s orphaned-member limitation tracked as KD-5d).
 
 ### Security Considerations
 
 - Provide credentials via `userPasswordSecretRef` (recommended) or `sshPublicKey` / `githubUser`. Inline `userPassword` is stored in the KairosConfig spec and readable by anyone who can `kubectl get kairosconfig`.
 - Worker tokens should use the `*SecretRef` variants. Inline tokens in specs are readable without Secret RBAC.
+- **HA etcd health/leave signals are node-self-reported and forgeable (KD-51).** Both day-2 HA signal channels — the per-cluster etcd-status Secret and the workload `kube-system/kairos-etcd-leave` ConfigMap leave acknowledgement — are written by control-plane nodes with vanilla RBAC on objects shared across the control plane, so a compromised control-plane node can forge them. This is not a privilege escalation (a compromised control-plane node already holds cluster-admin-equivalent access) and cannot force an unsafe deletion, because the quorum-safety decision is made independently of, and before, any node signal is consulted. A forged signal can only self-downgrade the clean-leave/health guarantee. Per-member-scoped signals are tracked as future hardening.
 - All Secrets referenced by `*SecretRef` fields must exist in the management cluster before the KairosConfig is reconciled. Missing Secrets cause a transient failure that clears automatically when the Secret is created.

@@ -431,3 +431,74 @@ func TestResolve_MultipleConfigsSameCluster_OwnedByCluster(t *testing.T) {
 		g.Expect(owner.Name).To(Equal("test-cluster"))
 	}
 }
+
+// TestResolve_GrantsEtcdStatusSecret asserts the node SA's Role is granted
+// get/update/patch (and NOT create) on the per-cluster etcd-status Secret
+// (ADR 0005 §E.1), on the same resourceNames-scoped rule as the kubeconfig +
+// join-token Secrets — a bounded named-Secret widening, no new rule.
+func TestResolve_GrantsEtcdStatusSecret(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	kc.Spec.Role = "control-plane"
+	kc.Spec.Distribution = "k0s"
+
+	_, err := r.Resolve(context.Background(), kc, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	role := &rbacv1.Role{}
+	saName := kubeconfigWriterName("test-cluster")
+	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
+
+	etcdName := bootstrapv1beta2.EtcdStatusSecretName("test-cluster")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "get")).To(BeTrue(), "node SA must get the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "update")).To(BeTrue(), "node SA must update the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "patch")).To(BeTrue(), "node SA must patch the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "create")).To(BeFalse(), "node SA must NOT create the etcd-status Secret (controller pre-creates it)")
+}
+
+// roleGrantsNamedSecret reports whether the Role grants the given verb on the
+// named core Secret via a resourceNames-scoped rule (the create rule carries no
+// resourceNames, so a create check only matches a named-create rule — which we
+// assert is absent).
+func roleGrantsNamedSecret(role *rbacv1.Role, name, verb string) bool {
+	for _, rule := range role.Rules {
+		coreGroup := false
+		for _, gp := range rule.APIGroups {
+			if gp == "" {
+				coreGroup = true
+				break
+			}
+		}
+		if !coreGroup {
+			continue
+		}
+		hasSecret := false
+		for _, res := range rule.Resources {
+			if res == "secrets" {
+				hasSecret = true
+				break
+			}
+		}
+		if !hasSecret {
+			continue
+		}
+		hasName := false
+		for _, rn := range rule.ResourceNames {
+			if rn == name {
+				hasName = true
+				break
+			}
+		}
+		if !hasName {
+			continue
+		}
+		for _, v := range rule.Verbs {
+			if v == verb {
+				return true
+			}
+		}
+	}
+	return false
+}

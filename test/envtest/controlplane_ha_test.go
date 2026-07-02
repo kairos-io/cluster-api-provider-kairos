@@ -181,11 +181,13 @@ func TestHA_K0sJoinTokenSecret_CreatedEmpty(t *testing.T) {
 }
 
 // TestHA_RoleAssignment_InitFirstThenJoin asserts the sequencing gate + role
-// assignment (ADR 0005 Phase 3): the first CP KairosConfig is created with
-// role=init, and NO join KairosConfig is created until the init machine is
-// joinable (NodeRef + KubeconfigReady + k0s token present). We drive that state
-// by hand (pre-create the init Machine with a NodeRef, push the kubeconfig
-// Secret, populate the k0s token) and assert a join KairosConfig then appears.
+// assignment (ADR 0005 Phase 3 + Phase-4 §E.1): the first CP KairosConfig is
+// created with role=init, and NO join KairosConfig is created until the init
+// machine is joinable (NodeRef + KubeconfigReady + k0s token present + the init
+// node has reported a healthy voting etcd member). We drive that state by hand
+// (pre-create the init Machine with a NodeRef, push the kubeconfig Secret,
+// populate the k0s token, write the init node's etcd-status report) and assert a
+// join KairosConfig then appears.
 func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -227,7 +229,8 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 	// Now make the init machine joinable:
 	//  (1) pre-create the init Machine with a NodeRef and Running phase,
 	//  (2) push the kubeconfig Secret (opens KubeconfigReady),
-	//  (3) populate the k0s join-token Secret (init-node push simulation).
+	//  (3) populate the k0s join-token Secret (init-node push simulation),
+	//  (4) report the init node's healthy voting etcd member (ADR 0005 §E.1).
 	initMachine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      kcpName + "-0",
@@ -268,6 +271,25 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 	tokenSecret.Data[bootstrapv1beta2.ControlPlaneJoinTokenSecretDataKey] = []byte("k0s-controller-join-token")
 	g.Expect(c.Update(ctx, tokenSecret)).To(Succeed())
 
+	// (4) Simulate the init node reporting a healthy, voting etcd member into the
+	// per-cluster etcd-status Secret (ADR 0005 §E.1). The Phase-4 k0s joiner gate
+	// requires this before opening; envtest has no real node reporter, so we write
+	// it by hand keyed on the init node's Node name. The controller creates this
+	// Secret (Cluster-owned, empty) for replicas>1, so retry until it exists and
+	// on write conflicts.
+	etcdStatusName := bootstrapv1beta2.EtcdStatusSecretName(clusterName)
+	g.Eventually(func() error {
+		es := &corev1.Secret{}
+		if err := c.Get(ctx, types.NamespacedName{Name: etcdStatusName, Namespace: nsName}, es); err != nil {
+			return err
+		}
+		if es.Data == nil {
+			es.Data = map[string][]byte{}
+		}
+		es.Data["init-node"] = []byte(`{"name":"init-node","healthy":true,"voting":true,"members":1,"reportedAt":"t"}`)
+		return c.Update(ctx, es)
+	}, 15*time.Second, 500*time.Millisecond).Should(Succeed())
+
 	// The gate should now open and the controller should create the join config.
 	g.Eventually(func() (bootstrapv1beta2.ControlPlaneRole, error) {
 		cfg := &bootstrapv1beta2.KairosConfig{}
@@ -275,7 +297,7 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 			return "", err
 		}
 		return cfg.Spec.ControlPlaneRole, nil
-	}, 20*time.Second, 500*time.Millisecond).Should(Equal(bootstrapv1beta2.ControlPlaneRoleJoin),
+	}, 30*time.Second, 500*time.Millisecond).Should(Equal(bootstrapv1beta2.ControlPlaneRoleJoin),
 		"join config must be created once the init machine is joinable")
 }
 

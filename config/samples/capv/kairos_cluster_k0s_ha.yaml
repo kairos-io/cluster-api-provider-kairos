@@ -1,0 +1,207 @@
+# ============================================================================
+# CAPV Sample: 3-Node HA k0s Control Plane on Kairos OS (ADR 0005 Phase 4)
+# ============================================================================
+#
+# This provisions a highly-available, 3-node k0s control plane fronted by a
+# kube-vip virtual IP (VIP). For the single-node variant see
+# kairos_cluster_k0s_single_node.yaml.
+#
+# HOW HA DIFFERS FROM SINGLE-NODE:
+#   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
+#     quorum needs an odd member count.
+#   - spec.ha.vip on the KairosControlPlane declares the kube-vip VIP. The
+#     controller renders a kube-vip DaemonSet (one Pod per control-plane node,
+#     leader-elected) into the bootstrap cloud-config so the VIP floats to a
+#     surviving node if the leader fails.
+#   - Cluster.spec.controlPlaneEndpoint.host MUST equal spec.ha.vip.address:
+#     the VIP is the stable API endpoint every node and kubeconfig targets.
+#   - The VIP address must be a free IP on the nodes' subnet (not in any DHCP
+#     pool), and spec.ha.vip.interface must be the NIC name that exists on the
+#     nodes (e.g. "ens192" on vSphere Hadron images — verify with `ip link`).
+#
+# DAY-2 BEHAVIOUR (ADR 0005 §E):
+#   - Each control-plane node reports its etcd member health into a per-cluster
+#     Secret; the controller surfaces it as the EtcdHealthy condition on the
+#     KairosControlPlane (kubectl get kairoscontrolplane -o yaml).
+#   - Replacement/scale-down is quorum-safe: the controller refuses a delete
+#     that would drop etcd below (N/2)+1 healthy voting members.
+#   - On a k0s control-plane removal the departing node runs `k0s etcd leave`
+#     cleanly before the VM is destroyed (no orphaned etcd member).
+#   - LIMITATIONS: see the security/limitations note at the bottom of this file
+#     (forgeable node-self-reported health — KD-51; k3s orphaned member — KD-5d).
+#
+# SETUP INSTRUCTIONS (same three-step flow as kairos_cluster_k0s_single_node.yaml):
+#
+# 1. FIRST, apply the VSphereClusterIdentity and Secret (at the bottom of this
+#    file). Edit the Secret with your actual vSphere credentials.
+#      kubectl apply -f config/samples/capv/kairos_cluster_k0s_ha.yaml
+#
+# 2. THEN, customize the VSphereCluster, VSphereMachineTemplate, and the VIP
+#    fields below (see TODO comments): server, datacenter, datastore, network,
+#    template names, VIP address, and NIC name.
+#
+# 3. FINALLY, apply the entire manifest again (or apply just the cluster parts):
+#      kubectl apply -f config/samples/capv/kairos_cluster_k0s_ha.yaml
+#
+# See docs/QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane for
+# the full walkthrough, HA prerequisites, and verification steps.
+# ============================================================================
+
+# IMPORTANT: replace `password:` below with a strong value before applying.
+# `openssl rand -base64 32` is fine. Inline UserPassword in KairosConfig is
+# deprecated; this Secret pattern is the recommended way to provide it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: kairos-cluster
+  namespace: default
+spec:
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: VSphereCluster
+    name: kairos-cluster
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KairosControlPlane
+    name: kairos-control-plane
+  # HA: this MUST be the kube-vip VIP declared in spec.ha.vip.address below.
+  # Pre-allocate a free IP on the nodes' subnet (outside any DHCP range).
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-VIP-ADDRESS"   # e.g. 172.16.56.95 — MUST match spec.ha.vip.address
+    port: 6443
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereCluster
+metadata:
+  name: kairos-cluster
+  namespace: default
+spec:
+  # vCenter FQDN or IP — hostname/IP ONLY, no protocol/path.
+  server: "TODO-YOUR-VCENTER-HOSTNAME"
+  identityRef:
+    kind: VSphereClusterIdentity
+    name: vsphere-credentials
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-control-plane
+  namespace: default
+spec:
+  # HA control plane: 3 or 5 only (odd count for etcd quorum). The webhook
+  # rejects even counts > 1.
+  replicas: 3
+  # Pin a version your Kairos image bundles (informational; see KD-24).
+  version: "v1.34.1+k0s.1"
+  # HA: the kube-vip virtual IP that fronts the control plane. Rendered as a
+  # kube-vip DaemonSet into every control-plane node's cloud-config.
+  ha:
+    vip:
+      # MUST equal Cluster.spec.controlPlaneEndpoint.host above.
+      address: "TODO-REPLACE-WITH-VIP-ADDRESS"   # e.g. 172.16.56.95
+      # NIC name present on the nodes (verify with `ip link` on the image).
+      interface: "TODO-NODE-NIC"                 # e.g. ens192
+      # ARP (L2, default) suits a flat lab subnet; BGP needs a peering fabric.
+      mode: ARP
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: VSphereMachineTemplate
+      name: kairos-control-plane-template
+      namespace: default
+  kairosConfigTemplate:
+    name: kairos-config-template-control-plane
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereMachineTemplate
+metadata:
+  name: kairos-control-plane-template
+  namespace: default
+spec:
+  template:
+    spec:
+      # TODO: Configure vSphere VM settings (datacenter, datastore, network,
+      # template, sizing). See the single-node sample for the full field list.
+      # datacenter: "Datacenter"
+      # datastore: "Datastore"
+      # network:
+      #   devices:
+      #     - networkName: "VM Network"
+      # numCPUs: 2
+      # memoryMiB: 4096
+      # diskGiB: 50
+      # template: "kairos-template"
+      # cloneMode: "fullClone"
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      distribution: k0s
+      # Pin a version your Kairos image bundles (informational; see KD-24).
+      kubernetesVersion: "v1.34.1+k0s.1"
+      userName: kairos
+      # Password comes from a Secret (defined at the top of this file).
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+      # Optional: sshPublicKey / githubUser for SSH access.
+---
+# ============================================================================
+# VSphere Credentials Setup (REQUIRED — apply BEFORE the cluster manifest)
+# Identical to the single-node sample; see its comments for details.
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsphere-credentials-secret
+  namespace: capv-system   # MUST be in capv-system (where CAPV runs)
+type: Opaque
+stringData:
+  username: "administrator@vsphere.local"   # TODO: your vSphere username
+  password: "your-vsphere-password"         # TODO: your vSphere password
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereClusterIdentity
+metadata:
+  name: vsphere-credentials
+spec:
+  secretName: vsphere-credentials-secret
+  allowedNamespaces:
+    selector:
+      matchLabels: {}
+# ============================================================================
+# SECURITY / LIMITATIONS (read before running HA in production)
+# ============================================================================
+# - Node-self-reported etcd health is FORGEABLE (KD-51). Each control-plane
+#   node writes its own etcd member health with vanilla RBAC on a shared Secret,
+#   and acks its etcd-leave on a shared workload ConfigMap. A COMPROMISED
+#   control-plane node could forge another member's health (to trick the
+#   quorum-safety guard) or forge its own leave ack (to drop the deletion hook
+#   early). This is NOT privilege escalation — a compromised control-plane node
+#   already holds cluster-admin-equivalent — and the quorum-safety decision is
+#   made independently, BEFORE any node signal, so a forged signal can only make
+#   an already-authorized removal cleaner/earlier, never authorize an unsafe
+#   one. Per-member-scoped signals are tracked future hardening.
+# - A stuck/unreachable k0s node that never acks its leave within ~5 minutes is
+#   deleted anyway (quorum was already proven safe); the etcd member may remain
+#   registered. Watch for the EtcdMemberLeaveTimedOut warning event and, if it
+#   fires, remove the member manually (`k0s etcdctl member remove`).
+# - k3s HA: embedded etcd has no supported clean member-remove, so replacing a
+#   k3s control-plane node leaves an orphaned etcd member requiring manual
+#   cleanup (KD-5d). k0s is the fully-supported HA distribution.
