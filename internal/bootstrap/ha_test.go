@@ -64,6 +64,45 @@ func haCPData(role string, kubevirt bool) TemplateData {
 	return d
 }
 
+// TestHA_CapkK0sControlPlaneEnablesWorker guards the Phase-4 CAPK-HA lab finding
+// (2026-07-02): an HA k0s control-plane node on CAPK MUST render --enable-worker.
+// A controller-only k0s node registers no kubelet/Kubernetes Node, so CAPI never
+// populates Machine.status.nodeRef, and the join gate (init must be joinable) plus
+// the etcd-health reporter/kubeconfig-push all key off that NodeRef — without the
+// flag, an HA CAPK k0s cluster never forms. Single-node is schedulable via --single
+// and must NOT carry --enable-worker. k3s servers are schedulable by default (no
+// --disable-agent), so this is a k0s-only concern.
+func TestHA_CapkK0sControlPlaneEnablesWorker(t *testing.T) {
+	for _, role := range []string{"init", "join"} {
+		out, err := RenderK0sCloudConfig(haCPData(role, true))
+		if err != nil {
+			t.Fatalf("render k0s CAPK %s: %v", role, err)
+		}
+		if !strings.Contains(string(out), "--enable-worker") {
+			t.Errorf("CAPK k0s HA %s node must render --enable-worker so it registers a Node "+
+				"(NodeRef); without it the join gate never opens", role)
+		}
+	}
+
+	// Single-node uses --single (already schedulable) and must not add --enable-worker.
+	single := TemplateData{
+		Role:             "control-plane",
+		ControlPlaneRole: "single",
+		SingleNode:       true,
+		Hostname:         "kairos-cp-0",
+		UserName:         "kairos",
+		UserGroups:       []string{"admin"},
+		IsKubeVirt:       true,
+	}
+	out, err := RenderK0sCloudConfig(single)
+	if err != nil {
+		t.Fatalf("render k0s CAPK single: %v", err)
+	}
+	if strings.Contains(string(out), "--enable-worker") {
+		t.Error("CAPK k0s single-node must not render --enable-worker (schedulable via --single)")
+	}
+}
+
 // TestHA_WorkerIgnoresControlPlaneRole is the render-time half of CPR-INV-1: a
 // worker config carrying controlPlaneRole=init/join must NOT produce any
 // control-plane HA artifact (no --cluster-init, no controller-token, no

@@ -21,6 +21,19 @@ k0s:
     - --config /etc/k0s/k0s.yaml
     # Controller-join: --token-file carries the controller-role join token.
     - --token-file=/etc/k0s/controller-token
+    # ADR 0005 (HA) on CAPK: run the k0s controller as a schedulable worker too so
+    # it registers a Kubernetes Node. CAPI populates Machine.status.nodeRef only
+    # from a registered Node, and BOTH the join gate (init must be joinable before
+    # joiners are created) and the etcd-health reporter/kubeconfig-push key off
+    # that NodeRef. A single-node control plane is schedulable via --single; an HA
+    # control-plane node is otherwise controller-only (no kubelet, no Node), so
+    # without this the NodeRef never appears and the join gate stays closed
+    # forever (Phase-4 CAPK-HA lab finding, 2026-07-02). k0s auto-applies the
+    # node-role.kubernetes.io/control-plane:NoSchedule taint with --enable-worker,
+    # so general workloads stay off. Unlike CAPV/CAPM3 this is NOT about kube-vip
+    # (CAPK uses its built-in LoadBalancer Service, OQ-5) — it is purely the
+    # infra-agnostic NodeRef requirement.
+    - --enable-worker
 
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml
