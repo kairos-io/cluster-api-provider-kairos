@@ -120,6 +120,14 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
+// CAPI v1beta2 contract-versioned refs (ADR 0006): resolving a
+// ContractVersionedObjectReference to a served apiVersion goes through
+// external.GetObjectFromContractVersionedRef -> contract.GetGKMetadata, which
+// Gets the target resource's CustomResourceDefinition to read its contract
+// label. Every infra read (node-IP, providerID, CAPK kubeconfig) now needs this;
+// without it those Gets fail Forbidden. Read-only, cluster-scoped (CRDs are), no
+// write — matches upstream CAPI's own role.
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=services;endpoints,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // Secrets: the KCP controller reads the workload kubeconfig Secret (KD-3b node
