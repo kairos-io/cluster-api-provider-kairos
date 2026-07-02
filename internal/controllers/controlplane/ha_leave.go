@@ -176,6 +176,7 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	}
 
 	nodeName := target.Status.NodeRef.Name
+	_, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]
 
 	// Build the workload client on demand. Build error is fail-safe: hook retained.
 	factory := r.WorkloadClientFactory
@@ -186,70 +187,85 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	if err != nil {
 		return false, fmt.Errorf("etcd-leave: build workload client: %w", err)
 	}
-
-	cm := &corev1.ConfigMap{}
 	cmKey := types.NamespacedName{Namespace: etcdLeaveConfigMapNamespace, Name: etcdLeaveConfigMapName}
+
+	// (3) First entry for THIS eviction cycle (no timestamp stamped yet). FORCE the
+	// leave-requested sentinel, overwriting any STALE `left` a prior eviction of a
+	// same-named Machine left behind: Machine indices/names are reused, and the
+	// workload ConfigMap key == the Node name, so a previous cycle's ack can linger
+	// and would otherwise short-circuit this eviction into removing the hook
+	// without the (new) member ever leaving etcd → orphan. The force-write MUST
+	// precede the timestamp stamp, so a stamp failure re-forces (clears the stale
+	// ack) next reconcile rather than leaving a stale `left` visible once
+	// requested==true. Terminal checks are deliberately NOT evaluated on this pass.
+	if !requested {
+		if err := r.ensureLeaveRequested(ctx, wc, cmKey, nodeName, true /*force*/); err != nil {
+			return false, err
+		}
+		if err := r.stampLeaveRequestedAt(ctx, target); err != nil {
+			return false, err
+		}
+		log.Info("etcd-leave: leave-requested written; awaiting node ack", "machine", target.Name, "node", nodeName)
+		return false, nil
+	}
+
+	// (4) This cycle has requested a leave — terminal checks below are now valid for
+	// THIS cycle (a `left` seen here was written by the node in response to our
+	// request, not a stale prior ack).
+	cm := &corev1.ConfigMap{}
 	if err := wc.Get(ctx, cmKey, cm); err != nil && !apierrors.IsNotFound(err) {
 		// Read error is fail-safe: hook retained, requeue.
 		return false, fmt.Errorf("etcd-leave: read workload ConfigMap %s: %w", cmKey, err)
 	}
-
-	// (3) Node acked the leave — unambiguous terminal, checked before anything
-	// that depends on prior state.
+	// Node acked the leave → done.
 	if cm.Data[nodeName] == etcdLeftValue {
 		log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName)
 		return true, r.removeEtcdLeaveHook(ctx, target)
 	}
-
-	// (4) Terminal checks that only apply once we have actually asked the node to
-	// leave. Gating on the stamped timestamp prevents a premature skip for a member
-	// that simply has not reported etcd-status yet (the guard already fails closed
-	// pre-delete for a live unreported member, so this is belt-and-braces).
-	if _, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]; requested {
-		// Member gone from node-reported etcd-status → treat as left. Best-effort:
-		// a read error leaves the member "present" so we keep waiting, never skip.
-		if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
-			if _, present := status[nodeName]; !present {
-				log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
-				return true, r.removeEtcdLeaveHook(ctx, target)
-			}
+	// Member gone from node-reported etcd-status → treat as left. Best-effort: a
+	// read error leaves the member "present" so we keep waiting, never skip.
+	if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
+		if _, present := status[nodeName]; !present {
+			log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
+			return true, r.removeEtcdLeaveHook(ctx, target)
 		}
-		// Timeout backstop: an unreachable/stuck node must not wedge deletion.
-		if requestedAt, perr := time.Parse(time.RFC3339, target.Annotations[etcdLeaveRequestedAtAnnotation]); perr == nil {
-			if time.Since(requestedAt) > memberLeaveTimeout {
-				log.Info("etcd-leave: timed out waiting for node ack; removing hook (etcd member may be orphaned)",
-					"machine", target.Name, "node", nodeName, "timeout", memberLeaveTimeout)
-				if r.Recorder != nil {
-					r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
-						"Control-plane node %q did not leave etcd within %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout)
-				}
-				return true, r.removeEtcdLeaveHook(ctx, target)
+	}
+	// Timeout backstop: an unreachable/stuck node must not wedge deletion.
+	if requestedAt, perr := time.Parse(time.RFC3339, target.Annotations[etcdLeaveRequestedAtAnnotation]); perr == nil {
+		if time.Since(requestedAt) > memberLeaveTimeout {
+			log.Info("etcd-leave: timed out waiting for node ack; removing hook (etcd member may be orphaned)",
+				"machine", target.Name, "node", nodeName, "timeout", memberLeaveTimeout)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
+					"Control-plane node %q did not leave etcd within %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout)
 			}
+			return true, r.removeEtcdLeaveHook(ctx, target)
 		}
 	}
 
-	// (5) Ask the node to leave and record when we first asked, then wait.
-	if err := r.ensureLeaveRequested(ctx, wc, cmKey, nodeName); err != nil {
+	// (5) Still waiting: keep the sentinel present (preserving a just-written `left`
+	// against a racy overwrite), then requeue.
+	if err := r.ensureLeaveRequested(ctx, wc, cmKey, nodeName, false); err != nil {
 		return false, err
 	}
-	if err := r.stampLeaveRequestedAt(ctx, target); err != nil {
-		return false, err
-	}
-	log.Info("etcd-leave: leave-requested written; awaiting node ack", "machine", target.Name, "node", nodeName)
+	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName)
 	return false, nil
 }
 
 // ensureLeaveRequested upserts the workload-cluster ConfigMap and sets this
-// member's key to the leave-requested sentinel. It never clobbers an existing
-// `left` ack (a racy reconcile must not un-ack a node that already left).
-func (r *KairosControlPlaneReconciler) ensureLeaveRequested(ctx context.Context, wc client.Client, cmKey types.NamespacedName, nodeName string) error {
+// member's key to the leave-requested sentinel. When force is false it never
+// clobbers an existing `left` ack (a racy reconcile within a cycle must not
+// un-ack a node that already left). When force is true (the first entry of an
+// eviction cycle) it overwrites any value, including a STALE `left` left behind
+// by a prior eviction of a same-named Machine.
+func (r *KairosControlPlaneReconciler) ensureLeaveRequested(ctx context.Context, wc client.Client, cmKey types.NamespacedName, nodeName string, force bool) error {
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmKey.Name, Namespace: cmKey.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, wc, cm, func() error {
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
-		if cm.Data[nodeName] == etcdLeftValue {
-			return nil // already left; keep the ack
+		if !force && cm.Data[nodeName] == etcdLeftValue {
+			return nil // already left this cycle; keep the ack
 		}
 		cm.Data[nodeName] = etcdLeaveRequestedValue
 		return nil

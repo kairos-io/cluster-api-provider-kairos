@@ -370,6 +370,38 @@ func TestWarnIfK3sEtcdLimitation(t *testing.T) {
 	}
 }
 
+// TestReconcileMemberLeave_StaleLeftDoesNotShortCircuit: a fresh eviction (no
+// requested-at annotation) of a Machine whose workload ConfigMap key still holds
+// a STALE `left` from a prior eviction of a same-named Machine must NOT
+// short-circuit. It must force-rewrite leave-requested (clearing the stale ack),
+// stamp the timestamp, and wait — otherwise the new member would be deleted
+// without ever leaving etcd (orphan). Regression for the lab-found bug.
+func TestReconcileMemberLeave_StaleLeftDoesNotShortCircuit(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+	// Fresh Machine: hook present, NO requested-at annotation.
+	target := hookedMachine("cp-0", "cp-0", nil)
+	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
+	// Workload ConfigMap carries a STALE `left` for cp-0 from a prior cycle.
+	wc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeftValue})).Build()
+
+	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), target)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(done).To(BeFalse(), "stale `left` must not complete the leave; a real leave must be requested")
+
+	// The stale `left` must have been overwritten with leave-requested.
+	cm := &corev1.ConfigMap{}
+	g.Expect(wc.Get(context.Background(), types.NamespacedName{Name: etcdLeaveConfigMapName, Namespace: etcdLeaveConfigMapNamespace}, cm)).To(Succeed())
+	g.Expect(cm.Data).To(HaveKeyWithValue("cp-0", etcdLeaveRequestedValue), "stale left must be overwritten")
+
+	// Timestamp stamped, hook retained.
+	got := &clusterv1.Machine{}
+	g.Expect(mgmt.Get(context.Background(), types.NamespacedName{Name: "cp-0", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Annotations).To(HaveKey(etcdLeaveRequestedAtAnnotation))
+	g.Expect(hasEtcdLeaveHook(got)).To(BeTrue())
+}
+
 // staticWorkloadClient returns a factory that always yields the given client.
 func staticWorkloadClient(wc client.Client) func(context.Context, *clusterv1.Cluster) (client.Client, error) {
 	return func(context.Context, *clusterv1.Cluster) (client.Client, error) { return wc, nil }
