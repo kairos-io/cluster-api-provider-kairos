@@ -269,9 +269,18 @@ write_files:
       # complement-translate, or it becomes a spurious trailing '-' that no
       # longer matches NodeRef.Name.
       member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
-      # Read our own leave signal from the workload ConfigMap via the LOCAL admin
-      # kubeconfig (k0s kubectl). Absent ConfigMap/key => empty => no-op exit.
-      val=$(k0s kubectl -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
+      # Target the control-plane VIP, NOT this node's local apiserver: `k0s etcd
+      # leave` (below) drops THIS node's local apiserver (it loses its etcd
+      # backend), so a localhost read/ack would fail post-leave and never retry.
+      # The VIP is always fronted by a surviving node, so both the sentinel read
+      # and the `left` ack keep working across the timer's poll cycles until the
+      # ack lands. VIP.Address is render-validated (VIP-INV-3) + shquoted
+      # (VIP-INV-1); it is a --server flag value, never eval'd.
+      vip_addr='192.168.1.240'
+      srv=(--server="https://${vip_addr}:6443")
+      # Read our own leave signal from the workload ConfigMap via the VIP.
+      # Absent ConfigMap/key => empty => no-op exit.
+      val=$(k0s kubectl "${srv[@]}" -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
       # Fixed sentinel, string-equality only — never eval'd, never a command arg.
       [ "${val}" = "leave-requested" ] || exit 0
       echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
@@ -283,9 +292,10 @@ write_files:
       else
         echo "etcd-leave: k0s etcd leave returned non-zero (already left?); acking anyway"
       fi
-      # Ack by patching our own key to `left`. Only member_key (locally
-      # sanitized) is interpolated; the read-back value is never reused.
-      k0s kubectl -n kube-system patch configmap kairos-etcd-leave --type merge \
+      # Ack by patching our own key to `left` via the VIP (the local apiserver is
+      # gone now). Only member_key (locally sanitized) is interpolated; the
+      # read-back value is never reused.
+      k0s kubectl "${srv[@]}" -n kube-system patch configmap kairos-etcd-leave --type merge \
         -p "{\"data\":{\"${member_key}\":\"left\"}}" 2>/dev/null || true
   - path: /etc/systemd/system/kairos-etcd-leave.service
     permissions: "0644"
