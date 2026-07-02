@@ -149,8 +149,11 @@ func main() {
 	}
 
 	if err = (&controlplane.KairosControlPlaneReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("kairoscontrolplane-controller"),
+		// WorkloadClientFactory left nil → defaultWorkloadClient (builds a client
+		// from the <cluster>-kubeconfig Secret) for the etcd-leave handshake.
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KairosControlPlane")
 		os.Exit(1)

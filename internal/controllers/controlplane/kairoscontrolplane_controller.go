@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -55,7 +56,15 @@ import (
 // KairosControlPlaneReconciler reconciles a KairosControlPlane object
 type KairosControlPlaneReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+
+	// WorkloadClientFactory builds a client for the workload cluster from its
+	// `<cluster>-kubeconfig` Secret. It backs the etcd-leave handshake (ADR 0005
+	// §E.3), which must reach the workload apiserver. nil → defaultWorkloadClient;
+	// tests inject a fake. Kept as a struct field (not a hard dependency on
+	// remote.NewClusterClient) so unit tests need no live workload cluster.
+	WorkloadClientFactory func(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error)
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
@@ -476,6 +485,28 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	log.Info("Reconciling control plane machines", "desired", desiredReplicas, "current", currentReplicas)
 
+	// HA (ADR 0005 §E.3): before any scale/rollout math, progress the etcd-leave
+	// pre-terminate handshake for every owned control-plane Machine that is
+	// terminating and still carries our hook. This single sweep covers the
+	// controller's own quorum-approved deletes below, operator/MHC-initiated
+	// Machine deletes, and crash recovery — the hook keeps CAPI paused (after
+	// drain, node still up) until the member has cleanly left etcd. A workload
+	// client/read error keeps the hook set (fail-safe: the delete stays blocked
+	// and quorum is preserved) and requeues; an in-progress leave requeues so we
+	// do not churn other machines while a member is draining out of etcd.
+	for _, m := range machines {
+		if m.DeletionTimestamp.IsZero() || !hasEtcdLeaveHook(m) {
+			continue
+		}
+		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, m)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile etcd member leave for %s: %w", m.Name, err)
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+		}
+	}
+
 	// HA: ensure the per-cluster join-token Secret exists before any joiner is
 	// created (ADR 0005 Phase 3). For k3s the controller generates the shared
 	// server token up front; for k0s the Secret is created empty and the init
@@ -531,6 +562,10 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 				log.Info("Holding back outdated-machine rollout — etcd quorum would break", "machine", target.Name, "reason", reason)
 				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 			}
+			// k3s embedded etcd has no supported member-remove (KD-5d); warn that
+			// the member will linger. For k0s the sweep above drives a clean
+			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
+			r.warnIfK3sEtcdLimitation(kcp, target)
 			log.Info("Deleting outdated control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
@@ -577,6 +612,10 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 				log.Info("Holding back control-plane scale-down — etcd quorum would break", "machine", target.Name, "reason", reason)
 				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 			}
+			// k3s embedded etcd has no supported member-remove (KD-5d); warn that
+			// the member will linger. For k0s the sweep above drives a clean
+			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
+			r.warnIfK3sEtcdLimitation(kcp, target)
 			log.Info("Scaling down control plane machine", "machine", target.Name)
 			if err := r.Delete(ctx, target); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to delete control plane machine: %w", err)
@@ -673,10 +712,7 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
 	// Create KairosConfig
-	distribution := kcp.Spec.Distribution
-	if distribution == "" {
-		distribution = "k0s"
-	}
+	distribution := distributionOf(kcp)
 	kairosConfig := &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%d", kcp.Name, index),
@@ -765,6 +801,19 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 				Namespace:  infraMachine.GetNamespace(),
 			},
 		},
+	}
+
+	// HA (ADR 0005 §E.3): stamp the etcd-leave pre-terminate hook on k0s HA
+	// control-plane Machines so CAPI pauses termination after drain (node still
+	// up) until the controller has driven a clean `k0s etcd leave`. Only k0s
+	// init/join are hooked — single-node has no etcd cluster and k3s has no
+	// supported member-remove (KD-5d). The empty annotation value is the CAPI
+	// convention for a hook awaiting external completion.
+	if shouldStampEtcdLeaveHook(kcp, role) {
+		if machine.Annotations == nil {
+			machine.Annotations = map[string]string{}
+		}
+		machine.Annotations[etcdLeaveHookAnnotation()] = ""
 	}
 
 	return r.Create(ctx, machine)
@@ -1607,6 +1656,16 @@ func (r *KairosControlPlaneReconciler) triggerClusterReconciliation(ctx context.
 // bypass the deferred Patch -- this path has already finalized the object
 // via a bare r.Update and a follow-up Patch would race with apiserver GC.
 func (r *KairosControlPlaneReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane) (ctrl.Result, bool, error) {
+	// ADR 0005 §E.3 (LOAD-BEARING): strip the etcd-leave pre-terminate hook from
+	// every owned Machine BEFORE draining. The hook pauses CAPI termination, and
+	// only the non-delete-path sweep (reconcileMachines) removes it during normal
+	// operation — so on whole-cluster teardown it would deadlock the drain.
+	// Teardown discards etcd wholesale, so no per-member leave is needed.
+	if err := stripEtcdLeaveHooks(ctx, r.Client, kcp); err != nil {
+		log.Error(err, "Failed to strip etcd-leave pre-terminate hooks during teardown",
+			"kcp", kcp.Name, "namespace", kcp.Namespace, "uid", kcp.UID)
+		return ctrl.Result{}, false, err
+	}
 	remaining, err := drainOwnedMachines(ctx, r.Client, kcp)
 	if err != nil {
 		log.Error(err, "Failed to drain owned Machines",
