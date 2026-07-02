@@ -26,8 +26,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -187,7 +187,7 @@ func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 	conditions.MarkTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition)
 	init := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "default"},
-		Status:     clusterv1.MachineStatus{NodeRef: &corev1.ObjectReference{Name: "cp-0"}},
+		Status:     clusterv1.MachineStatus{NodeRef: clusterv1.MachineNodeReference{Name: "cp-0"}},
 	}
 	jt := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: joinTokenSecretName("c"), Namespace: "default"},
@@ -223,7 +223,7 @@ func TestCanRemoveMember(t *testing.T) {
 		m := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
 		m.Status.Phase = phase
 		if node != "" {
-			m.Status.NodeRef = &corev1.ObjectReference{Name: node}
+			m.Status.NodeRef = clusterv1.MachineNodeReference{Name: node}
 		}
 		return m
 	}

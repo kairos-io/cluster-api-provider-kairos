@@ -17,16 +17,15 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
 	"regexp"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -34,18 +33,28 @@ import (
 var kairosconfigLog = logf.Log.WithName("kairosconfig-resource")
 
 // SetupWebhookWithManager sets up the webhook with the Manager.
+//
+// controller-runtime v0.23 removed the zero-arg self-webhook interfaces
+// (webhook.Defaulter/Validator); defaulting and validation are now provided by
+// separate typed admission.Defaulter[T]/Validator[T] implementations registered
+// on the generic builder. The logic below is unchanged from the previous
+// self-implementing form — only the plumbing moved (ADR 0006).
 func (r *KairosConfig) SetupWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(r).
+	return ctrl.NewWebhookManagedBy(mgr, &KairosConfig{}).
+		WithDefaulter(&kairosConfigDefaulter{}).
+		WithValidator(&kairosConfigValidator{}).
 		Complete()
 }
 
 //+kubebuilder:webhook:path=/mutate-bootstrap-cluster-x-k8s-io-v1beta2-kairosconfig,mutating=true,failurePolicy=fail,sideEffects=None,groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs,verbs=create;update,versions=v1beta2,name=mkairosconfig.kb.io,admissionReviewVersions=v1
 
-var _ webhook.Defaulter = &KairosConfig{}
+// kairosConfigDefaulter applies static/conditional defaults to a KairosConfig.
+type kairosConfigDefaulter struct{}
 
-// Default implements webhook.Defaulter so a webhook will be registered for the type
-func (r *KairosConfig) Default() {
+var _ admission.Defaulter[*KairosConfig] = &kairosConfigDefaulter{}
+
+// Default implements admission.Defaulter[*KairosConfig].
+func (*kairosConfigDefaulter) Default(_ context.Context, r *KairosConfig) error {
 	kairosconfigLog.Info("default", "name", r.Name)
 
 	// Set defaults for user configuration. UserPassword is no longer defaulted
@@ -69,26 +78,30 @@ func (r *KairosConfig) Default() {
 	if r.Spec.Role == "" {
 		r.Spec.Role = "worker"
 	}
+	return nil
 }
 
 //+kubebuilder:webhook:path=/validate-bootstrap-cluster-x-k8s-io-v1beta2-kairosconfig,mutating=false,failurePolicy=fail,sideEffects=None,groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs,verbs=create;update,versions=v1beta2,name=vkairosconfig.kb.io,admissionReviewVersions=v1
 
-var _ webhook.Validator = &KairosConfig{}
+// kairosConfigValidator validates a KairosConfig on create/update.
+type kairosConfigValidator struct{}
 
-// ValidateCreate implements webhook.Validator so a webhook will be registered for the type
-func (r *KairosConfig) ValidateCreate() (admission.Warnings, error) {
+var _ admission.Validator[*KairosConfig] = &kairosConfigValidator{}
+
+// ValidateCreate implements admission.Validator[*KairosConfig].
+func (*kairosConfigValidator) ValidateCreate(_ context.Context, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate create", "name", r.Name)
 	return nil, r.validate()
 }
 
-// ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *KairosConfig) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+// ValidateUpdate implements admission.Validator[*KairosConfig].
+func (*kairosConfigValidator) ValidateUpdate(_ context.Context, _, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate update", "name", r.Name)
 	return nil, r.validate()
 }
 
-// ValidateDelete implements webhook.Validator so a webhook will be registered for the type
-func (r *KairosConfig) ValidateDelete() (admission.Warnings, error) {
+// ValidateDelete implements admission.Validator[*KairosConfig].
+func (*kairosConfigValidator) ValidateDelete(_ context.Context, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate delete", "name", r.Name)
 	return nil, nil
 }

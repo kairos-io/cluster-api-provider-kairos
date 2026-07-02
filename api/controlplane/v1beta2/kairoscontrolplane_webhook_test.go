@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -151,7 +152,9 @@ func TestKairosControlPlane_Default_PreservesReplicas(t *testing.T) {
 	for _, in := range []*int32{ptr(int32(0)), ptr(int32(1)), ptr(int32(7))} {
 		kcp := newValidKCP()
 		kcp.Spec.Replicas = in
-		kcp.Default()
+		if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+			t.Fatalf("Default() returned error: %v", err)
+		}
 		if kcp.Spec.Replicas == nil || *kcp.Spec.Replicas != *in {
 			t.Errorf("Default() changed explicit replicas %d to %v; expected unchanged", *in, kcp.Spec.Replicas)
 		}
@@ -163,7 +166,9 @@ func TestKairosControlPlane_Default_PreservesReplicas(t *testing.T) {
 func TestKairosControlPlane_Default_FillsNilReplicas(t *testing.T) {
 	kcp := newValidKCP()
 	kcp.Spec.Replicas = nil
-	kcp.Default()
+	if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
 	if kcp.Spec.Replicas == nil {
 		t.Fatal("Default() left Spec.Replicas nil; expected it to be set to 1")
 	}
@@ -420,7 +425,9 @@ func TestKairosControlPlane_Default_SSHFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			kcp := newValidKCP()
 			kcp.Spec.SSHFallback = tc.in
-			kcp.Default()
+			if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+				t.Fatalf("Default() returned error: %v", err)
+			}
 			if tc.in == nil {
 				if kcp.Spec.SSHFallback != nil {
 					t.Fatalf("nil block became non-nil after Default(); want nil, got %+v", kcp.Spec.SSHFallback)

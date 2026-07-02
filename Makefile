@@ -73,7 +73,7 @@ test-envtest: ## Run envtest-based integration tests.
 	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 	@echo "Downloading CAPI CRDs..."
 	@mkdir -p test/crd/capi
-	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.8.0/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
+	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
 		(echo "Warning: Failed to download CAPI CRDs. Tests may fail." && rm -f test/crd/capi/cluster-api-components.yaml)
 	@echo "Setting up kubebuilder tools..."
 	@export PATH=$$(go env GOPATH)/bin:$$PATH && \
@@ -185,7 +185,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
-CONTROLLER_TOOLS_VERSION ?= v0.17.0
+CONTROLLER_TOOLS_VERSION ?= v0.19.0
 GOLANGCI_LINT_VERSION ?= v1.60.0
 
 .PHONY: controller-gen

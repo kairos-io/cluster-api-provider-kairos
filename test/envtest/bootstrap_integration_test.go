@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"os"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -112,10 +112,10 @@ func TestBootstrapIntegration(t *testing.T) {
 			Namespace: "test-namespace",
 		},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "DockerCluster",
-				Name:       "test-cluster",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     "test-cluster",
 			},
 		},
 	}
@@ -133,11 +133,10 @@ func TestBootstrapIntegration(t *testing.T) {
 		Spec: clusterv1.MachineSpec{
 			ClusterName: "test-cluster",
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       "test-kairos-config",
-					Namespace:  "test-namespace",
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     "test-kairos-config",
 				},
 			},
 		},
@@ -328,10 +327,10 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "DockerCluster",
-				Name:       clusterName,
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     clusterName,
 			},
 		},
 	}
@@ -346,11 +345,10 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       kcName,
-					Namespace:  nsName,
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     kcName,
 				},
 			},
 		},

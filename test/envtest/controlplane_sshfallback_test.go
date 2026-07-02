@@ -25,8 +25,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
 )
@@ -58,11 +58,10 @@ func TestSSHFallback_DisabledStaysSilent(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns.Name},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       clusterName + "-kcp",
-				Namespace:  ns.Name,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     clusterName + "-kcp",
 			},
 		},
 	}
@@ -150,11 +149,10 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns.Name},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       clusterName + "-kcp",
-				Namespace:  ns.Name,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     clusterName + "-kcp",
 			},
 		},
 	}
@@ -216,7 +214,7 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
 			Bootstrap:   clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			Version:     "v1.30.0+k0s.0",
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())
@@ -292,11 +290,10 @@ func TestSSHFallback_AnnotationDrivesReason(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns.Name},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       clusterName + "-kcp",
-				Namespace:  ns.Name,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     clusterName + "-kcp",
 			},
 		},
 	}
@@ -352,7 +349,7 @@ func TestSSHFallback_AnnotationDrivesReason(t *testing.T) {
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
 			Bootstrap:   clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			Version:     "v1.30.0+k0s.0",
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())

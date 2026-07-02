@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -232,7 +233,9 @@ func TestKairosControlPlaneTemplate_Default_FillsDefaults(t *testing.T) {
 		// User/Port/ActivateAfter empty — defaulter should fill them.
 	}
 
-	tmpl.Default()
+	if err := (&kairosControlPlaneTemplateDefaulter{}).Default(context.Background(), tmpl); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
 
 	if tmpl.Spec.Template.Spec.Replicas == nil || *tmpl.Spec.Template.Spec.Replicas != 1 {
 		t.Errorf("Replicas not defaulted to 1: %v", tmpl.Spec.Template.Spec.Replicas)
@@ -255,7 +258,9 @@ func TestKairosControlPlaneTemplate_Default_FillsDefaults(t *testing.T) {
 func TestKairosControlPlaneTemplate_Default_NilSSHFallbackStaysNil(t *testing.T) {
 	tmpl := newValidKCPTemplate()
 	tmpl.Spec.Template.Spec.SSHFallback = nil
-	tmpl.Default()
+	if err := (&kairosControlPlaneTemplateDefaulter{}).Default(context.Background(), tmpl); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
 	if tmpl.Spec.Template.Spec.SSHFallback != nil {
 		t.Errorf("nil SSHFallback became non-nil after Default(); got %+v", tmpl.Spec.Template.Spec.SSHFallback)
 	}

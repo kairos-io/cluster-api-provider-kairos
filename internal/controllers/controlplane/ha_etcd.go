@@ -26,7 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -173,7 +173,7 @@ func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp 
 	// Running is presumed dead/failed, is not a healthy voting member, and cannot
 	// reduce the healthy-voting count — allow. This is the primary replacement
 	// case for an unreachable node.
-	if target.Status.NodeRef == nil || target.Status.Phase != string(clusterv1.MachinePhaseRunning) {
+	if !target.Status.NodeRef.IsDefined() || target.Status.Phase != string(clusterv1.MachinePhaseRunning) {
 		return true, "", nil
 	}
 	// The target is a live, Running control-plane node. Prove that removing it

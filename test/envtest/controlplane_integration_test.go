@@ -30,7 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -127,16 +127,15 @@ func TestControlPlaneIntegration(t *testing.T) {
 			Namespace: "test-namespace",
 		},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "DockerCluster",
-				Name:       "test-cluster",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     "test-cluster",
 			},
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       "test-kcp",
-				Namespace:  "test-namespace",
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     "test-kcp",
 			},
 		},
 	}
@@ -326,11 +325,10 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       kcpName,
-				Namespace:  nsName,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     kcpName,
 			},
 		},
 	}
@@ -390,7 +388,7 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			Version:     "v1.30.0+k0s.0",
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())
@@ -443,11 +441,10 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       kcpName,
-				Namespace:  nsName,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     kcpName,
 			},
 		},
 	}
@@ -508,7 +505,7 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			Version:     "v1.30.0+k0s.0",
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())

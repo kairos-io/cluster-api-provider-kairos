@@ -36,9 +36,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -424,40 +424,29 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 		return nil, fmt.Errorf("failed to list clusters: %w", err)
 	}
 
-	// Find the Cluster that references this KairosControlPlane
+	// Find the Cluster that references this KairosControlPlane.
+	//
+	// In v1beta2 the ControlPlaneRef is a ContractVersionedObjectReference: it
+	// carries only APIGroup/Kind/Name (no namespace — refs are same-namespace,
+	// and the List above is already scoped to kcp.Namespace; no version — the
+	// contract resolves it). Match on group+kind+name.
+	expectedGroup := controlplanev1beta2.GroupVersion.Group
 	for i := range clusters.Items {
 		cluster := &clusters.Items[i]
-		if cluster.Spec.ControlPlaneRef != nil &&
-			cluster.Spec.ControlPlaneRef.Kind == "KairosControlPlane" &&
-			cluster.Spec.ControlPlaneRef.Name == kcp.Name {
-			// Check namespace - it might be empty (defaults to cluster namespace)
-			refNamespace := cluster.Spec.ControlPlaneRef.Namespace
-			if refNamespace == "" || refNamespace == kcp.Namespace {
-				// Check API version/group matches
-				// In v1beta2, ControlPlaneRef uses apiGroup in YAML, but Go type uses APIVersion
-				// When apiGroup is set, APIVersion may be empty or contain the full version string
-				refAPIVersion := cluster.Spec.ControlPlaneRef.APIVersion
-				expectedGroup := controlplanev1beta2.GroupVersion.Group
-				expectedVersion := controlplanev1beta2.GroupVersion.String()
-
-				// Match if:
-				// 1. APIVersion is empty (v1beta2 using apiGroup - we trust the kind match)
-				// 2. APIVersion matches expected version (v1beta1 style or v1beta2 with full version)
-				// 3. APIVersion contains the expected group (handles partial matches)
-				if refAPIVersion == "" {
-					// Empty APIVersion means apiGroup is being used - trust the kind match
-					log.Info("Found Cluster with matching ControlPlaneRef (apiGroup)", "cluster", cluster.Name, "kind", cluster.Spec.ControlPlaneRef.Kind)
-					return cluster, nil
-				}
-				if refAPIVersion == expectedVersion {
-					return cluster, nil
-				}
-				if len(refAPIVersion) > 0 && len(expectedGroup) > 0 && len(refAPIVersion) >= len(expectedGroup) && refAPIVersion[:len(expectedGroup)] == expectedGroup {
-					return cluster, nil
-				}
-				log.Info("Cluster ControlPlaneRef APIVersion doesn't match", "cluster", cluster.Name, "refAPIVersion", refAPIVersion, "expectedVersion", expectedVersion, "expectedGroup", expectedGroup)
-			}
+		ref := cluster.Spec.ControlPlaneRef
+		if !ref.IsDefined() ||
+			ref.Kind != "KairosControlPlane" ||
+			ref.Name != kcp.Name {
+			continue
 		}
+		// An empty APIGroup is tolerated (older manifests that relied on the
+		// kind match); otherwise it must be our control-plane group.
+		if ref.APIGroup != "" && ref.APIGroup != expectedGroup {
+			log.Info("Cluster ControlPlaneRef APIGroup doesn't match", "cluster", cluster.Name, "refAPIGroup", ref.APIGroup, "expectedGroup", expectedGroup)
+			continue
+		}
+		log.Info("Found Cluster with matching ControlPlaneRef", "cluster", cluster.Name, "kind", ref.Kind)
+		return cluster, nil
 	}
 
 	return nil, nil
@@ -533,7 +522,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	updatedReadyReplicas := int32(0)
 	for _, machine := range machines {
 		if r.machineMatchesVersion(machine, kcp.Spec.Version) {
-			if machine.Status.NodeRef != nil {
+			if machine.Status.NodeRef.IsDefined() {
 				updatedReadyReplicas++
 			}
 			continue
@@ -665,7 +654,7 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 		return false, "init machine not created yet", nil
 	}
 	init := machines[0] // oldest-first sorted by caller
-	if init.Status.NodeRef == nil {
+	if !init.Status.NodeRef.IsDefined() {
 		return false, "init machine has no NodeRef yet", nil
 	}
 	if !conditions.IsTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition) {
@@ -789,20 +778,18 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: cluster.Name,
-			Version:     &kcp.Spec.Version,
+			Version:     kcp.Spec.Version,
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       kairosConfig.Name,
-					Namespace:  kairosConfig.Namespace,
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     kairosConfig.Name,
 				},
 			},
-			InfrastructureRef: corev1.ObjectReference{
-				APIVersion: infraMachine.GetObjectKind().GroupVersionKind().GroupVersion().String(),
-				Kind:       infraMachine.GetObjectKind().GroupVersionKind().Kind,
-				Name:       infraMachine.GetName(),
-				Namespace:  infraMachine.GetNamespace(),
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: infraMachine.GetObjectKind().GroupVersionKind().Group,
+				Kind:     infraMachine.GetObjectKind().GroupVersionKind().Kind,
+				Name:     infraMachine.GetName(),
 			},
 		},
 	}
@@ -906,10 +893,10 @@ func (r *KairosControlPlaneReconciler) getControlPlaneMachines(ctx context.Conte
 }
 
 func (r *KairosControlPlaneReconciler) machineMatchesVersion(machine *clusterv1.Machine, desiredVersion string) bool {
-	if machine.Spec.Version == nil {
+	if machine.Spec.Version == "" {
 		return false
 	}
-	return *machine.Spec.Version == desiredVersion
+	return machine.Spec.Version == desiredVersion
 }
 
 func (r *KairosControlPlaneReconciler) nextMachineIndex(machines []*clusterv1.Machine, kcpName string) int32 {
@@ -1021,17 +1008,17 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	availableReplicas := int32(0)
 	for _, machine := range machines {
 		// Check if machine is ready (has NodeRef)
-		if machine.Status.NodeRef != nil {
+		if machine.Status.NodeRef.IsDefined() {
 			readyReplicas++
 		}
 
 		// Check if machine is updated (matches desired version)
-		if machine.Spec.Version != nil && *machine.Spec.Version == kcp.Spec.Version {
+		if machine.Spec.Version != "" && machine.Spec.Version == kcp.Spec.Version {
 			updatedReplicas++
 		}
 
 		// Available = ready (NodeRef set), Running phase, and not being deleted.
-		if machine.Status.NodeRef != nil &&
+		if machine.Status.NodeRef.IsDefined() &&
 			machine.Status.Phase == string(clusterv1.MachinePhaseRunning) &&
 			machine.DeletionTimestamp.IsZero() {
 			availableReplicas++
@@ -1780,31 +1767,26 @@ func (r *KairosControlPlaneReconciler) clusterToKairosControlPlane(ctx context.C
 		return nil
 	}
 
-	if cluster.Spec.ControlPlaneRef == nil {
+	ref := cluster.Spec.ControlPlaneRef
+	if !ref.IsDefined() {
 		return nil
 	}
 
-	if cluster.Spec.ControlPlaneRef.Kind != "KairosControlPlane" {
+	if ref.Kind != "KairosControlPlane" {
 		return nil
 	}
 
-	// Check API version/group matches
-	// In v1beta2, ControlPlaneRef uses apiGroup in YAML, but Go type uses APIVersion
-	refAPIVersion := cluster.Spec.ControlPlaneRef.APIVersion
-	expectedGroup := controlplanev1beta2.GroupVersion.Group
-	expectedVersion := controlplanev1beta2.GroupVersion.String()
-
-	// Match if APIVersion is empty (v1beta2 using apiGroup), matches expected version, or contains expected group
-	if refAPIVersion != "" &&
-		refAPIVersion != expectedVersion &&
-		!(len(refAPIVersion) > 0 && len(expectedGroup) > 0 && refAPIVersion[:len(expectedGroup)] == expectedGroup) {
+	// In v1beta2 ControlPlaneRef carries only APIGroup (no version). Match on
+	// the group; tolerate an empty APIGroup for older manifests that leaned on
+	// the kind match alone.
+	if ref.APIGroup != "" && ref.APIGroup != controlplanev1beta2.GroupVersion.Group {
 		return nil
 	}
 
 	return []reconcile.Request{
 		{
 			NamespacedName: types.NamespacedName{
-				Name:      cluster.Spec.ControlPlaneRef.Name,
+				Name:      ref.Name,
 				Namespace: cluster.Namespace,
 			},
 		},
@@ -1833,7 +1815,7 @@ func (r *KairosControlPlaneReconciler) secretToKairosControlPlane(ctx context.Co
 		return nil
 	}
 
-	if cluster.Spec.ControlPlaneRef == nil || cluster.Spec.ControlPlaneRef.Kind != "KairosControlPlane" {
+	if !cluster.Spec.ControlPlaneRef.IsDefined() || cluster.Spec.ControlPlaneRef.Kind != "KairosControlPlane" {
 		return nil
 	}
 

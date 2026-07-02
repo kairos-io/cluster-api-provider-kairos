@@ -23,14 +23,15 @@ import (
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -250,6 +251,7 @@ func TestGetNodeIP_KubevirtVMIFallback(t *testing.T) {
 	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(apiextensionsv1.AddToScheme(scheme)).To(Succeed())
 
 	kubevirtMachine := &unstructured.Unstructured{}
 	kubevirtMachine.SetGroupVersionKind(schema.GroupVersionKind{
@@ -259,6 +261,11 @@ func TestGetNodeIP_KubevirtVMIFallback(t *testing.T) {
 	})
 	kubevirtMachine.SetName("test-km")
 	kubevirtMachine.SetNamespace("default")
+
+	// getNodeIP resolves the KubevirtMachine apiVersion through the CAPI
+	// contract, so the fake client must expose its CRD carrying the
+	// contract-version label pointing at v1alpha1.
+	kmCRD := makeInfraCRD("infrastructure.cluster.x-k8s.io", "KubevirtMachine", "v1alpha1")
 
 	vmi := &unstructured.Unstructured{}
 	vmi.SetGroupVersionKind(schema.GroupVersionKind{
@@ -281,16 +288,15 @@ func TestGetNodeIP_KubevirtVMIFallback(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1alpha1",
-				Kind:       "KubevirtMachine",
-				Name:       "test-km",
-				Namespace:  "default",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "KubevirtMachine",
+				Name:     "test-km",
 			},
 		},
 	}
 
-	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kubevirtMachine, vmi).Build()
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kubevirtMachine, vmi, kmCRD).Build()
 	reconciler := &KairosControlPlaneReconciler{
 		Client: client,
 		Scheme: scheme,
@@ -377,11 +383,10 @@ func TestReconcile_FailureFieldsClearedOnSuccess(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       "recover-kcp",
-				Namespace:  "default",
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     "recover-kcp",
 			},
 		},
 	}
@@ -429,7 +434,7 @@ func TestReconcile_FailureFieldsClearedOnSuccess(t *testing.T) {
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: "recover-cluster",
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			Version:     "v1.30.0+k0s.0",
 		},
 	}
 
@@ -655,9 +660,10 @@ func TestSecretToKairosControlPlane_UsesClusterNameLabel(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				Kind: "KairosControlPlane",
-				Name: "test-kcp",
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     "test-kcp",
 			},
 		},
 	}

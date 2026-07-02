@@ -28,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -166,7 +166,7 @@ func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context
 // path.
 func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, target *clusterv1.Machine) (bool, error) {
 	// (1) Never-registered node: nothing to leave, nothing alive to run it.
-	if target.Status.NodeRef == nil {
+	if !target.Status.NodeRef.IsDefined() {
 		log.Info("etcd-leave: target has no NodeRef; removing hook without leave handshake", "machine", target.Name)
 		return true, r.removeEtcdLeaveHook(ctx, target)
 	}
