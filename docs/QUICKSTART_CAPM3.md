@@ -6,7 +6,7 @@ This guide walks you through creating a single-node k3s or k0s cluster on Kairos
 
 **Scope of this release:**
 
-- Single-node control plane only (`replicas: 1`). The webhook rejects `replicas > 1` (KD-5b).
+- This guide provisions a single-node control plane (`replicas: 1`). HA (`replicas: 3`/`5`) is now supported — the webhook accepts odd counts 1/3/5. CAPV k0s is the lab-validated HA path (see the [README HA section](../README.md#high-availability-control-planes)); CAPM3 reuses the same `spec.ha.vip` surface but its HA path is not yet lab-validated.
 - DHCP-only networking. Static IPAM via Metal3DataTemplate / Metal3IPPool is a future phase.
 - No cloud controller manager (`cloudProviderEnabled: false`). Node providerID is set by the Kairos cloud-config at first boot — no manual patching required.
 
@@ -527,7 +527,7 @@ If the node's IP changes after provisioning (DHCP lease reassignment), the `cont
 
 - Configure worker nodes via `MachineDeployment` with a `Metal3MachineTemplate` and a worker-role `KairosConfigTemplate`.
 - Add custom Kubernetes manifests via `spec.template.spec.manifests` in `KairosConfigTemplate`.
-- Multi-node control planes are tracked for a future release (KD-5b / KD-25).
+- HA control planes (`replicas: 3`/`5` with a kube-vip VIP via `spec.ha.vip`) are supported; CAPV k0s is the lab-validated path (see the [README HA section](../README.md#high-availability-control-planes)). CAPM3 reuses the same `spec.ha.vip` surface but its HA path is not yet lab-validated.
 - Static IPAM via Metal3DataTemplate / Metal3IPPool is a future phase.
 
 ---
