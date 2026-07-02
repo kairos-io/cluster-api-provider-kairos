@@ -264,8 +264,11 @@ write_files:
       #!/bin/bash
       set -euo pipefail
       # This member's key == the sanitized hostname, identical to the reporter's
-      # key so it matches what the controller writes.
-      member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+      # key so it matches what the controller writes (the node's Kubernetes Node
+      # name == NodeRef.Name). Strip hostname's trailing newline BEFORE the
+      # complement-translate, or it becomes a spurious trailing '-' that no
+      # longer matches NodeRef.Name.
+      member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
       # Read our own leave signal from the workload ConfigMap via the LOCAL admin
       # kubeconfig (k0s kubectl). Absent ConfigMap/key => empty => no-op exit.
       val=$(k0s kubectl -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
@@ -486,7 +489,10 @@ write_files:
         # allowed Secret-key charset [a-zA-Z0-9._-] so it is safe both as a
         # Secret key and inside the strategic-merge patch JSON.
         local member_key
-        member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+        # Strip hostname's trailing newline BEFORE the complement-translate, or
+        # it becomes a spurious trailing '-'; the key must equal the node's
+        # Kubernetes Node name (NodeRef.Name) that the controller looks up.
+        member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
         # Query k0s etcd membership. k0s controllers join as full voting members
         # (no learners), so "present in member-list" == "healthy voting member".
         local ml healthy=false voting=false members=0
