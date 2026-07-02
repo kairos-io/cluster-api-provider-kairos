@@ -208,7 +208,12 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   metadata:
-                    description: Metadata is the metadata to apply to the machines
+                    description: |-
+                      Metadata is the metadata to apply to the machines.
+                      A pointer so an unset value is OMITTED rather than serialized as an empty
+                      object: CAPI v1beta2's ObjectMeta type carries MinProperties=1, so a
+                      rendered empty `metadata: {}` (which a value-type field with omitempty does
+                      NOT omit) fails admission on controller writeback (ADR 0006).
                     minProperties: 1
                     properties:
                       annotations:

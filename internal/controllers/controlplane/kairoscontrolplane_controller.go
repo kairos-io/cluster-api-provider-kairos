@@ -826,17 +826,17 @@ func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.C
 		clusterv1.ClusterNameLabel:         cluster.Name,
 		clusterv1.MachineControlPlaneLabel: "",
 	}
-	// Merge with template metadata labels
-	if kcp.Spec.MachineTemplate.Metadata.Labels != nil {
-		for k, v := range kcp.Spec.MachineTemplate.Metadata.Labels {
+	// Merge with template metadata labels (Metadata is an optional pointer).
+	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
+		for k, v := range md.Labels {
 			labels[k] = v
 		}
 	}
 
 	annotations := map[string]string{}
-	// Merge with template metadata annotations
-	if kcp.Spec.MachineTemplate.Metadata.Annotations != nil {
-		for k, v := range kcp.Spec.MachineTemplate.Metadata.Annotations {
+	// Merge with template metadata annotations (Metadata is an optional pointer).
+	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
+		for k, v := range md.Annotations {
 			annotations[k] = v
 		}
 	}

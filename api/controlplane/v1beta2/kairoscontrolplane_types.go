@@ -211,9 +211,13 @@ type KairosControlPlaneMachineTemplate struct {
 	// +optional
 	NodeDrainTimeout *metav1.Duration `json:"nodeDrainTimeout,omitempty"`
 
-	// Metadata is the metadata to apply to the machines
+	// Metadata is the metadata to apply to the machines.
+	// A pointer so an unset value is OMITTED rather than serialized as an empty
+	// object: CAPI v1beta2's ObjectMeta type carries MinProperties=1, so a
+	// rendered empty `metadata: {}` (which a value-type field with omitempty does
+	// NOT omit) fails admission on controller writeback (ADR 0006).
 	// +optional
-	Metadata clusterv1.ObjectMeta `json:"metadata,omitempty"`
+	Metadata *clusterv1.ObjectMeta `json:"metadata,omitempty"`
 }
 
 // KairosConfigTemplateReference is a reference to a KairosConfigTemplate
