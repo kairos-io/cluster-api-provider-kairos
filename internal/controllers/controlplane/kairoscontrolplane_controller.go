@@ -652,10 +652,14 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 //     kubeconfig — KD-3b), AND
 //   - for k0s only, the join-token Secret has a non-empty token (the init node
 //     minted `k0s token create` and pushed it back). For k3s the token is
-//     controller-generated up front, so this clause is skipped.
+//     controller-generated up front, so this clause is skipped, AND
+//   - the init node has reported a healthy voting etcd member into the
+//     etcd-status Secret (ADR 0005 §E.1) — strict for k0s (authoritative
+//     `k0s etcd member-list`), advisory for k3s (block only on an explicit
+//     unhealthy report; a missing report never regresses k3s bring-up).
 //
-// Real etcd-member health is deferred to Phase 4. reason is a short
-// human-readable explanation when not joinable (for logging/conditions).
+// reason is a short human-readable explanation when not joinable (for
+// logging/conditions).
 func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) (bool, string, error) {
 	if len(machines) == 0 {
 		return false, "init machine not created yet", nil
