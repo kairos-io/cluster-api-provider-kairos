@@ -239,9 +239,80 @@ write_files:
       # this helper runs once multi-user.target is set up and triggers
       # both enablement and immediate start of the post-bootstrap service.
       ExecStart=/bin/systemctl enable --now kairos-k0s-post-bootstrap.service
+      # ADR 0005 §E.3: on HA control-plane nodes, also enable the etcd-leave
+      # responder timer so the node can cleanly `k0s etcd leave` when the
+      # controller requests it during a quorum-safe replacement/scale-down.
+      ExecStart=/bin/systemctl enable --now kairos-etcd-leave.timer
 
       [Install]
       WantedBy=multi-user.target
+  # ADR 0005 §E.3 (HA) k0s etcd-leave responder. During a quorum-safe
+  # replacement/scale-down the controller (a) sets a CAPI pre-terminate hook on
+  # this Machine and (b) writes a `leave-requested` sentinel for this member into
+  # the workload-cluster kube-system/kairos-etcd-leave ConfigMap. This node-local
+  # timer polls that ConfigMap via the LOCAL admin.conf (no mgmt token — the
+  # node's mgmt bearer token is only valid ~24h, but replacement happens much
+  # later; the local kubeconfig never expires), and on the exact sentinel runs
+  # `k0s etcd leave` (which leaves THIS node — no operator/ConfigMap value is
+  # ever passed as a command argument), then acks `left`. The controller then
+  # clears the pre-terminate hook and CAPI terminates the VM.
+  - path: /usr/local/bin/kairos-etcd-leave.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      # This member's key == the sanitized hostname, identical to the reporter's
+      # key so it matches what the controller writes.
+      member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+      # Read our own leave signal from the workload ConfigMap via the LOCAL admin
+      # kubeconfig (k0s kubectl). Absent ConfigMap/key => empty => no-op exit.
+      val=$(k0s kubectl -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
+      # Fixed sentinel, string-equality only — never eval'd, never a command arg.
+      [ "${val}" = "leave-requested" ] || exit 0
+      echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
+      # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
+      # configured peer address — no ConfigMap/operator-derived value reaches the
+      # command (security constraint: peer-address is never externally supplied).
+      if k0s etcd leave 2>/dev/null; then
+        echo "etcd-leave: left etcd cluster"
+      else
+        echo "etcd-leave: k0s etcd leave returned non-zero (already left?); acking anyway"
+      fi
+      # Ack by patching our own key to `left`. Only member_key (locally
+      # sanitized) is interpolated; the read-back value is never reused.
+      k0s kubectl -n kube-system patch configmap kairos-etcd-leave --type merge \
+        -p "{\"data\":{\"${member_key}\":\"left\"}}" 2>/dev/null || true
+  - path: /etc/systemd/system/kairos-etcd-leave.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k0s etcd-leave responder (ADR 0005 §E.3)
+      ConditionKernelCommandLine=!cdroot
+      After=k0s.service
+      Wants=k0s.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/kairos-etcd-leave.sh
+  - path: /etc/systemd/system/kairos-etcd-leave.timer
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Poll for Kairos k0s etcd-leave requests (ADR 0005 §E.3)
+      ConditionKernelCommandLine=!cdroot
+
+      [Timer]
+      OnBootSec=60
+      OnUnitActiveSec=30
+
+      [Install]
+      WantedBy=timers.target
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
     permissions: "0755"
     owner: root
