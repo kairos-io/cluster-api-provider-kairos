@@ -145,9 +145,19 @@ func withEtcdStatusSecretName(d TemplateData, name string) TemplateData {
 
 // capkHA sets the CAPK LoadBalancer endpoint that drives the CAPK HA join URL
 // and tls-san. CAPK never renders kube-vip (OQ-5), so VIP is intentionally nil.
+//
+// PodCIDR/ServiceCIDR are set so the goldens exercise BUG #2 (2026-07-02 HA lab):
+// the k0s INIT node keeps spec.network.podCIDR/serviceCIDR (fresh ClusterConfig),
+// but the k0s JOIN node must DROP them — the CIDRs are inherited from the cluster
+// via the controller-join token, and a conflicting fresh ClusterConfig on the
+// joiner is a second reason HA fails. The k3s CAPK templates ignore these fields
+// (k3s takes CIDRs via flags on the init only), so setting them here only diverges
+// the k0s CAPK init/join goldens.
 func capkHA(d TemplateData) TemplateData {
 	d.ControlPlaneLBEndpoint = "10.96.0.10"
 	d.K3sServerURL = "https://10.96.0.10:6443"
+	d.PodCIDR = "10.244.0.0/16"
+	d.ServiceCIDR = "10.96.0.0/12"
 	d.ManagementEndpoint = &ManagementEndpoint{
 		APIServer:                 "https://mgmt.example.com:6443",
 		Token:                     "mgmt-token",

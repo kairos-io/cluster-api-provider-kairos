@@ -836,3 +836,165 @@ func TestHA_EtcdLeaveResponder_k0sOnly(t *testing.T) {
 		}
 	}
 }
+
+// capkK0sHAWithCIDR builds the CAPK k0s HA render data for the given role with a
+// representative PodCIDR/ServiceCIDR set — the cluster-wide CIDRs the controller
+// stamps onto the init node's fresh ClusterConfig. It is the fixture the
+// dual-interface bridge / BUG #2 regression tests below exercise.
+func capkK0sHAWithCIDR(role string) TemplateData {
+	d := haCPData(role, true)
+	d.PodCIDR = "10.244.0.0/16"
+	d.ServiceCIDR = "10.96.0.0/12"
+	return d
+}
+
+// TestHA_CapkK0sJoinDropsClusterCIDRs is the BUG #2 regression guard (2026-07-02
+// dual-interface bridge HA lab): a k0s JOIN node on CAPK must NOT carry the
+// cluster-wide spec.network.podCIDR/serviceCIDR. Those are inherited from the
+// cluster via the controller-join token; a conflicting fresh ClusterConfig on the
+// joiner is a second reason HA never forms. The INIT node (fresh ClusterConfig)
+// keeps them. Mirrors the CAPV template's .IsInitControlPlane CIDR gating.
+func TestHA_CapkK0sJoinDropsClusterCIDRs(t *testing.T) {
+	join, err := RenderK0sCloudConfig(capkK0sHAWithCIDR("join"))
+	if err != nil {
+		t.Fatalf("render k0s CAPK join: %v", err)
+	}
+	k0sYAML := extractWriteFile(t, join, "/etc/k0s/k0s.yaml")
+	if k0sYAML == "" {
+		t.Fatal("k0s CAPK join must still write /etc/k0s/k0s.yaml (api.sans + etcd peerAddress)")
+	}
+	for _, forbidden := range []string{"podCIDR", "serviceCIDR", "network:"} {
+		if strings.Contains(k0sYAML, forbidden) {
+			t.Errorf("k0s CAPK join /etc/k0s/k0s.yaml must NOT contain %q — cluster CIDRs are inherited via the join token (BUG #2)", forbidden)
+		}
+	}
+
+	// The INIT node, with the same CIDR inputs, MUST keep podCIDR/serviceCIDR.
+	initOut, err := RenderK0sCloudConfig(capkK0sHAWithCIDR("init"))
+	if err != nil {
+		t.Fatalf("render k0s CAPK init: %v", err)
+	}
+	initYAML := extractWriteFile(t, initOut, "/etc/k0s/k0s.yaml")
+	if !strings.Contains(initYAML, "podCIDR: 10.244.0.0/16") {
+		t.Error("k0s CAPK init must keep the cluster podCIDR in its fresh ClusterConfig")
+	}
+	if !strings.Contains(initYAML, "serviceCIDR: 10.96.0.0/12") {
+		t.Error("k0s CAPK init must keep the cluster serviceCIDR in its fresh ClusterConfig")
+	}
+}
+
+// TestHA_CapkK0sEtcdPeerAddress asserts the dual-interface bridge etcd wiring
+// (2026-07-02 HA lab): EVERY CAPK k0s HA control-plane node (init AND join) must
+// (a) set spec.storage.etcd.peerAddress to the __ETCD_PEER_ADDR__ sentinel in
+// /etc/k0s/k0s.yaml, and (b) render the k0scontroller ExecStartPre drop-in +
+// bridge-detect script that substitutes the sentinel with the node's routable
+// bridge IP before k0s first starts. Without a routable per-node peer address the
+// masquerade self-address (10.0.2.2, identical on every VM) would be advertised
+// and etcd quorum could never form.
+func TestHA_CapkK0sEtcdPeerAddress(t *testing.T) {
+	const sentinel = "__ETCD_PEER_ADDR__"
+	const scriptPath = "/usr/local/bin/kairos-k0s-etcd-peer-addr.sh"
+	const dropinPath = "/etc/systemd/system/k0scontroller.service.d/z-etcd-peer-addr.conf"
+
+	bashPath, _ := exec.LookPath("bash")
+
+	for _, role := range []string{"init", "join"} {
+		role := role
+		t.Run(role, func(t *testing.T) {
+			out, err := RenderK0sCloudConfig(capkK0sHAWithCIDR(role))
+			if err != nil {
+				t.Fatalf("render k0s CAPK %s: %v", role, err)
+			}
+
+			// (a) etcd peerAddress sentinel in /etc/k0s/k0s.yaml.
+			k0sYAML := extractWriteFile(t, out, "/etc/k0s/k0s.yaml")
+			for _, want := range []string{"storage:", "etcd:", "peerAddress:", sentinel} {
+				if !strings.Contains(k0sYAML, want) {
+					t.Errorf("k0s CAPK %s /etc/k0s/k0s.yaml must contain %q for the per-node etcd peer address", role, want)
+				}
+			}
+
+			// (a2) api.address sentinel — the k0s API advertise address must ALSO be
+			// the routable bridge IP, else `k0s token create` bakes the unroutable
+			// masquerade self (10.0.2.2) into the controller-join token and joiners
+			// can never reach the init's join API (Phase-4 CAPK-HA lab root cause).
+			for _, want := range []string{"api:", "address:", "__API_ADDR__"} {
+				if !strings.Contains(k0sYAML, want) {
+					t.Errorf("k0s CAPK %s /etc/k0s/k0s.yaml must contain %q for the per-node API advertise address", role, want)
+				}
+			}
+
+			// (b) the ExecStartPre drop-in references the bridge-detect script,
+			// and the script exists and is valid bash.
+			dropin := extractWriteFile(t, out, dropinPath)
+			if dropin == "" {
+				t.Fatalf("k0s CAPK %s must render the k0scontroller ExecStartPre drop-in %q", role, dropinPath)
+			}
+			if !strings.Contains(dropin, "ExecStartPre=") || !strings.Contains(dropin, scriptPath) {
+				t.Errorf("k0s CAPK %s drop-in must invoke %q via ExecStartPre; got:\n%s", role, scriptPath, dropin)
+			}
+
+			script := extractWriteFile(t, out, scriptPath)
+			if script == "" {
+				t.Fatalf("k0s CAPK %s must render the bridge-detect script %q", role, scriptPath)
+			}
+			// The script substitutes the sentinel and selects the routable bridge
+			// IP by property (NOT the 10.0.2.x masquerade, NOT loopback) — never by
+			// a hardcoded interface name.
+			for _, want := range []string{sentinel, "10.0.2.", "127.", "sed -i", "ip -o -4 addr show"} {
+				if !strings.Contains(script, want) {
+					t.Errorf("k0s CAPK %s bridge-detect script must contain %q", role, want)
+				}
+			}
+			if strings.Contains(script, "eth1") {
+				t.Errorf("k0s CAPK %s bridge-detect script must NOT hardcode the eth1 interface name (select by property)", role)
+			}
+			if bashPath != "" {
+				f := filepathJoinTemp(t, "k0s-etcd-peer-addr-"+role+".sh")
+				if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
+					t.Fatalf("write temp script: %v", werr)
+				}
+				if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
+					t.Fatalf("k0s CAPK %s bridge-detect script is not valid bash: %v\n%s", role, berr, b)
+				}
+			}
+		})
+	}
+}
+
+// TestHA_CapkK0sSingleHasNoEtcdPeerAddress asserts the block is HA-only: a
+// single-node CAPK k0s control plane (no etcd quorum) must render NEITHER the
+// etcd peerAddress block NOR the bridge-detect ExecStartPre drop-in/script.
+func TestHA_CapkK0sSingleHasNoEtcdPeerAddress(t *testing.T) {
+	single := TemplateData{
+		Role:             "control-plane",
+		ControlPlaneRole: "single",
+		SingleNode:       true,
+		Hostname:         "kairos-cp-0",
+		UserName:         "kairos",
+		UserGroups:       []string{"admin"},
+		IsKubeVirt:       true,
+		PodCIDR:          "10.244.0.0/16",
+		ServiceCIDR:      "10.96.0.0/12",
+	}
+	out, err := RenderK0sCloudConfig(single)
+	if err != nil {
+		t.Fatalf("render k0s CAPK single: %v", err)
+	}
+	k0sYAML := extractWriteFile(t, out, "/etc/k0s/k0s.yaml")
+	for _, forbidden := range []string{"__ETCD_PEER_ADDR__", "peerAddress", "storage:"} {
+		if strings.Contains(k0sYAML, forbidden) {
+			t.Errorf("k0s CAPK single /etc/k0s/k0s.yaml must NOT contain %q (no etcd quorum on single-node)", forbidden)
+		}
+	}
+	if extractWriteFile(t, out, "/usr/local/bin/kairos-k0s-etcd-peer-addr.sh") != "" {
+		t.Error("k0s CAPK single must NOT render the bridge-detect script (HA-only)")
+	}
+	if extractWriteFile(t, out, "/etc/systemd/system/k0scontroller.service.d/z-etcd-peer-addr.conf") != "" {
+		t.Error("k0s CAPK single must NOT render the k0scontroller ExecStartPre drop-in (HA-only)")
+	}
+	// A single-node CP still keeps its own cluster CIDRs (fresh ClusterConfig).
+	if !strings.Contains(k0sYAML, "podCIDR: 10.244.0.0/16") {
+		t.Error("k0s CAPK single must keep podCIDR (single is a fresh ClusterConfig, like init)")
+	}
+}

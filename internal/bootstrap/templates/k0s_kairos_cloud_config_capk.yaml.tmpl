@@ -130,6 +130,26 @@ write_files:
     group: root
     content: |
 {{ persistencyOEM | indent 6 }}
+  {{- /*
+    /etc/k0s/k0s.yaml on CAPK control-plane nodes. IsKubeVirt is always true here,
+    so every CAPK control-plane node writes this file (the runtime lb-sans updater
+    watches it via PathExists=/etc/k0s/k0s.yaml).
+
+    BUG #2 (2026-07-02 HA lab): a JOIN node must NOT carry cluster-wide
+    spec.network.podCIDR/serviceCIDR — those are inherited from the cluster via the
+    controller-join token, and a conflicting fresh ClusterConfig on the joiner is a
+    second reason HA never forms. Only init AND single emit the network block; join
+    drops it. Mirrors the CAPV template's .IsInitControlPlane CIDR gating.
+
+    HA etcd peer address (BUG #1 / dual-interface bridge): every HA control-plane
+    node (init AND join) sets spec.storage.etcd.peerAddress to the __ETCD_PEER_ADDR__
+    sentinel, replaced at first k0scontroller start with this node's routable bridge
+    IP by the ExecStartPre drop-in below. CAPK VMs see their masquerade IP as the
+    SLIRP self-address (10.0.2.2) on every VM, so without a routable peer address the
+    joiners can never reach the init's etcd. Single-node (non-HA) has no etcd quorum
+    and gets no storage block.
+  */ -}}
+  {{- $emitNetwork := and (or .PodCIDR .ServiceCIDR) (not .IsJoinControlPlane) }}
   {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR .IsKubeVirt) }}
   - path: /etc/k0s/k0s.yaml
     permissions: "0644"
@@ -138,14 +158,26 @@ write_files:
       kind: ClusterConfig
       metadata:
         name: k0s
-      {{- if or .PodCIDR .ServiceCIDR .ControlPlaneLBEndpoint }}
+      {{- if or $emitNetwork .ControlPlaneLBEndpoint .IsHAControlPlane }}
       spec:
-      {{- if .ControlPlaneLBEndpoint }}
+      {{- if or .ControlPlaneLBEndpoint .IsHAControlPlane }}
         api:
+      {{- if .IsHAControlPlane }}
+          # Per-node API advertise address. __API_ADDR__ is a sentinel replaced
+          # with this node's routable bridge IP by the k0scontroller ExecStartPre
+          # drop-in BEFORE k0s first starts. `k0s token create --role=controller`
+          # bakes this address into the join token; on CAPK masquerade the
+          # auto-detected address is the unroutable SLIRP self 10.0.2.2, so joiners
+          # dial 10.0.2.2:9443 (their own masquerade addr) and the controller-join
+          # hangs — HA never forms. Must be the routable eth1 IP, same as etcd.
+          address: __API_ADDR__
+      {{- end }}
+      {{- if .ControlPlaneLBEndpoint }}
           sans:
             - {{ .ControlPlaneLBEndpoint | quote }}
       {{- end }}
-      {{- if or .PodCIDR .ServiceCIDR }}
+      {{- end }}
+      {{- if $emitNetwork }}
         network:
       {{ if .PodCIDR }}
           podCIDR: {{ .PodCIDR | quote }}
@@ -154,9 +186,115 @@ write_files:
           serviceCIDR: {{ .ServiceCIDR | quote }}
       {{ end }}
       {{- end }}
+      {{- if .IsHAControlPlane }}
+        storage:
+          etcd:
+            # Per-node etcd peer address. __ETCD_PEER_ADDR__ is a sentinel replaced
+            # with this node's routable bridge IP by the k0scontroller ExecStartPre
+            # drop-in BEFORE k0s first starts (etcd reads peerAddress at init/join).
+            peerAddress: __ETCD_PEER_ADDR__
+      {{- end }}
       {{- else }}
       spec: {}
       {{- end }}
+  {{- end }}
+  {{- if .IsHAControlPlane }}
+  # Dual-interface bridge networking (2026-07-02 HA lab): CAPK VMs use KubeVirt
+  # masquerade networking, so every VM's primary (eth0/pod) IP is the SLIRP
+  # self-address 10.0.2.2 — identical on every VM and unroutable between VMs. k0s
+  # would advertise its etcd peer URL as https://10.0.2.2:2380, so joiners can never
+  # reach the init's etcd and HA never forms. The VM therefore gets a SECOND NIC
+  # (eth1, Multus lan-bridge, routable DHCP address on the lab bridge, 172.16.56.x);
+  # etcd peers over THAT address. eth0/pod stays the LB/API path (unchanged, OQ-5).
+  #
+  # This script detects the routable bridge IP ON-NODE (the controller cannot: the
+  # Kairos image ships no qemu-guest-agent, so KubeVirt never reports a bridge IP up)
+  # and substitutes it for the __ETCD_PEER_ADDR__ sentinel in /etc/k0s/k0s.yaml
+  # BEFORE k0s first starts — etcd reads peerAddress at first init/join, so it MUST
+  # be correct by then. The IP is picked purely by properties (global-scope IPv4,
+  # NOT in 10.0.2.0/24 masquerade, NOT loopback) — the interface name (eth1) is NOT
+  # hardcoded. No user/template-interpolated value enters this script: the address is
+  # runtime-detected, so there is no shell-injection surface here.
+  - path: /usr/local/bin/kairos-k0s-etcd-peer-addr.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      CFG=/etc/k0s/k0s.yaml
+      # Both the etcd peerAddress AND the k0s API advertise address must be the
+      # node's routable bridge IP: peerAddress so etcd members can reach each
+      # other, and api.address so `k0s token create` bakes a routable join
+      # address into the controller-join token (else joiners dial the unroutable
+      # masquerade self 10.0.2.2:9443 and the join hangs).
+      ETCD_SENTINEL=__ETCD_PEER_ADDR__
+      API_SENTINEL=__API_ADDR__
+
+      # Nothing to do if the sentinels were already substituted on a prior boot
+      # (these addresses are immutable once etcd/API have initialized; re-running
+      # is a no-op).
+      if [ -f "${CFG}" ] && ! grep -qE "${ETCD_SENTINEL}|${API_SENTINEL}" "${CFG}"; then
+        echo "etcd-peer-addr: sentinels already substituted in ${CFG}; nothing to do"
+        exit 0
+      fi
+
+      # Pick the routable bridge IPv4: global scope, NOT in the 10.0.2.0/24 KubeVirt
+      # masquerade range, NOT loopback. On this lab that is the lan-bridge DHCP lease
+      # (172.16.56.x), but we select by property, never by interface name, so bridge
+      # renaming or a different routable subnet still works.
+      detect_bridge_ip() {
+        ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | \
+          while read -r addr; do
+            case "${addr}" in
+              10.0.2.*) continue ;;   # KubeVirt masquerade self (SLIRP)
+              127.*)    continue ;;   # loopback
+              "")       continue ;;
+              *)        echo "${addr}"; return 0 ;;
+            esac
+          done
+      }
+
+      # Bounded wait for the DHCP lease on the bridge NIC — etcd needs the address at
+      # first start, and the lease may lag the ExecStartPre by a few seconds.
+      PEER_IP=""
+      for i in $(seq 1 30); do
+        PEER_IP="$(detect_bridge_ip || true)"
+        if [ -n "${PEER_IP}" ]; then
+          break
+        fi
+        echo "etcd-peer-addr: waiting for routable bridge IP (${i}/30)..."
+        sleep 2
+      done
+
+      if [ -z "${PEER_IP}" ]; then
+        echo "WARN: etcd-peer-addr: no routable bridge IP found (only masquerade/loopback present); leaving sentinel in place — k0s etcd will not form HA quorum until the lan-bridge NIC has a lease"
+        exit 0
+      fi
+
+      if [ ! -f "${CFG}" ]; then
+        echo "WARN: etcd-peer-addr: ${CFG} not found; cannot set etcd peerAddress"
+        exit 0
+      fi
+
+      # Substitute both sentinels with the detected IP. PEER_IP is a bare IPv4 from
+      # `ip`'s own output (never operator input); it contains only [0-9.] so it is
+      # safe as a sed replacement. Use '|' delimiters (IPv4 has no '|').
+      sed -i "s|${ETCD_SENTINEL}|${PEER_IP}|g; s|${API_SENTINEL}|${PEER_IP}|g" "${CFG}"
+      echo "etcd-peer-addr: set etcd peerAddress + api.address=${PEER_IP} in ${CFG}"
+  # k0scontroller ExecStartPre drop-in: run the bridge-IP substitution BEFORE k0s
+  # starts (provider-kairos's `k0s.enabled: true` primitive starts k0scontroller;
+  # etcd reads spec.storage.etcd.peerAddress at first init/join, so the sentinel MUST
+  # be resolved by then). Mirrors the KD-3c ExecStartPre drop-in pattern used by the
+  # k3s templates. HA-only: single-node CAPK never reaches this block.
+  - path: /etc/systemd/system/k0scontroller.service.d/z-etcd-peer-addr.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k0s-etcd-peer-addr.sh || true'
   {{- end }}
   {{- if .IsJoinControlPlane }}
   # ADR 0005 (HA) join node on CAPK: k0s controller-role join token. Sourced
