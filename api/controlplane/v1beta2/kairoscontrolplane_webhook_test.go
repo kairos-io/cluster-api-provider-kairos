@@ -177,6 +177,36 @@ func TestKairosControlPlane_Default_FillsNilReplicas(t *testing.T) {
 	}
 }
 
+// TestKairosControlPlane_Default_DoesNotSetDistribution asserts the defaulter no
+// longer fills spec.distribution. The effective distribution is resolved in the
+// controller (which can read the referenced KairosConfigTemplate); a webhook
+// default here would make "unset" indistinguishable from an explicit "k0s" and
+// silently override a distribution set only on the template. The defaulter MUST
+// leave an unset value empty and preserve an explicit one.
+func TestKairosControlPlane_Default_DoesNotSetDistribution(t *testing.T) {
+	// Unset stays unset.
+	kcp := newValidKCP()
+	kcp.Spec.Distribution = ""
+	if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
+	if kcp.Spec.Distribution != "" {
+		t.Errorf("Default() set Spec.Distribution to %q; expected it to stay empty for controller-side inherit", kcp.Spec.Distribution)
+	}
+
+	// Explicit values are preserved verbatim.
+	for _, dist := range []string{"k0s", "k3s"} {
+		kcp := newValidKCP()
+		kcp.Spec.Distribution = dist
+		if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+			t.Fatalf("Default() returned error: %v", err)
+		}
+		if kcp.Spec.Distribution != dist {
+			t.Errorf("Default() changed explicit distribution %q to %q; expected unchanged", dist, kcp.Spec.Distribution)
+		}
+	}
+}
+
 func TestKairosControlPlane_Validate_Distribution(t *testing.T) {
 	cases := []struct {
 		name    string

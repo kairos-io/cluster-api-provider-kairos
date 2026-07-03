@@ -273,6 +273,53 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
+	// Resolve + persist the effective distribution BEFORE any machine creation
+	// or etcd-leave logic, so every downstream call to distributionOf(kcp) —
+	// createControlPlaneMachine, the join gate, the etcd-leave handshake — sees
+	// the resolved value without threading it through call signatures.
+	//
+	// Precedence: an explicit spec.distribution wins; otherwise inherit
+	// spec.template.spec.distribution from the referenced KairosConfigTemplate;
+	// otherwise fall back to k0s (applied downstream by distributionOf). We only
+	// PERSIST when we can actually resolve an inherited value — a missing template
+	// (or one without a distribution) leaves the field empty for this reconcile
+	// (distributionOf falls back to k0s) and a later reconcile resolves it once
+	// the template exists, rather than persisting a guessed k0s.
+	if kcp.Spec.Distribution == "" {
+		inherited, rerr := r.resolveEffectiveDistribution(ctx, kcp)
+		if rerr != nil {
+			return ctrl.Result{}, rerr
+		}
+		if inherited != "" {
+			// Persist with a dedicated MergeFrom patch, separate from the status
+			// patch helper, so this spec write is not folded into a status patch
+			// (never mix spec + status writes on the same object in one Reconcile).
+			base := kcp.DeepCopy()
+			kcp.Spec.Distribution = inherited
+			if err := r.Patch(ctx, kcp, client.MergeFrom(base)); err != nil {
+				return ctrl.Result{}, fmt.Errorf("persist inherited spec.distribution: %w", err)
+			}
+			log.Info("Inherited spec.distribution from KairosConfigTemplate",
+				"distribution", inherited, "template", kcp.Spec.KairosConfigTemplate.Name)
+			// Re-anchor the status patch helper against the post-Patch state so
+			// the deferred Patch on early-exit paths still produces a clean diff.
+			patchHelper, err = patch.NewHelper(kcp, r.Client)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			kcp.Status.ObservedGeneration = kcp.Generation
+		}
+	} else if r.Recorder != nil {
+		// An explicit spec.distribution is authoritative but MAY conflict with a
+		// distribution set only on the KairosConfigTemplate. Surface the override
+		// so operators are not surprised the template value was ignored.
+		if tmplDist, rerr := r.resolveEffectiveDistribution(ctx, kcp); rerr == nil &&
+			tmplDist != "" && tmplDist != kcp.Spec.Distribution {
+			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "DistributionOverride",
+				"spec.distribution=%s overrides KairosConfigTemplate distribution=%s", kcp.Spec.Distribution, tmplDist)
+		}
+	}
+
 	// Reconcile control plane machines. machinesResult carries a requeue when
 	// the HA joiner-sequencing gate is holding back the next join machine
 	// (ADR 0005 Phase 3) — it is applied at the end of Reconcile so status is

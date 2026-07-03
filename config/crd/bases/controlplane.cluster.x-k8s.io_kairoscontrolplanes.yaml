@@ -67,9 +67,15 @@ spec:
             description: KairosControlPlaneSpec defines the desired state of KairosControlPlane
             properties:
               distribution:
-                default: k0s
-                description: Distribution specifies the Kubernetes distribution to
-                  install
+                description: |-
+                  Distribution specifies the Kubernetes distribution to install.
+
+                  When left empty the controller resolves the effective distribution by
+                  inheriting spec.template.spec.distribution from the referenced
+                  KairosConfigTemplate; if the template does not specify one either, it
+                  defaults to k0s. An explicit value here always wins and overrides the
+                  template's distribution. There is intentionally NO CRD-level default so
+                  that "unset" (inherit) is distinguishable from an explicit "k0s".
                 enum:
                 - k0s
                 - k3s

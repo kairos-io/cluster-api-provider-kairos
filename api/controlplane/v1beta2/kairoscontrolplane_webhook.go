@@ -76,10 +76,12 @@ func (*kairosControlPlaneDefaulter) Default(_ context.Context, r *KairosControlP
 		r.Spec.Replicas = &replicas
 	}
 
-	// Set default distribution
-	if r.Spec.Distribution == "" {
-		r.Spec.Distribution = "k0s"
-	}
+	// NOTE: spec.distribution is intentionally NOT defaulted here. The effective
+	// distribution is resolved in the controller (which can read the referenced
+	// KairosConfigTemplate), because a defaulting webhook MUST NOT make API calls
+	// (api/CLAUDE.md rule 8). Defaulting it to k0s here would make "unset"
+	// indistinguishable from an explicit "k0s" and silently override a
+	// distribution set only on the KairosConfigTemplate.
 
 	defaultSSHFallback(r.Spec.SSHFallback)
 	return nil

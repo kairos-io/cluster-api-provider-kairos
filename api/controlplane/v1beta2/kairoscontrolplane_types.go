@@ -53,9 +53,15 @@ type KairosControlPlaneSpec struct {
 	// +kubebuilder:validation:Required
 	Version string `json:"version"`
 
-	// Distribution specifies the Kubernetes distribution to install
+	// Distribution specifies the Kubernetes distribution to install.
+	//
+	// When left empty the controller resolves the effective distribution by
+	// inheriting spec.template.spec.distribution from the referenced
+	// KairosConfigTemplate; if the template does not specify one either, it
+	// defaults to k0s. An explicit value here always wins and overrides the
+	// template's distribution. There is intentionally NO CRD-level default so
+	// that "unset" (inherit) is distinguishable from an explicit "k0s".
 	// +kubebuilder:validation:Enum=k0s;k3s
-	// +kubebuilder:default=k0s
 	// +optional
 	Distribution string `json:"distribution,omitempty"`
 

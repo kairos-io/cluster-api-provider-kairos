@@ -91,11 +91,45 @@ func hasEtcdLeaveHook(m *clusterv1.Machine) bool {
 
 // distributionOf returns the effective distribution for a KCP, defaulting the
 // empty value to k0s (mirrors createControlPlaneMachine).
+//
+// The controller resolves + persists spec.distribution early in Reconcile (see
+// resolveEffectiveDistribution + the resolve block in Reconcile), so by the time
+// any of the machine-create / etcd-leave paths call distributionOf the field is
+// already populated with the inherited-or-explicit value. The k0s fallback here
+// is the last-resort default used only when the referenced KairosConfigTemplate
+// has not been observed yet (the template read failed / does not exist), in which
+// case a later reconcile resolves it.
 func distributionOf(kcp *controlplanev1beta2.KairosControlPlane) string {
 	if kcp.Spec.Distribution == "" {
 		return "k0s"
 	}
 	return kcp.Spec.Distribution
+}
+
+// resolveEffectiveDistribution reads the KairosConfigTemplate referenced by the
+// KCP and returns its spec.template.spec.distribution ("" when the template does
+// not set one). It is the inherit source for KCP.spec.distribution: the KCP's
+// explicit value always wins over this, and this in turn wins over the k0s
+// fallback in distributionOf.
+//
+// It is intentionally read-only and side-effect free (no persistence): the
+// caller in Reconcile decides whether to persist the resolved value. A NotFound
+// on the template is NOT an error — it returns ("", nil) so the reconcile can
+// proceed and resolve on a later pass once the template exists. All other read
+// errors are surfaced.
+func (r *KairosControlPlaneReconciler) resolveEffectiveDistribution(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane) (string, error) {
+	if kcp.Spec.KairosConfigTemplate.Name == "" {
+		return "", nil
+	}
+	template := &bootstrapv1beta2.KairosConfigTemplate{}
+	key := types.NamespacedName{Namespace: kcp.Namespace, Name: kcp.Spec.KairosConfigTemplate.Name}
+	if err := r.Get(ctx, key, template); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("resolve effective distribution: get KairosConfigTemplate %s: %w", key, err)
+	}
+	return template.Spec.Template.Spec.Distribution, nil
 }
 
 // shouldStampEtcdLeaveHook decides whether a newly-created control-plane Machine
