@@ -998,3 +998,97 @@ func TestHA_CapkK0sSingleHasNoEtcdPeerAddress(t *testing.T) {
 		t.Error("k0s CAPK single must keep podCIDR (single is a fresh ClusterConfig, like init)")
 	}
 }
+
+// TestHA_CapkK3sNodeIP asserts the dual-interface bridge etcd wiring for k3s
+// (2026-07-03 HA lab): EVERY CAPK k3s HA control-plane node (init AND join) must
+// render (a) the on-node node-ip detect script and (b) a k3s.service ExecStartPre
+// drop-in that invokes it. Under KubeVirt masquerade the primary IP is the SLIRP
+// self-address 10.0.2.2 (identical on every VM), so k3s embedded etcd must peer
+// over the routable Multus lan-bridge NIC instead — the script detects that IP and
+// writes node-ip into config.yaml.d BEFORE k3s starts. Unlike the k0s path there is
+// NO static sentinel: the fail-safe writes the value at runtime and writes nothing
+// if no routable IP is present (k3s falls back to its default node IP, no crash).
+func TestHA_CapkK3sNodeIP(t *testing.T) {
+	const scriptPath = "/usr/local/bin/kairos-k3s-node-ip.sh"
+	const dropinPath = "/etc/systemd/system/k3s.service.d/z-node-ip.conf"
+	const cfgPath = "/etc/rancher/k3s/config.yaml.d/92-node-ip.yaml"
+
+	bashPath, _ := exec.LookPath("bash")
+
+	for _, role := range []string{"init", "join"} {
+		role := role
+		t.Run(role, func(t *testing.T) {
+			out, err := RenderK3sCloudConfig(haCPData(role, true))
+			if err != nil {
+				t.Fatalf("render k3s CAPK %s: %v", role, err)
+			}
+
+			// (b) the ExecStartPre drop-in invokes the node-ip script.
+			dropin := extractWriteFile(t, out, dropinPath)
+			if dropin == "" {
+				t.Fatalf("k3s CAPK %s must render the k3s.service ExecStartPre drop-in %q", role, dropinPath)
+			}
+			if !strings.Contains(dropin, "ExecStartPre=") || !strings.Contains(dropin, scriptPath) {
+				t.Errorf("k3s CAPK %s drop-in must invoke %q via ExecStartPre; got:\n%s", role, scriptPath, dropin)
+			}
+
+			// (a) the script detects the routable bridge IP by property (NOT the
+			// 10.0.2.x masquerade, NOT loopback), never by a hardcoded interface
+			// name, and writes node-ip into config.yaml.d.
+			script := extractWriteFile(t, out, scriptPath)
+			if script == "" {
+				t.Fatalf("k3s CAPK %s must render the node-ip detect script %q", role, scriptPath)
+			}
+			for _, want := range []string{"10.0.2.", "127.", "ip -o -4 addr show", "node-ip:", cfgPath} {
+				if !strings.Contains(script, want) {
+					t.Errorf("k3s CAPK %s node-ip script must contain %q", role, want)
+				}
+			}
+			if strings.Contains(script, "eth1") {
+				t.Errorf("k3s CAPK %s node-ip script must NOT hardcode the eth1 interface name (select by property)", role)
+			}
+
+			// Fail-safe: NO static placeholder sentinel anywhere in the render — the
+			// address is written at runtime, never shipped as a value k3s must
+			// substitute (an unsubstituted sentinel would crash-loop the server).
+			if strings.Contains(out, "__NODE_IP__") {
+				t.Errorf("k3s CAPK %s must NOT ship a static __NODE_IP__ sentinel (node-ip is runtime-detected)", role)
+			}
+
+			if bashPath != "" {
+				f := filepathJoinTemp(t, "k3s-node-ip-"+role+".sh")
+				if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
+					t.Fatalf("write temp script: %v", werr)
+				}
+				if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
+					t.Fatalf("k3s CAPK %s node-ip script is not valid bash: %v\n%s", role, berr, b)
+				}
+			}
+		})
+	}
+}
+
+// TestHA_CapkK3sSingleHasNoNodeIP asserts the node-ip block is HA-only: a
+// single-node CAPK k3s control plane (no etcd quorum, no cross-VM peering) must
+// render NEITHER the node-ip detect script NOR the k3s.service ExecStartPre drop-in.
+func TestHA_CapkK3sSingleHasNoNodeIP(t *testing.T) {
+	single := TemplateData{
+		Role:             "control-plane",
+		ControlPlaneRole: "single",
+		SingleNode:       true,
+		Hostname:         "kairos-cp-0",
+		UserName:         "kairos",
+		UserGroups:       []string{"admin"},
+		IsKubeVirt:       true,
+	}
+	out, err := RenderK3sCloudConfig(single)
+	if err != nil {
+		t.Fatalf("render k3s CAPK single: %v", err)
+	}
+	if extractWriteFile(t, out, "/usr/local/bin/kairos-k3s-node-ip.sh") != "" {
+		t.Error("k3s CAPK single must NOT render the node-ip detect script (HA-only)")
+	}
+	if extractWriteFile(t, out, "/etc/systemd/system/k3s.service.d/z-node-ip.conf") != "" {
+		t.Error("k3s CAPK single must NOT render the k3s.service ExecStartPre drop-in (HA-only)")
+	}
+}

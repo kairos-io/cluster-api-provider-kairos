@@ -76,6 +76,85 @@ write_files:
       # the management cluster (KD-3b push pattern).
       tls-san:
         - 10.96.0.10
+  # Dual-interface bridge networking (CAPK HA). CAPK VMs use KubeVirt masquerade,
+  # so every VM's primary (eth0/pod) IP is the SLIRP self-address 10.0.2.2 —
+  # identical on every VM and unroutable between VMs. k3s embedded etcd peers over
+  # the node IP, which auto-detects to 10.0.2.2, so etcd members can never reach
+  # each other and HA never forms (the same masquerade constraint the k0s CAPK HA
+  # path solves via spec.storage.etcd.peerAddress + spec.api.address). The VM gets
+  # a SECOND NIC (eth1, Multus lan-bridge, routable DHCP address, e.g. 172.16.56.x);
+  # k3s must peer etcd over THAT. eth0/pod stays the LB/API path (OQ-5, no kube-vip);
+  # k3s joiners already join via the routable LB endpoint (--server=<LB>:6443), so
+  # unlike k0s no token-encoded address needs fixing — only node-ip.
+  #
+  # Fail-safe design: rather than ship a static config with a placeholder that k3s
+  # would reject if left unsubstituted (crash-loops the server), a k3s.service
+  # ExecStartPre detects the routable bridge IP on-node and WRITES
+  # /etc/rancher/k3s/config.yaml.d/92-node-ip.yaml with node-ip=<detected IP> BEFORE
+  # k3s starts. If no routable IP is found the file is NOT written and k3s falls back
+  # to its default node IP (no crash) — HA simply will not form until the lan-bridge
+  # NIC has a lease. No user/template value enters the script (the address is
+  # runtime-detected), so there is no shell-injection surface.
+  - path: /usr/local/bin/kairos-k3s-node-ip.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      CFG=/etc/rancher/k3s/config.yaml.d/92-node-ip.yaml
+
+      # Already written on a prior boot (node-ip is fixed once etcd has initialized).
+      if [ -f "${CFG}" ]; then
+        echo "k3s-node-ip: ${CFG} already present; nothing to do"
+        exit 0
+      fi
+
+      detect_bridge_ip() {
+        ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | \
+          while read -r addr; do
+            case "${addr}" in
+              10.0.2.*) continue ;;   # KubeVirt masquerade self (SLIRP)
+              127.*)    continue ;;   # loopback
+              "")       continue ;;
+              *)        echo "${addr}"; return 0 ;;
+            esac
+          done
+      }
+
+      # Bounded wait for the DHCP lease on the bridge NIC — etcd needs the address
+      # at first start, and the lease may lag the ExecStartPre by a few seconds.
+      NODE_IP=""
+      for i in $(seq 1 30); do
+        NODE_IP="$(detect_bridge_ip || true)"
+        if [ -n "${NODE_IP}" ]; then
+          break
+        fi
+        echo "k3s-node-ip: waiting for routable bridge IP (${i}/30)..."
+        sleep 2
+      done
+
+      if [ -z "${NODE_IP}" ]; then
+        echo "WARN: k3s-node-ip: no routable bridge IP found (only masquerade/loopback present); NOT writing ${CFG} — k3s uses its default node IP (HA etcd will not form until the lan-bridge NIC has a lease)"
+        exit 0
+      fi
+
+      # NODE_IP is a bare IPv4 from `ip`'s own output (never operator input) — only
+      # [0-9.], safe to interpolate into the config value.
+      mkdir -p "$(dirname "${CFG}")"
+      printf 'node-ip: %s\n' "${NODE_IP}" > "${CFG}"
+      echo "k3s-node-ip: wrote node-ip=${NODE_IP} to ${CFG}"
+  # k3s.service ExecStartPre drop-in: detect + write node-ip BEFORE k3s starts (etcd
+  # reads node-ip at first init/join). Mirrors the k0s CAPK ExecStartPre drop-in.
+  # HA-only.
+  - path: /etc/systemd/system/k3s.service.d/z-node-ip.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-node-ip.sh || true'
   # ADR 0005 (HA) on CAPK: shared k3s server token, written on BOTH init and join
   # (IsHAControlPlane) so every HA member uses the same K3S_TOKEN — init via
   # --token-file, joiners via --server+--token-file. Sourced from .JoinToken,
