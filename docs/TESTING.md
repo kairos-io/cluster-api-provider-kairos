@@ -1,6 +1,6 @@
 # Testing
 
-Last verified against: Go toolchain 1.26.3, provider v0.1.0-alpha.2.
+Last verified against: Go toolchain 1.26.3, provider v0.1.0-beta.1.
 
 See [Install guide](INSTALL.md) for development install.
 
@@ -45,16 +45,18 @@ This is the highest-confidence gate but requires Docker and a host with enough m
 
 After the cluster is `Available=true`, drain a node via `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`, restart the underlying VM (`virtctl restart <vm>` for CAPK; vSphere "Restart Guest OS" for CAPV), uncordon, and verify `kubectl get nodes` shows `Ready` within 5 minutes. This validates KD-23's persistence injection — k0s/k3s state, SSH host keys, and CNI config must survive the reboot.
 
-## Validated configurations (v0.1.0-alpha.2)
+## Supported configurations (v0.1.0-beta.1)
 
-The following combinations were validated end-to-end before the alpha.2 release:
+Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3, for both k0s and k3s. CAPD is dev-only (single-node); HA is not exercised on CAPD. CAPD is tested via unit/envtest rather than a live e2e run.
 
-| Infrastructure | Distribution | Image | Result |
+| Infrastructure | Distribution | Single-node | HA (3-node) |
 |---|---|---|---|
-| CAPV | k0s | Kairos Hadron v0.0.4 | PASS |
-| CAPV | k3s | Kairos Hadron v0.0.4 | PASS |
-| CAPM3 | k0s | Kairos Hadron v0.0.4 | PASS |
-| CAPM3 | k3s | Kairos Hadron v0.0.4 | PASS |
-| CAPK | k0s | standard Kairos v3.6.0 | Passed alpha-1; no code regression in alpha-2 |
+| CAPV | k0s | Supported | Supported |
+| CAPV | k3s | Supported | Supported (KD-5d day-2 caveat) |
+| CAPM3 | k0s | Supported | Supported |
+| CAPM3 | k3s | Supported | Supported (KD-5d day-2 caveat) |
+| CAPK | k0s | Supported | Supported |
+| CAPK | k3s | Supported | Supported (KD-5d day-2 caveat) |
+| CAPD | k0s | Supported (dev only) | Not exercised |
 
-CAPD is exercised via unit/envtest rather than a live e2e run. Hadron is the musl-libc-based next-generation Kairos OS; validating it confirms compatibility with both glibc and musl targets.
+Hadron is the musl-libc-based next-generation Kairos OS; it is exercised alongside standard (glibc) Kairos images to confirm compatibility with both targets.

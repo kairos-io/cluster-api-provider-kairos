@@ -135,7 +135,65 @@ for the full operator procedure.
 
 ---
 
-## v0.1.0-alpha.2 → v0.1.0-alpha.3
+## v0.1.0-alpha.2 → v0.1.0-beta.1
 
-No upgrade guidance is published for this path yet — alpha.3 has not shipped.
-This section will be populated when the alpha.3 release branch is cut.
+Full release notes: [v0.1.0-beta.1](release-notes/v0.1.0-beta.1.md).
+
+### Management cluster CAPI core must be v1.13.3+
+
+This provider's dependency on `sigs.k8s.io/cluster-api` moves from v1.8 to
+v1.13.3, adopting the v1beta2 contract-versioned object-reference model
+(`ContractVersionedObjectReference` / `MachineNodeReference`) in place of
+v1beta1 pointer-based references (commit `736aeb3`, [ADR 0006](../.claude/decisions/0006-dependency-bump-capi-v1.13.md)).
+
+**Required operator action:** upgrade the management cluster's Cluster API
+core to v1.13.3 or later before upgrading this provider:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/cluster-api-components.yaml
+```
+
+**Deploy this provider's CRDs via kustomize or clusterctl, not raw `kubectl
+apply -f config/crd/bases/`.** The CRDs must carry the
+`cluster.x-k8s.io/v1beta2: v1beta2` contract label (applied by
+`config/crd/kustomization.yaml`) or CAPI core cannot resolve this provider's
+object references — the Machine owner reference is never set on
+`KairosConfig` and bootstrap data never renders. `make deploy`, the
+published `kairos-capi-provider.yaml`, and `clusterctl` all apply this
+label correctly.
+
+### RBAC addition: `customresourcedefinitions` read (commit `b31083f`)
+
+The controller's ClusterRole gained `get;list;watch` on
+`customresourcedefinitions.apiextensions.k8s.io`, required by
+`external.GetObjectFromContractVersionedRef` to resolve which API version
+satisfies the v1beta2 contract for a given object reference. Without this
+rule, every infra-object read is `Forbidden` and no Machines are created —
+this only surfaces against a real API server (envtest's fake client does
+not enforce RBAC), so it is easy to miss if you manage RBAC separately from
+the shipped manifest. Included in the release manifest; if you maintain a
+hand-rolled RBAC configuration, add this rule before upgrading.
+
+### `KairosControlPlane.spec.machineTemplate.metadata` is now a pointer (commit `58bc284`)
+
+The field changed from a value type to `*clusterv1.ObjectMeta` so an empty
+value is omitted from the API payload instead of round-tripping as `{}`.
+CAPI v1beta2's `ObjectMeta` schema requires `MinProperties=1`; the
+value-type field previously caused every KCP reconcile against a real API
+server to be rejected by schema validation. **No operator action required**
+unless you have external tooling that constructs `KairosControlPlane`
+objects programmatically and depends on the Go field being a value type —
+the YAML shape (including an explicit `metadata: {}`) is unaffected.
+
+### `KairosControlPlane.spec.replicas` now accepts `3` and `5` (HA)
+
+Previously only `1` was accepted. `replicas: 3` or `5` now provisions a
+multi-node control plane; even counts and values above `5` are
+webhook-rejected. Existing `replicas: 1` deployments are unaffected. See
+[README.md § High-Availability control planes](../README.md#high-availability-control-planes)
+for the new HA fields (`spec.ha.vip`, provider-specific endpoint mechanism)
+and the [HA sample manifests](../config/samples/) for CAPK, CAPV, and CAPM3.
+
+**No in-place single-node-to-HA conversion.** To move an existing
+single-node cluster to HA, provision a new HA cluster rather than editing
+`spec.replicas` on a running single-node `KairosControlPlane`.

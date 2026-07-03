@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.9+ required (go.mod imports v1.8 types; see Notes §API Version Compatibility), provider v0.1.0-alpha.3 (provisional — HA control-plane support, unreleased at time of writing).
+Last verified against: Kairos v3.6.0+, CAPI v1.13.3 (v1beta2 contract), provider v0.1.0-beta.1.
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
@@ -474,14 +474,14 @@ This is a known limitation of post-boot file writes for network configuration on
 ### API Version Compatibility
 
 - **Kairos CAPI Provider APIs**: `bootstrap.cluster.x-k8s.io/v1beta2` and `controlplane.cluster.x-k8s.io/v1beta2`.
-- **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). The Go module currently imports `sigs.k8s.io/cluster-api/api/v1beta1` because go.mod pins CAPI v1.8 Go types — the v1beta2 Go package did not exist at that module version. This is a compile-time import detail only; the CRD API group and version on the wire are not affected. CAPI v1.9+ is required at runtime (the v1beta2 wire contract). Bumping go.mod to CAPI v1.11+ is tracked as KD-13.
+- **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). `go.mod` imports `sigs.k8s.io/cluster-api v1.13.3` and this provider's controllers use the `ContractVersionedObjectReference` / `MachineNodeReference` value types introduced by that contract. CAPI core v1.13.3+ is required at runtime.
 - **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK uses `infrastructure.cluster.x-k8s.io/v1alpha1`).
 
 ### Credential Requirements
 
 At least one of the following must be set on every `KairosConfig` (enforced by the validating webhook):
 
-- `userPassword` (inline; not recommended outside lab use)
+- `userPassword` (inline; discouraged — the value is stored in the resource spec and readable by anyone with read access to it)
 - `userPasswordSecretRef` (recommended)
 - `sshPublicKey`
 - `githubUser`

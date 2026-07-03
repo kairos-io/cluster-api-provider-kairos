@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPD (Docker)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x), provider v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.3, provider v0.1.0-beta.1.
 
 This guide walks you through creating a single-node k0s cluster on Kairos using Cluster API with the Docker provider (CAPD).
 
@@ -13,7 +13,7 @@ This guide walks you through creating a single-node k0s cluster on Kairos using 
 ## Prerequisites
 
 1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster).
-2. **Cluster API**: CAPI v1.9+ installed (v1beta2 wire contract; lab-validated against v1.12.x).
+2. **Cluster API**: CAPI v1.13.3+ installed (v1beta2 contract).
 3. **CAPD**: Cluster API Provider Docker installed.
 4. **Kairos CAPI Provider**: Installed (see [Install guide](INSTALL.md)).
 
@@ -28,7 +28,7 @@ Install CAPI and CAPD using your preferred method. See the [Cluster API book](ht
 **Recommended (released artifact):**
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
 ```
 
 **Developer install (from source):**
@@ -60,7 +60,7 @@ Key components:
 - `Secret` — user password (referenced by `userPasswordSecretRef` in KairosConfigTemplate).
 - `Cluster` — references `DockerCluster` and `KairosControlPlane`.
 - `DockerCluster` — Docker infrastructure cluster.
-- `KairosControlPlane` — control plane with `replicas: 1` (this guide is single-node; HA with `replicas: 3`/`5` via `spec.ha.vip` is supported — see the [README HA section](../README.md#high-availability-control-planes). CAPV k0s is the lab-validated HA path; CAPD HA is not yet lab-validated).
+- `KairosControlPlane` — control plane with `replicas: 1` (this guide is single-node). HA (`replicas: 3`/`5`) is supported on CAPK, CAPV, and CAPM3 — see the [README HA section](../README.md#high-availability-control-planes). CAPD is dev-only and HA is not exercised on it; there is no CAPD HA sample.
 - `DockerMachineTemplate` — template for Docker machines.
 - `KairosConfigTemplate` — bootstrap configuration with `userPasswordSecretRef`.
 
@@ -150,7 +150,7 @@ This adds a `MachineDeployment` for worker nodes referencing a separate `KairosC
 
 - Configure additional Kubernetes manifests via `spec.manifests` in `KairosConfigTemplate`.
 - Scale worker nodes by updating `MachineDeployment.spec.replicas`.
-- HA control planes (`replicas: 3`/`5` with a kube-vip VIP via `spec.ha.vip`) are supported; CAPV k0s is the lab-validated path (see the [README HA section](../README.md#high-availability-control-planes)). CAPD reuses the same `spec.ha.vip` surface but its HA path is not yet lab-validated.
+- HA control planes (`replicas: 3`/`5`) are supported on CAPK, CAPV, and CAPM3 — see the [README HA section](../README.md#high-availability-control-planes). CAPD is dev-only; HA is not exercised on it.
 
 ## Cleanup
 

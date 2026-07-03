@@ -31,6 +31,18 @@ releaseSeries:
         url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/components.yaml
         # sha256 populated by release engineering at publish time.
 
+      # v0.1.0-beta.1 — Highly-available control planes on CAPK/CAPV/CAPM3
+      # (k0s and k3s), CAPI core dependency bump to v1.13.3 / k8s 1.35 /
+      # controller-runtime v0.23.3 (ADR 0006, v1beta2 contract-versioned
+      # object references), quorum-safe control-plane replacement, etcd
+      # health condition. v0.1.0-alpha.3 was never released; this supersedes
+      # it (see docs/release-notes/v0.1.0-alpha.3.md).
+      - version: v0.1.0-beta.1
+        releaseDate: "2026-07-03"
+        contract: v1beta2
+        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/components.yaml
+        # sha256 populated by release engineering at publish time.
+
       # v0.1.0 — not yet released.
       - version: v0.1.0
         releaseDate: "2024-11-21"

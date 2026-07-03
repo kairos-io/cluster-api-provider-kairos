@@ -98,8 +98,7 @@ write_files:
       # a stranded cluster is not.
       # DMI uses mixed-endian byte order for the first three UUID groups; vSphere
       # expects RFC/ISO big-endian. The byte-swap below is the same algorithm
-      # proven correct in the k3s CAPV template (lab-validated: discovered UUID
-      # matched VSphereMachine providerID and Machine reached Running).
+      # used in the k3s CAPV template.
       export KUBECONFIG=/var/lib/k0s/pki/admin.conf
       PROVIDER_ID=""
       if [ -f /sys/class/dmi/id/product_uuid ]; then
