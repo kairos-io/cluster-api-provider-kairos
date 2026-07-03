@@ -2,8 +2,8 @@
 # CAPM3 Sample: Single-Node k3s Cluster on Kairos OS (bare metal via Metal3)
 # ============================================================================
 #
-# Lab-validated path. This manifest provisions a single-node k3s control plane
-# on real (or emulated) bare metal via Metal3 + Ironic + baremetal-operator.
+# This manifest provisions a single-node k3s control plane on real (or
+# emulated) bare metal via Metal3 + Ironic + baremetal-operator.
 #
 # PREREQUISITES (all must be satisfied before applying this manifest):
 #
@@ -15,8 +15,8 @@
 #   3. baremetal-operator (BMO) v0.13+ and Ironic running and accessible.
 #      Verify: kubectl get baremetalhosts -A
 #
-#   4. Kairos CAPI provider v0.1.0-alpha.2+ installed.
-#      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+#   4. Kairos CAPI provider v0.1.0-beta.1+ installed.
+#      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
 #
 #   5. A fully-installed Kairos k3s disk image served over HTTP.
 #      See the "Building the disk image" section in docs/QUICKSTART_CAPM3.md.
@@ -74,8 +74,9 @@
 #
 # ============================================================================
 #
-# SINGLE-NODE ONLY
-# replicas > 1 is webhook-rejected. HA control planes are tracked in KD-5b.
+# SINGLE-NODE
+# This sample provisions replicas: 1. For a 3-node HA control plane, see
+# kairos_cluster_k3s_ha.yaml in this directory.
 #
 # ============================================================================
 
@@ -142,7 +143,7 @@ metadata:
   name: kairos-m3-cp
   namespace: default
 spec:
-  # Single-node only. replicas > 1 is webhook-rejected (KD-5b).
+  # Single-node. For HA (replicas: 3/5) see kairos_cluster_k3s_ha.yaml.
   replicas: 1
   # Set this to match the k3s version bundled in your disk image (see CRITICAL
   # note at the top of this file). This value is informational on the Metal3
