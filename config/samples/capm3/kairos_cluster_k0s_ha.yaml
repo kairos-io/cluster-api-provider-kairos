@@ -14,13 +14,12 @@
 #     before the Cluster stack is applied.
 #   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
 #     quorum needs an odd member count.
-#   - spec.distribution MUST be set EXPLICITLY on the KairosControlPlane and
-#     match the KairosConfigTemplate. The webhook defaults an unset
-#     KairosControlPlane distribution to k0s, and the controller writes the
-#     KCP's own distribution back onto the generated KairosConfig AFTER
-#     merging the KairosConfigTemplate — silently overriding the template.
-#     For k0s this sample is a no-op (both default to k0s), but always set it
-#     explicitly; the k3s HA sample in this directory depends on it.
+#   - spec.distribution is set EXPLICITLY on the KairosControlPlane and
+#     matches the KairosConfigTemplate. An explicit value here always wins;
+#     if left unset, the controller inherits spec.distribution from the
+#     referenced KairosConfigTemplate, falling back to k0s only if neither
+#     sets one. Setting it explicitly here is still recommended for clarity —
+#     the k3s HA sample in this directory does the same.
 #   - spec.ha.vip declares the kube-vip VIP. Cluster.spec.controlPlaneEndpoint
 #     .host and Metal3Cluster.spec.controlPlaneEndpoint.host MUST both equal
 #     spec.ha.vip.address — this is the stable API endpoint every node and

@@ -11,11 +11,12 @@
 #   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
 #     quorum needs an odd member count.
 #   - spec.distribution is set EXPLICITLY on the KairosControlPlane and MUST
-#     be "k3s". The webhook defaults an unset KairosControlPlane distribution
-#     to k0s, and the controller writes the KCP's own distribution back onto
-#     the generated KairosConfig AFTER merging the KairosConfigTemplate —
-#     silently overriding the template. Omitting spec.distribution here
-#     provisions a k0s cloud-config onto a k3s image and nothing starts.
+#     be "k3s". An explicit value here always wins; if left unset, the
+#     controller inherits spec.distribution from the referenced
+#     KairosConfigTemplate, so this would still resolve to k3s given the
+#     template below — but set it explicitly for clarity. A mismatched
+#     distribution (k0s cloud-config onto a k3s image, or vice versa) means
+#     nothing starts.
 #   - NO spec.ha.vip. CAPK provisions its own LoadBalancer Service and
 #     reflects its IP into Cluster.spec.controlPlaneEndpoint. Setting
 #     spec.ha.vip in addition to CAPK's own LoadBalancer produces two
@@ -108,8 +109,8 @@ spec:
   # HA control plane: 3 or 5 only (odd count for etcd quorum). The webhook
   # rejects even counts > 1.
   replicas: 3
-  # EXPLICIT and REQUIRED — see the note at the top of this file. Omitting
-  # this defaults to k0s and silently overrides the KairosConfigTemplate.
+  # Set explicitly for clarity — see the note at the top of this file. If
+  # omitted, the controller inherits k3s from the KairosConfigTemplate below.
   distribution: k3s
   version: "v1.34.8+k3s1"
   machineTemplate:

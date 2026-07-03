@@ -8,12 +8,12 @@
 # HOW HA DIFFERS FROM SINGLE-NODE:
 #   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
 #     quorum needs an odd member count.
-#   - spec.distribution is set EXPLICITLY on the KairosControlPlane. It
-#     defaults to k0s and, after the KairosConfigTemplate is merged, the
-#     controller writes the KCP's own distribution back onto the generated
-#     KairosConfig — silently overriding the template. For k0s this is a
-#     no-op (both default to k0s), but always set it explicitly; the k3s HA
-#     sample in this directory depends on it.
+#   - spec.distribution is set EXPLICITLY on the KairosControlPlane. An
+#     explicit value here always wins; if left unset, the controller inherits
+#     spec.distribution from the referenced KairosConfigTemplate, falling
+#     back to k0s only if neither sets one. Setting it explicitly here is
+#     still recommended for clarity — the k3s HA sample in this directory
+#     does the same.
 #   - NO spec.ha.vip. CAPK provisions its own LoadBalancer Service and
 #     reflects its IP into Cluster.spec.controlPlaneEndpoint. Setting
 #     spec.ha.vip in addition to CAPK's own LoadBalancer produces two

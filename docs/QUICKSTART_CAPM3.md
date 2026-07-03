@@ -384,7 +384,7 @@ apiVersion: controlplane.cluster.x-k8s.io/v1beta2
 kind: KairosControlPlane
 spec:
   replicas: 3               # 3 or 5 only — odd counts for etcd quorum
-  distribution: k0s          # or k3s — MUST be set explicitly (see note below)
+  distribution: k0s          # or k3s — set explicitly for clarity (see note below)
   ha:
     vip:
       address: "TODO-REPLACE-WITH-VIP-ADDRESS"
@@ -392,7 +392,7 @@ spec:
       mode: ARP
 ```
 
-**`spec.distribution` must be set explicitly on the `KairosControlPlane`.** It defaults to `k0s` and silently overrides the `KairosConfigTemplate` distribution after templates are merged — a k3s HA manifest that only sets `distribution: k3s` on the `KairosConfigTemplate` provisions k0s instead. Both HA sample files set it correctly; if you write your own, do not drop this field.
+**Setting `spec.distribution` explicitly on the `KairosControlPlane` is recommended.** An explicit value always wins. If left unset, the controller inherits `spec.distribution` from the referenced `KairosConfigTemplate` (falling back to `k0s` only if neither sets one), so a k3s HA manifest that sets `distribution: k3s` only on the `KairosConfigTemplate` still provisions k3s. Setting it explicitly on both resources removes any ambiguity and is what both HA sample files do; if an explicit `KairosControlPlane` value ever disagrees with the template's, the controller emits a `DistributionOverride` warning Event and the explicit value wins.
 
 ### Apply and verify
 
@@ -423,7 +423,7 @@ Same failure modes as [CAPV HA troubleshooting](QUICKSTART_CAPV.md#ha-troublesho
 | Symptom | Cause | Action |
 |---|---|---|
 | All three Nodes register with the same name | `hostname` was set instead of `hostnamePrefix` in the `KairosConfigTemplate` | Switch to `hostnamePrefix`; each node then derives a distinct name from its machine ID. |
-| A control-plane node comes up running the wrong distribution | `KairosControlPlane.spec.distribution` was left unset (defaults to `k0s`) or does not match the `KairosConfigTemplate` | Set `spec.distribution` explicitly on the `KairosControlPlane` to match the `KairosConfigTemplate`. |
+| A control-plane node comes up running the wrong distribution | An explicit `KairosControlPlane.spec.distribution` disagrees with the `KairosConfigTemplate`'s (explicit KCP value always wins — check for a `DistributionOverride` warning Event on the `KairosControlPlane`), or the disk image doesn't match the resolved distribution | Set `spec.distribution` explicitly on the `KairosControlPlane` to match the `KairosConfigTemplate`, and confirm the Metal3 image is built for that distribution. |
 
 ---
 
