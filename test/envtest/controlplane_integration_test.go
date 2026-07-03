@@ -32,6 +32,7 @@ import (
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -83,6 +84,12 @@ func TestControlPlaneIntegration(t *testing.T) {
 	mgr, err := manager.New(cfg, manager.Options{
 		Scheme: scheme,
 		Logger: log.Log,
+		// Each envtest in this package brings up its own manager in the same
+		// process; controller-runtime v0.23 validates controller-name uniqueness
+		// against a process-global registry, so the shared "kairosconfig"
+		// controller name collides across managers. Test-harness concern only —
+		// production runs a single manager.
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)},
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -247,7 +254,8 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
 
-	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log})
+	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	bootstrapReconciler := &bootstrap.KairosConfigReconciler{
