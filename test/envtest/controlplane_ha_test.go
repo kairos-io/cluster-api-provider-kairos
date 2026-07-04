@@ -242,7 +242,12 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 				*metav1.NewControllerRef(getKCP(g, ctx, c, nsName, kcpName), controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
 			},
 		},
-		Spec: clusterv1.MachineSpec{ClusterName: clusterName, Version: "v1.30.0+k0s.0"},
+		Spec: clusterv1.MachineSpec{
+			ClusterName:       clusterName,
+			Version:           "v1.30.0+k0s.0",
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
+		},
 	}
 	g.Expect(c.Create(ctx, initMachine)).To(Succeed())
 	initMachine.Status.NodeRef = clusterv1.MachineNodeReference{Name: "init-node"}
@@ -371,6 +376,7 @@ func TestHA_JoinTokenWatch_ReReconcilesJoinConfig(t *testing.T) {
 					Name:     "pending-join",
 				},
 			},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(c.Create(ctx, joinMachine)).To(Succeed())
@@ -448,7 +454,12 @@ func TestHA_StatusMath_N3(t *testing.T) {
 					*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
 				},
 			},
-			Spec: clusterv1.MachineSpec{ClusterName: clusterName, Version: "v1.30.0+k0s.0"},
+			Spec: clusterv1.MachineSpec{
+				ClusterName:       clusterName,
+				Version:           "v1.30.0+k0s.0",
+				Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+				InfrastructureRef: testMachineInfraRef("infra"),
+			},
 		}
 		g.Expect(c.Create(ctx, m)).To(Succeed())
 		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: "node-" + string(rune('0'+i))}

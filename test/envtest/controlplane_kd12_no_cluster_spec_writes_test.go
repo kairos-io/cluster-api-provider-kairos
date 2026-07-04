@@ -120,9 +120,10 @@ func TestKD12_KCPDoesNotWriteClusterSpecEndpoint(t *testing.T) {
 			},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Bootstrap:   clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
-			Version:     "v1.30.0+k0s.0",
+			ClusterName:       clusterName,
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
+			Version:           "v1.30.0+k0s.0",
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())
@@ -264,9 +265,10 @@ func TestKD12_KCPReadsClusterSpecEndpointAfterInfraSets(t *testing.T) {
 			},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Bootstrap:   clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
-			Version:     "v1.30.0+k0s.0",
+			ClusterName:       clusterName,
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
+			Version:           "v1.30.0+k0s.0",
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())

@@ -145,6 +145,7 @@ func TestBootstrapIntegration(t *testing.T) {
 					Name:     "test-kairos-config",
 				},
 			},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(mgr.GetClient().Create(ctx, machine)).To(Succeed())
@@ -358,6 +359,7 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 					Name:     kcName,
 				},
 			},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(mgr.GetClient().Create(ctx, machine)).To(Succeed())

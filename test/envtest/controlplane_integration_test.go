@@ -395,8 +395,10 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 			},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Version:     "v1.30.0+k0s.0",
+			ClusterName:       clusterName,
+			Version:           "v1.30.0+k0s.0",
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())
@@ -512,8 +514,10 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 			Finalizers: []string{foreignFinalizer},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Version:     "v1.30.0+k0s.0",
+			ClusterName:       clusterName,
+			Version:           "v1.30.0+k0s.0",
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())

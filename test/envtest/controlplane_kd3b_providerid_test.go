@@ -139,9 +139,10 @@ func TestProviderID_NotPatchedByController(t *testing.T) {
 			},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Bootstrap:   clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
-			Version:     "v1.30.0+k0s.0",
+			ClusterName:       clusterName,
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
+			Version:           "v1.30.0+k0s.0",
 			// ProviderID intentionally left nil so it can't trivially
 			// satisfy a regression that only ever wrote when ProviderID
 			// was already known.
