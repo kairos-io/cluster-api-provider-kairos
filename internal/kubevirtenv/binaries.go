@@ -146,12 +146,12 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 			"amd64": {
 				Version:     KubeVirtVersion,
 				URLTemplate: "https://github.com/kubevirt/kubevirt/releases/download/%[1]s/virtctl-%[1]s-linux-%[2]s",
-				SHA256:      "c5bc1d0cea095645f3aca4fb86c8e9de27b949f7b06e08873472547596104ab7",
+				SHA256:      "745f3c58c6a77be65b828e67b6ad930e9039ab293ed5b2bef6d44c8681af5b75",
 			},
 			"arm64": {
 				Version:     KubeVirtVersion,
 				URLTemplate: "https://github.com/kubevirt/kubevirt/releases/download/%[1]s/virtctl-%[1]s-linux-%[2]s",
-				SHA256:      "c209eca93501b193851b816b5be4de40d5ec850faefe4f158d81e5810bddee02",
+				SHA256:      "345b29874d3c98801ad022ef3074b21e2b21a386b22a2779997ab7c74c7e6f57",
 			},
 		},
 	},
