@@ -123,15 +123,20 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 		Name: "clusterctl",
 		Arches: map[string]BinaryArchArtifact{
 			"amd64": {
-				// must match DefaultCAPIVersion (and the sigs.k8s.io/cluster-api version in go.mod)
-				Version:     "v1.8.0",
+				// clusterctl init installs the management cluster's CAPI core at this
+				// version, so it MUST match the sigs.k8s.io/cluster-api version in
+				// go.mod (v1.13.3). The controller now emits cluster.x-k8s.io/v1beta2
+				// Machines; a v1.8.0 management apiserver does not serve that contract,
+				// so the KCP's Machine create fails and no workload VM is ever
+				// provisioned (the e2e regression fixed here).
+				Version:     "v1.13.3",
 				URLTemplate: "https://github.com/kubernetes-sigs/cluster-api/releases/download/%[1]s/clusterctl-linux-%[2]s",
-				SHA256:      "9489713e4306300d5915fe8a301dd3f641764177dd3be51bf10e16e995b97092",
+				SHA256:      "a6b94e0da68df254191480b11c0b50019a7a5df87560d6f70a76d3453116f21e",
 			},
 			"arm64": {
-				Version:     "v1.8.0",
+				Version:     "v1.13.3",
 				URLTemplate: "https://github.com/kubernetes-sigs/cluster-api/releases/download/%[1]s/clusterctl-linux-%[2]s",
-				SHA256:      "cc594a67672a08e60cefd7e01d1cc487156dc3c224ac433a1a8685d0309b8fcc",
+				SHA256:      "a9b32e0179cdbb66ba67ebdb45be818c983dedcc827f6d31bca72277250df52c",
 			},
 		},
 	},
@@ -141,12 +146,12 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 			"amd64": {
 				Version:     KubeVirtVersion,
 				URLTemplate: "https://github.com/kubevirt/kubevirt/releases/download/%[1]s/virtctl-%[1]s-linux-%[2]s",
-				SHA256:      "c5bc1d0cea095645f3aca4fb86c8e9de27b949f7b06e08873472547596104ab7",
+				SHA256:      "745f3c58c6a77be65b828e67b6ad930e9039ab293ed5b2bef6d44c8681af5b75",
 			},
 			"arm64": {
 				Version:     KubeVirtVersion,
 				URLTemplate: "https://github.com/kubevirt/kubevirt/releases/download/%[1]s/virtctl-%[1]s-linux-%[2]s",
-				SHA256:      "c209eca93501b193851b816b5be4de40d5ec850faefe4f158d81e5810bddee02",
+				SHA256:      "345b29874d3c98801ad022ef3074b21e2b21a386b22a2779997ab7c74c7e6f57",
 			},
 		},
 	},
