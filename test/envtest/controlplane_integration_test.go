@@ -30,8 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -83,6 +84,12 @@ func TestControlPlaneIntegration(t *testing.T) {
 	mgr, err := manager.New(cfg, manager.Options{
 		Scheme: scheme,
 		Logger: log.Log,
+		// Each envtest in this package brings up its own manager in the same
+		// process; controller-runtime v0.23 validates controller-name uniqueness
+		// against a process-global registry, so the shared "kairosconfig"
+		// controller name collides across managers. Test-harness concern only —
+		// production runs a single manager.
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)},
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -127,16 +134,15 @@ func TestControlPlaneIntegration(t *testing.T) {
 			Namespace: "test-namespace",
 		},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "DockerCluster",
-				Name:       "test-cluster",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     "test-cluster",
 			},
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       "test-kcp",
-				Namespace:  "test-namespace",
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     "test-kcp",
 			},
 		},
 	}
@@ -248,7 +254,8 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
 
-	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log})
+	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	bootstrapReconciler := &bootstrap.KairosConfigReconciler{
@@ -326,11 +333,10 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       kcpName,
-				Namespace:  nsName,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     kcpName,
 			},
 		},
 	}
@@ -389,8 +395,10 @@ func TestControlPlaneIntegration_DeleteDrainsOwnedMachine(t *testing.T) {
 			},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			ClusterName:       clusterName,
+			Version:           "v1.30.0+k0s.0",
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())
@@ -443,11 +451,10 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       kcpName,
-				Namespace:  nsName,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     kcpName,
 			},
 		},
 	}
@@ -507,8 +514,10 @@ func TestControlPlaneIntegration_DeleteHeldByForeignFinalizerOnMachine(t *testin
 			Finalizers: []string{foreignFinalizer},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: clusterName,
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			ClusterName:       clusterName,
+			Version:           "v1.30.0+k0s.0",
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(c.Create(ctx, machine)).To(Succeed())

@@ -17,19 +17,18 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
 	"net"
 	"regexp"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -49,18 +48,26 @@ var vipInterfaceRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]{0,14}$`)
 var kairoscontrolplaneLog = logf.Log.WithName("kairoscontrolplane-resource")
 
 // SetupWebhookWithManager sets up the webhook with the Manager.
+//
+// controller-runtime v0.23 replaced the zero-arg self-webhook interfaces with
+// typed admission.Defaulter[T]/Validator[T]; the defaulting/validation logic is
+// unchanged from the previous form — only the plumbing moved (ADR 0006).
 func (r *KairosControlPlane) SetupWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(r).
+	return ctrl.NewWebhookManagedBy(mgr, &KairosControlPlane{}).
+		WithDefaulter(&kairosControlPlaneDefaulter{}).
+		WithValidator(&kairosControlPlaneValidator{}).
 		Complete()
 }
 
 //+kubebuilder:webhook:path=/mutate-controlplane-cluster-x-k8s-io-v1beta2-kairoscontrolplane,mutating=true,failurePolicy=fail,sideEffects=None,groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=create;update,versions=v1beta2,name=mkairoscontrolplane.kb.io,admissionReviewVersions=v1
 
-var _ webhook.Defaulter = &KairosControlPlane{}
+// kairosControlPlaneDefaulter applies static/conditional defaults to a KCP.
+type kairosControlPlaneDefaulter struct{}
 
-// Default implements webhook.Defaulter so a webhook will be registered for the type
-func (r *KairosControlPlane) Default() {
+var _ admission.Defaulter[*KairosControlPlane] = &kairosControlPlaneDefaulter{}
+
+// Default implements admission.Defaulter[*KairosControlPlane].
+func (*kairosControlPlaneDefaulter) Default(_ context.Context, r *KairosControlPlane) error {
 	kairoscontrolplaneLog.Info("default", "name", r.Name)
 
 	// Set default replicas to 1 if not specified
@@ -69,12 +76,15 @@ func (r *KairosControlPlane) Default() {
 		r.Spec.Replicas = &replicas
 	}
 
-	// Set default distribution
-	if r.Spec.Distribution == "" {
-		r.Spec.Distribution = "k0s"
-	}
+	// NOTE: spec.distribution is intentionally NOT defaulted here. The effective
+	// distribution is resolved in the controller (which can read the referenced
+	// KairosConfigTemplate), because a defaulting webhook MUST NOT make API calls
+	// (api/CLAUDE.md rule 8). Defaulting it to k0s here would make "unset"
+	// indistinguishable from an explicit "k0s" and silently override a
+	// distribution set only on the KairosConfigTemplate.
 
 	defaultSSHFallback(r.Spec.SSHFallback)
+	return nil
 }
 
 // defaultSSHFallback applies runtime defaults to a non-nil SSHFallback
@@ -105,18 +115,27 @@ func defaultSSHFallback(s *SSHFallback) {
 
 //+kubebuilder:webhook:path=/validate-controlplane-cluster-x-k8s-io-v1beta2-kairoscontrolplane,mutating=false,failurePolicy=fail,sideEffects=None,groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes,verbs=create;update,versions=v1beta2,name=vkairoscontrolplane.kb.io,admissionReviewVersions=v1
 
-var _ webhook.Validator = &KairosControlPlane{}
+// kairosControlPlaneValidator validates a KCP on create/update.
+type kairosControlPlaneValidator struct{}
 
-// ValidateCreate implements webhook.Validator so a webhook will be registered for the type
-func (r *KairosControlPlane) ValidateCreate() (admission.Warnings, error) {
+var _ admission.Validator[*KairosControlPlane] = &kairosControlPlaneValidator{}
+
+// ValidateCreate implements admission.Validator[*KairosControlPlane].
+func (*kairosControlPlaneValidator) ValidateCreate(_ context.Context, r *KairosControlPlane) (admission.Warnings, error) {
 	kairoscontrolplaneLog.Info("validate create", "name", r.Name)
 	return r.validateWithWarnings()
 }
 
-// ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *KairosControlPlane) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+// ValidateUpdate implements admission.Validator[*KairosControlPlane].
+func (*kairosControlPlaneValidator) ValidateUpdate(_ context.Context, _, r *KairosControlPlane) (admission.Warnings, error) {
 	kairoscontrolplaneLog.Info("validate update", "name", r.Name)
 	return r.validateWithWarnings()
+}
+
+// ValidateDelete implements admission.Validator[*KairosControlPlane].
+func (*kairosControlPlaneValidator) ValidateDelete(_ context.Context, r *KairosControlPlane) (admission.Warnings, error) {
+	kairoscontrolplaneLog.Info("validate delete", "name", r.Name)
+	return nil, nil
 }
 
 // validateWithWarnings runs validate() and also collects non-blocking warnings.
@@ -137,12 +156,6 @@ func (r *KairosControlPlane) validateWithWarnings() (admission.Warnings, error) 
 	}
 
 	return warnings, r.validate()
-}
-
-// ValidateDelete implements webhook.Validator so a webhook will be registered for the type
-func (r *KairosControlPlane) ValidateDelete() (admission.Warnings, error) {
-	kairoscontrolplaneLog.Info("validate delete", "name", r.Name)
-	return nil, nil
 }
 
 // validate performs validation on the KairosControlPlane spec.

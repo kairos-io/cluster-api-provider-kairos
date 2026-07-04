@@ -21,17 +21,35 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/contract"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
 )
+
+// makeInfraCRD builds a minimal CustomResourceDefinition carrying the CAPI
+// contract-version label. external.GetObjectFromContractVersionedRef resolves
+// a ContractVersionedObjectReference's apiVersion by reading this label off the
+// CRD named <plural>.<group>, so unit tests that go through that helper must
+// seed it into the fake client.
+func makeInfraCRD(group, kind, contractAPIVersion string) *unstructured.Unstructured {
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
+	crd.SetName(contract.CalculateCRDName(group, kind))
+	crd.SetLabels(map[string]string{
+		// Contract version == the core CAPI API version by convention.
+		clusterv1.GroupVersion.String(): contractAPIVersion,
+	})
+	return crd
+}
 
 // makeMetal3Machine builds a fake Metal3Machine with a status.addresses slice
 // that matches the MachineAddresses shape used by CAPV and CAPM3.
@@ -62,6 +80,7 @@ func TestGetNodeIP_Metal3Machine(t *testing.T) {
 	_ = controlplanev1beta2.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = apiextensionsv1.AddToScheme(scheme)
 
 	tests := []struct {
 		name      string
@@ -105,22 +124,22 @@ func TestGetNodeIP_Metal3Machine(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m3m := makeMetal3Machine("test-m3m", "default", tc.addresses)
+			m3mCRD := makeInfraCRD("infrastructure.cluster.x-k8s.io", "Metal3Machine", "v1beta2")
 
 			machine := &clusterv1.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
 				Spec: clusterv1.MachineSpec{
-					InfrastructureRef: corev1.ObjectReference{
-						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta2",
-						Kind:       "Metal3Machine",
-						Name:       "test-m3m",
-						Namespace:  "default",
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						APIGroup: "infrastructure.cluster.x-k8s.io",
+						Kind:     "Metal3Machine",
+						Name:     "test-m3m",
 					},
 				},
 			}
 
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(m3m).
+				WithObjects(m3m, m3mCRD).
 				Build()
 
 			r := &KairosControlPlaneReconciler{

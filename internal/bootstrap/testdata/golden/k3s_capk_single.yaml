@@ -134,7 +134,7 @@ write_files:
         chmod 0644 /run/cluster-api/bootstrap-success.complete
       }
       trap mark_bootstrap_success EXIT
-      
+
       # Mark bootstrap success for CAPI/CAPK consumers
       mkdir -p /run/cluster-api
       echo "success" > /run/cluster-api/bootstrap-success.complete

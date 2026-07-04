@@ -1,0 +1,236 @@
+# ============================================================================
+# CAPK Sample: 3-Node HA k0s Control Plane on Kairos OS with KubeVirt
+# ============================================================================
+#
+# This provisions a highly-available, 3-node k0s control plane on KubeVirt.
+# For the single-node variant see kubevirt_cluster_k0s_single_node.yaml.
+#
+# HOW HA DIFFERS FROM SINGLE-NODE:
+#   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
+#     quorum needs an odd member count.
+#   - spec.distribution is set EXPLICITLY on the KairosControlPlane. An
+#     explicit value here always wins; if left unset, the controller inherits
+#     spec.distribution from the referenced KairosConfigTemplate, falling
+#     back to k0s only if neither sets one. Setting it explicitly here is
+#     still recommended for clarity — the k3s HA sample in this directory
+#     does the same.
+#   - NO spec.ha.vip. CAPK provisions its own LoadBalancer Service and
+#     reflects its IP into Cluster.spec.controlPlaneEndpoint. Setting
+#     spec.ha.vip in addition to CAPK's own LoadBalancer produces two
+#     competing endpoint mechanisms.
+#   - Each control-plane VM needs a second, routable network interface for
+#     etcd peering, in addition to the default masquerade interface. KubeVirt
+#     masquerade gives every VM the same self-address (10.0.2.2), so etcd
+#     cannot form quorum across nodes using masquerade alone. Attach a
+#     Multus-backed bridge (or equivalent routable) network as a second NIC —
+#     see the KubevirtMachineTemplate below.
+#   - KairosConfigTemplate uses hostnamePrefix, not hostname: all 3 VMs boot
+#     the same image, so an explicit hostname would collide every Node name.
+#
+# PREREQUISITES:
+#   - Everything from kubevirt_cluster_k0s_single_node.yaml (CDI, the blank
+#     install-target DataVolume, a LoadBalancer implementation such as
+#     MetalLB).
+#   - A second, routable Multus NetworkAttachmentDefinition reachable from
+#     every KubeVirt node that will host a control-plane VM. This is the
+#     etcd peering path; it must let the 3 control-plane VMs reach each
+#     other directly (not through the pod-network masquerade NAT).
+#
+# SETUP INSTRUCTIONS (same pattern as the single-node sample):
+#
+# 1. Apply the blank install-target DataVolume:
+#      kubectl apply -f config/samples/capk/kairos-install-disk.yaml
+#
+# 2. Replace every TODO-REPLACE placeholder below: the secondary network
+#    name, CPU/memory sizing, and (if not all nodes have KVM) nodeSelector.
+#
+# 3. Apply this manifest:
+#      kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_ha.yaml
+#
+# See docs/QUICKSTART_CAPK.md#high-availability-control-plane for the full
+# walkthrough.
+# ============================================================================
+
+# IMPORTANT: replace `password:` below with a strong value before applying.
+# `openssl rand -base64 32` is fine. Inline UserPassword in KairosConfig is
+# deprecated; this Secret pattern is the recommended way to provide it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: kairos-cluster-kv-ha
+  namespace: default
+spec:
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: KubevirtCluster
+    name: kairos-cluster-kv-ha
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KairosControlPlane
+    name: kairos-control-plane-kv-ha
+  # CAPK assigns this once its LoadBalancer Service gets an external IP.
+  # Apply with the placeholder, wait for the <cluster>-control-plane-lb
+  # Service to get an IP, then `kubectl edit cluster kairos-cluster-kv-ha`.
+  # CAPI core does not overwrite a populated value.
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-LB-IP"
+    port: 6443
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtCluster
+metadata:
+  name: kairos-cluster-kv-ha
+  namespace: default
+spec: {}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-control-plane-kv-ha
+  namespace: default
+spec:
+  # HA control plane: 3 or 5 only (odd count for etcd quorum). The webhook
+  # rejects even counts > 1.
+  replicas: 3
+  # EXPLICIT — see the note at the top of this file.
+  distribution: k0s
+  version: "v1.34.8+k0s.0"
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+      kind: KubevirtMachineTemplate
+      name: kairos-control-plane-template-ha
+      namespace: default
+  kairosConfigTemplate:
+    name: kairos-config-template-control-plane-ha
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kairos-control-plane-template-ha
+  namespace: default
+spec:
+  template:
+    spec:
+      # Bypass SSH sentinel check — kubeconfig push avoids SSH.
+      virtualMachineBootstrapCheck:
+        checkStrategy: none
+      virtualMachineTemplate:
+        spec:
+          runStrategy: Always
+          template:
+            metadata:
+              labels:
+                kubevirt.io/domain: kairos-control-plane-ha
+            spec:
+              # Schedule on a KVM-capable node. Remove this selector entirely if
+              # all nodes support KVM, or replace the hostname value with one
+              # that matches a KVM-capable node in your cluster.
+              # nodeSelector:
+              #   kubernetes.io/hostname: TODO-REPLACE-KVM-NODE-HOSTNAME
+              domain:
+                cpu:
+                  cores: 8
+                  model: host-passthrough
+                resources:
+                  requests:
+                    memory: 12Gi
+                devices:
+                  disks:
+                  - name: installeriso
+                    cdrom:
+                      bus: sata
+                    bootOrder: 2
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+                    bootOrder: 1
+                  interfaces:
+                  - name: default
+                    masquerade: {}     # eth0 — pod network / LoadBalancer path
+                  - name: etcd-peer
+                    bridge: {}         # eth1 — routable etcd peering NIC (REQUIRED for HA)
+                features:
+                  smm:
+                    enabled: true
+                  acpi:
+                    enabled: true
+                firmware:
+                  bootloader:
+                    efi:
+                      secureBoot: true
+              networks:
+              - name: default
+                pod: {}
+              - name: etcd-peer
+                multus:
+                  # TODO-REPLACE: name of a NetworkAttachmentDefinition that
+                  # gives each control-plane VM a routable IP the other two
+                  # can reach directly (not through pod-network masquerade).
+                  networkName: TODO-REPLACE-SECONDARY-NETWORK
+              volumes:
+              - name: installeriso
+                dataVolume:
+                  name: kairos-rootdisk
+              - name: rootdisk
+                dataVolume:
+                  name: kairos-install-disk
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-config-template-control-plane-ha
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      # MUST match KairosControlPlane.spec.distribution above.
+      distribution: k0s
+      kubernetesVersion: "v1.34.8+k0s.0"
+      install:
+        auto: true
+        device: "/dev/vda"
+        reboot: true
+      # HA-CRITICAL: use hostnamePrefix, NOT hostname. All 3 VMs boot the
+      # same image; an explicit hostname would collide every Node name.
+      hostnamePrefix: "kairos-cp-"
+      userName: kairos
+      # Password comes from a Secret (defined at the top of this file).
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+      # Optional: sshPublicKey / githubUser for SSH access.
+---
+# ============================================================================
+# SECURITY / LIMITATIONS (read before running HA in production)
+# ============================================================================
+# - Node-self-reported etcd health is FORGEABLE (KD-51). Each control-plane
+#   node writes its own etcd member health with vanilla RBAC on a shared
+#   Secret, and acks its etcd-leave on a shared workload ConfigMap. A
+#   COMPROMISED control-plane node could forge another member's health (to
+#   trick the quorum-safety guard) or forge its own leave ack (to drop the
+#   deletion hook early). This is NOT privilege escalation — a compromised
+#   control-plane node already holds cluster-admin-equivalent — and the
+#   quorum-safety decision is made independently, BEFORE any node signal, so
+#   a forged signal can only make an already-authorized removal cleaner or
+#   earlier, never authorize an unsafe one. Per-member-scoped signals are
+#   tracked as future hardening.
+# - A stuck/unreachable k0s node that never acks its leave within ~5 minutes
+#   is deleted anyway (quorum was already proven safe); the etcd member may
+#   remain registered. Watch for the EtcdMemberLeaveTimedOut warning event
+#   and, if it fires, remove the member manually (`k0s etcdctl member
+#   remove`).
+# - k3s HA: embedded etcd has no supported clean member-remove, so replacing
+#   a k3s control-plane node leaves an orphaned etcd member requiring manual
+#   cleanup (KD-5d). k0s is the fully-supported HA distribution.

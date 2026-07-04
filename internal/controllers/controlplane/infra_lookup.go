@@ -38,7 +38,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/external"
 )
 
 // getNodeIP retrieves the node IP from the infrastructure provider.
@@ -48,14 +49,8 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 	switch machine.Spec.InfrastructureRef.Kind {
 	case "VSphereMachine":
 		// First, try to get IP from VSphereMachine status
-		vsphereMachine := &unstructured.Unstructured{}
-		vsphereMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		vsphereMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err != nil {
+		vsphereMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
 			return "", fmt.Errorf("failed to get VSphereMachine: %w", err)
 		}
 
@@ -73,7 +68,7 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 		})
 		vsphereVMKey := types.NamespacedName{
 			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
+			Namespace: machine.Namespace,
 		}
 
 		if err := r.Get(ctx, vsphereVMKey, vsphereVM); err != nil {
@@ -86,14 +81,8 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 
 		return "", fmt.Errorf("no IP address found in VSphereMachine or VSphereVM status")
 	case "KubevirtMachine", "KubeVirtMachine":
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err != nil {
+		kubevirtMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
 			return "", fmt.Errorf("failed to get KubevirtMachine: %w", err)
 		}
 
@@ -108,13 +97,8 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 
 		return "", fmt.Errorf("no IP address found in KubevirtMachine status")
 	case "DockerMachine":
-		dockerMachine := &unstructured.Unstructured{}
-		dockerMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		dockerMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, dockerMachineKey, dockerMachine); err != nil {
+		dockerMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
 			return "", fmt.Errorf("failed to get DockerMachine: %w", err)
 		}
 		if ip := r.extractIPFromUnstructured(dockerMachine); ip != "" {
@@ -124,13 +108,8 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 	case "Metal3Machine":
 		// Metal3Machine.status.addresses uses the same MachineAddresses shape as CAPV,
 		// so the generic extractor handles it without a provider-specific fallback.
-		metal3Machine := &unstructured.Unstructured{}
-		metal3Machine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		metal3MachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, metal3MachineKey, metal3Machine); err != nil {
+		metal3Machine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
 			return "", fmt.Errorf("failed to get Metal3Machine: %w", err)
 		}
 		if ip := r.extractIPFromUnstructured(metal3Machine); ip != "" {
@@ -216,7 +195,7 @@ func (r *KairosControlPlaneReconciler) getKubevirtVMIIP(ctx context.Context, log
 	})
 	vmiKey := types.NamespacedName{
 		Name:      machine.Spec.InfrastructureRef.Name,
-		Namespace: machine.Spec.InfrastructureRef.Namespace,
+		Namespace: machine.Namespace,
 	}
 	if err := r.Get(ctx, vmiKey, vmi); err != nil {
 		return "", fmt.Errorf("failed to get VMI: %w", err)

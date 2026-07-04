@@ -1,6 +1,6 @@
 # Quickstart: CAPK (KubeVirt)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x), KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-alpha.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.3, KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-beta.1.
 
 This guide covers two paths:
 
@@ -161,13 +161,13 @@ Do not use `clusterctl init --bootstrap kairos` — clusterctl integration is de
 ### Prerequisites
 
 - Kubernetes management cluster with:
-  - CAPI v1.9+ installed (v1beta2 wire contract; lab-validated against v1.12.x)
+  - CAPI v1.13.3+ installed (v1beta2 contract)
   - CAPK (`infrastructure.cluster.x-k8s.io`) installed
   - CDI (Containerized Data Importer) installed
   - A LoadBalancer implementation (MetalLB or equivalent)
 - Kairos CAPI provider installed:
   ```bash
-  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
   ```
 - A Kairos image uploaded to CDI as a DataVolume named `kairos-rootdisk` (for k0s) or `kairos-k3s-rootdisk` (for k3s) in namespace `default`. The image must be a Kairos live-installer image — not a pre-installed disk image.
 
@@ -203,6 +203,23 @@ kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_single_node.yaml
 ### Step 5: Watch cluster status and retrieve kubeconfig
 
 Same commands as the lab path above.
+
+---
+
+## High-availability control plane
+
+CAPK supports a 3- or 5-node control plane (`spec.replicas: 3`/`5`). CAPK provisions its own LoadBalancer Service for the control-plane endpoint, so HA samples do **not** set `spec.ha.vip` — setting it would produce a conflicting endpoint.
+
+Samples:
+
+```bash
+kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_ha.yaml
+kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_ha.yaml
+```
+
+Prerequisite specific to CAPK HA: etcd peers over each control-plane VM's own IP. KubeVirt's default `masquerade` interface gives every VM the same self-address (`10.0.2.2`), so etcd cannot peer across nodes on that interface alone. Each control-plane VM needs a second, routable NIC (a Multus-attached bridge network or equivalent) in addition to the default masquerade interface. See the header comments in the HA sample files for the exact `interfaces`/`networks` shape.
+
+k3s HA has the same day-2 limitation as other providers: replacing a k3s control-plane node leaves an orphaned etcd member requiring manual cleanup (KD-5d). See the [README Day-2 section](../README.md#day-2-etcd-health-and-quorum-safe-replacement).
 
 ---
 

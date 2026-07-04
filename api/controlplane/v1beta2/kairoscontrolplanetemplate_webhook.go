@@ -17,13 +17,13 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
+
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -31,23 +31,30 @@ import (
 var kairoscontrolplanetemplateLog = logf.Log.WithName("kairoscontrolplanetemplate-resource")
 
 // SetupWebhookWithManager sets up the webhook with the Manager.
+//
+// controller-runtime v0.23 typed-webhook plumbing (ADR 0006); validation and
+// defaulting logic are unchanged from the previous self-implementing form.
 func (r *KairosControlPlaneTemplate) SetupWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(r).
+	return ctrl.NewWebhookManagedBy(mgr, &KairosControlPlaneTemplate{}).
+		WithDefaulter(&kairosControlPlaneTemplateDefaulter{}).
+		WithValidator(&kairosControlPlaneTemplateValidator{}).
 		Complete()
 }
 
 //+kubebuilder:webhook:path=/mutate-controlplane-cluster-x-k8s-io-v1beta2-kairoscontrolplanetemplate,mutating=true,failurePolicy=fail,sideEffects=None,groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanetemplates,verbs=create;update,versions=v1beta2,name=mkairoscontrolplanetemplate.kb.io,admissionReviewVersions=v1
 
-var _ webhook.Defaulter = &KairosControlPlaneTemplate{}
+// kairosControlPlaneTemplateDefaulter defaults the nested template spec.
+type kairosControlPlaneTemplateDefaulter struct{}
 
-// Default implements webhook.Defaulter. Applies the same field defaults
-// the KCP webhook applies, but on the nested template spec
-// (r.Spec.Template.Spec). Operators creating a template should see the
+var _ admission.Defaulter[*KairosControlPlaneTemplate] = &kairosControlPlaneTemplateDefaulter{}
+
+// Default implements admission.Defaulter[*KairosControlPlaneTemplate]. Applies
+// the same field defaults the KCP webhook applies, but on the nested template
+// spec (r.Spec.Template.Spec). Operators creating a template should see the
 // same defaulted shape they would see on a KCP after admission, so
 // `kubectl get kairoscontrolplanetemplate -o yaml` reflects the values
 // CAPI's MachineDeployment / template stamping will produce.
-func (r *KairosControlPlaneTemplate) Default() {
+func (*kairosControlPlaneTemplateDefaulter) Default(_ context.Context, r *KairosControlPlaneTemplate) error {
 	kairoscontrolplanetemplateLog.Info("default", "name", r.Name)
 
 	s := &r.Spec.Template.Spec
@@ -68,26 +75,30 @@ func (r *KairosControlPlaneTemplate) Default() {
 	// blocks, so leaving SSHFallback unset on a template is idiomatic
 	// and admission-clean.
 	defaultSSHFallback(s.SSHFallback)
+	return nil
 }
 
 //+kubebuilder:webhook:path=/validate-controlplane-cluster-x-k8s-io-v1beta2-kairoscontrolplanetemplate,mutating=false,failurePolicy=fail,sideEffects=None,groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanetemplates,verbs=create;update,versions=v1beta2,name=vkairoscontrolplanetemplate.kb.io,admissionReviewVersions=v1
 
-var _ webhook.Validator = &KairosControlPlaneTemplate{}
+// kairosControlPlaneTemplateValidator validates the nested template spec.
+type kairosControlPlaneTemplateValidator struct{}
 
-// ValidateCreate implements webhook.Validator.
-func (r *KairosControlPlaneTemplate) ValidateCreate() (admission.Warnings, error) {
+var _ admission.Validator[*KairosControlPlaneTemplate] = &kairosControlPlaneTemplateValidator{}
+
+// ValidateCreate implements admission.Validator[*KairosControlPlaneTemplate].
+func (*kairosControlPlaneTemplateValidator) ValidateCreate(_ context.Context, r *KairosControlPlaneTemplate) (admission.Warnings, error) {
 	kairoscontrolplanetemplateLog.Info("validate create", "name", r.Name)
 	return nil, r.validate()
 }
 
-// ValidateUpdate implements webhook.Validator.
-func (r *KairosControlPlaneTemplate) ValidateUpdate(_ runtime.Object) (admission.Warnings, error) {
+// ValidateUpdate implements admission.Validator[*KairosControlPlaneTemplate].
+func (*kairosControlPlaneTemplateValidator) ValidateUpdate(_ context.Context, _, r *KairosControlPlaneTemplate) (admission.Warnings, error) {
 	kairoscontrolplanetemplateLog.Info("validate update", "name", r.Name)
 	return nil, r.validate()
 }
 
-// ValidateDelete implements webhook.Validator.
-func (r *KairosControlPlaneTemplate) ValidateDelete() (admission.Warnings, error) {
+// ValidateDelete implements admission.Validator[*KairosControlPlaneTemplate].
+func (*kairosControlPlaneTemplateValidator) ValidateDelete(_ context.Context, r *KairosControlPlaneTemplate) (admission.Warnings, error) {
 	kairoscontrolplanetemplateLog.Info("validate delete", "name", r.Name)
 	return nil, nil
 }

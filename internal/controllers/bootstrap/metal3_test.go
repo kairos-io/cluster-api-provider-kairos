@@ -30,7 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -41,11 +41,10 @@ func machineWithInfraKind(kind string) *clusterv1.Machine {
 	return &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta2",
-				Kind:       kind,
-				Name:       "infra-obj",
-				Namespace:  "default",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     kind,
+				Name:     "infra-obj",
 			},
 		},
 	}
@@ -126,8 +125,8 @@ func TestGetProviderID_Metal3ReturnsEmpty(t *testing.T) {
 
 	t.Run("no Machine.Spec.ProviderID set — getProviderID returns empty", func(t *testing.T) {
 		machine := machineWithInfraKind("Metal3Machine")
-		// Machine.Spec.ProviderID is nil (CAPM3 pre-provisioning state)
-		machine.Spec.ProviderID = nil
+		// Machine.Spec.ProviderID is empty (CAPM3 pre-provisioning state)
+		machine.Spec.ProviderID = ""
 
 		got := r.getProviderID(context.Background(), log.Log, machine)
 		if got != "" {
@@ -141,7 +140,7 @@ func TestGetProviderID_Metal3ReturnsEmpty(t *testing.T) {
 		// bootstrap controller gets that value directly, regardless of infra kind.
 		providerID := "metal3://default/my-bmh/my-m3m"
 		machine := machineWithInfraKind("Metal3Machine")
-		machine.Spec.ProviderID = &providerID
+		machine.Spec.ProviderID = providerID
 
 		got := r.getProviderID(context.Background(), log.Log, machine)
 		if got != providerID {

@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -151,7 +152,9 @@ func TestKairosControlPlane_Default_PreservesReplicas(t *testing.T) {
 	for _, in := range []*int32{ptr(int32(0)), ptr(int32(1)), ptr(int32(7))} {
 		kcp := newValidKCP()
 		kcp.Spec.Replicas = in
-		kcp.Default()
+		if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+			t.Fatalf("Default() returned error: %v", err)
+		}
 		if kcp.Spec.Replicas == nil || *kcp.Spec.Replicas != *in {
 			t.Errorf("Default() changed explicit replicas %d to %v; expected unchanged", *in, kcp.Spec.Replicas)
 		}
@@ -163,12 +166,44 @@ func TestKairosControlPlane_Default_PreservesReplicas(t *testing.T) {
 func TestKairosControlPlane_Default_FillsNilReplicas(t *testing.T) {
 	kcp := newValidKCP()
 	kcp.Spec.Replicas = nil
-	kcp.Default()
+	if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
 	if kcp.Spec.Replicas == nil {
 		t.Fatal("Default() left Spec.Replicas nil; expected it to be set to 1")
 	}
 	if *kcp.Spec.Replicas != 1 {
 		t.Errorf("Default() set Spec.Replicas to %d; expected 1", *kcp.Spec.Replicas)
+	}
+}
+
+// TestKairosControlPlane_Default_DoesNotSetDistribution asserts the defaulter no
+// longer fills spec.distribution. The effective distribution is resolved in the
+// controller (which can read the referenced KairosConfigTemplate); a webhook
+// default here would make "unset" indistinguishable from an explicit "k0s" and
+// silently override a distribution set only on the template. The defaulter MUST
+// leave an unset value empty and preserve an explicit one.
+func TestKairosControlPlane_Default_DoesNotSetDistribution(t *testing.T) {
+	// Unset stays unset.
+	kcp := newValidKCP()
+	kcp.Spec.Distribution = ""
+	if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
+	if kcp.Spec.Distribution != "" {
+		t.Errorf("Default() set Spec.Distribution to %q; expected it to stay empty for controller-side inherit", kcp.Spec.Distribution)
+	}
+
+	// Explicit values are preserved verbatim.
+	for _, dist := range []string{"k0s", "k3s"} {
+		kcp := newValidKCP()
+		kcp.Spec.Distribution = dist
+		if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+			t.Fatalf("Default() returned error: %v", err)
+		}
+		if kcp.Spec.Distribution != dist {
+			t.Errorf("Default() changed explicit distribution %q to %q; expected unchanged", dist, kcp.Spec.Distribution)
+		}
 	}
 }
 
@@ -420,7 +455,9 @@ func TestKairosControlPlane_Default_SSHFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			kcp := newValidKCP()
 			kcp.Spec.SSHFallback = tc.in
-			kcp.Default()
+			if err := (&kairosControlPlaneDefaulter{}).Default(context.Background(), kcp); err != nil {
+				t.Fatalf("Default() returned error: %v", err)
+			}
 			if tc.in == nil {
 				if kcp.Spec.SSHFallback != nil {
 					t.Fatalf("nil block became non-nil after Default(); want nil, got %+v", kcp.Spec.SSHFallback)

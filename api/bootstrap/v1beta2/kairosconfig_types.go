@@ -19,7 +19,7 @@ package v1beta2
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 const (
@@ -563,12 +563,12 @@ type KairosConfigList struct {
 }
 
 // GetConditions returns the set of conditions for this object.
-func (c *KairosConfig) GetConditions() clusterv1.Conditions {
+func (c *KairosConfig) GetV1Beta1Conditions() clusterv1.Conditions {
 	return c.Status.Conditions
 }
 
 // SetConditions sets the conditions on this object.
-func (c *KairosConfig) SetConditions(conditions clusterv1.Conditions) {
+func (c *KairosConfig) SetV1Beta1Conditions(conditions clusterv1.Conditions) {
 	c.Status.Conditions = conditions
 }
 

@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPV (vSphere)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.9+ (lab-validated v1.12.x), CAPV v1.11.x, provider v0.1.0-alpha.3 (provisional — HA control-plane support, unreleased at time of writing).
+Last verified against: Kairos v3.6.0+, CAPI v1.13.3, CAPV v1.11.x+, provider v0.1.0-beta.1.
 
 This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV). For a 3-node highly-available k0s control plane, see [High-Availability: 3-node k0s control plane](#high-availability-3-node-k0s-control-plane) below.
 
@@ -16,7 +16,7 @@ This guide walks you through creating a single-node k0s or k3s cluster on Kairos
 
 2. **Management Cluster**: A Kubernetes cluster with network access to vSphere.
 
-3. **Cluster API**: CAPI v1.9+ installed (v1beta2 wire contract; lab-validated against v1.12.x).
+3. **Cluster API**: CAPI v1.13.3+ installed (v1beta2 contract).
 
 4. **CAPV**: Cluster API Provider vSphere installed and configured.
 
@@ -69,7 +69,7 @@ kubectl label namespace default vsphere-identity=allowed
 **Recommended (released artifact):**
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
 ```
 
 **Developer install (from source):**
@@ -83,8 +83,7 @@ See [INSTALL.md](INSTALL.md) for the full developer install process.
 
 ## Building the Kairos VM template
 
-This guide uses **Kairos Hadron**, the OS validated end-to-end with this
-provider (k0s and k3s on CAPV).
+This guide uses **Kairos Hadron** (k0s and k3s on CAPV).
 
 CAPV discovers a VM's IP address through VMware Tools (`vmtoolsd`). The
 published Hadron images do not ship open-vm-tools — Hadron is a minimal,
@@ -302,7 +301,7 @@ kubectl --kubeconfig=kairos-kubeconfig.yaml get nodes
 kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system
 ```
 
-**Note (alpha-2+):** As of v0.1.0-alpha.2, the control-plane controller no
+**Note:** As of v0.1.0-alpha.2, the control-plane controller no
 longer SSHes into nodes to retrieve the kubeconfig. The node pushes its
 kubeconfig to a Secret in the management cluster at bootstrap time. The
 workload VM must have network reachability to the management cluster's API
@@ -315,7 +314,7 @@ on the `KairosControlPlane`.
 
 ## High-Availability: 3-node k0s control plane
 
-This section walks through a 3-node HA k0s control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capv/kairos_cluster_k0s_ha.yaml`](../config/samples/capv/kairos_cluster_k0s_ha.yaml). Read the [single-node walkthrough](#creating-a-cluster) above first — the vSphere template, credentials Secret, and `userPasswordSecretRef` steps are identical. This section covers only what's different for HA.
+This section walks through a 3-node HA k0s control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capv/kairos_cluster_k0s_ha.yaml`](../config/samples/capv/kairos_cluster_k0s_ha.yaml). A k3s HA sample with the same shape is at [`config/samples/capv/kairos_cluster_k3s_ha.yaml`](../config/samples/capv/kairos_cluster_k3s_ha.yaml). Read the [single-node walkthrough](#creating-a-cluster) above first — the vSphere template, credentials Secret, and `userPasswordSecretRef` steps are identical. This section covers only what's different for HA.
 
 k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup — see [README.md § High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 explanation (KD-5d).
 

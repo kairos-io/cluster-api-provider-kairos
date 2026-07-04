@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -84,7 +84,7 @@ func hookedMachine(name, node string, extraAnnotations map[string]string) *clust
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Annotations: ann},
 	}
 	if node != "" {
-		m.Status.NodeRef = &corev1.ObjectReference{Name: node}
+		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: node}
 	}
 	return m
 }

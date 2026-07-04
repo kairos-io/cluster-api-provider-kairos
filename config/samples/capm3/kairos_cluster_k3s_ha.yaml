@@ -1,0 +1,284 @@
+# ============================================================================
+# CAPM3 Sample: 3-Node HA k3s Control Plane on Kairos OS (bare metal via Metal3)
+# ============================================================================
+#
+# This provisions a highly-available, 3-node k3s control plane on bare metal,
+# fronted by a kube-vip virtual IP (VIP). For the single-node variant see
+# kairos_cluster_k3s_single_node.yaml — read its header comments first; the
+# disk-image and Ironic whole-disk-deploy constraints described there apply
+# unchanged here. For the k0s HA variant (fully-supported HA distribution)
+# see kairos_cluster_k0s_ha.yaml in this directory.
+#
+# HOW HA DIFFERS FROM SINGLE-NODE:
+#   - Three (or five) BareMetalHosts are required instead of one, each with
+#     its own BMC-credentials Secret. All must reach BMO state "available"
+#     before the Cluster stack is applied.
+#   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
+#     quorum needs an odd member count.
+#   - spec.distribution is set EXPLICITLY on the KairosControlPlane and MUST
+#     be "k3s". An explicit value here always wins; if left unset, the
+#     controller inherits spec.distribution from the referenced
+#     KairosConfigTemplate, so this would still resolve to k3s given the
+#     template below — but set it explicitly for clarity. A mismatched
+#     distribution (k0s cloud-config onto a k3s image, or vice versa) means
+#     nothing starts.
+#   - spec.ha.vip declares the kube-vip VIP. Cluster.spec.controlPlaneEndpoint
+#     .host and Metal3Cluster.spec.controlPlaneEndpoint.host MUST both equal
+#     spec.ha.vip.address — this is the stable API endpoint every node and
+#     kubeconfig targets, not any individual node's DHCP-assigned IP.
+#   - KairosConfigTemplate uses hostnamePrefix, not hostname: all 3 nodes
+#     boot the same disk image, so an explicit hostname would collide every
+#     Node name.
+#
+# PREREQUISITES (in addition to the single-node prerequisites):
+#   - Three (or five) BareMetalHosts registered with BMO, on a routable
+#     network (not just the provisioning network) — kube-vip and etcd both
+#     need node-to-node and node-to-VIP reachability.
+#   - A free VIP address on that network, outside any DHCP pool and not
+#     otherwise in use.
+#   - The NIC name present on the booted Kairos disk image (verify with
+#     `ip link` on a provisioned node) — this is the interface kube-vip ARPs
+#     the VIP on.
+#
+# KNOWN LIMITATION (KD-5d): k3s embedded etcd has no supported clean
+# member-remove. Replacing a k3s control-plane node leaves an orphaned etcd
+# member requiring manual `etcdctl member remove`. See the limitations
+# footer at the bottom of this file and docs/QUICKSTART_CAPM3.md.
+#
+# APPLY ORDER:
+#   1. Apply the BMC-credentials Secrets and BareMetalHosts (TODO-templated
+#      blocks below) and wait for each to reach state "available":
+#        kubectl get baremetalhosts -w
+#   2. Fill in every other TODO-REPLACE placeholder: VIP address, NIC name,
+#      disk image URL/checksum.
+#   3. Apply this manifest:
+#        kubectl apply -f config/samples/capm3/kairos_cluster_k3s_ha.yaml
+#
+# See docs/QUICKSTART_CAPM3.md#high-availability-control-plane for the full
+# walkthrough.
+# ============================================================================
+
+# IMPORTANT: replace `password:` below with a strong value before applying.
+# `openssl rand -base64 32` generates a suitable value.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-user-password
+  namespace: default
+type: Opaque
+stringData:
+  password: REPLACE_WITH_A_STRONG_PASSWORD
+---
+# ============================================================================
+# BMC credentials and BareMetalHosts — one Secret + one BareMetalHost per
+# control-plane node. Three shown; extend the pattern for 5 replicas.
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-m3-k3s-ha-node-0-bmc
+  namespace: default
+type: Opaque
+stringData:
+  username: "TODO-BMC-USERNAME"
+  password: "TODO-BMC-PASSWORD"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-m3-k3s-ha-node-1-bmc
+  namespace: default
+type: Opaque
+stringData:
+  username: "TODO-BMC-USERNAME"
+  password: "TODO-BMC-PASSWORD"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kairos-m3-k3s-ha-node-2-bmc
+  namespace: default
+type: Opaque
+stringData:
+  username: "TODO-BMC-USERNAME"
+  password: "TODO-BMC-PASSWORD"
+---
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: kairos-m3-k3s-ha-node-0
+  namespace: default
+spec:
+  online: true
+  bootMACAddress: "TODO-NIC-MAC-ADDRESS-0"
+  bmc:
+    # Format depends on hardware, e.g.:
+    #   IPMI:    ipmi://TODO-BMC-ADDRESS-0
+    #   Redfish: redfish://TODO-BMC-ADDRESS-0/redfish/v1/Systems/1
+    address: "TODO-BMC-ADDRESS-0"
+    credentialsName: kairos-m3-k3s-ha-node-0-bmc
+  # Optional: root device hint to avoid ambiguity on multi-disk nodes.
+  # rootDeviceHints:
+  #   minSizeGigabytes: 100
+---
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: kairos-m3-k3s-ha-node-1
+  namespace: default
+spec:
+  online: true
+  bootMACAddress: "TODO-NIC-MAC-ADDRESS-1"
+  bmc:
+    address: "TODO-BMC-ADDRESS-1"
+    credentialsName: kairos-m3-k3s-ha-node-1-bmc
+---
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: kairos-m3-k3s-ha-node-2
+  namespace: default
+spec:
+  online: true
+  bootMACAddress: "TODO-NIC-MAC-ADDRESS-2"
+  bmc:
+    address: "TODO-BMC-ADDRESS-2"
+    credentialsName: kairos-m3-k3s-ha-node-2-bmc
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: kairos-m3-k3s-ha
+  namespace: default
+spec:
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: Metal3Cluster
+    name: kairos-m3-k3s-ha
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KairosControlPlane
+    name: kairos-m3-k3s-ha-cp
+  # HA: this MUST equal spec.ha.vip.address on the KairosControlPlane below,
+  # and MUST be a free IP on the nodes' routable network, outside any DHCP
+  # pool — never an individual node's DHCP-assigned IP.
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-VIP-ADDRESS"
+    port: 6443
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: Metal3Cluster
+metadata:
+  name: kairos-m3-k3s-ha
+  namespace: default
+spec:
+  # MUST match Cluster.spec.controlPlaneEndpoint above.
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-VIP-ADDRESS"
+    port: 6443
+  # No cloud controller manager for bare metal. CAPM3 v1.13 with this setting
+  # finds the Node by the metal3.io/uuid label and validates
+  # providerID=metal3://<BareMetalHost-UID>. The Kairos cloud-config sets
+  # both the kubelet --provider-id flag and the node label from the
+  # config-drive metadata before k3s registers the node — no manual
+  # providerID patching is required.
+  cloudProviderEnabled: false
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+metadata:
+  name: kairos-m3-k3s-ha-cp
+  namespace: default
+spec:
+  # HA control plane: 3 or 5 only (odd count for etcd quorum). The webhook
+  # rejects even counts > 1.
+  replicas: 3
+  # Set explicitly for clarity — see the note at the top of this file. If
+  # omitted, the controller inherits k3s from the KairosConfigTemplate below.
+  distribution: k3s
+  # Must equal the k3s version baked into the disk image (informational on
+  # the Metal3 whole-disk path — see the single-node sample's CRITICAL note).
+  version: "v1.34.8+k3s1"
+  # HA: the kube-vip virtual IP that fronts the control plane. Rendered as a
+  # kube-vip DaemonSet into every control-plane node's cloud-config.
+  ha:
+    vip:
+      # MUST equal Cluster/Metal3Cluster controlPlaneEndpoint.host above.
+      address: "TODO-REPLACE-WITH-VIP-ADDRESS"
+      # NIC name present on the booted Kairos disk image (verify with
+      # `ip link` on a provisioned node).
+      interface: "TODO-NODE-NIC"
+      # ARP (L2, default) suits a flat network; BGP needs a peering fabric.
+      mode: ARP
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: Metal3MachineTemplate
+      name: kairos-m3-k3s-ha-cp
+      namespace: default
+  kairosConfigTemplate:
+    name: kairos-m3-k3s-ha-cp-config
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: Metal3MachineTemplate
+metadata:
+  name: kairos-m3-k3s-ha-cp
+  namespace: default
+spec:
+  template:
+    spec:
+      image:
+        # Fully-installed (QEMU install-to-disk) whole-disk raw — NOT an
+        # auroraboot disk.raw and NOT a build-iso output (those boot into
+        # recovery). See the single-node sample's CRITICAL note.
+        url: "http://TODO-IMAGE-HOST/images/kairos-k3s-installed.raw"
+        checksum: "http://TODO-IMAGE-HOST/images/kairos-k3s-installed.raw.md5"
+        checksumType: md5
+        diskFormat: raw
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-m3-k3s-ha-cp-config
+  namespace: default
+spec:
+  template:
+    spec:
+      role: control-plane
+      # MUST match KairosControlPlane.spec.distribution above.
+      distribution: k3s
+      kubernetesVersion: "v1.34.8+k3s1"
+      # HA-CRITICAL: use hostnamePrefix, NOT hostname. All 3 nodes boot the
+      # same disk image; an explicit hostname would collide every Node name.
+      hostnamePrefix: "kairos-m3-cp-"
+      # NO install: block — Ironic already wrote the OS to disk. Cloud-config
+      # is consumed on first boot via the Ironic config-drive.
+      userName: kairos
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+      # Optional: sshPublicKey / githubUser for SSH access.
+---
+# ============================================================================
+# SECURITY / LIMITATIONS (read before running HA in production)
+# ============================================================================
+# - BMC credentials: stored in a Secret per BareMetalHost above. Do not set
+#   BMC credentials inline anywhere.
+# - Node-self-reported etcd health is FORGEABLE (KD-51). Each control-plane
+#   node writes its own etcd member health with vanilla RBAC on a shared
+#   Secret, and acks its etcd-leave on a shared workload ConfigMap. A
+#   COMPROMISED control-plane node could forge another member's health (to
+#   trick the quorum-safety guard) or forge its own leave ack (to drop the
+#   deletion hook early). This is NOT privilege escalation — a compromised
+#   control-plane node already holds cluster-admin-equivalent — and the
+#   quorum-safety decision is made independently, BEFORE any node signal, so
+#   a forged signal can only make an already-authorized removal cleaner or
+#   earlier, never authorize an unsafe one. Per-member-scoped signals are
+#   tracked as future hardening.
+# - k3s HA has NO supported clean member-remove for its embedded etcd
+#   (KD-5d): replacing a k3s control-plane node leaves an orphaned etcd
+#   member that requires manual `etcdctl member remove`. The controller
+#   emits an EtcdMemberRemoveUnsupportedForK3s warning event when this
+#   happens. k0s is the fully-supported HA distribution; k3s HA works for
+#   bring-up but needs manual cleanup on every control-plane replacement.

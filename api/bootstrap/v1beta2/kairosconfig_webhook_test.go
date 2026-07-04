@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -147,7 +148,9 @@ func TestKairosConfig_Default_DoesNotSetUserPassword(t *testing.T) {
 	// was removed. Default() must NOT populate UserPassword from nothing.
 	kc := newValidKairosConfig()
 	kc.Spec.UserPassword = ""
-	kc.Default()
+	if err := (&kairosConfigDefaulter{}).Default(context.Background(), kc); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
 	if kc.Spec.UserPassword != "" {
 		t.Errorf("Default() set UserPassword to %q; expected it to remain empty (KD-3a)", kc.Spec.UserPassword)
 	}
@@ -248,7 +251,9 @@ func TestKairosConfig_Default_StillSetsOtherDefaults(t *testing.T) {
 			KubernetesVersion: "v1.30.0+k0s.0",
 		},
 	}
-	kc.Default()
+	if err := (&kairosConfigDefaulter{}).Default(context.Background(), kc); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
 	if kc.Spec.UserName != "kairos" {
 		t.Errorf("Default() UserName = %q; expected %q", kc.Spec.UserName, "kairos")
 	}

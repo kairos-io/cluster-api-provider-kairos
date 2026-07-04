@@ -1,12 +1,12 @@
 # Quick Start Guide - CAPM3 (Metal3 / bare metal)
 
-Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.12.x, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0-alpha.2. Validated on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal, 2026-06-18); the same flow applies to physical hardware with a Redfish/IPMI BMC.
+Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.3, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0-beta.1. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
 
-This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). The k3s path is the lab-validated end-to-end path; k0s uses the identical flow and differs only in distribution and version fields.
+This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). k0s and k3s use the identical flow and differ only in distribution and version fields. For a 3-node HA control plane, see [High-Availability control plane](#high-availability-control-plane) below.
 
-**Scope of this release:**
+**Scope of this guide:**
 
-- This guide provisions a single-node control plane (`replicas: 1`). HA (`replicas: 3`/`5`) is now supported — the webhook accepts odd counts 1/3/5. CAPV k0s is the lab-validated HA path (see the [README HA section](../README.md#high-availability-control-planes)); CAPM3 reuses the same `spec.ha.vip` surface but its HA path is not yet lab-validated.
+- The single-node walkthrough below provisions `replicas: 1`. HA (`replicas: 3`/`5`) is supported on CAPM3 for both k0s and k3s — see [High-Availability control plane](#high-availability-control-plane).
 - DHCP-only networking. Static IPAM via Metal3DataTemplate / Metal3IPPool is a future phase.
 - No cloud controller manager (`cloudProviderEnabled: false`). Node providerID is set by the Kairos cloud-config at first boot — no manual patching required.
 
@@ -196,7 +196,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 
 2. **Management cluster**: A Kubernetes cluster with network access to the Ironic API and to the workload nodes.
 
-3. **Cluster API core**: v1.9+ required (v1beta2 wire contract); lab-validated against v1.12.x. CAPM3 v1.13 stores its CRDs at the `v1beta2` contract, so the management cluster's CAPI core must serve `v1beta2`. (This provider's typed client additionally relies on `cluster.x-k8s.io/v1beta1` still being served; CAPI continues to serve both, so no action is needed.) The manifests in this guide are authored in `v1beta2`. Verify:
+3. **Cluster API core**: v1.13.3+ required (v1beta2 contract). CAPM3 v1.13 stores its CRDs at the `v1beta2` contract, so the management cluster's CAPI core must serve `v1beta2`. (This provider's typed client additionally relies on `cluster.x-k8s.io/v1beta1` still being served; CAPI continues to serve both, so no action is needed.) The manifests in this guide are authored in `v1beta2`. Verify:
    ```bash
    kubectl api-versions | grep cluster.x-k8s.io
    ```
@@ -206,7 +206,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
    kubectl get crd metal3clusters.infrastructure.cluster.x-k8s.io
    ```
 
-5. **Kairos CAPI Provider**: v0.1.0-alpha.2+ installed (see [INSTALL.md](INSTALL.md)).
+5. **Kairos CAPI Provider**: v0.1.0-beta.1+ installed (see [INSTALL.md](INSTALL.md)).
 
 6. **Fully-installed Kairos disk image**: See "Building the disk image" above.
 
@@ -221,7 +221,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 Install CAPM3 using `clusterctl` or the upstream manifests. Refer to the [Metal3 documentation](https://book.metal3.io/capm3/introduction) for the current install procedure. The Kairos CAPI provider is installed separately:
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
 ```
 
 See [INSTALL.md](INSTALL.md) for the full provider install and verification steps.
@@ -258,7 +258,7 @@ The sample manifests reference this Secret via `userPasswordSecretRef`. Do not s
 
 ### Step 3: Choose a sample manifest
 
-- k3s single node (lab-validated): `config/samples/capm3/kairos_cluster_k3s_single_node.yaml`
+- k3s single node: `config/samples/capm3/kairos_cluster_k3s_single_node.yaml`
 - k0s single node: `config/samples/capm3/kairos_cluster_k0s_single_node.yaml`
 
 ### Step 4: Customize the manifest
@@ -347,9 +347,83 @@ kubectl --kubeconfig=kairos-m3-kubeconfig.yaml get nodes
 kubectl --kubeconfig=kairos-m3-kubeconfig.yaml get pods -n kube-system
 ```
 
-**Node-push behavior (alpha-2+):** The control-plane node posts its kubeconfig to a Secret in the management cluster at bootstrap time. The node must have network reachability to the management cluster's API server (`<mgmt-api-server-host>:6443`). See [INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) for verification steps.
+**Node-push behavior:** The control-plane node posts its kubeconfig to a Secret in the management cluster at bootstrap time. The node must have network reachability to the management cluster's API server (`<mgmt-api-server-host>:6443`). See [INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) for verification steps.
 
 If the node cannot reach the management API server, enable the opt-in [Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback) on the `KairosControlPlane`.
+
+---
+
+## High-Availability control plane
+
+CAPM3 supports a 3- or 5-node control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capm3/kairos_cluster_k0s_ha.yaml`](../config/samples/capm3/kairos_cluster_k0s_ha.yaml) or [`kairos_cluster_k3s_ha.yaml`](../config/samples/capm3/kairos_cluster_k3s_ha.yaml). Read the single-node walkthrough above first — the disk-image, BareMetalHost, and credentials-Secret steps are identical. This section covers only what's different for HA.
+
+k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d) — see [README.md § Day-2](../README.md#day-2-etcd-health-and-quorum-safe-replacement).
+
+### HA prerequisites
+
+In addition to the [single-node prerequisites](#prerequisites):
+
+1. **Three (or five) BareMetalHosts** registered and `available`, instead of one.
+2. **A free VIP address** on the nodes' routable network, outside any DHCP pool and not otherwise in use. `Cluster.spec.controlPlaneEndpoint.host` and `Metal3Cluster.spec.controlPlaneEndpoint.host` must equal this VIP, not any individual node's IP.
+3. **The NIC name on your Kairos image.** kube-vip advertises the VIP on a specific interface (`spec.ha.vip.interface`); confirm the name with `ip link` on a provisioned node.
+4. **Per-node identity via `hostnamePrefix`, not `hostname`.** All control-plane nodes boot from the same disk image; setting an explicit `hostname` collides every Node name. Use `KairosConfigTemplate.spec.template.spec.hostnamePrefix` so each node gets a distinct name.
+
+### Customizing the HA sample
+
+Open the chosen HA sample and fill in the `TODO` placeholders — one BMC-credentials Secret and one `BareMetalHost` per node, plus these HA-specific fields:
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+spec:
+  controlPlaneEndpoint:
+    host: "TODO-REPLACE-WITH-VIP-ADDRESS"   # MUST equal spec.ha.vip.address below
+    port: 6443
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KairosControlPlane
+spec:
+  replicas: 3               # 3 or 5 only — odd counts for etcd quorum
+  distribution: k0s          # or k3s — set explicitly for clarity (see note below)
+  ha:
+    vip:
+      address: "TODO-REPLACE-WITH-VIP-ADDRESS"
+      interface: "TODO-NODE-NIC"   # NIC name from `ip link` on a provisioned node
+      mode: ARP
+```
+
+**Setting `spec.distribution` explicitly on the `KairosControlPlane` is recommended.** An explicit value always wins. If left unset, the controller inherits `spec.distribution` from the referenced `KairosConfigTemplate` (falling back to `k0s` only if neither sets one), so a k3s HA manifest that sets `distribution: k3s` only on the `KairosConfigTemplate` still provisions k3s. Setting it explicitly on both resources removes any ambiguity and is what both HA sample files do; if an explicit `KairosControlPlane` value ever disagrees with the template's, the controller emits a `DistributionOverride` warning Event and the explicit value wins.
+
+### Apply and verify
+
+```bash
+kubectl apply -f config/samples/capm3/kairos_cluster_k0s_ha.yaml
+kubectl get kairoscontrolplane kairos-m3-ha-cp -w
+```
+
+HA comes up successfully when:
+
+```bash
+kubectl get kairoscontrolplane kairos-m3-ha-cp \
+  -o jsonpath='{.status.readyReplicas}/{.status.replicas}'
+# expect: 3/3
+```
+
+Check `EtcdHealthy` and confirm the VIP answers the API:
+
+```bash
+kubectl get kairoscontrolplane kairos-m3-ha-cp -o yaml | grep -A4 "type: EtcdHealthy"
+curl -k https://<vip-address>:6443/livez
+```
+
+### HA troubleshooting
+
+Same failure modes as [CAPV HA troubleshooting](QUICKSTART_CAPV.md#ha-troubleshooting) — the `KairosControlPlane`/etcd behavior is provider-independent. Metal3-specific additions:
+
+| Symptom | Cause | Action |
+|---|---|---|
+| All three Nodes register with the same name | `hostname` was set instead of `hostnamePrefix` in the `KairosConfigTemplate` | Switch to `hostnamePrefix`; each node then derives a distinct name from its machine ID. |
+| A control-plane node comes up running the wrong distribution | An explicit `KairosControlPlane.spec.distribution` disagrees with the `KairosConfigTemplate`'s (explicit KCP value always wins — check for a `DistributionOverride` warning Event on the `KairosControlPlane`), or the disk image doesn't match the resolved distribution | Set `spec.distribution` explicitly on the `KairosControlPlane` to match the `KairosConfigTemplate`, and confirm the Metal3 image is built for that distribution. |
 
 ---
 
@@ -389,9 +463,9 @@ If the node cannot reach the management API server, enable the opt-in [Air-gappe
 
 ---
 
-## Hadron on Metal3: operator notes
+## Kairos Hadron notes
 
-This section collects lab-validated findings specific to Kairos Hadron images deployed via Metal3. Hadron is the musl-libc-based next-generation Kairos OS; it shares the same Metal3 provisioning flow but has a few differences from standard (glibc) Kairos images.
+This section covers behavior specific to Kairos Hadron images deployed via Metal3. Hadron is the musl-libc-based next-generation Kairos OS; it shares the same Metal3 provisioning flow but has a few differences from standard (glibc) Kairos images.
 
 ### Pinning the control-plane IP
 
@@ -429,7 +503,7 @@ Two approaches, in preference order:
 
 ### Hadron `write_files` file ownership (musl compatibility)
 
-Kairos Hadron uses musl-libc, which resolves file ownership by name rather than by numeric UID/GID. The provider emits `owner: root` (by name) in all `write_files:` entries, not `owner: 0` (by UID). This is the correct behavior for Hadron and is also accepted by glibc-based Kairos images. If you author your own `spec.files` entries, use `owner: "root:root"` (name form) — numeric owners such as `"0:0"` are rejected by the webhook and would fail on Hadron regardless. This behavior was confirmed in the lab (2026-06-18, commit 9ac886b).
+Kairos Hadron uses musl-libc, which resolves file ownership by name rather than by numeric UID/GID. The provider emits `owner: root` (by name) in all `write_files:` entries, not `owner: 0` (by UID). This is the correct behavior for Hadron and is also accepted by glibc-based Kairos images. If you author your own `spec.files` entries, use `owner: "root:root"` (name form) — numeric owners such as `"0:0"` are rejected by the webhook and would fail on Hadron regardless.
 
 ---
 
@@ -486,7 +560,7 @@ Reprovision with a fully-installed Hadron disk. See the "Hadron images: addition
 The node k3s/k0s is running but the kubeconfig has not reached the management cluster. Causes:
 
 1. **No network route from the node to the management cluster API server**: run `curl -k https://<mgmt-api-server-host>:6443/api` from the node. If it fails, either open the network path or enable [SSHFallback](#air-gapped-fallback-sshfallback).
-2. **bootstrap-Secret naming (pre-alpha-2 provider)**: if `BareMetalHost.spec.userData` references a Secret that does not exist, upgrade the provider to v0.1.0-alpha.2+. The deterministic bootstrap-Secret naming fix shipped in alpha-2 and is required for unattended Metal3 provisioning.
+2. **bootstrap-Secret naming**: if `BareMetalHost.spec.userData` references a Secret that does not exist, upgrade the provider to v0.1.0-alpha.2+. The deterministic bootstrap-Secret naming fix shipped in alpha.2 and is required for unattended Metal3 provisioning.
 
 ### Bootstrap issues
 
@@ -527,7 +601,7 @@ If the node's IP changes after provisioning (DHCP lease reassignment), the `cont
 
 - Configure worker nodes via `MachineDeployment` with a `Metal3MachineTemplate` and a worker-role `KairosConfigTemplate`.
 - Add custom Kubernetes manifests via `spec.template.spec.manifests` in `KairosConfigTemplate`.
-- HA control planes (`replicas: 3`/`5` with a kube-vip VIP via `spec.ha.vip`) are supported; CAPV k0s is the lab-validated path (see the [README HA section](../README.md#high-availability-control-planes)). CAPM3 reuses the same `spec.ha.vip` surface but its HA path is not yet lab-validated.
+- HA control planes (`replicas: 3`/`5` with a kube-vip VIP via `spec.ha.vip`) are supported on CAPM3 for both k0s and k3s — see [High-Availability control plane](#high-availability-control-plane) above and the [README HA section](../README.md#high-availability-control-planes).
 - Static IPAM via Metal3DataTemplate / Metal3IPPool is a future phase.
 
 ---

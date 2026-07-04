@@ -26,9 +26,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"os"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -74,6 +76,10 @@ func TestBootstrapIntegration(t *testing.T) {
 	mgr, err := manager.New(cfg, manager.Options{
 		Scheme: scheme,
 		Logger: log.Log,
+		// Multiple managers share this process; controller-runtime v0.23 enforces
+		// process-global controller-name uniqueness, so the "kairosconfig" name
+		// collides across per-test managers. Test-harness only.
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)},
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -112,10 +118,10 @@ func TestBootstrapIntegration(t *testing.T) {
 			Namespace: "test-namespace",
 		},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "DockerCluster",
-				Name:       "test-cluster",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     "test-cluster",
 			},
 		},
 	}
@@ -133,13 +139,13 @@ func TestBootstrapIntegration(t *testing.T) {
 		Spec: clusterv1.MachineSpec{
 			ClusterName: "test-cluster",
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       "test-kairos-config",
-					Namespace:  "test-namespace",
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     "test-kairos-config",
 				},
 			},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(mgr.GetClient().Create(ctx, machine)).To(Succeed())
@@ -293,7 +299,8 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 
-	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log})
+	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	reconciler := &bootstrap.KairosConfigReconciler{
@@ -328,10 +335,10 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "DockerCluster",
-				Name:       clusterName,
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     clusterName,
 			},
 		},
 	}
@@ -346,13 +353,13 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       kcName,
-					Namespace:  nsName,
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     kcName,
 				},
 			},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(mgr.GetClient().Create(ctx, machine)).To(Succeed())

@@ -64,6 +64,45 @@ func haCPData(role string, kubevirt bool) TemplateData {
 	return d
 }
 
+// TestHA_CapkK0sControlPlaneEnablesWorker guards the Phase-4 CAPK-HA lab finding
+// (2026-07-02): an HA k0s control-plane node on CAPK MUST render --enable-worker.
+// A controller-only k0s node registers no kubelet/Kubernetes Node, so CAPI never
+// populates Machine.status.nodeRef, and the join gate (init must be joinable) plus
+// the etcd-health reporter/kubeconfig-push all key off that NodeRef — without the
+// flag, an HA CAPK k0s cluster never forms. Single-node is schedulable via --single
+// and must NOT carry --enable-worker. k3s servers are schedulable by default (no
+// --disable-agent), so this is a k0s-only concern.
+func TestHA_CapkK0sControlPlaneEnablesWorker(t *testing.T) {
+	for _, role := range []string{"init", "join"} {
+		out, err := RenderK0sCloudConfig(haCPData(role, true))
+		if err != nil {
+			t.Fatalf("render k0s CAPK %s: %v", role, err)
+		}
+		if !strings.Contains(string(out), "--enable-worker") {
+			t.Errorf("CAPK k0s HA %s node must render --enable-worker so it registers a Node "+
+				"(NodeRef); without it the join gate never opens", role)
+		}
+	}
+
+	// Single-node uses --single (already schedulable) and must not add --enable-worker.
+	single := TemplateData{
+		Role:             "control-plane",
+		ControlPlaneRole: "single",
+		SingleNode:       true,
+		Hostname:         "kairos-cp-0",
+		UserName:         "kairos",
+		UserGroups:       []string{"admin"},
+		IsKubeVirt:       true,
+	}
+	out, err := RenderK0sCloudConfig(single)
+	if err != nil {
+		t.Fatalf("render k0s CAPK single: %v", err)
+	}
+	if strings.Contains(string(out), "--enable-worker") {
+		t.Error("CAPK k0s single-node must not render --enable-worker (schedulable via --single)")
+	}
+}
+
 // TestHA_WorkerIgnoresControlPlaneRole is the render-time half of CPR-INV-1: a
 // worker config carrying controlPlaneRole=init/join must NOT produce any
 // control-plane HA artifact (no --cluster-init, no controller-token, no
@@ -669,10 +708,10 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			d := haCPData(tc.role, tc.kv)
-			// CAPV HA nodes render the etcd-health reporter (ADR 0005 §E.1); set
-			// the gate so its shell body is included in the bash -n syntax check.
-			// CAPK (kubevirt) does not render it.
-			if !tc.kv && d.ManagementEndpoint != nil {
+			// Every HA control-plane node (CAPV and CAPK, both distros) renders the
+			// etcd-health reporter (ADR 0005 §E.1); set the gate so its shell body
+			// is included in the bash -n syntax check.
+			if d.ManagementEndpoint != nil {
 				d.ManagementEndpoint.EtcdStatusSecretName = "ha-cluster-etcd-status"
 			}
 			out, err := tc.render(d)
@@ -683,9 +722,10 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 			if script == "" {
 				t.Fatalf("post-bootstrap script %q not found", tc.script)
 			}
-			// The etcd-health reporter must render on the CAPV path (and only there).
-			if hasReporter := strings.Contains(script, "push_etcd_status"); hasReporter != !tc.kv {
-				t.Errorf("etcd-health reporter present=%v, want %v (CAPV renders it, CAPK does not)", hasReporter, !tc.kv)
+			// The etcd-health reporter must render on every HA control-plane path
+			// (CAPV and CAPK, both distros — ADR 0005 §E.1 ported to CAPK).
+			if !strings.Contains(script, "push_etcd_status") {
+				t.Error("etcd-health reporter (push_etcd_status) must render on every HA control-plane path")
 			}
 			f := filepathJoinTemp(t, strings.ReplaceAll(tc.name, "/", "_")+".sh")
 			if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
@@ -699,57 +739,356 @@ func TestHA_RenderedScriptsValidBash(t *testing.T) {
 }
 
 // TestHA_EtcdLeaveResponder_k0sOnly asserts the ADR 0005 §E.3 etcd-leave
-// responder renders on k0s CAPV HA nodes (valid bash; gates on the fixed
-// leave-requested sentinel via string equality; runs `k0s etcd leave` with NO
-// externally-supplied argument), and does NOT render for k0s single-node or for
-// k3s (no clean member-remove, KD-5d).
+// responder renders on k0s HA nodes on BOTH infra backends (valid bash; gates
+// on the fixed leave-requested sentinel via string equality; runs `k0s etcd
+// leave` with NO externally-supplied argument), and does NOT render for k0s
+// single-node or for k3s on either backend (no clean member-remove, KD-5d).
+// CAPV acks via the VIP; CAPK has no VIP and acks via the stable
+// ControlPlaneLBEndpoint instead (there is no VIP to front the surviving
+// apiservers) — the CAPK sub-test asserts that split explicitly.
 func TestHA_EtcdLeaveResponder_k0sOnly(t *testing.T) {
 	bashPath, err := exec.LookPath("bash")
 	if err != nil {
 		t.Skip("bash not available; skipping rendered-script syntax check")
 	}
-	out, err := RenderK0sCloudConfig(haCPData("init", false))
-	if err != nil {
-		t.Fatalf("render k0s init: %v", err)
-	}
-	script := extractWriteFile(t, out, "kairos-etcd-leave.sh")
-	if script == "" {
-		t.Fatal("k0s HA control-plane must render the etcd-leave responder script")
-	}
-	if !strings.Contains(script, `[ "${val}" = "leave-requested" ]`) {
-		t.Error("leave script must gate on the fixed sentinel via string equality (security constraint #4)")
-	}
-	if !strings.Contains(script, "k0s etcd leave") {
-		t.Error("leave script must run `k0s etcd leave`")
-	}
-	if strings.Contains(script, "etcd leave --peer-address") {
-		t.Error("leave script must NOT pass --peer-address (node leaves itself; no external arg — security constraint #5)")
-	}
-	f := filepathJoinTemp(t, "k0s-etcd-leave.sh")
-	if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
-		t.Fatalf("write temp script: %v", werr)
-	}
-	if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
-		t.Fatalf("etcd-leave script is not valid bash: %v\n%s", berr, b)
+	assertResponder := func(t *testing.T, script string) {
+		t.Helper()
+		if !strings.Contains(script, `[ "${val}" = "leave-requested" ]`) {
+			t.Error("leave script must gate on the fixed sentinel via string equality (security constraint #4)")
+		}
+		if !strings.Contains(script, "k0s etcd leave") {
+			t.Error("leave script must run `k0s etcd leave`")
+		}
+		if strings.Contains(script, "etcd leave --peer-address") {
+			t.Error("leave script must NOT pass --peer-address (node leaves itself; no external arg — security constraint #5)")
+		}
+		f := filepathJoinTemp(t, "k0s-etcd-leave.sh")
+		if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
+			t.Fatalf("write temp script: %v", werr)
+		}
+		if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
+			t.Fatalf("etcd-leave script is not valid bash: %v\n%s", berr, b)
+		}
 	}
 
-	// k0s single-node must NOT render it (no etcd quorum).
-	single := haCPData("single", false)
-	single.SingleNode = true
-	sout, err := RenderK0sCloudConfig(single)
-	if err != nil {
-		t.Fatalf("render k0s single: %v", err)
-	}
-	if extractWriteFile(t, sout, "kairos-etcd-leave.sh") != "" {
-		t.Error("k0s single-node must NOT render the etcd-leave responder")
+	t.Run("capv", func(t *testing.T) {
+		out, err := RenderK0sCloudConfig(haCPData("init", false))
+		if err != nil {
+			t.Fatalf("render k0s init: %v", err)
+		}
+		script := extractWriteFile(t, out, "kairos-etcd-leave.sh")
+		if script == "" {
+			t.Fatal("k0s CAPV HA control-plane must render the etcd-leave responder script")
+		}
+		assertResponder(t, script)
+		if !strings.Contains(script, `srv=(--server="https://${vip_addr}:6443")`) {
+			t.Error("k0s CAPV etcd-leave responder must ack via the VIP")
+		}
+		if strings.Contains(script, "ControlPlaneLBEndpoint") || strings.Contains(script, "lb_addr") {
+			t.Error("k0s CAPV etcd-leave responder must NOT reference the CAPK LB endpoint")
+		}
+	})
+
+	t.Run("capk", func(t *testing.T) {
+		out, err := RenderK0sCloudConfig(haCPData("init", true))
+		if err != nil {
+			t.Fatalf("render k0s init: %v", err)
+		}
+		script := extractWriteFile(t, out, "kairos-etcd-leave.sh")
+		if script == "" {
+			t.Fatal("k0s CAPK HA control-plane must render the etcd-leave responder script")
+		}
+		assertResponder(t, script)
+		// CAPK has no VIP (OQ-5): the responder must ack via the stable
+		// ControlPlaneLBEndpoint, and must NOT leak any VIP/vip_addr reference.
+		if !strings.Contains(script, `lb_addr='10.96.0.10'`) {
+			t.Error("k0s CAPK etcd-leave responder must shquote ControlPlaneLBEndpoint into lb_addr")
+		}
+		if !strings.Contains(script, `srv=(--server="https://${lb_addr}:6443")`) {
+			t.Error("k0s CAPK etcd-leave responder must ack via the ControlPlaneLBEndpoint (--server)")
+		}
+		if strings.Contains(script, "vip_addr") || strings.Contains(script, "VIP.Address") {
+			t.Error("k0s CAPK etcd-leave responder must NOT reference a VIP (CAPK has no VIP, OQ-5)")
+		}
+	})
+
+	// k0s single-node must NOT render it (no etcd quorum), on either backend.
+	for _, kv := range []bool{false, true} {
+		single := haCPData("single", kv)
+		single.SingleNode = true
+		sout, err := RenderK0sCloudConfig(single)
+		if err != nil {
+			t.Fatalf("render k0s single (kubevirt=%v): %v", kv, err)
+		}
+		if extractWriteFile(t, sout, "kairos-etcd-leave.sh") != "" {
+			t.Errorf("k0s single-node (kubevirt=%v) must NOT render the etcd-leave responder", kv)
+		}
 	}
 
-	// k3s HA must NOT render it (KD-5d: no clean member-remove).
-	kout, err := RenderK3sCloudConfig(haCPData("init", false))
-	if err != nil {
-		t.Fatalf("render k3s init: %v", err)
+	// k3s HA must NOT render it on either backend (KD-5d: no clean member-remove).
+	for _, kv := range []bool{false, true} {
+		kout, err := RenderK3sCloudConfig(haCPData("init", kv))
+		if err != nil {
+			t.Fatalf("render k3s init (kubevirt=%v): %v", kv, err)
+		}
+		if extractWriteFile(t, kout, "kairos-etcd-leave.sh") != "" {
+			t.Errorf("k3s (kubevirt=%v) must NOT render the etcd-leave responder (KD-5d)", kv)
+		}
 	}
-	if extractWriteFile(t, kout, "kairos-etcd-leave.sh") != "" {
-		t.Error("k3s must NOT render the etcd-leave responder (KD-5d)")
+}
+
+// capkK0sHAWithCIDR builds the CAPK k0s HA render data for the given role with a
+// representative PodCIDR/ServiceCIDR set — the cluster-wide CIDRs the controller
+// stamps onto the init node's fresh ClusterConfig. It is the fixture the
+// dual-interface bridge / BUG #2 regression tests below exercise.
+func capkK0sHAWithCIDR(role string) TemplateData {
+	d := haCPData(role, true)
+	d.PodCIDR = "10.244.0.0/16"
+	d.ServiceCIDR = "10.96.0.0/12"
+	return d
+}
+
+// TestHA_CapkK0sJoinDropsClusterCIDRs is the BUG #2 regression guard (2026-07-02
+// dual-interface bridge HA lab): a k0s JOIN node on CAPK must NOT carry the
+// cluster-wide spec.network.podCIDR/serviceCIDR. Those are inherited from the
+// cluster via the controller-join token; a conflicting fresh ClusterConfig on the
+// joiner is a second reason HA never forms. The INIT node (fresh ClusterConfig)
+// keeps them. Mirrors the CAPV template's .IsInitControlPlane CIDR gating.
+func TestHA_CapkK0sJoinDropsClusterCIDRs(t *testing.T) {
+	join, err := RenderK0sCloudConfig(capkK0sHAWithCIDR("join"))
+	if err != nil {
+		t.Fatalf("render k0s CAPK join: %v", err)
+	}
+	k0sYAML := extractWriteFile(t, join, "/etc/k0s/k0s.yaml")
+	if k0sYAML == "" {
+		t.Fatal("k0s CAPK join must still write /etc/k0s/k0s.yaml (api.sans + etcd peerAddress)")
+	}
+	for _, forbidden := range []string{"podCIDR", "serviceCIDR", "network:"} {
+		if strings.Contains(k0sYAML, forbidden) {
+			t.Errorf("k0s CAPK join /etc/k0s/k0s.yaml must NOT contain %q — cluster CIDRs are inherited via the join token (BUG #2)", forbidden)
+		}
+	}
+
+	// The INIT node, with the same CIDR inputs, MUST keep podCIDR/serviceCIDR.
+	initOut, err := RenderK0sCloudConfig(capkK0sHAWithCIDR("init"))
+	if err != nil {
+		t.Fatalf("render k0s CAPK init: %v", err)
+	}
+	initYAML := extractWriteFile(t, initOut, "/etc/k0s/k0s.yaml")
+	if !strings.Contains(initYAML, "podCIDR: 10.244.0.0/16") {
+		t.Error("k0s CAPK init must keep the cluster podCIDR in its fresh ClusterConfig")
+	}
+	if !strings.Contains(initYAML, "serviceCIDR: 10.96.0.0/12") {
+		t.Error("k0s CAPK init must keep the cluster serviceCIDR in its fresh ClusterConfig")
+	}
+}
+
+// TestHA_CapkK0sEtcdPeerAddress asserts the dual-interface bridge etcd wiring
+// (2026-07-02 HA lab): EVERY CAPK k0s HA control-plane node (init AND join) must
+// (a) set spec.storage.etcd.peerAddress to the __ETCD_PEER_ADDR__ sentinel in
+// /etc/k0s/k0s.yaml, and (b) render the k0scontroller ExecStartPre drop-in +
+// bridge-detect script that substitutes the sentinel with the node's routable
+// bridge IP before k0s first starts. Without a routable per-node peer address the
+// masquerade self-address (10.0.2.2, identical on every VM) would be advertised
+// and etcd quorum could never form.
+func TestHA_CapkK0sEtcdPeerAddress(t *testing.T) {
+	const sentinel = "__ETCD_PEER_ADDR__"
+	const scriptPath = "/usr/local/bin/kairos-k0s-etcd-peer-addr.sh"
+	const dropinPath = "/etc/systemd/system/k0scontroller.service.d/z-etcd-peer-addr.conf"
+
+	bashPath, _ := exec.LookPath("bash")
+
+	for _, role := range []string{"init", "join"} {
+		role := role
+		t.Run(role, func(t *testing.T) {
+			out, err := RenderK0sCloudConfig(capkK0sHAWithCIDR(role))
+			if err != nil {
+				t.Fatalf("render k0s CAPK %s: %v", role, err)
+			}
+
+			// (a) etcd peerAddress sentinel in /etc/k0s/k0s.yaml.
+			k0sYAML := extractWriteFile(t, out, "/etc/k0s/k0s.yaml")
+			for _, want := range []string{"storage:", "etcd:", "peerAddress:", sentinel} {
+				if !strings.Contains(k0sYAML, want) {
+					t.Errorf("k0s CAPK %s /etc/k0s/k0s.yaml must contain %q for the per-node etcd peer address", role, want)
+				}
+			}
+
+			// (a2) api.address sentinel — the k0s API advertise address must ALSO be
+			// the routable bridge IP, else `k0s token create` bakes the unroutable
+			// masquerade self (10.0.2.2) into the controller-join token and joiners
+			// can never reach the init's join API (Phase-4 CAPK-HA lab root cause).
+			for _, want := range []string{"api:", "address:", "__API_ADDR__"} {
+				if !strings.Contains(k0sYAML, want) {
+					t.Errorf("k0s CAPK %s /etc/k0s/k0s.yaml must contain %q for the per-node API advertise address", role, want)
+				}
+			}
+
+			// (b) the ExecStartPre drop-in references the bridge-detect script,
+			// and the script exists and is valid bash.
+			dropin := extractWriteFile(t, out, dropinPath)
+			if dropin == "" {
+				t.Fatalf("k0s CAPK %s must render the k0scontroller ExecStartPre drop-in %q", role, dropinPath)
+			}
+			if !strings.Contains(dropin, "ExecStartPre=") || !strings.Contains(dropin, scriptPath) {
+				t.Errorf("k0s CAPK %s drop-in must invoke %q via ExecStartPre; got:\n%s", role, scriptPath, dropin)
+			}
+
+			script := extractWriteFile(t, out, scriptPath)
+			if script == "" {
+				t.Fatalf("k0s CAPK %s must render the bridge-detect script %q", role, scriptPath)
+			}
+			// The script substitutes the sentinel and selects the routable bridge
+			// IP by property (NOT the 10.0.2.x masquerade, NOT loopback) — never by
+			// a hardcoded interface name.
+			for _, want := range []string{sentinel, "10.0.2.", "127.", "sed -i", "ip -o -4 addr show"} {
+				if !strings.Contains(script, want) {
+					t.Errorf("k0s CAPK %s bridge-detect script must contain %q", role, want)
+				}
+			}
+			if strings.Contains(script, "eth1") {
+				t.Errorf("k0s CAPK %s bridge-detect script must NOT hardcode the eth1 interface name (select by property)", role)
+			}
+			if bashPath != "" {
+				f := filepathJoinTemp(t, "k0s-etcd-peer-addr-"+role+".sh")
+				if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
+					t.Fatalf("write temp script: %v", werr)
+				}
+				if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
+					t.Fatalf("k0s CAPK %s bridge-detect script is not valid bash: %v\n%s", role, berr, b)
+				}
+			}
+		})
+	}
+}
+
+// TestHA_CapkK0sSingleHasNoEtcdPeerAddress asserts the block is HA-only: a
+// single-node CAPK k0s control plane (no etcd quorum) must render NEITHER the
+// etcd peerAddress block NOR the bridge-detect ExecStartPre drop-in/script.
+func TestHA_CapkK0sSingleHasNoEtcdPeerAddress(t *testing.T) {
+	single := TemplateData{
+		Role:             "control-plane",
+		ControlPlaneRole: "single",
+		SingleNode:       true,
+		Hostname:         "kairos-cp-0",
+		UserName:         "kairos",
+		UserGroups:       []string{"admin"},
+		IsKubeVirt:       true,
+		PodCIDR:          "10.244.0.0/16",
+		ServiceCIDR:      "10.96.0.0/12",
+	}
+	out, err := RenderK0sCloudConfig(single)
+	if err != nil {
+		t.Fatalf("render k0s CAPK single: %v", err)
+	}
+	k0sYAML := extractWriteFile(t, out, "/etc/k0s/k0s.yaml")
+	for _, forbidden := range []string{"__ETCD_PEER_ADDR__", "peerAddress", "storage:"} {
+		if strings.Contains(k0sYAML, forbidden) {
+			t.Errorf("k0s CAPK single /etc/k0s/k0s.yaml must NOT contain %q (no etcd quorum on single-node)", forbidden)
+		}
+	}
+	if extractWriteFile(t, out, "/usr/local/bin/kairos-k0s-etcd-peer-addr.sh") != "" {
+		t.Error("k0s CAPK single must NOT render the bridge-detect script (HA-only)")
+	}
+	if extractWriteFile(t, out, "/etc/systemd/system/k0scontroller.service.d/z-etcd-peer-addr.conf") != "" {
+		t.Error("k0s CAPK single must NOT render the k0scontroller ExecStartPre drop-in (HA-only)")
+	}
+	// A single-node CP still keeps its own cluster CIDRs (fresh ClusterConfig).
+	if !strings.Contains(k0sYAML, "podCIDR: 10.244.0.0/16") {
+		t.Error("k0s CAPK single must keep podCIDR (single is a fresh ClusterConfig, like init)")
+	}
+}
+
+// TestHA_CapkK3sNodeIP asserts the dual-interface bridge etcd wiring for k3s
+// (2026-07-03 HA lab): EVERY CAPK k3s HA control-plane node (init AND join) must
+// render (a) the on-node node-ip detect script and (b) a k3s.service ExecStartPre
+// drop-in that invokes it. Under KubeVirt masquerade the primary IP is the SLIRP
+// self-address 10.0.2.2 (identical on every VM), so k3s embedded etcd must peer
+// over the routable Multus lan-bridge NIC instead — the script detects that IP and
+// writes node-ip into config.yaml.d BEFORE k3s starts. Unlike the k0s path there is
+// NO static sentinel: the fail-safe writes the value at runtime and writes nothing
+// if no routable IP is present (k3s falls back to its default node IP, no crash).
+func TestHA_CapkK3sNodeIP(t *testing.T) {
+	const scriptPath = "/usr/local/bin/kairos-k3s-node-ip.sh"
+	const dropinPath = "/etc/systemd/system/k3s.service.d/z-node-ip.conf"
+	const cfgPath = "/etc/rancher/k3s/config.yaml.d/92-node-ip.yaml"
+
+	bashPath, _ := exec.LookPath("bash")
+
+	for _, role := range []string{"init", "join"} {
+		role := role
+		t.Run(role, func(t *testing.T) {
+			out, err := RenderK3sCloudConfig(haCPData(role, true))
+			if err != nil {
+				t.Fatalf("render k3s CAPK %s: %v", role, err)
+			}
+
+			// (b) the ExecStartPre drop-in invokes the node-ip script.
+			dropin := extractWriteFile(t, out, dropinPath)
+			if dropin == "" {
+				t.Fatalf("k3s CAPK %s must render the k3s.service ExecStartPre drop-in %q", role, dropinPath)
+			}
+			if !strings.Contains(dropin, "ExecStartPre=") || !strings.Contains(dropin, scriptPath) {
+				t.Errorf("k3s CAPK %s drop-in must invoke %q via ExecStartPre; got:\n%s", role, scriptPath, dropin)
+			}
+
+			// (a) the script detects the routable bridge IP by property (NOT the
+			// 10.0.2.x masquerade, NOT loopback), never by a hardcoded interface
+			// name, and writes node-ip into config.yaml.d.
+			script := extractWriteFile(t, out, scriptPath)
+			if script == "" {
+				t.Fatalf("k3s CAPK %s must render the node-ip detect script %q", role, scriptPath)
+			}
+			for _, want := range []string{"10.0.2.", "127.", "ip -o -4 addr show", "node-ip:", cfgPath} {
+				if !strings.Contains(script, want) {
+					t.Errorf("k3s CAPK %s node-ip script must contain %q", role, want)
+				}
+			}
+			if strings.Contains(script, "eth1") {
+				t.Errorf("k3s CAPK %s node-ip script must NOT hardcode the eth1 interface name (select by property)", role)
+			}
+
+			// Fail-safe: NO static placeholder sentinel anywhere in the render — the
+			// address is written at runtime, never shipped as a value k3s must
+			// substitute (an unsubstituted sentinel would crash-loop the server).
+			if strings.Contains(out, "__NODE_IP__") {
+				t.Errorf("k3s CAPK %s must NOT ship a static __NODE_IP__ sentinel (node-ip is runtime-detected)", role)
+			}
+
+			if bashPath != "" {
+				f := filepathJoinTemp(t, "k3s-node-ip-"+role+".sh")
+				if werr := os.WriteFile(f, []byte(script), 0o600); werr != nil {
+					t.Fatalf("write temp script: %v", werr)
+				}
+				if b, berr := exec.Command(bashPath, "-n", f).CombinedOutput(); berr != nil {
+					t.Fatalf("k3s CAPK %s node-ip script is not valid bash: %v\n%s", role, berr, b)
+				}
+			}
+		})
+	}
+}
+
+// TestHA_CapkK3sSingleHasNoNodeIP asserts the node-ip block is HA-only: a
+// single-node CAPK k3s control plane (no etcd quorum, no cross-VM peering) must
+// render NEITHER the node-ip detect script NOR the k3s.service ExecStartPre drop-in.
+func TestHA_CapkK3sSingleHasNoNodeIP(t *testing.T) {
+	single := TemplateData{
+		Role:             "control-plane",
+		ControlPlaneRole: "single",
+		SingleNode:       true,
+		Hostname:         "kairos-cp-0",
+		UserName:         "kairos",
+		UserGroups:       []string{"admin"},
+		IsKubeVirt:       true,
+	}
+	out, err := RenderK3sCloudConfig(single)
+	if err != nil {
+		t.Fatalf("render k3s CAPK single: %v", err)
+	}
+	if extractWriteFile(t, out, "/usr/local/bin/kairos-k3s-node-ip.sh") != "" {
+		t.Error("k3s CAPK single must NOT render the node-ip detect script (HA-only)")
+	}
+	if extractWriteFile(t, out, "/etc/systemd/system/k3s.service.d/z-node-ip.conf") != "" {
+		t.Error("k3s CAPK single must NOT render the k3s.service ExecStartPre drop-in (HA-only)")
 	}
 }

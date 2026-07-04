@@ -33,9 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/conditions"
+	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
@@ -261,7 +262,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		})
 		vsphereMachineKey := types.NamespacedName{
 			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
+			Namespace: machine.Namespace,
 		}
 
 		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err == nil {
@@ -301,14 +302,8 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// For CAPK: Only wait for providerID if KubevirtMachine is Ready (VM already provisioned)
 	// If KubevirtMachine is not Ready yet, allow secret creation so VM can be provisioned
 	if machine != nil && (machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine") && currentProviderID == "" {
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err == nil {
+		kubevirtMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err == nil {
 			isReady := false
 			if ready, found, _ := unstructured.NestedBool(kubevirtMachine.Object, "status", "ready"); found && ready {
 				isReady = true
@@ -333,13 +328,13 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			if isReady {
 				log.V(4).Info("KubevirtMachine is Ready but providerID not yet set, waiting briefly for CAPK to set it",
 					"machine", machine.Name,
-					"kubevirtMachine", kubevirtMachineKey.Name)
+					"kubevirtMachine", machine.Spec.InfrastructureRef.Name)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 
 			log.V(5).Info("KubevirtMachine not Ready yet, proceeding with bootstrap secret creation",
 				"machine", machine.Name,
-				"kubevirtMachine", kubevirtMachineKey.Name)
+				"kubevirtMachine", machine.Spec.InfrastructureRef.Name)
 		}
 	}
 
@@ -1500,10 +1495,10 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 		if *machine.Spec.Bootstrap.DataSecretName != bootstrapSecretName {
 			continue
 		}
-		if machine.Spec.Bootstrap.ConfigRef == nil {
+		if !machine.Spec.Bootstrap.ConfigRef.IsDefined() {
 			continue
 		}
-		if machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group != bootstrapv1beta2.GroupVersion.Group {
+		if machine.Spec.Bootstrap.ConfigRef.APIGroup != bootstrapv1beta2.GroupVersion.Group {
 			continue
 		}
 		if machine.Spec.Bootstrap.ConfigRef.Kind != "KairosConfig" {
@@ -1513,7 +1508,7 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 			{
 				NamespacedName: types.NamespacedName{
 					Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-					Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
+					Namespace: machine.Namespace,
 				},
 			},
 		}
@@ -1573,12 +1568,12 @@ func (r *KairosConfigReconciler) machineToKairosConfig(ctx context.Context, o cl
 	}
 
 	// Check if Machine has a bootstrap config reference
-	if machine.Spec.Bootstrap.ConfigRef == nil {
+	if !machine.Spec.Bootstrap.ConfigRef.IsDefined() {
 		return nil
 	}
 
 	// Check if it's a KairosConfig
-	if machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group != bootstrapv1beta2.GroupVersion.Group {
+	if machine.Spec.Bootstrap.ConfigRef.APIGroup != bootstrapv1beta2.GroupVersion.Group {
 		return nil
 	}
 	if machine.Spec.Bootstrap.ConfigRef.Kind != "KairosConfig" {
@@ -1613,14 +1608,14 @@ func (r *KairosConfigReconciler) infraMachineToKairosConfig(ctx context.Context,
 	for _, machine := range machineList.Items {
 		ref := machine.Spec.InfrastructureRef
 		if ref.Kind == infraKind &&
-			ref.Name == o.GetName() && ref.Namespace == o.GetNamespace() &&
-			machine.Spec.Bootstrap.ConfigRef != nil &&
-			machine.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group == bootstrapv1beta2.GroupVersion.Group &&
+			ref.Name == o.GetName() && machine.Namespace == o.GetNamespace() &&
+			machine.Spec.Bootstrap.ConfigRef.IsDefined() &&
+			machine.Spec.Bootstrap.ConfigRef.APIGroup == bootstrapv1beta2.GroupVersion.Group &&
 			machine.Spec.Bootstrap.ConfigRef.Kind == "KairosConfig" {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      machine.Spec.Bootstrap.ConfigRef.Name,
-					Namespace: machine.Spec.Bootstrap.ConfigRef.Namespace,
+					Namespace: machine.Namespace,
 				},
 			})
 		}
@@ -1639,9 +1634,9 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 	}
 
 	// First, check if Machine already has providerID set
-	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
-		log.Info("Using providerID from Machine spec", "providerID", *machine.Spec.ProviderID, "machine", machine.Name)
-		return *machine.Spec.ProviderID
+	if machine.Spec.ProviderID != "" {
+		log.Info("Using providerID from Machine spec", "providerID", machine.Spec.ProviderID, "machine", machine.Name)
+		return machine.Spec.ProviderID
 	}
 
 	// Try to get providerID from infrastructure reference (e.g., VSphereMachine)
@@ -1660,7 +1655,7 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 		})
 		vsphereMachineKey := types.NamespacedName{
 			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
+			Namespace: machine.Namespace,
 		}
 
 		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err != nil {
@@ -1693,46 +1688,27 @@ func (r *KairosConfigReconciler) getProviderID(ctx context.Context, log logr.Log
 
 	// For CAPK, get providerID from KubevirtMachine spec
 	if machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine" {
-		kubevirtMachine := &unstructured.Unstructured{}
-		kubevirtMachineGVK := machine.Spec.InfrastructureRef.GroupVersionKind()
-		if kubevirtMachineGVK.Group == "" || kubevirtMachineGVK.Version == "" {
-			kubevirtMachineGVK = schema.GroupVersionKind{
-				Group:   "infrastructure.cluster.x-k8s.io",
-				Version: "v1alpha1",
-				Kind:    "KubevirtMachine",
-			}
-		}
-		kubevirtMachine.SetGroupVersionKind(kubevirtMachineGVK)
-		kubevirtMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-
-		if err := r.Get(ctx, kubevirtMachineKey, kubevirtMachine); err != nil {
-			log.V(4).Info("Failed to get KubevirtMachine for providerID", "machine", machine.Name, "kubevirtMachine", kubevirtMachineKey.Name, "error", err)
+		kubevirtMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
+			log.V(4).Info("Failed to get KubevirtMachine for providerID", "machine", machine.Name, "kubevirtMachine", machine.Spec.InfrastructureRef.Name, "error", err)
 			return ""
 		}
 
 		if providerID, found, err := unstructured.NestedString(kubevirtMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			log.V(4).Info("Found providerID in KubevirtMachine spec", "providerID", providerID, "machine", machine.Name, "kubevirtMachine", kubevirtMachineKey.Name)
+			log.V(4).Info("Found providerID in KubevirtMachine spec", "providerID", providerID, "machine", machine.Name, "kubevirtMachine", machine.Spec.InfrastructureRef.Name)
 			return providerID
 		}
 	}
 
 	// For CAPD, get providerID from DockerMachine spec
 	if machine.Spec.InfrastructureRef.Kind == "DockerMachine" {
-		dockerMachine := &unstructured.Unstructured{}
-		dockerMachine.SetGroupVersionKind(machine.Spec.InfrastructureRef.GroupVersionKind())
-		dockerMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Spec.InfrastructureRef.Namespace,
-		}
-		if err := r.Get(ctx, dockerMachineKey, dockerMachine); err != nil {
-			log.V(4).Info("Failed to get DockerMachine for providerID", "machine", machine.Name, "dockerMachine", dockerMachineKey.Name, "error", err)
+		dockerMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
+			log.V(4).Info("Failed to get DockerMachine for providerID", "machine", machine.Name, "dockerMachine", machine.Spec.InfrastructureRef.Name, "error", err)
 			return ""
 		}
 		if providerID, found, err := unstructured.NestedString(dockerMachine.Object, "spec", "providerID"); err == nil && found && providerID != "" {
-			log.V(4).Info("Found providerID in DockerMachine spec", "providerID", providerID, "machine", machine.Name, "dockerMachine", dockerMachineKey.Name)
+			log.V(4).Info("Found providerID in DockerMachine spec", "providerID", providerID, "machine", machine.Name, "dockerMachine", machine.Spec.InfrastructureRef.Name)
 			return providerID
 		}
 	}

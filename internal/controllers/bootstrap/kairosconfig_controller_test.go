@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -236,10 +236,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneKubeVirtBootstrapTrap(t *testing.T) 
 			Namespace: "default",
 		},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				Kind:      "KubevirtMachine",
-				Name:      "test-kubevirt-machine",
-				Namespace: "default",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "KubevirtMachine",
+				Name:     "test-kubevirt-machine",
 			},
 		},
 	}
@@ -607,11 +607,11 @@ func TestGenerateCloudConfig_WorkerIgnoresControlPlaneRole(t *testing.T) {
 			kairosConfig := &bootstrapv1beta2.KairosConfig{
 				ObjectMeta: metav1.ObjectMeta{Name: "poisoned-worker", Namespace: "default"},
 				Spec: bootstrapv1beta2.KairosConfigSpec{
-					Role:              "worker",
-					Distribution:      dist,
-					KubernetesVersion: "v1.30.0",
-					ControlPlaneRole:  bootstrapv1beta2.ControlPlaneRoleInit,
-					ControlPlaneVIP:   &bootstrapv1beta2.ControlPlaneVIP{Address: "192.168.1.240", Interface: "eth0", Mode: "ARP"},
+					Role:                 "worker",
+					Distribution:         dist,
+					KubernetesVersion:    "v1.30.0",
+					ControlPlaneRole:     bootstrapv1beta2.ControlPlaneRoleInit,
+					ControlPlaneVIP:      &bootstrapv1beta2.ControlPlaneVIP{Address: "192.168.1.240", Interface: "eth0", Mode: "ARP"},
 					WorkerTokenSecretRef: &bootstrapv1beta2.WorkerTokenSecretReference{Name: "worker-token", Key: "token"},
 					K3sTokenSecretRef:    &bootstrapv1beta2.WorkerTokenSecretReference{Name: "worker-token", Key: "token"},
 					UserName:             "kairos",
@@ -1017,10 +1017,10 @@ func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{
-				Kind:      "KubevirtMachine",
-				Name:      "test-kubevirt-machine",
-				Namespace: "default",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "KubevirtMachine",
+				Name:     "test-kubevirt-machine",
 			},
 		},
 	}
@@ -1248,7 +1248,7 @@ func TestSupportsManagementEndpoint(t *testing.T) {
 	mkMachine := func(kind string) *clusterv1.Machine {
 		return &clusterv1.Machine{
 			Spec: clusterv1.MachineSpec{
-				InfrastructureRef: corev1.ObjectReference{Kind: kind},
+				InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: kind},
 			},
 		}
 	}
@@ -1327,7 +1327,7 @@ func TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock(t *testing.T) 
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{Kind: "VSphereMachine"},
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: "VSphereMachine"},
 		},
 	}
 	cluster := &clusterv1.Cluster{
@@ -1383,7 +1383,7 @@ func TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock(t *testing.T) {
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
 		Spec: clusterv1.MachineSpec{
-			InfrastructureRef: corev1.ObjectReference{Kind: "KubevirtMachine"},
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: "KubevirtMachine"},
 		},
 	}
 	cluster := &clusterv1.Cluster{

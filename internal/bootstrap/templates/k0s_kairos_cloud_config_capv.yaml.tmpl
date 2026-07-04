@@ -452,8 +452,7 @@ MANIFEST_EOF
       # a stranded cluster is not.
       # DMI uses mixed-endian byte order for the first three UUID groups; vSphere
       # expects RFC/ISO big-endian. The byte-swap below is the same algorithm
-      # proven correct in the k3s CAPV template (lab-validated: discovered UUID
-      # matched VSphereMachine providerID and Machine reached Running).
+      # used in the k3s CAPV template.
       export KUBECONFIG=/var/lib/k0s/pki/admin.conf
       PROVIDER_ID=""
       if [ -f /sys/class/dmi/id/product_uuid ]; then
@@ -536,8 +535,10 @@ MANIFEST_EOF
       # same admin.conf-based post-bootstrap patch the non-Metal3 path above uses. This
       # runs inside the already-enabled kairos-k0s-post-bootstrap.service: no extra
       # unit, no Before=, no restart, no deadlock, no Node-registration race.
-      # Control-plane only — admin.conf is CP-only and Metal3 is single-node-CP this
-      # release (replicas > 1 is webhook-rejected; k0s Metal3 workers are a future item).
+      # Control-plane only — admin.conf is CP-only, so this branch runs on every
+      # k0s Metal3 control-plane node (single-node and HA alike). k0s Metal3
+      # workers are a separate, not-yet-implemented item (see the worker branch
+      # below, which is intentionally unsupported).
       set_metal3_providerid() {
         # Read + validate the BMH UUID from the Ironic config-drive (config-2 /
         # /openstack/latest/meta_data.json). This is the ONLY trusted source; mount
@@ -624,9 +625,10 @@ MANIFEST_EOF
       # control flow and a stray command error cannot kill the node bring-up.
       set_metal3_providerid || echo "WARN: metal3-providerid: step errored; continuing post-bootstrap"
       {{- else }}
-      # Metal3 k0s WORKER providerID is not supported in this release: a worker has no
-      # local admin.conf to patch and k0s has no config.yaml.d kubelet-arg drop-in.
-      # Metal3 is single-node control-plane only (replicas > 1 is webhook-rejected).
+      # Metal3 k0s WORKER providerID is not implemented: a worker has no local
+      # admin.conf to patch and k0s has no config.yaml.d kubelet-arg drop-in.
+      # k0s Metal3 control-plane nodes (single-node and HA) are handled above;
+      # k0s Metal3 workers are a separate future item.
       {{- end }}
       {{- end }}
 

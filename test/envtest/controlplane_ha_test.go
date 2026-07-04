@@ -26,7 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -47,11 +47,10 @@ func haFixture(t *testing.T, ctx context.Context, c client.Client, nsName, clust
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
 		Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: controlplanev1beta2.GroupVersion.String(),
-				Kind:       "KairosControlPlane",
-				Name:       kcpName,
-				Namespace:  nsName,
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     kcpName,
 			},
 		},
 	}
@@ -243,10 +242,15 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 				*metav1.NewControllerRef(getKCP(g, ctx, c, nsName, kcpName), controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
 			},
 		},
-		Spec: clusterv1.MachineSpec{ClusterName: clusterName, Version: ptr.To("v1.30.0+k0s.0")},
+		Spec: clusterv1.MachineSpec{
+			ClusterName:       clusterName,
+			Version:           "v1.30.0+k0s.0",
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
+		},
 	}
 	g.Expect(c.Create(ctx, initMachine)).To(Succeed())
-	initMachine.Status.NodeRef = &corev1.ObjectReference{Kind: "Node", Name: "init-node"}
+	initMachine.Status.NodeRef = clusterv1.MachineNodeReference{Name: "init-node"}
 	initMachine.Status.Phase = string(clusterv1.MachinePhaseRunning)
 	g.Expect(c.Status().Update(ctx, initMachine)).To(Succeed())
 
@@ -364,15 +368,15 @@ func TestHA_JoinTokenWatch_ReReconcilesJoinConfig(t *testing.T) {
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: clusterName,
-			Version:     ptr.To("v1.30.0+k0s.0"),
+			Version:     "v1.30.0+k0s.0",
 			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: bootstrapv1beta2.GroupVersion.String(),
-					Kind:       "KairosConfig",
-					Name:       "pending-join",
-					Namespace:  nsName,
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     "pending-join",
 				},
 			},
+			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}
 	g.Expect(c.Create(ctx, joinMachine)).To(Succeed())
@@ -450,10 +454,15 @@ func TestHA_StatusMath_N3(t *testing.T) {
 					*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
 				},
 			},
-			Spec: clusterv1.MachineSpec{ClusterName: clusterName, Version: ptr.To("v1.30.0+k0s.0")},
+			Spec: clusterv1.MachineSpec{
+				ClusterName:       clusterName,
+				Version:           "v1.30.0+k0s.0",
+				Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+				InfrastructureRef: testMachineInfraRef("infra"),
+			},
 		}
 		g.Expect(c.Create(ctx, m)).To(Succeed())
-		m.Status.NodeRef = &corev1.ObjectReference{Kind: "Node", Name: "node-" + string(rune('0'+i))}
+		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: "node-" + string(rune('0'+i))}
 		m.Status.Phase = string(clusterv1.MachinePhaseRunning)
 		g.Expect(c.Status().Update(ctx, m)).To(Succeed())
 	}
