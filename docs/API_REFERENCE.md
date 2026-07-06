@@ -503,7 +503,7 @@ When `KairosControlPlane.spec.replicas == 1`, the controller automatically sets 
 
 `KairosControlPlane.spec.replicas` accepts `1`, `3`, or `5`. The validating webhook rejects even counts (they give the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement — always use the next-higher odd number instead) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance for a control plane).
 
-`3` and `5` configure a highly-available control plane. Set `spec.ha.vip` on CAPV, CAPM3, and CAPD clusters so kube-vip provides a stable, failover-capable endpoint — do not set it on CAPK, which supplies its own LoadBalancer-backed endpoint. See [HAConfig](#haconfig) and [EtcdHealthy condition](#etcdhealthy-condition) above, and [README.md § High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 behavior (quorum-safe replacement, k0s clean etcd-leave, and the k3s orphaned-member limitation tracked as KD-5d).
+`3` and `5` configure a highly-available control plane. Set `spec.ha.vip` on CAPV, CAPM3, and CAPD clusters so kube-vip provides a stable, failover-capable endpoint — do not set it on CAPK, which supplies its own LoadBalancer-backed endpoint. See [HAConfig](#haconfig) and [EtcdHealthy condition](#etcdhealthy-condition) above, and [README.md — High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 behavior (quorum-safe replacement, k0s clean etcd-leave, and the k3s orphaned-member limitation tracked as KD-5d).
 
 ### Security Considerations
 

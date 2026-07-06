@@ -316,7 +316,7 @@ on the `KairosControlPlane`.
 
 This section walks through a 3-node HA k0s control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capv/kairos_cluster_k0s_ha.yaml`](../config/samples/capv/kairos_cluster_k0s_ha.yaml). A k3s HA sample with the same shape is at [`config/samples/capv/kairos_cluster_k3s_ha.yaml`](../config/samples/capv/kairos_cluster_k3s_ha.yaml). Read the [single-node walkthrough](#creating-a-cluster) above first — the vSphere template, credentials Secret, and `userPasswordSecretRef` steps are identical. This section covers only what's different for HA.
 
-k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup — see [README.md § High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 explanation (KD-5d).
+k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup — see [README.md — High-Availability control planes](../README.md#high-availability-control-planes) for the full day-2 explanation (KD-5d).
 
 ### HA prerequisites
 

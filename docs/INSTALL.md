@@ -132,7 +132,7 @@ curl -k https://<mgmt-api-server-host>:6443/api
 For air-gapped or strictly-segmented network environments, enable the opt-in
 `SSHFallback` mechanism on the `KairosControlPlane`. This requires a
 host-key-verified SSH identity Secret and a `known_hosts` Secret. See
-[QUICKSTART_CAPV.md §Air-gapped fallback](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
+[QUICKSTART_CAPV.md — Air-gapped fallback](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
 for the full configuration steps.
 
 ---
