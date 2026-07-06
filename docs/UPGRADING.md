@@ -190,7 +190,7 @@ the YAML shape (including an explicit `metadata: {}`) is unaffected.
 Previously only `1` was accepted. `replicas: 3` or `5` now provisions a
 multi-node control plane; even counts and values above `5` are
 webhook-rejected. Existing `replicas: 1` deployments are unaffected. See
-[README.md § High-Availability control planes](../README.md#high-availability-control-planes)
+[README.md — High-Availability control planes](../README.md#high-availability-control-planes)
 for the new HA fields (`spec.ha.vip`, provider-specific endpoint mechanism)
 and the [HA sample manifests](../config/samples/) for CAPK, CAPV, and CAPM3.
 

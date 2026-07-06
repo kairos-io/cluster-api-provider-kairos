@@ -19,7 +19,7 @@
 #     pool), and spec.ha.vip.interface must be the NIC name that exists on the
 #     nodes (e.g. "ens192" on vSphere Hadron images — verify with `ip link`).
 #
-# DAY-2 BEHAVIOUR (ADR 0005 §E):
+# DAY-2 BEHAVIOUR (ADR 0005 section E):
 #   - Each control-plane node reports its etcd member health into a per-cluster
 #     Secret; the controller surfaces it as the EtcdHealthy condition on the
 #     KairosControlPlane (kubectl get kairoscontrolplane -o yaml).

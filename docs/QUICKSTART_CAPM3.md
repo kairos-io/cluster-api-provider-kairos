@@ -357,7 +357,7 @@ If the node cannot reach the management API server, enable the opt-in [Air-gappe
 
 CAPM3 supports a 3- or 5-node control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capm3/kairos_cluster_k0s_ha.yaml`](../config/samples/capm3/kairos_cluster_k0s_ha.yaml) or [`kairos_cluster_k3s_ha.yaml`](../config/samples/capm3/kairos_cluster_k3s_ha.yaml). Read the single-node walkthrough above first — the disk-image, BareMetalHost, and credentials-Secret steps are identical. This section covers only what's different for HA.
 
-k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d) — see [README.md § Day-2](../README.md#day-2-etcd-health-and-quorum-safe-replacement).
+k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d) — see [README.md — Day-2](../README.md#day-2-etcd-health-and-quorum-safe-replacement).
 
 ### HA prerequisites
 

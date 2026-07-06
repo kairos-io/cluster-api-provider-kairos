@@ -22,7 +22,7 @@
 #      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
 #
 #   5. A fully-installed Kairos k0s disk image served over HTTP.
-#      See docs/QUICKSTART_CAPM3.md § "Building the disk image".
+#      See docs/QUICKSTART_CAPM3.md section "Building the disk image".
 #      Use a Kairos installer ISO built with k0s, e.g.:
 #        kairos-ubuntu-24.04-standard-amd64-generic-v3.6.0-k0sv1.32.3+k0s.0.iso
 #
@@ -49,8 +49,8 @@
 # HADRON IMAGES: an auroraboot disk.raw or build-iso output for Hadron also
 # does not work. The node will boot into recovery mode (kairos-agent reports
 # boot_mode=recovery_boot) and k0s will never start. Build a fully-installed
-# disk using the QEMU procedure. See docs/QUICKSTART_CAPM3.md §
-# "Hadron images: additional failure mode" and § "Hadron on Metal3: operator
+# disk using the QEMU procedure. See docs/QUICKSTART_CAPM3.md section
+# "Hadron images: additional failure mode" and section "Hadron on Metal3: operator
 # notes" for the build pipeline and IP-pinning guidance.
 #
 # !! CRITICAL: KUBERNETES VERSION IS BAKED INTO THE DISK IMAGE !!

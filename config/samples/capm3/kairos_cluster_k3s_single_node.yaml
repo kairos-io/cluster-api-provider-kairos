@@ -57,8 +57,8 @@
 #
 # You MUST supply a fully-installed disk image (COS_ACTIVE + COS_PERSISTENT
 # for standard Kairos; "state" + "recovery" for Hadron). See
-# docs/QUICKSTART_CAPM3.md § "Building the disk image" for the QEMU
-# install-to-disk procedure and § "Hadron on Metal3: operator notes" for
+# docs/QUICKSTART_CAPM3.md section "Building the disk image" for the QEMU
+# install-to-disk procedure and section "Hadron on Metal3: operator notes" for
 # Hadron-specific guidance including control-plane IP pinning.
 #
 # !! CRITICAL: KUBERNETES VERSION IS BAKED INTO THE DISK IMAGE !!
