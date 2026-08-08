@@ -278,6 +278,18 @@ write_files:
     content: |
       [Service]
       ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-metal3-providerid.sh || true'
+  {{- else if and .IsFleet (not .ProviderID) }}
+  # Fleet (AuroraBoot): the node self-discovers its providerID before k3s starts.
+  # Runs for BOTH control-plane and worker roles — the providerID is not known at
+  # bootstrap render (the node is claimed from a group afterwards). z-provider-id.conf
+  # loads after override.conf.
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-fleet-discover-provider-id.sh || true'
   {{- else if and (eq .Role "control-plane") (not .Metal3) }}
   # Systemd override: write providerID to k3s config before k3s starts.
   # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
@@ -375,7 +387,53 @@ write_files:
       printf 'kubelet-arg:\n  - provider-id=metal3://%s\nnode-label:\n  - metal3.io/uuid=%s\n' "${uuid}" "${uuid}" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
       echo "metal3-providerid: wrote provider-id=metal3://${uuid} and metal3.io/uuid=${uuid} for kubelet registration"
   {{- end }}
-  {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
+  {{- if and .IsFleet (not .ProviderID) }}
+  # Fleet (AuroraBoot) providerID self-discovery (runs as the k3s ExecStartPre above,
+  # BEFORE k3s/kubelet starts, for both control-plane and worker roles).
+  #
+  # The KairosFleetMachine controller sets spec.providerID = kairos-fleet://<node-id>
+  # where <node-id> is the AuroraBoot managed-node UUID. That same UUID is persisted on
+  # the node by the phone-home agent at /usr/local/.kairos/phonehome-credentials.yaml
+  # (yaml key node_id; /usr/local is COS_PERSISTENT, so it survives reboots). This
+  # script derives the providerID from that file so the kubelet registers with the
+  # identical string on first registration (providerID is immutable).
+  #
+  # This block is STATIC shell — there is NO render-time interpolation, so no
+  # Go-template injection surface. The node-id is validated as a UUID before it
+  # reaches a file/shell context, and the script fails closed (writes nothing) on any
+  # missing/malformed value.
+  - path: /usr/local/bin/kairos-fleet-discover-provider-id.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -eu
+      CREDS="/usr/local/.kairos/phonehome-credentials.yaml"
+      DROPIN_DIR="/etc/rancher/k3s/config.yaml.d"
+      # Wait briefly for the phone-home agent to have written its credentials. On an
+      # enrolled fleet node these already exist (registration precedes the claim); the
+      # bounded wait just tolerates a slow first boot without racing k3s.
+      i=0
+      while [ ! -f "${CREDS}" ] && [ "${i}" -lt 30 ]; do
+        sleep 2
+        i=$((i + 1))
+      done
+      if [ ! -f "${CREDS}" ]; then
+        echo "fleet: no credentials at ${CREDS}; leaving providerID to k3s default"
+        exit 0
+      fi
+      # Extract node_id (a server-assigned UUID); strip the key, whitespace and quotes.
+      NODE_ID="$(sed -n 's/^[[:space:]]*node_id:[[:space:]]*//p' "${CREDS}" | head -n1 | tr -d '[:space:]"')"
+      # Defence in depth: only accept a well-formed UUID before it reaches the drop-in.
+      if ! printf '%s' "${NODE_ID}" | grep -qE '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'; then
+        echo "fleet: node_id in ${CREDS} is missing or not a UUID; leaving providerID to k3s default"
+        exit 0
+      fi
+      mkdir -p "${DROPIN_DIR}"
+      printf 'kubelet-arg:\n  - provider-id=kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/90-provider-id.yaml"
+      echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
+  {{- else if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
   # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre).
   # Omitted for Metal3: discovery is done at post-bootstrap via config-drive read (ADR 0004).
   # Writes to k3s config file - k3s loads config.yaml.d/*.yaml at startup
@@ -646,7 +704,11 @@ MANIFEST_EOF
 {{- /* DNS overrides and bootstrap stages */}}
 stages:
   boot:
-    {{- if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
+    {{- if and .IsFleet (not .ProviderID) }}
+    - name: "Discover providerID for k3s (fleet self-discovery)"
+      commands:
+        - /usr/local/bin/kairos-fleet-discover-provider-id.sh || true
+    {{- else if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
     - name: "Discover providerID for k3s (VM self-discovery)"
       commands:
         - /usr/local/bin/kairos-k3s-discover-provider-id.sh || true

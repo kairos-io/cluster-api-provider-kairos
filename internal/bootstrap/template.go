@@ -69,6 +69,14 @@ type TemplateData struct {
 	// Node.spec.providerID. Metal3 rides the generic (non-KubeVirt) CAPV
 	// template. (ADR 0004, OQ-1 RESOLVED.)
 	Metal3                         bool
+	// IsFleet selects the Kairos fleet (AuroraBoot) render path: the node is claimed
+	// from a group after the bootstrap data is generated, so no providerID is known at
+	// render time. Instead of the vSphere/DMI self-discovery, the node runs
+	// kairos-fleet-discover-provider-id.sh, which reads the AuroraBoot node-id from the
+	// phone-home agent's persisted credentials and writes a kairos-fleet://<node-id>
+	// kubelet drop-in before k3s/k0s starts (for both control-plane and worker roles).
+	// Fleet nodes ride the generic (non-KubeVirt) CAPV template.
+	IsFleet                        bool
 	Install                        *InstallConfig
 	ProviderID                     string // ProviderID for the Node (e.g., "vsphere://<vm-uuid>"). Validated against providerIDPattern at render time.
 	K3sServerURL                   string
@@ -247,6 +255,14 @@ func (d TemplateData) RenderKubeVIP() bool {
 
 // RenderK0sCloudConfig renders the k0s Kairos cloud-config template.
 func RenderK0sCloudConfig(data TemplateData) (string, error) {
+	// The Kairos fleet providerID self-discovery is implemented for k3s only. The k0s
+	// templates would fall through to vSphere DMI discovery and self-register a
+	// vsphere://<uuid> providerID that never matches the KairosFleetMachine's
+	// kairos-fleet://<node-id> — a silent provisioning dead-end. Fail loudly instead
+	// until k0s fleet support lands.
+	if data.IsFleet {
+		return "", fmt.Errorf("k0s is not yet supported with the Kairos fleet infrastructure provider (KairosFleetMachine); use k3s")
+	}
 	templatePath := "templates/k0s_kairos_cloud_config_capv.yaml.tmpl"
 	if data.IsKubeVirt {
 		templatePath = "templates/k0s_kairos_cloud_config_capk.yaml.tmpl"

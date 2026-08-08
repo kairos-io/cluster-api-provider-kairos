@@ -246,7 +246,10 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// secret. Zeroing it here prevents the reconcile loop from treating CAPM3's post-registration providerID as a
 	// "missing from secret" signal and triggering infinite regeneration. (ADR 0004.)
 	currentProviderID := r.getProviderID(ctx, log, machine)
-	if isMetal3Machine(machine) {
+	if isMetal3Machine(machine) || isFleetMachine(machine) {
+		// Metal3: CAPM3 owns providerID end-to-end. Fleet: the node is claimed after
+		// bootstrap render and self-discovers providerID. Either way, do not embed it
+		// in the secret (avoids the "missing from secret" regeneration loop).
 		currentProviderID = ""
 	}
 
@@ -685,6 +688,20 @@ func isMetal3Machine(machine *clusterv1.Machine) bool {
 	return machine.Spec.InfrastructureRef.Kind == "Metal3Machine"
 }
 
+// isFleetMachine reports whether machine is backed by the Kairos fleet
+// infrastructure provider (KairosFleetMachine). Like Metal3, the providerID is not
+// known at bootstrap-render time (the node is claimed from an AuroraBoot group after
+// the bootstrap data is generated), so the node self-discovers it: the rendered
+// cloud-config carries kairos-fleet-discover-provider-id.sh, which derives
+// kairos-fleet://<node-id> from the phone-home agent's persisted credentials before
+// k3s/k0s starts.
+func isFleetMachine(machine *clusterv1.Machine) bool {
+	if machine == nil {
+		return false
+	}
+	return machine.Spec.InfrastructureRef.Kind == "KairosFleetMachine"
+}
+
 func (r *KairosConfigReconciler) sanitizeCapkUserdataSecret(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) (bool, bool, error) {
 	secretName := ""
 	if machine != nil && machine.Spec.Bootstrap.DataSecretName != nil && *machine.Spec.Bootstrap.DataSecretName != "" {
@@ -1046,7 +1063,9 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	// the template does not emit --provider-id args or the kubectl patch block.
 	// (ADR 0004, OQ-1 RESOLVED.)
 	var providerID string
-	if !isMetal3Machine(machine) {
+	if !isMetal3Machine(machine) && !isFleetMachine(machine) {
+		// Fleet, like Metal3, does not embed a render-time providerID: the node is
+		// claimed after render and self-discovers kairos-fleet://<node-id>.
 		providerID = r.getProviderID(ctx, log, machine)
 	}
 
@@ -1088,6 +1107,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		ClusterNS:                      "",
 		IsKubeVirt:                     isKubevirtMachine(machine),
 		Metal3:                         isMetal3Machine(machine),
+		IsFleet:                        isFleetMachine(machine),
 		Install:                        installConfig,
 		ProviderID:                     providerID,
 		ControlPlaneLBServiceName:      "",
@@ -1231,7 +1251,9 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 	// the template does not emit --provider-id args or the kubectl patch block.
 	// (ADR 0004, OQ-1 RESOLVED.)
 	var providerID string
-	if !isMetal3Machine(machine) {
+	if !isMetal3Machine(machine) && !isFleetMachine(machine) {
+		// Fleet, like Metal3, does not embed a render-time providerID: the node is
+		// claimed after render and self-discovers kairos-fleet://<node-id>.
 		providerID = r.getProviderID(ctx, log, machine)
 	}
 
@@ -1265,6 +1287,7 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		ClusterNS:                      "",
 		IsKubeVirt:                     isKubevirtMachine(machine),
 		Metal3:                         isMetal3Machine(machine),
+		IsFleet:                        isFleetMachine(machine),
 		Install:                        installConfig,
 		ProviderID:                     providerID,
 		K3sServerURL:                   serverAddress,
