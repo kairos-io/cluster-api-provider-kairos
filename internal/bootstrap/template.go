@@ -68,14 +68,21 @@ type TemplateData struct {
 	// SUPPRESS our providerID arg + kubectl-patch block, because CAPM3 owns
 	// Node.spec.providerID. Metal3 rides the generic (non-KubeVirt) CAPV
 	// template. (ADR 0004, OQ-1 RESOLVED.)
-	Metal3                         bool
+	Metal3 bool
 	// IsFleet selects the Kairos fleet (AuroraBoot) render path: the node is claimed
 	// from a group after the bootstrap data is generated, so no providerID is known at
-	// render time. Instead of the vSphere/DMI self-discovery, the node runs
-	// kairos-fleet-discover-provider-id.sh, which reads the AuroraBoot node-id from the
-	// phone-home agent's persisted credentials and writes a kairos-fleet://<node-id>
-	// kubelet drop-in before k3s/k0s starts (for both control-plane and worker roles).
-	// Fleet nodes ride the generic (non-KubeVirt) CAPV template.
+	// render time. Instead of the vSphere/DMI self-discovery, the node derives the
+	// AuroraBoot node-id from the phone-home agent's persisted credentials and produces
+	// a kairos-fleet://<node-id> providerID. The delivery differs by distribution:
+	//   - k3s (both roles): kairos-fleet-discover-provider-id.sh writes the k3s
+	//     config.yaml.d kubelet drop-in before k3s starts.
+	//   - k0s control-plane: derives the providerID from the credentials and patches
+	//     the Node post-bootstrap via `k0s kubectl` (admin.conf is control-plane only).
+	//   - k0s worker: kairos-k0s-fleet-provider-id.sh writes a KubeletConfiguration
+	//     providerID drop-in that the kubelet reads via a static --config-dir arg
+	//     before it registers (a worker has no admin.conf to patch).
+	// Fleet nodes ride the generic (non-KubeVirt) CAPV template; fleet never co-occurs
+	// with KubeVirt.
 	IsFleet                        bool
 	Install                        *InstallConfig
 	ProviderID                     string // ProviderID for the Node (e.g., "vsphere://<vm-uuid>"). Validated against providerIDPattern at render time.
@@ -254,15 +261,15 @@ func (d TemplateData) RenderKubeVIP() bool {
 }
 
 // RenderK0sCloudConfig renders the k0s Kairos cloud-config template.
+//
+// Kairos fleet (AuroraBoot) providerID self-discovery is implemented on the CAPV
+// template only: the control-plane derives kairos-fleet://<node-id> from the
+// phone-home credentials and patches its Node post-bootstrap (admin.conf is
+// CP-only), while workers write a KubeletConfiguration providerID drop-in read
+// via --config-dir before the kubelet registers. Fleet never co-occurs with
+// KubeVirt (isFleetMachine and isKubevirtMachine are mutually exclusive Kinds),
+// so the CAPK path needs no fleet branch.
 func RenderK0sCloudConfig(data TemplateData) (string, error) {
-	// The Kairos fleet providerID self-discovery is implemented for k3s only. The k0s
-	// templates would fall through to vSphere DMI discovery and self-register a
-	// vsphere://<uuid> providerID that never matches the KairosFleetMachine's
-	// kairos-fleet://<node-id> — a silent provisioning dead-end. Fail loudly instead
-	// until k0s fleet support lands.
-	if data.IsFleet {
-		return "", fmt.Errorf("k0s is not yet supported with the Kairos fleet infrastructure provider (KairosFleetMachine); use k3s")
-	}
 	templatePath := "templates/k0s_kairos_cloud_config_capv.yaml.tmpl"
 	if data.IsKubeVirt {
 		templatePath = "templates/k0s_kairos_cloud_config_capk.yaml.tmpl"
