@@ -248,9 +248,15 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 	// Determinism: the sibling reconciler's time-based backstop is
 	// collapsed to EvalRequeue=2s in startKCPEnvtest, so once the gate is
 	// open the eligibility re-check fires within a couple of seconds
-	// rather than racing the 1-minute production cadence. The 90s window
-	// (well above that 2s cadence) is generous headroom so envtest
-	// start-up cost on a slow/contended CI runner cannot eat into it.
+	// rather than racing the 1-minute production cadence.
+	//
+	// The window is 180s (not the 2s cadence) because the SSH-fallback
+	// reconciler *shares the manager workqueue* with every other controller
+	// in this envtest suite (see its SetupWithManager note). On a busy/shared
+	// CI runner the full suite can starve its 2s requeues long enough to eat a
+	// tighter 90s window (observed: the same test passes on a quiet runner and
+	// intermittently times out on a contended one). 180s is headroom against
+	// that queue contention, not against the reconciler's own cadence.
 	g.Eventually(func() string {
 		got := &controlplanev1beta2.KairosControlPlane{}
 		if err := c.Get(ctx, types.NamespacedName{Name: kcp.Name, Namespace: kcp.Namespace}, got); err != nil {
@@ -261,7 +267,7 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 			return ""
 		}
 		return cond.Reason
-	}, 90*time.Second, 2*time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
+	}, 180*time.Second, 2*time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
 		"missing SSHFallback Secrets MUST surface SSHFallbackMisconfigured on KubeconfigReadyCondition")
 }
 
