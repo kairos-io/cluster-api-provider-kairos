@@ -114,7 +114,17 @@ k0s-worker:
   enabled: true
   args:
     - --token-file /etc/k0s/token
-    {{- if and .ProviderID (not .Metal3) }}
+    {{- if and .IsFleet (not .ProviderID) }}
+    # Fleet (AuroraBoot): the providerID is not known at bootstrap render (the node
+    # is claimed from a group afterwards), and a worker has no admin.conf to patch
+    # its Node post-bootstrap. So the kubelet must self-register with the right
+    # providerID: it reads a KubeletConfiguration drop-in from --config-dir (a
+    # STATIC path, no interpolation) that kairos-k0s-fleet-provider-id.sh writes as
+    # an ExecStartPre BEFORE the kubelet starts. We deliberately do NOT emit an
+    # empty --provider-id= here — that would pin the k0s default and never match
+    # kairos-fleet://<node-id>. The dynamic node-id is validated in-script.
+    - --kubelet-extra-args=--config-dir=/etc/kubernetes/kubelet.conf.d
+    {{- else if and .ProviderID (not .Metal3) }}
     # KD-3c: same providerID-at-startup story as the control-plane block above.
     # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
     - --kubelet-extra-args=--provider-id={{ .ProviderID }}
@@ -200,6 +210,74 @@ write_files:
     permissions: "0644"
     content: |
       {{ .WorkerToken }}
+  {{- end }}
+  {{- if and .IsFleet (not .ProviderID) (ne .Role "control-plane") }}
+  # Fleet (AuroraBoot) providerID self-discovery for k0s WORKERS.
+  #
+  # A worker has no admin.conf, so the control-plane's post-bootstrap kubectl-patch
+  # path is unavailable; the kubelet must instead register the Node with the right
+  # providerID on FIRST registration (providerID is immutable once non-empty). The
+  # k0s-worker args carry a STATIC --kubelet-extra-args=--config-dir=/etc/kubernetes/kubelet.conf.d,
+  # and this ExecStartPre writes a KubeletConfiguration drop-in there BEFORE the
+  # worker's kubelet starts. k0sworker.service cannot successfully start until
+  # /etc/k0s/token (written by write_files) is present, so this drop-in — also from
+  # write_files — is guaranteed in place before the registration that matters.
+  #
+  # SECURITY: STATIC shell — there is NO render-time interpolation of the node-id,
+  # so no Go-template injection surface. node_id is read from the credentials file
+  # at boot and validated against the UUID pattern BEFORE it reaches the drop-in;
+  # the script fails closed (writes nothing, exit 0) on any missing/malformed value.
+  - path: /etc/systemd/system/k0sworker.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k0s-fleet-provider-id.sh || true'
+  - path: /usr/local/bin/kairos-k0s-fleet-provider-id.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -eu
+      CREDS="/usr/local/.kairos/phonehome-credentials.yaml"
+      DROPIN_DIR="/etc/kubernetes/kubelet.conf.d"
+      # Bounded wait for the phone-home agent's credentials. On an enrolled fleet
+      # node these already exist (registration precedes the claim); the wait just
+      # tolerates a slow first boot without racing the kubelet.
+      i=0
+      while [ ! -f "${CREDS}" ] && [ "${i}" -lt 30 ]; do
+        sleep 2
+        i=$((i + 1))
+      done
+      if [ ! -f "${CREDS}" ]; then
+        echo "fleet: no credentials at ${CREDS}; leaving providerID to k0s default"
+        exit 0
+      fi
+      # Extract node_id (a server-assigned UUID); strip the key, whitespace, quotes.
+      NODE_ID="$(sed -n 's/^[[:space:]]*node_id:[[:space:]]*//p' "${CREDS}" | head -n1 | tr -d '[:space:]"')"
+      # Defence in depth, mirroring the DMI/Metal3 blocks in this file: first reject
+      # any value with a character outside [hex,dash] (closes provider-id injection
+      # and a multi-line smuggle), then enforce the exact UUID shape with bash =~
+      # (string-anchored, not line-anchored). This keeps the validation correct even
+      # if the upstream whitespace strip ever changed.
+      uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+      case "${NODE_ID}" in
+        "" | *[!0-9a-fA-F-]* )
+          echo "fleet: node_id in ${CREDS} is empty or contains illegal characters; leaving providerID to k0s default"
+          exit 0 ;;
+      esac
+      if ! [[ "${NODE_ID}" =~ ${uuid_re} ]]; then
+        echo "fleet: node_id in ${CREDS} does not match the UUID pattern; leaving providerID to k0s default"
+        exit 0
+      fi
+      mkdir -p "${DROPIN_DIR}"
+      # KubeletConfiguration drop-in merged via --config-dir before the kubelet
+      # registers the Node. Written with printf (not an interpolated heredoc); the
+      # only substituted value is the UUID validated above.
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nproviderID: kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/10-provider-id.conf"
+      echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
   {{- end }}
   {{- /*
     Post-bootstrap unit + script writes were previously emitted via
@@ -400,7 +478,93 @@ MANIFEST_EOF
       {{- end }}
       {{- end }}
 
-      {{- if and .ProviderID (not .Metal3) }}
+      {{- if and .IsFleet (not .ProviderID) (eq .Role "control-plane") }}
+      # Fleet (AuroraBoot) providerID self-discovery for the CONTROL-PLANE, then
+      # patch. The node is claimed from a group AFTER bootstrap render, so the
+      # providerID is not known at render time; derive kairos-fleet://<node-id> from
+      # the phone-home agent's persisted credentials and patch the Node. The CP has
+      # /var/lib/k0s/pki/admin.conf, so the post-bootstrap kubectl patch is available
+      # (mirrors the DMI path below; the worker path instead sets it pre-start).
+      # KD-55: fail-OPEN — a providerID hiccup must not abort the kubeconfig push.
+      #
+      # SECURITY: STATIC shell — NODE_ID is read from the credentials file at boot
+      # and validated against the UUID pattern BEFORE it reaches the patch JSON.
+      # There is NO render-time interpolation of the node-id (no injection surface).
+      export KUBECONFIG=/var/lib/k0s/pki/admin.conf
+      PROVIDER_ID=""
+      CREDS="/usr/local/.kairos/phonehome-credentials.yaml"
+      # Bounded wait for the phone-home credentials (present on an enrolled node).
+      i=0
+      while [ ! -f "${CREDS}" ] && [ "${i}" -lt 30 ]; do
+        sleep 2
+        i=$((i + 1))
+      done
+      if [ ! -f "${CREDS}" ]; then
+        echo "WARN: fleet: no credentials at ${CREDS}; skipping providerID (continuing post-bootstrap)"
+      else
+        NODE_ID="$(sed -n 's/^[[:space:]]*node_id:[[:space:]]*//p' "${CREDS}" | head -n1 | tr -d '[:space:]"')"
+        # Whole-string UUID validation before the value reaches the patch JSON,
+        # mirroring the DMI/Metal3 blocks: reject any character outside [hex,dash],
+        # then enforce the exact UUID shape with bash =~ (string-anchored).
+        uuid_re='^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+        case "${NODE_ID}" in
+          "" | *[!0-9a-fA-F-]* ) NODE_ID="" ;;
+        esac
+        if [ -n "${NODE_ID}" ] && [[ "${NODE_ID}" =~ ${uuid_re} ]]; then
+          PROVIDER_ID="kairos-fleet://${NODE_ID}"
+          echo "fleet: discovered providerID ${PROVIDER_ID}"
+        else
+          echo "WARN: fleet: node_id in ${CREDS} is missing or not a UUID; skipping providerID (continuing post-bootstrap)"
+        fi
+      fi
+      if [ -n "${PROVIDER_ID}" ]; then
+        echo "Waiting for k0s node to be registered..."
+        # Use `k0s kubectl` (resolves the local admin kubeconfig). The Hadron k0s
+        # image ships no standalone `kubectl` binary, so bare `kubectl` would fail
+        # and silently never set the providerID — mirrors the non-fleet paths.
+        node_registered=false
+        MAX_WAIT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          if k0s kubectl get node $(hostname) &>/dev/null; then
+            node_registered=true
+            break
+          fi
+          echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
+        done
+        if [ "$node_registered" != "true" ]; then
+          echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+        else
+          # Set the discovered providerID on the Node. The kubelet registers the CP
+          # Node with an EMPTY providerID (no --provider-id on the fleet CP), and the
+          # apiserver permits setting a previously-empty providerID, so this patch
+          # succeeds on first registration. ${PROVIDER_ID} is validated above.
+          echo "Setting providerID=${PROVIDER_ID} on node $(hostname)..."
+          PROVIDER_ID_SET=false
+          for i in {1..30}; do
+            if k0s kubectl patch node $(hostname) --type=merge -p "{\"spec\":{\"providerID\":\"${PROVIDER_ID}\"}}" &>/dev/null; then
+              echo "Successfully set providerID=${PROVIDER_ID} on node $(hostname)"
+              PROVIDER_ID_SET=true
+              break
+            fi
+            echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+            sleep 5
+          done
+          if [ "$PROVIDER_ID_SET" != "true" ]; then
+            echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
+          fi
+        fi
+      fi
+      {{- else if and .IsFleet (not .ProviderID) }}
+      # Fleet worker: the providerID is set PRE-START via the kubelet --config-dir
+      # KubeletConfiguration drop-in written by kairos-k0s-fleet-provider-id.sh (see
+      # write_files). A worker has no admin.conf, so there is no post-bootstrap
+      # kubectl patch here — and, critically, no fall-through to the vSphere DMI
+      # self-discovery below (which would self-register a vsphere DMI providerID and
+      # never match kairos-fleet://<node-id>).
+      {{- else if and .ProviderID (not .Metal3) }}
       # Wait for k0s to be ready and the Node to be registered, then set providerID.
       # KD-55: fail-OPEN. A providerID hiccup (API blip, slow registration) must NOT
       # abort the rest of post-bootstrap — the kubeconfig push below MUST still run,
@@ -867,6 +1031,15 @@ MANIFEST_EOF
 {{- /* DNS overrides */}}
 stages:
   boot:
+    {{- if and .IsFleet (not .ProviderID) (ne .Role "control-plane") }}
+    # Fleet worker: also run the providerID drop-in writer as an early boot stage
+    # (belt-and-suspenders alongside the k0sworker.service ExecStartPre), so the
+    # KubeletConfiguration drop-in is present before the kubelet registers. The
+    # script is idempotent and fails closed on a missing/malformed node_id.
+    - name: "Discover providerID for k0s worker (fleet self-discovery)"
+      commands:
+        - /usr/local/bin/kairos-k0s-fleet-provider-id.sh || true
+    {{- end }}
     - name: "Ensure SSH service is enabled"
       commands:
         - systemctl enable --now sshd || systemctl enable --now ssh || true
