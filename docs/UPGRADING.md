@@ -200,6 +200,46 @@ single-node cluster to HA, provision a new HA cluster rather than editing
 
 ---
 
+## v0.1.0-beta.1 → v0.1.0-beta.2
+
+Full release notes: [v0.1.0-beta.2](release-notes/v0.1.0-beta.2.md).
+
+This release adds a second, `clusterctl`-native install path (ADR 0007) and
+bumps the required CAPI core version. Neither change force-migrates an
+existing install.
+
+### If you stay on the flat manifest: no action required
+
+`kairos-capi-provider.yaml` keeps the same namespace (`kairos-capi-system`)
+and provider label (`cluster.x-k8s.io/provider: kairos`) it has always had.
+Upgrade in place with the usual `kubectl apply`:
+
+```bash
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
+```
+
+### If you want to move to `clusterctl`: not an in-place upgrade
+
+The `clusterctl` providers use different namespaces and provider labels
+than the flat manifest, and `Deployment.spec.selector` /
+`ClusterRoleBinding.roleRef` are immutable, so moving to `clusterctl` is an
+uninstall-old / install-new operation, not a re-apply. See
+[Moving from the flat install to clusterctl packaging](#moving-from-the-flat-install-to-clusterctl-packaging)
+below for the full procedure and the namespace/label comparison table.
+
+### CAPI core v1.13.4 required
+
+The management-side CAPI dependency moves from v1.13.3 to v1.13.4, a
+low-risk patch release — `controller-runtime` (v0.23.3) and `k8s.io/*`
+(v0.35.4) are unchanged. Upgrade the management cluster's Cluster API core
+to v1.13.4 or later before upgrading this provider:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.4/cluster-api-components.yaml
+```
+
+---
+
 ## Moving from the flat install to clusterctl packaging
 
 Full design: ADR 0007 (maintained in the repository's internal decision records).

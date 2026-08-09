@@ -13,11 +13,11 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 ## Status
 
-**Latest release**: [`v0.1.0-beta.1`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-beta.1) — pre-1.0; API surface may still change before v1.0.
+**Latest release**: [`v0.1.0-beta.2`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-beta.2) — pre-1.0; API surface may still change before v1.0.
 
 Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPD is dev-only; HA is not exercised on CAPD. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
 
-Read the [v0.1.0-beta.1 release notes](docs/release-notes/v0.1.0-beta.1.md) before installing — there are breaking changes, security hardening requirements, and known limitations that affect all operators upgrading from alpha.2. Additional infrastructure providers (Tinkerbell, hyperscalers) are on the roadmap.
+Read the [v0.1.0-beta.2 release notes](docs/release-notes/v0.1.0-beta.2.md) before installing. This release adds a second, `clusterctl`-native install path — if you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest paths are mutually exclusive and cannot be swapped in place. Additional infrastructure providers (Tinkerbell, hyperscalers) are on the roadmap.
 
 ## Install (released version)
 
@@ -49,7 +49,7 @@ clusterctl init --bootstrap kairos --control-plane kairos
 ### Path 2 - flat manifest (`kubectl apply`)
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
 ```
 
 This applies an all-in-one manifest: both providers run as one Deployment in namespace `kairos-capi-system`, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact; it is kept as a `kubectl apply` convenience alongside the `clusterctl` path through the beta series.
