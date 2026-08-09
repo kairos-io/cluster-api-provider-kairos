@@ -144,7 +144,7 @@ Full release notes: [v0.1.0-beta.1](release-notes/v0.1.0-beta.1.md).
 This provider's dependency on `sigs.k8s.io/cluster-api` moves from v1.8 to
 v1.13.3, adopting the v1beta2 contract-versioned object-reference model
 (`ContractVersionedObjectReference` / `MachineNodeReference`) in place of
-v1beta1 pointer-based references (commit `736aeb3`, [ADR 0006](../.claude/decisions/0006-dependency-bump-capi-v1.13.md)).
+v1beta1 pointer-based references (commit `736aeb3`, ADR 0006).
 
 **Required operator action:** upgrade the management cluster's Cluster API
 core to v1.13.3 or later before upgrading this provider:
@@ -197,3 +197,62 @@ and the [HA sample manifests](../config/samples/) for CAPK, CAPV, and CAPM3.
 **No in-place single-node-to-HA conversion.** To move an existing
 single-node cluster to HA, provision a new HA cluster rather than editing
 `spec.replicas` on a running single-node `KairosControlPlane`.
+
+---
+
+## Moving from the flat install to clusterctl packaging
+
+Full design: ADR 0007 (maintained in the repository's internal decision records).
+
+This provider now also ships as two `clusterctl` providers (see
+[docs/INSTALL.md: Path 1](INSTALL.md#path-1---clusterctl-recommended)),
+alongside the existing flat, `kubectl apply` manifest (Path 2). **If you are
+staying on the flat manifest, no action is required**: `kairos-capi-provider.yaml`
+keeps the same namespace (`kairos-capi-system`) and provider label
+(`cluster.x-k8s.io/provider: kairos`) as before.
+
+**If you want to move an existing flat installation to `clusterctl`**, treat
+it as an uninstall-old / install-new operation, not an in-place re-apply:
+
+| | Flat install (unchanged) | clusterctl providers (new) |
+| --- | --- | --- |
+| Namespace | `kairos-capi-system` | `capi-kairos-bootstrap-system` (bootstrap), `capi-kairos-control-plane-system` (control plane) |
+| `cluster.x-k8s.io/provider` label | `kairos` | `bootstrap-kairos`, `control-plane-kairos` |
+
+`Deployment.spec.selector` and `ClusterRoleBinding.roleRef` are immutable, and
+the namespaces differ, so applying the clusterctl components over an existing
+flat install (or the reverse) does not update it in place. It creates a
+second, independent set of controllers and webhooks watching the same CRDs.
+This is unsupported; see
+[docs/INSTALL.md: the two paths are mutually exclusive](INSTALL.md#path-1-and-path-2-are-mutually-exclusive).
+
+To migrate:
+
+1. Uninstall the flat manifest:
+   ```bash
+   kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
+   ```
+2. Confirm no stale webhook configurations remain (see the re-install note in
+   [docs/INSTALL.md: Path 2 Uninstall](INSTALL.md#uninstall-1)):
+   ```bash
+   kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations | grep kairos
+   ```
+3. Install via `clusterctl` per
+   [docs/INSTALL.md: Path 1](INSTALL.md#path-1---clusterctl-recommended).
+
+Existing `KairosConfig`, `KairosConfigTemplate`, `KairosControlPlane`, and
+`KairosControlPlaneTemplate` objects, and the CRDs themselves, are unaffected
+by the migration: only the controller Deployments, RBAC, webhook
+configurations, and their owning namespace/label change. Machines already
+provisioned keep running; reconciliation resumes once the new controllers
+start.
+
+### CA injection no longer needs a post-install script
+
+`hack/post-install-webhook-ca-injection.sh` is gone. Webhook CA injection is
+handled entirely by cert-manager's standard `cert-manager.io/inject-ca-from`
+annotation on each `MutatingWebhookConfiguration` /
+`ValidatingWebhookConfiguration`, wired per namespace by kustomize (KD-1).
+There is no post-install CA-injection step on any install path (`clusterctl`
+or flat manifest). If you have automation that runs the old script, remove
+that step.
