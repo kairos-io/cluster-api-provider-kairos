@@ -51,19 +51,18 @@ func (e *Environment) kairosImageBuildDir() string {
 // The "core" family ships without a Kubernetes distro and is unusable for CAPI workload nodes; "hadron-standard-k3s"
 // is also significantly smaller, which speeds up build + CDI upload.
 //
-// Pinned to v0.2.0 GA to align CI with the image stack used for KD-3b PR-7
-// lab validation (Hadron Linux v0.2.0, kernel 7.0.6-hadron). The previous
-// v0.0.4 pin pre-dated the post-bootstrap unit changes in this PR and let
-// CI diverge from the lab in ways that were impossible to reproduce.
-// k3s baked into the image is v1.35.4; the manifest's `kubernetesVersion`
-// is ignored by the Kairos k3s.enabled cloud-config primitive (the binary
-// in the image wins). Tracked separately as KD-50 / task #12.
+// Pinned to Hadron v0.4.0 / Kairos v4.1.2 (latest stable) with k3s v1.36.1, to
+// match the management-cluster bump to Kubernetes 1.36. The k3s baked into the
+// image is v1.36.1; the manifest's `kubernetesVersion` is ignored by the Kairos
+// k3s.enabled cloud-config primitive (the binary in the image wins). Tracked
+// separately as KD-50 / task #12. A k0s variant of the same Kairos version
+// exists (v4.1.2-k0s-v1.36.1) for a k0s lab pass.
 func kairosOSArtifactBaseImage(goarch string) string {
 	switch goarch {
 	case "arm64":
-		return "quay.io/kairos/hadron:v0.2.0-standard-arm64-generic-v4.1.0-k3s-v1.35.4-k3s1"
+		return "quay.io/kairos/hadron:v0.4.0-standard-arm64-generic-v4.1.2-k3s-v1.36.1-k3s1"
 	default:
-		return "quay.io/kairos/hadron:v0.2.0-standard-amd64-generic-v4.1.0-k3s-v1.35.4-k3s1"
+		return "quay.io/kairos/hadron:v0.4.0-standard-amd64-generic-v4.1.2-k3s-v1.36.1-k3s1"
 	}
 }
 
