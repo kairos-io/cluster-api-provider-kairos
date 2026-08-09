@@ -219,7 +219,7 @@ kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_ha.yaml
 
 Prerequisite specific to CAPK HA: etcd peers over each control-plane VM's own IP. KubeVirt's default `masquerade` interface gives every VM the same self-address (`10.0.2.2`), so etcd cannot peer across nodes on that interface alone. Each control-plane VM needs a second, routable NIC (a Multus-attached bridge network or equivalent) in addition to the default masquerade interface. See the header comments in the HA sample files for the exact `interfaces`/`networks` shape.
 
-k3s HA has the same day-2 limitation as other providers: replacing a k3s control-plane node leaves an orphaned etcd member requiring manual cleanup (KD-5d). See the [README Day-2 section](../README.md#day-2-etcd-health-and-quorum-safe-replacement).
+k3s HA has the same day-2 limitation as other providers: replacing a k3s control-plane node leaves an orphaned etcd member requiring manual cleanup (KD-5d). See [docs/HIGH_AVAILABILITY.md — Day-2](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement).
 
 ---
 

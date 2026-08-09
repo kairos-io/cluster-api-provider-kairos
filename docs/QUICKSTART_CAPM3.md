@@ -357,7 +357,7 @@ If the node cannot reach the management API server, enable the opt-in [Air-gappe
 
 CAPM3 supports a 3- or 5-node control plane fronted by a kube-vip virtual IP (VIP), using [`config/samples/capm3/kairos_cluster_k0s_ha.yaml`](../config/samples/capm3/kairos_cluster_k0s_ha.yaml) or [`kairos_cluster_k3s_ha.yaml`](../config/samples/capm3/kairos_cluster_k3s_ha.yaml). Read the single-node walkthrough above first — the disk-image, BareMetalHost, and credentials-Secret steps are identical. This section covers only what's different for HA.
 
-k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d) — see [README.md — Day-2](../README.md#day-2-etcd-health-and-quorum-safe-replacement).
+k0s is the fully-supported HA distribution. k3s HA bring-up works the same way, but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d) — see [docs/HIGH_AVAILABILITY.md — Day-2](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement).
 
 ### HA prerequisites
 
@@ -601,7 +601,7 @@ If the node's IP changes after provisioning (DHCP lease reassignment), the `cont
 
 - Configure worker nodes via `MachineDeployment` with a `Metal3MachineTemplate` and a worker-role `KairosConfigTemplate`.
 - Add custom Kubernetes manifests via `spec.template.spec.manifests` in `KairosConfigTemplate`.
-- HA control planes (`replicas: 3`/`5` with a kube-vip VIP via `spec.ha.vip`) are supported on CAPM3 for both k0s and k3s — see [High-Availability control plane](#high-availability-control-plane) above and the [README HA section](../README.md#high-availability-control-planes).
+- HA control planes (`replicas: 3`/`5` with a kube-vip VIP via `spec.ha.vip`) are supported on CAPM3 for both k0s and k3s — see [High-Availability control plane](#high-availability-control-plane) above and [docs/HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md).
 - Static IPAM via Metal3DataTemplate / Metal3IPPool is a future phase.
 
 ---
