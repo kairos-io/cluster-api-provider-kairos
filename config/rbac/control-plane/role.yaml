@@ -2,14 +2,13 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: manager-role
+  name: control-plane-manager-role
 rules:
 - apiGroups:
   - ""
   resources:
   - endpoints
-  - serviceaccounts
-  - serviceaccounts/token
+  - secrets
   - services
   verbs:
   - create
@@ -25,18 +24,6 @@ rules:
   verbs:
   - create
   - patch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
 - apiGroups:
   - apiextensions.k8s.io
   resources:
@@ -58,20 +45,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - bootstrap.cluster.x-k8s.io
-  resources:
-  - kairosconfigs/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - bootstrap.cluster.x-k8s.io
-  resources:
-  - kairosconfigs/status
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - cluster.x-k8s.io
   resources:
@@ -135,6 +108,9 @@ rules:
   - infrastructure.cluster.x-k8s.io
   resources:
   - dockermachines
+  - kubevirtmachines
+  - metal3machines
+  - vspheremachines
   verbs:
   - create
   - get
@@ -152,32 +128,3 @@ rules:
   - vspherevms
   verbs:
   - get
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - kubevirtmachines
-  - metal3machines
-  - vspheremachines
-  verbs:
-  - create
-  - get
-  - list
-  - watch
-- apiGroups:
-  - kubevirt.io
-  resources:
-  - virtualmachineinstances
-  verbs:
-  - get
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
-  - rolebindings
-  - roles
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - update
-  - watch

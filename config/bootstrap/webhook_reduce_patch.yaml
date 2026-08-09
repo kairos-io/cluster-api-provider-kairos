@@ -1,0 +1,25 @@
+# Reduce the shared 2+2 webhook manifests to the bootstrap provider's webhooks.
+# Strategic-merge $patch: delete keys on webhook `name` (the merge key for the
+# admissionregistration webhooks list — stable across `make manifests`). Removes
+# the 4 control-plane webhooks, leaving mkairosconfig.kb.io / vkairosconfig.kb.io
+# (one per config). failurePolicy: Fail and sideEffects: None on the survivor are
+# untouched.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: mutating-webhook-configuration
+webhooks:
+- name: mkairoscontrolplane.kb.io
+  $patch: delete
+- name: mkairoscontrolplanetemplate.kb.io
+  $patch: delete
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- name: vkairoscontrolplane.kb.io
+  $patch: delete
+- name: vkairoscontrolplanetemplate.kb.io
+  $patch: delete

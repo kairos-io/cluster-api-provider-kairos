@@ -44,8 +44,24 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+manifests: controller-gen ## Generate CRDs, webhooks, and the three provider ClusterRoles.
+	# Pass 1: combined manager-role (+ CRDs + webhook manifests) for the flat
+	# config/default overlay (--controllers=all). Shared markers now live only in
+	# internal/controllers/shared, so this union stays drift-free.
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook \
+	  paths="./..." output:crd:artifacts:config=config/crd/bases
+	# Pass 2: bootstrap-only role from the bootstrap package + the shared markers.
+	# Distinct roleName AND distinct output dir — two passes to one dir would
+	# overwrite role.yaml. Semicolon-separated paths= is supported on the pinned
+	# controller-gen v0.19.0 (verified); fall back to repeated paths= flags if a
+	# future bump balks.
+	$(CONTROLLER_GEN) rbac:roleName=bootstrap-manager-role \
+	  paths="./internal/controllers/bootstrap/...;./internal/controllers/shared/..." \
+	  output:rbac:artifacts:config=config/rbac/bootstrap
+	# Pass 3: control-plane-only role from the controlplane package + shared.
+	$(CONTROLLER_GEN) rbac:roleName=control-plane-manager-role \
+	  paths="./internal/controllers/controlplane/...;./internal/controllers/shared/..." \
+	  output:rbac:artifacts:config=config/rbac/control-plane
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -98,7 +114,7 @@ verify-generate: generate ## Verify that generated code is up to date.
 
 .PHONY: verify-manifests
 verify-manifests: manifests ## Verify that manifests are up to date.
-	@git diff --exit-code config/crd/bases config/rbac || (echo "Error: Manifests are out of date. Run 'make manifests' and commit the changes." && exit 1)
+	@git diff --exit-code config/crd/bases config/rbac config/rbac/bootstrap config/rbac/control-plane || (echo "Error: Manifests are out of date. Run 'make manifests' and commit the changes." && exit 1)
 
 ##@ Build
 
