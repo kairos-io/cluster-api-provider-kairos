@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -84,6 +85,10 @@ func TestControlPlaneIntegration(t *testing.T) {
 	mgr, err := manager.New(cfg, manager.Options{
 		Scheme: scheme,
 		Logger: log.Log,
+		// Tests don't scrape metrics; disable the listener so the manager does not
+		// bind controller-runtime's fixed :8080 default (which flakes whenever the
+		// port is already held, in CI or on a shared dev box).
+		Metrics: metricsserver.Options{BindAddress: "0"},
 		// Each envtest in this package brings up its own manager in the same
 		// process; controller-runtime v0.23 validates controller-name uniqueness
 		// against a process-global registry, so the shared "kairosconfig"
@@ -255,6 +260,7 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
 
 	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
 	g.Expect(err).NotTo(HaveOccurred())
 

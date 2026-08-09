@@ -78,7 +78,7 @@ jobs:
 
     - name: Install controller-gen
       run: |
-        go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.0
+        go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
 
     - name: Generate code
       run: make generate
@@ -115,7 +115,7 @@ jobs:
 
     - name: Install controller-gen
       run: |
-        go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.0
+        go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
 
     - name: Install ruamel.yaml (for label insertion with formatting preservation)
       run: |
@@ -144,9 +144,9 @@ jobs:
 
     - name: Install envtest tools
       run: |
-        go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+        go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.24.1
         export PATH=$(go env GOPATH)/bin:$PATH
-        setup-envtest use -p path latest
+        setup-envtest use -p path 1.36.2
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -164,7 +164,7 @@ jobs:
     - name: Run envtest integration tests
       run: make test-envtest
       env:
-        KUBEBUILDER_ASSETS: $(setup-envtest use -p path latest)
+        KUBEBUILDER_ASSETS: $(setup-envtest use -p path 1.36.2)
 
   e2e:
     runs-on: ubuntu-latest

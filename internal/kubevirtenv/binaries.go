@@ -93,14 +93,14 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 		Name: "kubectl",
 		Arches: map[string]BinaryArchArtifact{
 			"amd64": {
-				Version:     "v1.35.3",
+				Version:     "v1.36.3",
 				URLTemplate: "https://dl.k8s.io/release/%[1]s/bin/linux/%[2]s/kubectl",
-				SHA256:      "fd31c7d7129260e608f6faf92d5984c3267ad0b5ead3bced2fe125686e286ad6",
+				SHA256:      "ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336",
 			},
 			"arm64": {
-				Version:     "v1.35.3",
+				Version:     "v1.36.3",
 				URLTemplate: "https://dl.k8s.io/release/%[1]s/bin/linux/%[2]s/kubectl",
-				SHA256:      "6f0cd088a82dde5d5807122056069e2fac4ed447cc518efc055547ae46525f14",
+				SHA256:      "3d86f24401c41ae5a46ac50eef8865fe891d3647d324a0836f6c63757a126e62",
 			},
 		},
 	},
@@ -108,14 +108,14 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 		Name: "kind",
 		Arches: map[string]BinaryArchArtifact{
 			"amd64": {
-				Version:     "v0.31.0",
+				Version:     "v0.32.0",
 				URLTemplate: "https://github.com/kubernetes-sigs/kind/releases/download/%[1]s/kind-linux-%[2]s",
-				SHA256:      "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa",
+				SHA256:      "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54",
 			},
 			"arm64": {
-				Version:     "v0.31.0",
+				Version:     "v0.32.0",
 				URLTemplate: "https://github.com/kubernetes-sigs/kind/releases/download/%[1]s/kind-linux-%[2]s",
-				SHA256:      "8e1014e87c34901cc422a1445866835d1e666f2a61301c27e722bdeab5a1f7e4",
+				SHA256:      "b92cd615e97585de8ddade28ed5cd7feb4248d717c233eea5b03c37298900f5d",
 			},
 		},
 	},
@@ -125,18 +125,18 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 			"amd64": {
 				// clusterctl init installs the management cluster's CAPI core at this
 				// version, so it MUST match the sigs.k8s.io/cluster-api version in
-				// go.mod (v1.13.3). The controller now emits cluster.x-k8s.io/v1beta2
-				// Machines; a v1.8.0 management apiserver does not serve that contract,
-				// so the KCP's Machine create fails and no workload VM is ever
-				// provisioned (the e2e regression fixed here).
-				Version:     "v1.13.3",
+				// go.mod (v1.13.4). The controller emits cluster.x-k8s.io/v1beta2
+				// Machines; a management apiserver whose CAPI core predates that
+				// contract fails the KCP's Machine create and never provisions a
+				// workload VM (the e2e regression this pin guards against).
+				Version:     "v1.13.4",
 				URLTemplate: "https://github.com/kubernetes-sigs/cluster-api/releases/download/%[1]s/clusterctl-linux-%[2]s",
-				SHA256:      "a6b94e0da68df254191480b11c0b50019a7a5df87560d6f70a76d3453116f21e",
+				SHA256:      "17a7a98e62d423b92981cd5fb005e35ebb76fa0a21e32046336627c7521a1049",
 			},
 			"arm64": {
-				Version:     "v1.13.3",
+				Version:     "v1.13.4",
 				URLTemplate: "https://github.com/kubernetes-sigs/cluster-api/releases/download/%[1]s/clusterctl-linux-%[2]s",
-				SHA256:      "a9b32e0179cdbb66ba67ebdb45be818c983dedcc827f6d31bca72277250df52c",
+				SHA256:      "da95037d036f36d0d0e92026d84cfd0eb0f8b2f69308e201cdf3b411bc1f25ec",
 			},
 		},
 	},
@@ -146,12 +146,12 @@ var ToolBinaryCatalog = map[string]BinaryDependency{
 			"amd64": {
 				Version:     KubeVirtVersion,
 				URLTemplate: "https://github.com/kubevirt/kubevirt/releases/download/%[1]s/virtctl-%[1]s-linux-%[2]s",
-				SHA256:      "745f3c58c6a77be65b828e67b6ad930e9039ab293ed5b2bef6d44c8681af5b75",
+				SHA256:      "40ede2ee37c98a1aeed71c9c219616a05247ce2be109e1edddf0477572e8b978",
 			},
 			"arm64": {
 				Version:     KubeVirtVersion,
 				URLTemplate: "https://github.com/kubevirt/kubevirt/releases/download/%[1]s/virtctl-%[1]s-linux-%[2]s",
-				SHA256:      "345b29874d3c98801ad022ef3074b21e2b21a386b22a2779997ab7c74c7e6f57",
+				SHA256:      "9d9b45d0f09ba2316d255bc629154f293210f803d51ace7995c9f2260999e78e",
 			},
 		},
 	},

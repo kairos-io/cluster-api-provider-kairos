@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPV (vSphere)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.3, CAPV v1.11.x+, provider v0.1.0-beta.1.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4, CAPV v1.11.x+, provider v0.1.0-beta.1.
 
 This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV). For a 3-node highly-available k0s control plane, see [High-Availability: 3-node k0s control plane](#high-availability-3-node-k0s-control-plane) below.
 
@@ -16,7 +16,7 @@ This guide walks you through creating a single-node k0s or k3s cluster on Kairos
 
 2. **Management Cluster**: A Kubernetes cluster with network access to vSphere.
 
-3. **Cluster API**: CAPI v1.13.3+ installed (v1beta2 contract).
+3. **Cluster API**: CAPI v1.13.4+ installed (v1beta2 contract).
 
 4. **CAPV**: Cluster API Provider vSphere installed and configured.
 

@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPD (Docker)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.3, provider v0.1.0-beta.1.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4, provider v0.1.0-beta.1.
 
 This guide walks you through creating a single-node k0s cluster on Kairos using Cluster API with the Docker provider (CAPD).
 
@@ -13,7 +13,7 @@ This guide walks you through creating a single-node k0s cluster on Kairos using 
 ## Prerequisites
 
 1. **Management Cluster**: A Kubernetes cluster (kind, minikube, or any Kubernetes cluster).
-2. **Cluster API**: CAPI v1.13.3+ installed (v1beta2 contract).
+2. **Cluster API**: CAPI v1.13.4+ installed (v1beta2 contract).
 3. **CAPD**: Cluster API Provider Docker installed.
 4. **Kairos CAPI Provider**: Installed (see [Install guide](INSTALL.md)).
 

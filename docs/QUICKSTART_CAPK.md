@@ -1,6 +1,6 @@
 # Quickstart: CAPK (KubeVirt)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.3, KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-beta.1.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4, KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-beta.1.
 
 This guide covers two paths:
 
@@ -156,12 +156,12 @@ make test-kubevirt     # run the full scripted flow
 
 For users with an existing management cluster that already has KubeVirt, CDI, CAPI, and CAPK installed.
 
-Do not use `clusterctl init --bootstrap kairos` — clusterctl integration is deferred to a later release (KD-38).
+This walkthrough uses the flat manifest (`kubectl apply -f kairos-capi-provider.yaml`, below). `clusterctl init --bootstrap kairos --control-plane kairos` is also supported as of this release; see [docs/INSTALL.md: Path 1](INSTALL.md#path-1---clusterctl-recommended). Do not run both against the same management cluster: the two install paths are mutually exclusive (see [docs/INSTALL.md](INSTALL.md#path-1-and-path-2-are-mutually-exclusive)).
 
 ### Prerequisites
 
 - Kubernetes management cluster with:
-  - CAPI v1.13.3+ installed (v1beta2 contract)
+  - CAPI v1.13.4+ installed (v1beta2 contract)
   - CAPK (`infrastructure.cluster.x-k8s.io`) installed
   - CDI (Containerized Data Importer) installed
   - A LoadBalancer implementation (MetalLB or equivalent)

@@ -1,13 +1,74 @@
 # Install Guide
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.3, cert-manager v1.15+,
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
 provider v0.1.0-beta.1.
 
-Two install paths: the released artifact (recommended for users) and a developer install from source.
+Three install paths: `clusterctl` (recommended), the released flat artifact (`kubectl apply`), and a developer install from source. Path 1 and Path 2 are mutually exclusive on one management cluster: see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive) below before picking one.
 
-## Path 1 — Released artifact (`kubectl apply`)
+## Path 1 - clusterctl (recommended)
 
-Use this if you want to consume a tagged release.
+Use this for a `clusterctl`-managed management cluster, and for the closest match to upstream Cluster API tooling and documentation.
+
+Per ADR 0007, this provider packages as two `clusterctl` providers built from one container image: a **bootstrap provider** (namespace `capi-kairos-bootstrap-system`, label `bootstrap-kairos`) and a **control-plane provider** (namespace `capi-kairos-control-plane-system`, label `control-plane-kairos`). A release publishes `bootstrap-components.yaml`, `control-plane-components.yaml`, and a shared `metadata.yaml`, all digest-pinned to the release image.
+
+### Prerequisites
+
+1. A Kubernetes cluster acting as the management cluster (kind, EKS, GKE, AKS, etc.).
+2. `clusterctl` CLI installed, e.g. from the [Cluster API v1.13.4 release](https://github.com/kubernetes-sigs/cluster-api/releases/tag/v1.13.4).
+3. `kubectl` configured to use the management cluster.
+
+`clusterctl init` installs cert-manager and Cluster API core automatically if they are not already present, so unlike Path 2 (a plain `kubectl apply` with no `clusterctl` involved) you do not need to install either one by hand first.
+
+### Register the provider
+
+This provider is not yet in the upstream `clusterctl` provider list, so add it explicitly to your `clusterctl` configuration:
+
+```yaml
+# ~/.cluster-api/clusterctl.yaml (or pass --config <path> to clusterctl)
+providers:
+  - name: "kairos"
+    url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/download/bootstrap-components.yaml"
+    type: "BootstrapProvider"
+  - name: "kairos"
+    url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/download/control-plane-components.yaml"
+    type: "ControlPlaneProvider"
+```
+
+`clusterctl` discovers `metadata.yaml` next to each components file in the same GitHub release; it does not need its own entry in this file.
+
+### Install
+
+```bash
+clusterctl init --bootstrap kairos --control-plane kairos
+```
+
+To also initialize your infrastructure provider in the same call, add `--infrastructure <provider>` (`docker`, `vsphere`, `kubevirt`, `metal3`; see the matching quickstart in [Next steps](#next-steps) for provider-specific setup):
+
+```bash
+clusterctl init --bootstrap kairos --control-plane kairos --infrastructure docker
+```
+
+### Verify
+
+```bash
+kubectl get pods -n capi-kairos-bootstrap-system
+kubectl get pods -n capi-kairos-control-plane-system
+kubectl get providers -A
+```
+
+Expected: Deployment `capi-kairos-bootstrap-controller-manager` in `capi-kairos-bootstrap-system` and Deployment `capi-kairos-control-plane-controller-manager` in `capi-kairos-control-plane-system`, both `Available`, plus a `bootstrap-kairos` and a `control-plane-kairos` entry in clusterctl's provider inventory.
+
+### Uninstall
+
+```bash
+clusterctl delete --bootstrap kairos --control-plane kairos
+```
+
+---
+
+## Path 2 - Flat manifest (`kubectl apply`)
+
+Use this if you want a single `kubectl apply -f` without configuring `clusterctl`, or if your management cluster is not `clusterctl`-managed.
 
 ### Prerequisites
 
@@ -21,9 +82,9 @@ Use this if you want to consume a tagged release.
    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.2/cert-manager.yaml
    kubectl wait --for=condition=Available --timeout=2m -n cert-manager deploy/cert-manager-webhook
    ```
-3. **Cluster API core v1.13.3+** installed. Easiest path:
+3. **Cluster API core v1.13.4+** installed. Easiest path:
    ```bash
-   kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/cluster-api-components.yaml
+   kubectl apply -f https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.4/cluster-api-components.yaml
    ```
    Or use `clusterctl init --infrastructure docker` (or vsphere, kubevirt, ...) if you already have clusterctl configured — `clusterctl init` installs Cluster API core as a side effect of installing the infrastructure provider.
 4. `kubectl` configured to use the management cluster.
@@ -34,7 +95,7 @@ Use this if you want to consume a tagged release.
 kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
 ```
 
-This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace.
+This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
 
 ### Verify
 
@@ -68,7 +129,13 @@ kubectl delete validatingwebhookconfiguration <stale-name>
 
 ---
 
-## Path 2 — Developer install (from source)
+## Path 1 and Path 2 are mutually exclusive
+
+Do not install both on the same management cluster. They use different namespaces (`capi-kairos-bootstrap-system` / `capi-kairos-control-plane-system` for Path 1, `kairos-capi-system` for Path 2) and different `cluster.x-k8s.io/provider` label values (`bootstrap-kairos` / `control-plane-kairos` for Path 1, `kairos` for Path 2). Deployment selectors and ClusterRoleBinding roleRefs are immutable, so installing the second path on a cluster already running the first does not upgrade or replace it. It runs a second, independent set of controllers and webhooks watching the same CRDs, which is unsupported and can produce conflicting webhook admission decisions. If you need to move an existing installation from one path to the other, see [docs/UPGRADING.md](UPGRADING.md).
+
+---
+
+## Path 3 — Developer install (from source)
 
 Use this if you are hacking on the provider itself.
 
@@ -76,7 +143,7 @@ Use this if you are hacking on the provider itself.
 
 - Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0` / toolchain `go1.26.0`).
 - A Kubernetes cluster acting as the management cluster.
-- cert-manager and Cluster API core installed (same as Path 1).
+- cert-manager and Cluster API core installed (same as Path 2).
 - `kubectl` configured to use the management cluster.
 
 ### Install

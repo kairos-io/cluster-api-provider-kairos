@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPM3 (Metal3 / bare metal)
 
-Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.3, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0-beta.1. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
+Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0-beta.1. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
 
 This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). k0s and k3s use the identical flow and differ only in distribution and version fields. For a 3-node HA control plane, see [High-Availability control plane](#high-availability-control-plane) below.
 
@@ -196,7 +196,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 
 2. **Management cluster**: A Kubernetes cluster with network access to the Ironic API and to the workload nodes.
 
-3. **Cluster API core**: v1.13.3+ required (v1beta2 contract). CAPM3 v1.13 stores its CRDs at the `v1beta2` contract, so the management cluster's CAPI core must serve `v1beta2`. (This provider's typed client additionally relies on `cluster.x-k8s.io/v1beta1` still being served; CAPI continues to serve both, so no action is needed.) The manifests in this guide are authored in `v1beta2`. Verify:
+3. **Cluster API core**: v1.13.4+ required (v1beta2 contract). CAPM3 v1.13 stores its CRDs at the `v1beta2` contract, so the management cluster's CAPI core must serve `v1beta2`. (This provider's typed client additionally relies on `cluster.x-k8s.io/v1beta1` still being served; CAPI continues to serve both, so no action is needed.) The manifests in this guide are authored in `v1beta2`. Verify:
    ```bash
    kubectl api-versions | grep cluster.x-k8s.io
    ```

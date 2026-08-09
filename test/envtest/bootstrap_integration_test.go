@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"strings"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -76,6 +77,10 @@ func TestBootstrapIntegration(t *testing.T) {
 	mgr, err := manager.New(cfg, manager.Options{
 		Scheme: scheme,
 		Logger: log.Log,
+		// Tests don't scrape metrics; disable the listener so the manager does not
+		// bind controller-runtime's fixed :8080 default (which flakes whenever the
+		// port is already held, in CI or on a shared dev box).
+		Metrics: metricsserver.Options{BindAddress: "0"},
 		// Multiple managers share this process; controller-runtime v0.23 enforces
 		// process-global controller-name uniqueness, so the "kairosconfig" name
 		// collides across per-test managers. Test-harness only.
@@ -300,6 +305,7 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 
 	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
 	g.Expect(err).NotTo(HaveOccurred())
 

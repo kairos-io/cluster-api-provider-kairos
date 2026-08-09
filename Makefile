@@ -7,6 +7,16 @@ IMG_REGISTRY ?= ghcr.io/kairos-io/cluster-api-provider-kairos
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo "dev")
 # Directory where release-manifests writes its artifacts.
 RELEASE_DIR ?= dist
+# Image reference stamped into released manifests. CI passes IMG_DIGEST (the
+# pushed multi-arch index digest, e.g. sha256:abc...) so every shipped manifest
+# pins the image by digest rather than a moving tag (rule 4 / config §3). Local
+# dry-runs leave IMG_DIGEST empty and fall back to the VERSION tag.
+IMG_DIGEST ?=
+ifeq ($(strip $(IMG_DIGEST)),)
+RELEASE_IMG_REF := $(IMG_REGISTRY):$(VERSION)
+else
+RELEASE_IMG_REF := $(IMG_REGISTRY)@$(IMG_DIGEST)
+endif
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:generateEmbeddedObjectMeta=true"
 
@@ -44,8 +54,24 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+manifests: controller-gen ## Generate CRDs, webhooks, and the three provider ClusterRoles.
+	# Pass 1: combined manager-role (+ CRDs + webhook manifests) for the flat
+	# config/default overlay (--controllers=all). Shared markers now live only in
+	# internal/controllers/shared, so this union stays drift-free.
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook \
+	  paths="./..." output:crd:artifacts:config=config/crd/bases
+	# Pass 2: bootstrap-only role from the bootstrap package + the shared markers.
+	# Distinct roleName AND distinct output dir — two passes to one dir would
+	# overwrite role.yaml. Semicolon-separated paths= is supported on the pinned
+	# controller-gen v0.19.0 (verified); fall back to repeated paths= flags if a
+	# future bump balks.
+	$(CONTROLLER_GEN) rbac:roleName=bootstrap-manager-role \
+	  paths="./internal/controllers/bootstrap/...;./internal/controllers/shared/..." \
+	  output:rbac:artifacts:config=config/rbac/bootstrap
+	# Pass 3: control-plane-only role from the controlplane package + shared.
+	$(CONTROLLER_GEN) rbac:roleName=control-plane-manager-role \
+	  paths="./internal/controllers/controlplane/...;./internal/controllers/shared/..." \
+	  output:rbac:artifacts:config=config/rbac/control-plane
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -70,14 +96,14 @@ test-unit: ## Run unit tests only.
 .PHONY: test-envtest
 test-envtest: ## Run envtest-based integration tests.
 	@echo "Installing/updating setup-envtest..."
-	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 	@echo "Downloading CAPI CRDs..."
 	@mkdir -p test/crd/capi
-	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
+	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.4/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
 		(echo "Warning: Failed to download CAPI CRDs. Tests may fail." && rm -f test/crd/capi/cluster-api-components.yaml)
 	@echo "Setting up kubebuilder tools..."
 	@export PATH=$$(go env GOPATH)/bin:$$PATH && \
-	eval $$(setup-envtest use -p env latest) && \
+	eval $$(setup-envtest use -p env $(ENVTEST_K8S_VERSION)) && \
 	go test ./test/envtest/... -v -timeout 600s
 
 .PHONY: test-kubevirt
@@ -98,7 +124,7 @@ verify-generate: generate ## Verify that generated code is up to date.
 
 .PHONY: verify-manifests
 verify-manifests: manifests ## Verify that manifests are up to date.
-	@git diff --exit-code config/crd/bases config/rbac || (echo "Error: Manifests are out of date. Run 'make manifests' and commit the changes." && exit 1)
+	@git diff --exit-code config/crd/bases config/rbac config/rbac/bootstrap config/rbac/control-plane || (echo "Error: Manifests are out of date. Run 'make manifests' and commit the changes." && exit 1)
 
 ##@ Build
 
@@ -154,17 +180,27 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 ##@ Release
 
 .PHONY: release-manifests
-release-manifests: manifests kustomize ## Render the all-in-one provider manifest into $(RELEASE_DIR)/kairos-capi-provider.yaml.
+release-manifests: manifests kustomize ## Render clusterctl components (bootstrap + control-plane), metadata, and the flat manifest into $(RELEASE_DIR).
 	@mkdir -p $(RELEASE_DIR)
 	@# Render against a temporary copy of config/ so the source tree stays clean
-	@# (kustomize edit set image mutates config/manager/kustomization.yaml in place,
-	@# which would leave the working directory dirty after a local dry-run).
+	@# (kustomize edit set image mutates the kustomization in place, which would
+	@# otherwise leave the working directory dirty after a local dry-run).
+	@# The image is set in config/manager (the shared base): its transformer runs
+	@# first and renames controller -> the pinned ref, so all three overlays
+	@# (default, bootstrap, control-plane) that include ../manager inherit it.
 	@tmp=$$(mktemp -d) && \
 	  cp -r config "$$tmp/config" && \
-	  (cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=$(IMG_REGISTRY):$(VERSION)) && \
-	  $(KUSTOMIZE) build "$$tmp/config/default" > $(RELEASE_DIR)/kairos-capi-provider.yaml && \
+	  (cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=$(RELEASE_IMG_REF)) && \
+	  $(KUSTOMIZE) build "$$tmp/config/default"       > $(RELEASE_DIR)/kairos-capi-provider.yaml && \
+	  $(KUSTOMIZE) build "$$tmp/config/bootstrap"     > $(RELEASE_DIR)/bootstrap-components.yaml && \
+	  $(KUSTOMIZE) build "$$tmp/config/control-plane" > $(RELEASE_DIR)/control-plane-components.yaml && \
+	  cp config/clusterctl/metadata.yaml $(RELEASE_DIR)/metadata.yaml && \
 	  rm -rf "$$tmp"
-	@cd $(RELEASE_DIR) && sha256sum kairos-capi-provider.yaml > sha256sums.txt
+	@cd $(RELEASE_DIR) && sha256sum \
+	  kairos-capi-provider.yaml \
+	  bootstrap-components.yaml \
+	  control-plane-components.yaml \
+	  metadata.yaml > sha256sums.txt
 	@echo "Release artifacts in $(RELEASE_DIR):"
 	@ls -la $(RELEASE_DIR)
 
@@ -187,6 +223,11 @@ GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 GOLANGCI_LINT_VERSION ?= v1.60.0
+# Pinned so `make test-envtest` is reproducible (rule 4: no unpinned @latest / floating envtest assets).
+# ENVTEST_K8S_VERSION is the Kubernetes API-server/etcd binary version the controllers are tested
+# against; 1.36 is the top of Cluster API v1.13's supported management-cluster band. Bump deliberately.
+SETUP_ENVTEST_VERSION ?= v0.24.1
+ENVTEST_K8S_VERSION ?= 1.36.2
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.

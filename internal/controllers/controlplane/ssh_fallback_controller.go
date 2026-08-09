@@ -118,7 +118,7 @@ func (r *SSHFallbackReconciler) evalRequeue() time.Duration {
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kairoscontrolplanes/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machines,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
-//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// events lives in internal/controllers/shared (both managers need it).
 
 // Reconcile evaluates the SSH-fallback eligibility gate for a single KCP
 // and, when eligible, enqueues an SSH-fetch job onto the worker pool.

@@ -1,0 +1,229 @@
+# clusterctl BOOTSTRAP-provider components overlay (ADR 0007, Option A1).
+#
+# Renders the shared single-image manager as the bootstrap provider: provider
+# label bootstrap-kairos, namespace capi-kairos-bootstrap-system, manager runs
+# --controllers=bootstrap, only the two bootstrap.cluster.x-k8s.io CRDs and the
+# single kairosconfig mutating/validating webhook, bound to bootstrap-manager-role.
+#
+# This overlay is a clusterctl components artifact and MUST honor the contract:
+# unique provider label, exactly one Namespace, provider-unique webhook-config
+# names. The flat config/default overlay stays the kubectl-apply convenience.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../namespace
+  - ../crd
+  - ../rbac/bootstrap
+  - ../certmanager
+  - ../webhook
+  - ../manager
+
+# Provider-unique prefix. BLOCKING (ADR 0007 / RBAC brief §4): the webhook
+# configurations are cluster-scoped singletons; the bootstrap and control-plane
+# overlays MUST NOT share a name or the second install silently overwrites the
+# first's webhooks (fail-open). A distinct namePrefix guarantees distinct names
+# and distinct RBAC / SA / Service names on a shared management cluster.
+namePrefix: capi-kairos-bootstrap-
+namespace: capi-kairos-bootstrap-system
+
+# Provider label via labels/includeSelectors:false — NOT the deprecated
+# commonLabels, which bleeds the label into the immutable
+# Deployment.spec.selector.matchLabels (config/manager's selector is only
+# {control-plane: controller-manager}, so pods still select under
+# includeSelectors:false).
+labels:
+  - includeSelectors: false
+    pairs:
+      cluster.x-k8s.io/provider: bootstrap-kairos
+      app.kubernetes.io/name: capi-kairos-bootstrap
+      app.kubernetes.io/component: controller-manager
+
+# No images: block here on purpose. The controller image is set once in
+# config/manager (the shared base) and inherited by this overlay; the release
+# workflow pins it by digest there. A per-overlay images: entry would be a dead
+# no-op: the base transformer renames "controller" before this one could match.
+
+patches:
+  # This overlay pulls the shared ../crd base (all four CRDs + the contract
+  # labels) and drops the two control-plane CRDs, leaving only the two
+  # bootstrap.cluster.x-k8s.io CRDs. kustomize's root-only load restrictor
+  # forbids a subdir kustomization from reaching up into ../crd/bases, so the
+  # subset is expressed as whole-resource $patch: delete by CRD name.
+  - patch: |-
+      $patch: delete
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: kairoscontrolplanes.controlplane.cluster.x-k8s.io
+    target:
+      kind: CustomResourceDefinition
+      name: kairoscontrolplanes.controlplane.cluster.x-k8s.io
+  - patch: |-
+      $patch: delete
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: kairoscontrolplanetemplates.controlplane.cluster.x-k8s.io
+    target:
+      kind: CustomResourceDefinition
+      name: kairoscontrolplanetemplates.controlplane.cluster.x-k8s.io
+  # Reduce the shared 2+2 webhook manifests to just the bootstrap webhook per
+  # config (delete the 4 control-plane webhooks by name).
+  - path: webhook_reduce_patch.yaml
+  # Gate this manager process to the bootstrap controllers/webhooks.
+  - target:
+      kind: Deployment
+      name: controller-manager
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --controllers=bootstrap
+
+# Wire CRD-typed cross-references that Kustomize's built-in nameReference
+# transformer doesn't know about: Certificate.spec.issuerRef.name and the
+# cert-manager.io/inject-ca-from annotation on the webhook configs. Scoped to
+# THIS overlay's namespace, so inject-ca-from resolves to the bootstrap
+# namespace's own Certificate. The bootstrap webhook configs carry a single
+# webhook each (.webhooks.0), so all .webhooks.1 targets are dropped (RBAC
+# brief §5: positional targets on a 1-element list would be out of bounds).
+replacements:
+  - source:
+      kind: Issuer
+      group: cert-manager.io
+      version: v1
+      name: selfsigned-issuer
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.issuerRef.name
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: webhook-server-cert
+      fieldPath: .metadata.namespace
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: webhook-server-cert
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.dnsNames.0
+          - .spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 0
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.namespace
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.dnsNames.0
+          - .spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 1
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: webhook-server-cert
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+          name: webhook-server-cert
+        fieldPaths:
+          - .spec.secretName
+      - select:
+          kind: Deployment
+          group: apps
+          version: v1
+          name: controller-manager
+        fieldPaths:
+          - .spec.template.spec.volumes.[name=cert].secret.secretName
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.name
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.name
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.namespace
+    targets:
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.namespace
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .webhooks.0.clientConfig.service.namespace

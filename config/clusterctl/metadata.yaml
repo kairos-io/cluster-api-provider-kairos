@@ -1,51 +1,18 @@
-# clusterctl metadata.yaml
-# This file is used by clusterctl to discover and install the provider.
-# It is published alongside components.yaml in each release.
+# clusterctl provider metadata.
 #
-# sha256 values are intentionally omitted from all entries below.
-# Release engineering populates them at publish time by hashing the
-# final artifacts. Do NOT add `sha256: ""` — an empty string defeats
-# clusterctl integrity checks silently (see config/CLAUDE.md §6).
-
-apiVersion: clusterctl.cluster.x-k8s.io/v1beta1
+# Published alongside the components manifests in every release. clusterctl reads
+# it to map a release version to the Cluster API contract the provider implements
+# so it can refuse an incompatible management cluster.
+#
+# The Metadata kind has exactly one field, releaseSeries, and each entry is
+# {major, minor, contract} for one MINOR series. It does NOT carry per-patch
+# version / url / sha256 / releaseDate entries: clusterctl discovers available
+# versions from the GitHub releases and resolves the components URL from the
+# clusterctl provider configuration, not from this file. (The previous
+# v1beta1 + patches: shape was not a valid Metadata document.)
+apiVersion: clusterctl.cluster.x-k8s.io/v1alpha3
 kind: Metadata
 releaseSeries:
   - major: 0
     minor: 1
-    patches:
-      # v0.1.0-alpha.1 — initial alpha (bootstrap + control-plane providers,
-      # CAPD/CAPV/CAPK support, single-node k0s and k3s).
-      - version: v0.1.0-alpha.1
-        releaseDate: "2026-04-15"
-        contract: v1beta2
-        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.1/components.yaml
-        # sha256 populated by release engineering at publish time.
-
-      # v0.1.0-alpha.2 — Metal3/CAPM3 bare-metal support, default-credentials
-      # removal, SSH eliminated from controller hot path, SSHFallback opt-in,
-      # spec.files rendering, KairosControlPlaneTemplate webhook, reconcileDelete
-      # cleanup (KD-4), latched-failure recovery (KD-14).
-      - version: v0.1.0-alpha.2
-        releaseDate: "2026-06-18"
-        contract: v1beta2
-        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-alpha.2/components.yaml
-        # sha256 populated by release engineering at publish time.
-
-      # v0.1.0-beta.1 — Highly-available control planes on CAPK/CAPV/CAPM3
-      # (k0s and k3s), CAPI core dependency bump to v1.13.3 / k8s 1.35 /
-      # controller-runtime v0.23.3 (ADR 0006, v1beta2 contract-versioned
-      # object references), quorum-safe control-plane replacement, etcd
-      # health condition. v0.1.0-alpha.3 was never released; this supersedes
-      # it (see docs/release-notes/v0.1.0-alpha.3.md).
-      - version: v0.1.0-beta.1
-        releaseDate: "2026-07-03"
-        contract: v1beta2
-        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/components.yaml
-        # sha256 populated by release engineering at publish time.
-
-      # v0.1.0 — not yet released.
-      - version: v0.1.0
-        releaseDate: "2024-11-21"
-        contract: v1beta2
-        url: https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/components.yaml
-        # sha256 populated by release engineering at publish time.
+    contract: v1beta2

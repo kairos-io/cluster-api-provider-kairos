@@ -98,16 +98,24 @@ type KairosConfigReconciler struct {
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;metal3machines,verbs=list;watch
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status,verbs=get
 //+kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
-//+kubebuilder:rbac:groups="",resources=secrets;events,verbs=get;list;watch;create;update;patch;delete
+// Secrets: this controller writes and owns the bootstrap-data Secret (and the
+// CAPK kubeconfig-push Secret). events lives in internal/controllers/shared
+// (both managers need it). NOTE (KD-46 follow-up): the `delete` verb here is a
+// blast-radius wart — no controller code issues an explicit client.Delete on a
+// Secret (owned Secrets cascade via owner references). Dropping it needs a
+// watch/cache redesign and is tracked as a follow-up, not this PR.
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// serviceaccounts/token + roles/rolebindings: the KubeVirt/CAPK management-
+// endpoint resolver (management_endpoint_resolver.go, KD-33) mints a per-cluster
+// ServiceAccount + namespaced Role/RoleBinding + TokenRequest so the workload
+// cluster can reach the management apiserver. These grants are BOOTSTRAP-only;
+// the control-plane manager creates no RBAC objects.
 //+kubebuilder:rbac:groups="",resources=serviceaccounts;serviceaccounts/token,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
-//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// services: read-only — the bootstrap controller reads the control-plane LB
+// Service to discover the management endpoint. The control-plane manager owns
+// (creates/updates) that Service.
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
-//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;get;list;update;patch;watch
-//+kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch
-//+kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations;validatingwebhookconfigurations,verbs=get;list;patch;update
-//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch
-//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;patch;update
 
 // Reconcile is part of the main kubernetes reconciliation loop
 //
