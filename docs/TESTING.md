@@ -1,6 +1,6 @@
 # Testing
 
-Last verified against: Go toolchain 1.26.3, provider v0.1.0-beta.1.
+Last verified against: Go toolchain 1.26.3, provider v0.1.0-beta.2.
 
 See [Install guide](INSTALL.md) for development install.
 
@@ -45,7 +45,7 @@ This is the highest-confidence gate but requires Docker and a host with enough m
 
 After the cluster is `Available=true`, drain a node via `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`, restart the underlying VM (`virtctl restart <vm>` for CAPK; vSphere "Restart Guest OS" for CAPV), uncordon, and verify `kubectl get nodes` shows `Ready` within 5 minutes. This validates KD-23's persistence injection — k0s/k3s state, SSH host keys, and CNI config must survive the reboot.
 
-## Supported configurations (v0.1.0-beta.1)
+## Supported configurations (v0.1.0-beta.2)
 
 Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3, for both k0s and k3s. CAPD is dev-only (single-node); HA is not exercised on CAPD. CAPD is tested via unit/envtest rather than a live e2e run.
 

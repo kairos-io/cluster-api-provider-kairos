@@ -1,6 +1,6 @@
 # Quickstart: CAPK (KubeVirt)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4, KubeVirt v1.8.2, CAPK v0.1.x, provider v0.1.0-beta.1.
+Last verified against: Kairos v4.1.2, CAPI v1.13.4, KubeVirt v1.9, CAPK v0.1.x, provider v0.1.0-beta.2.
 
 This guide covers two paths:
 
@@ -167,7 +167,7 @@ This walkthrough uses the flat manifest (`kubectl apply -f kairos-capi-provider.
   - A LoadBalancer implementation (MetalLB or equivalent)
 - Kairos CAPI provider installed:
   ```bash
-  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.1/kairos-capi-provider.yaml
+  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
   ```
 - A Kairos image uploaded to CDI as a DataVolume named `kairos-rootdisk` (for k0s) or `kairos-k3s-rootdisk` (for k3s) in namespace `default`. The image must be a Kairos live-installer image — not a pre-installed disk image.
 
