@@ -196,8 +196,9 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	host, err := r.resolveControlPlaneHost(ctx, log, kcp, cluster)
 	if err != nil {
 		log.Info("could not resolve control-plane host; will retry", "error", err.Error())
-		// Soft retry: no condition change, no job enqueue. The next
-		// reconcile (woken by Machine status update) will retry.
+		// No condition change and no job enqueue: requeue on the eval cadence
+		// (evalRequeue) so host resolution is retried once the control-plane
+		// Machine reports an address.
 		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
