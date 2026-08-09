@@ -43,6 +43,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -192,6 +193,29 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
+	// Fail fast on a missing/empty Secret misconfiguration in the reconcile
+	// itself, before dispatching a worker. The worker would only reach the same
+	// SSHFallbackMisconfigured outcome several async hops later
+	// (reconcile -> enqueue -> worker -> result drain), and that chain can be
+	// starved for a long time under workqueue contention on a busy runner —
+	// long enough that the condition never settles on Misconfigured and flaps
+	// through Dialing instead. Deciding a plain missing-Secret misconfiguration
+	// here makes the condition deterministic and stable: it is set on this
+	// reconcile and re-confirmed idempotently on each eval-cadence requeue.
+	// When the operator creates the Secrets, the next reconcile finds them
+	// present and proceeds to dial. The worker still validates parseability and
+	// non-empty content when the Secrets exist.
+	if missing := r.missingSSHFallbackSecrets(ctx, kcp.Spec.SSHFallback, cluster.Namespace); len(missing) > 0 {
+		conditions.MarkFalse(kcp,
+			controlplanev1beta2.KubeconfigReadyCondition,
+			controlplanev1beta2.SSHFallbackMisconfiguredReason,
+			clusterv1.ConditionSeverityWarning,
+			"SSH fallback misconfigured; missing or empty Secret(s): %s.", strings.Join(missing, ", "),
+		)
+		patchOnExit = true
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
+	}
+
 	// Resolve the host IP from the first control-plane Machine.
 	host, err := r.resolveControlPlaneHost(ctx, log, kcp, cluster)
 	if err != nil {
@@ -324,6 +348,45 @@ func (r *SSHFallbackReconciler) resolveControlPlaneHost(ctx context.Context, log
 		}
 	}
 	return "", fmt.Errorf("no control-plane Machine with a usable address found")
+}
+
+// missingSSHFallbackSecrets returns display names for the SSHFallback Secret
+// references that are absent or empty. It backs the reconcile-time fail-fast in
+// Reconcile so a plain missing-Secret misconfiguration is decided synchronously
+// rather than via a worker round-trip. Existence and non-empty-data-key only;
+// the worker still validates parseability when the Secrets are present. A
+// transient API error (anything other than NotFound) is deliberately NOT
+// treated as missing — that defers to the worker path and the next
+// eval-cadence retry rather than latching a false Misconfigured.
+func (r *SSHFallbackReconciler) missingSSHFallbackSecrets(ctx context.Context, spec *controlplanev1beta2.SSHFallback, clusterNamespace string) []string {
+	if spec == nil {
+		return nil
+	}
+	var missing []string
+	check := func(ref *controlplanev1beta2.SSHFallbackSecretReference, unsetLabel, defaultKey string) {
+		if ref == nil || ref.Name == "" {
+			missing = append(missing, unsetLabel)
+			return
+		}
+		key := ref.Key
+		if key == "" {
+			key = defaultKey
+		}
+		secret := &corev1.Secret{}
+		nn := client.ObjectKey{Name: ref.Name, Namespace: secretRefNamespace(ref, clusterNamespace)}
+		if err := r.Get(ctx, nn, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				missing = append(missing, ref.Name)
+			}
+			return
+		}
+		if v, ok := secret.Data[key]; !ok || len(v) == 0 {
+			missing = append(missing, ref.Name+" (empty key "+key+")")
+		}
+	}
+	check(spec.KnownHostsSecretRef, "knownHostsSecretRef (unset)", "known_hosts")
+	check(spec.IdentitySecretRef, "identitySecretRef (unset)", "ssh-privatekey")
+	return missing
 }
 
 // preferredMachineAddress returns the best dial target from a Machine's
