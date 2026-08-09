@@ -15,7 +15,7 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 **Latest release**: [`v0.1.0-beta.2`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-beta.2) — pre-1.0; API surface may still change before v1.0.
 
-Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPD is dev-only; HA is not exercised on CAPD. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
+Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal), plus single-control-plane clusters with the Kairos fleet infrastructure provider (AuroraBoot-claimed nodes; ADR 0008, maintained in the repository's internal decision records). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPD is dev-only; HA is not exercised on CAPD. Fleet HA is not yet exercised — fleet is single-control-plane only today. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
 
 Read the [v0.1.0-beta.2 release notes](docs/release-notes/v0.1.0-beta.2.md) before installing. This release adds a second, `clusterctl`-native install path — if you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest paths are mutually exclusive and cannot be swapped in place. Additional infrastructure providers (Tinkerbell, hyperscalers) are on the roadmap.
 
@@ -50,6 +50,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | CAPV | v1.11.x+ |
 | CAPK | KubeVirt v1.9.x / CAPK v0.1.x |
 | CAPM3 | v1.13+; BMO/Ironic v0.13+ |
+| kairos-fleet | v0.1.0-beta.1+ (`cluster-api-provider-kairos-fleet`); AuroraBoot |
 | k0s | ~v1.36.1+k0s |
 | k3s | ~v1.36.1+k3s1 |
 | Kairos | v4.1.2 (standard and Hadron images) |
@@ -71,6 +72,7 @@ Management-cluster support is the full Cluster API v1.13 band (v1.30-v1.36); v1.
 - [CAPV (vSphere)](docs/QUICKSTART_CAPV.md)
 - [CAPK (KubeVirt)](docs/QUICKSTART_CAPK.md)
 - [Metal3 (bare metal)](docs/QUICKSTART_CAPM3.md)
+- [Fleet (AuroraBoot-claimed nodes)](docs/QUICKSTART_FLEET.md)
 
 ## Development
 

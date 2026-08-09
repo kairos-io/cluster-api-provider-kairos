@@ -1,7 +1,12 @@
 # Install Guide
 
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
-provider v0.1.0-beta.2.
+provider v0.1.0-beta.2. The "Registering the Kairos fleet infrastructure
+provider" section below documents `cluster-api-provider-kairos-fleet`
+v0.1.0-beta.1's own `clusterctl.yaml` entry; it has not been re-verified by
+running `clusterctl init --infrastructure kairos-fleet` in this repository's
+CI — see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the same
+caveat.
 
 Three install paths: `clusterctl` (recommended), the released flat artifact (`kubectl apply`), and a developer install from source. Path 1 and Path 2 are mutually exclusive on one management cluster: see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive) below before picking one.
 
@@ -36,16 +41,45 @@ providers:
 
 `clusterctl` discovers `metadata.yaml` next to each components file in the same GitHub release; it does not need its own entry in this file.
 
+### Registering the Kairos fleet infrastructure provider
+
+The Kairos fleet infrastructure provider (`cluster-api-provider-kairos-fleet`,
+clusterctl name `kairos-fleet`) is a separate repository and release series.
+Like the bootstrap and control-plane providers above, it is not yet in the
+upstream `clusterctl` provider list, so add it explicitly:
+
+```yaml
+# ~/.cluster-api/clusterctl.yaml
+providers:
+  - name: "kairos-fleet"
+    url: "https://github.com/kairos-io/cluster-api-provider-kairos-fleet/releases/latest/infrastructure-components.yaml"
+    type: "InfrastructureProvider"
+```
+
+Point `url` at a specific tag instead of `latest` to pin a version, for
+example `.../releases/download/v0.1.0-beta.1/infrastructure-components.yaml`.
+Fleet claims already-enrolled AuroraBoot nodes rather than creating machines
+on demand; see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the full
+provisioning model and ADR 0008 (maintained in the repository's internal
+decision records) for how it integrates with the bootstrap and control-plane
+providers in this repo.
+
 ### Install
 
 ```bash
 clusterctl init --bootstrap kairos --control-plane kairos
 ```
 
-To also initialize your infrastructure provider in the same call, add `--infrastructure <provider>` (`docker`, `vsphere`, `kubevirt`, `metal3`; see the matching quickstart in [Next steps](#next-steps) for provider-specific setup):
+To also initialize your infrastructure provider in the same call, add `--infrastructure <provider>` (`docker`, `vsphere`, `kubevirt`, `metal3`, `kairos-fleet`; see the matching quickstart in [Next steps](#next-steps) for provider-specific setup):
 
 ```bash
 clusterctl init --bootstrap kairos --control-plane kairos --infrastructure docker
+```
+
+For fleet specifically:
+
+```bash
+clusterctl init --bootstrap kairos --control-plane kairos --infrastructure kairos-fleet
 ```
 
 ### Verify
@@ -186,11 +220,12 @@ Starting with v0.1.0-alpha.2 (carried forward in v0.1.0-beta.1), the controller 
 retrieve the workload kubeconfig. Instead, control-plane nodes POST their
 kubeconfig back to a Secret in the management cluster.
 
-**Workload nodes running on non-CAPK infrastructure (CAPV / CAPM3 / Tinkerbell
-and any future provider) must have network reachability to the management
-cluster's API server URL.** This includes bare-metal nodes provisioned via
-Metal3 — they POST their kubeconfig to a Secret in the management cluster.
-Verify reachability from a sample workload node before deploying:
+**Workload nodes running on non-CAPK infrastructure (CAPV / CAPM3 / Kairos
+fleet / Tinkerbell and any future provider) must have network reachability to
+the management cluster's API server URL.** This includes bare-metal nodes
+provisioned via Metal3 and nodes claimed via the Kairos fleet provider — they
+POST their kubeconfig to a Secret in the management cluster. Verify
+reachability from a sample workload node before deploying:
 
 ```bash
 curl -k https://<mgmt-api-server-host>:6443/api
@@ -210,5 +245,6 @@ for the full configuration steps.
 - [CAPV Quickstart](QUICKSTART_CAPV.md) — create a cluster with vSphere.
 - [CAPK Quickstart](QUICKSTART_CAPK.md) — create a cluster with KubeVirt.
 - [CAPM3 Quickstart](QUICKSTART_CAPM3.md) — create a cluster on bare metal via Metal3.
+- [Fleet Quickstart](QUICKSTART_FLEET.md) — create a cluster from AuroraBoot-claimed nodes with the Kairos fleet infrastructure provider.
 
 For the current release status, breaking changes, and security caveats, read the [v0.1.0-beta.2 release notes](release-notes/v0.1.0-beta.2.md).
