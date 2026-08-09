@@ -1253,13 +1253,8 @@ func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Conte
 	// still owns the timestamp anchor above and the success transition (once a
 	// Secret appears, the ready path handles it before we reach here); it just
 	// stops clobbering the sibling's Reason.
-	if cur := conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition); cur != nil {
-		switch cur.Reason {
-		case controlplanev1beta2.SSHFallbackDialingReason,
-			controlplanev1beta2.SSHFallbackFailedReason,
-			controlplanev1beta2.SSHFallbackMisconfiguredReason:
-			return false, nil
-		}
+	if sshFallbackOwnsKubeconfigCondition(kcp) {
+		return false, nil
 	}
 
 	severity := clusterv1.ConditionSeverityInfo

@@ -389,6 +389,27 @@ func (r *SSHFallbackReconciler) missingSSHFallbackSecrets(ctx context.Context, s
 	return missing
 }
 
+// sshFallbackOwnsKubeconfigCondition reports whether the SSH-fallback sibling
+// currently owns KubeconfigReadyCondition, i.e. its Reason is one of the
+// SSH-fallback Reasons (Dialing / Failed / Misconfigured). The main
+// KairosControlPlane reconciler consults this in observeKubeconfigSecret to
+// avoid clobbering the sibling's Reason back to WaitingForNodePush while the
+// fallback path is active.
+func sshFallbackOwnsKubeconfigCondition(kcp *controlplanev1beta2.KairosControlPlane) bool {
+	cur := conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
+	if cur == nil {
+		return false
+	}
+	switch cur.Reason {
+	case controlplanev1beta2.SSHFallbackDialingReason,
+		controlplanev1beta2.SSHFallbackFailedReason,
+		controlplanev1beta2.SSHFallbackMisconfiguredReason:
+		return true
+	default:
+		return false
+	}
+}
+
 // preferredMachineAddress returns the best dial target from a Machine's
 // Status.Addresses, prioritising InternalIP > ExternalIP > any.
 func preferredMachineAddress(m *clusterv1.Machine) string {
