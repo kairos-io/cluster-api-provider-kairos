@@ -406,7 +406,7 @@ Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence
 
 ## Writing files to nodes
 
-`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on all distributions (k0s, k3s) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3).
+`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on all distributions (k0s, k3s) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3, and the Kairos fleet provider).
 
 ### Limits
 
@@ -475,7 +475,7 @@ This is a known limitation of post-boot file writes for network configuration on
 
 - **Kairos CAPI Provider APIs**: `bootstrap.cluster.x-k8s.io/v1beta2` and `controlplane.cluster.x-k8s.io/v1beta2`.
 - **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). `go.mod` imports `sigs.k8s.io/cluster-api v1.13.4` and this provider's controllers use the `ContractVersionedObjectReference` / `MachineNodeReference` value types introduced by that contract. CAPI core v1.13.4+ is required at runtime.
-- **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK uses `infrastructure.cluster.x-k8s.io/v1alpha1`).
+- **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK and the Kairos fleet provider use `infrastructure.cluster.x-k8s.io/v1alpha1`).
 
 ### Credential Requirements
 

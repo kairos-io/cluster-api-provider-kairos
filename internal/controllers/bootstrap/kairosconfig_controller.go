@@ -666,9 +666,14 @@ func isKubevirtMachine(machine *clusterv1.Machine) bool {
 // supportsManagementEndpoint returns true for infrastructure kinds whose
 // control-plane Machines run the in-node kubeconfig-push block (KD-3b).
 //
-// Today: KubeVirt (CAPK), vSphere (CAPV), and Metal3 (CAPM3). Bare-metal
-// nodes have real routable IPs and real management-cluster reachability,
-// making the node-push pattern a natural fit for CAPM3.
+// Today: KubeVirt (CAPK), vSphere (CAPV), Metal3 (CAPM3), and the Kairos fleet
+// provider (KairosFleetMachine). Bare-metal and fleet-claimed nodes have real
+// routable IPs and real management-cluster reachability, making the node-push
+// pattern a natural fit — the management cluster cannot always dial the workload
+// API server directly, so the node pushes its kubeconfig back instead. Fleet is
+// treated like CAPM3 here (ADR 0008); without this, a fleet control-plane node
+// never publishes its kubeconfig and the KairosControlPlane never reaches
+// Initialized.
 //
 // KD-46 (post-alpha-2): the resolver's RBAC currently grants
 // `kubevirt.io/virtualmachineinstances:get` on every cluster that uses this
@@ -681,7 +686,7 @@ func supportsManagementEndpoint(machine *clusterv1.Machine) bool {
 		return false
 	}
 	switch machine.Spec.InfrastructureRef.Kind {
-	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine", "Metal3Machine":
+	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine", "Metal3Machine", "KairosFleetMachine":
 		return true
 	}
 	return false

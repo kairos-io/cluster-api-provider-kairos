@@ -1262,6 +1262,7 @@ func TestSupportsManagementEndpoint(t *testing.T) {
 		{name: "KubevirtMachine (CAPK lowercase v)", machine: mkMachine("KubevirtMachine"), want: true},
 		{name: "KubeVirtMachine (CAPK uppercase V)", machine: mkMachine("KubeVirtMachine"), want: true},
 		{name: "VSphereMachine (CAPV)", machine: mkMachine("VSphereMachine"), want: true},
+		{name: "KairosFleetMachine (fleet)", machine: mkMachine("KairosFleetMachine"), want: true},
 		{name: "DockerMachine (unsupported today)", machine: mkMachine("DockerMachine"), want: false},
 		{name: "AWSMachine (unsupported today)", machine: mkMachine("AWSMachine"), want: false},
 	}

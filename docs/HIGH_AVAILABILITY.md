@@ -13,6 +13,7 @@ HA control planes need a stable endpoint that survives the loss of any one node.
 
 - **CAPV and CAPM3**: configure a kube-vip virtual IP via `spec.ha.vip`. `Cluster.spec.controlPlaneEndpoint.host` must equal `spec.ha.vip.address` — CAPI core copies the InfraCluster's endpoint into `Cluster.spec.controlPlaneEndpoint`, and every node and kubeconfig targets that value.
 - **CAPK**: do not set `spec.ha.vip`. CAPK provisions its own LoadBalancer Service and reflects its IP into the control-plane endpoint; a kube-vip VIP alongside it would produce a conflicting ARP announcement.
+- **Fleet (Kairos fleet / AuroraBoot)**: the control-plane endpoint is operator-supplied on `KairosFleetCluster.spec.controlPlaneEndpoint` (a kube-vip VIP, load balancer, or DNS name you manage) — the provider allocates and discovers nothing. **HA (`replicas: 3`/`5`) is not yet exercised on fleet: single control-plane only today.** No fleet HA sample is shipped (ADR 0008). See [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md).
 - **CAPD**: dev-only; HA is not exercised.
 
 ```yaml

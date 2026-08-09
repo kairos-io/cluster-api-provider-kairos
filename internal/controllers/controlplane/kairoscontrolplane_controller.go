@@ -113,12 +113,15 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 // (they cascade via the CAPI Machine's OwnerReferences — KD-11), and never
 // list/watch them (the control-plane manager registers no infra-kind watch; the
 // bootstrap controller owns the infra Watches via its own list/watch grant).
-// metal3machines/-templates added for CAPM3 (ADR 0004). Metal3Cluster and
-// BareMetalHost are deliberately absent: we never read them (CAPI core copies
-// the endpoint per KD-12; CAPM3 mediates BMH).
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines,verbs=create;get
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status,verbs=get
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates,verbs=get
+// metal3machines/-templates added for CAPM3 (ADR 0004). kairosfleetmachines/-templates
+// added for the Kairos fleet provider (ADR 0008): the control-plane provider clones
+// the KairosFleetMachineTemplate and creates the per-Machine KairosFleetMachine, same
+// create;get access as the other infra kinds. Metal3Cluster, KairosFleetCluster, and
+// BareMetalHost are deliberately absent: we never read them (CAPI core copies the
+// endpoint per KD-12; CAPM3 mediates BMH; the fleet provider owns its own Cluster).
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines;kairosfleetmachines,verbs=create;get
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status;kairosfleetmachines/status,verbs=get
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates;kairosfleetmachinetemplates,verbs=get
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
 // customresourcedefinitions (contract-versioned ref resolution, ADR 0006) and
 // events both live in internal/controllers/shared — both managers need them.
@@ -412,6 +415,7 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		const endpointMsg = "Waiting for the infrastructure provider to populate Cluster.Spec.ControlPlaneEndpoint. " +
 			"Set VSphereCluster.spec.controlPlaneEndpoint (CAPV), " +
 			"KubevirtCluster.spec.controlPlaneServiceTemplate (CAPK), " +
+			"KairosFleetCluster.spec.controlPlaneEndpoint (Kairos fleet), " +
 			"or Cluster.spec.controlPlaneEndpoint (CAPD / direct) per the provider's contract."
 		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.WaitingForInfrastructureControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, "%s", endpointMsg)
 		conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.WaitingForInfrastructureControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, "%s", endpointMsg)

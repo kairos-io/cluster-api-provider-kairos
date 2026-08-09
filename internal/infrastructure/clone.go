@@ -61,6 +61,8 @@ func CloneInfrastructureMachine(ctx context.Context, c client.Client, scheme *ru
 		return cloneKubevirtMachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
 	case "Metal3MachineTemplate":
 		return cloneMetal3MachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
+	case "KairosFleetMachineTemplate":
+		return cloneKairosFleetMachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
 	default:
 		return nil, fmt.Errorf("unsupported infrastructure provider: %s (Group: %s, Version: %s, FullGVK: %s)",
 			kind,
@@ -170,6 +172,39 @@ func cloneMetal3MachineTemplate(ctx context.Context, c client.Client, scheme *ru
 	}
 
 	return metal3Machine, nil
+}
+
+func cloneKairosFleetMachineTemplate(ctx context.Context, c client.Client, scheme *runtime.Scheme, template *unstructured.Unstructured, machineName, namespace string, labels, annotations map[string]string) (client.Object, error) {
+	// For the Kairos fleet provider (cluster-api-provider-kairos-fleet), create a
+	// KairosFleetMachine from a KairosFleetMachineTemplate. KairosFleetMachine.spec
+	// is a verbatim copy of spec.template.spec (the AuroraBoot `group` to claim
+	// from) — the same pattern as CAPV/CAPD/CAPM3. Derive the API version from the
+	// template ref, defaulting to v1alpha1 (the fleet provider's storage version).
+	// See ADR 0008.
+	fleetMachine := &unstructured.Unstructured{}
+	version := template.GroupVersionKind().Version
+	if version == "" {
+		version = "v1alpha1"
+	}
+	fleetMachine.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: version,
+		Kind:    "KairosFleetMachine",
+	})
+
+	fleetMachine.SetName(machineName)
+	fleetMachine.SetNamespace(namespace)
+	fleetMachine.SetLabels(labels)
+	fleetMachine.SetAnnotations(annotations)
+
+	// Copy spec from template
+	if spec, ok, _ := unstructured.NestedMap(template.UnstructuredContent(), "spec", "template", "spec"); ok {
+		if err := unstructured.SetNestedMap(fleetMachine.UnstructuredContent(), spec, "spec"); err != nil {
+			return nil, fmt.Errorf("failed to set spec: %w", err)
+		}
+	}
+
+	return fleetMachine, nil
 }
 
 func cloneKubevirtMachineTemplate(ctx context.Context, c client.Client, scheme *runtime.Scheme, template *unstructured.Unstructured, machineName, namespace string, labels, annotations map[string]string) (client.Object, error) {
