@@ -70,14 +70,14 @@ test-unit: ## Run unit tests only.
 .PHONY: test-envtest
 test-envtest: ## Run envtest-based integration tests.
 	@echo "Installing/updating setup-envtest..."
-	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 	@echo "Downloading CAPI CRDs..."
 	@mkdir -p test/crd/capi
-	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.3/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
+	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.4/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
 		(echo "Warning: Failed to download CAPI CRDs. Tests may fail." && rm -f test/crd/capi/cluster-api-components.yaml)
 	@echo "Setting up kubebuilder tools..."
 	@export PATH=$$(go env GOPATH)/bin:$$PATH && \
-	eval $$(setup-envtest use -p env latest) && \
+	eval $$(setup-envtest use -p env $(ENVTEST_K8S_VERSION)) && \
 	go test ./test/envtest/... -v -timeout 600s
 
 .PHONY: test-kubevirt
@@ -187,6 +187,11 @@ GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 GOLANGCI_LINT_VERSION ?= v1.60.0
+# Pinned so `make test-envtest` is reproducible (rule 4: no unpinned @latest / floating envtest assets).
+# ENVTEST_K8S_VERSION is the Kubernetes API-server/etcd binary version the controllers are tested
+# against; 1.36 is the top of Cluster API v1.13's supported management-cluster band. Bump deliberately.
+SETUP_ENVTEST_VERSION ?= v0.24.1
+ENVTEST_K8S_VERSION ?= 1.36.2
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
