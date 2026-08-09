@@ -38,11 +38,10 @@ labels:
       app.kubernetes.io/name: capi-kairos-control-plane
       app.kubernetes.io/component: controller-manager
 
-# Release plumbing (PR-E) pins the digest; latest is fine in-tree.
-images:
-  - name: controller
-    newName: ghcr.io/kairos-io/cluster-api-provider-kairos
-    newTag: latest
+# No images: block here on purpose. The controller image is set once in
+# config/manager (the shared base) and inherited by this overlay; the release
+# workflow pins it by digest there. A per-overlay images: entry would be a dead
+# no-op: the base transformer renames "controller" before this one could match.
 
 patches:
   # This overlay pulls the shared ../crd base (all four CRDs + the contract

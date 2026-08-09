@@ -64,28 +64,39 @@ jobs:
           IMG_REGISTRY="${IMG_REGISTRY}" \
           make docker-buildx-release
 
-      - name: Render release manifest
+      - name: Resolve pushed image digest
+        id: digest
+        run: |
+          DIGEST="$(docker buildx imagetools inspect "${IMG_REGISTRY}:${GITHUB_REF_NAME}" --format '{{.Manifest.Digest}}')"
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Could not resolve the pushed image digest."
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Resolved multi-arch index digest: $DIGEST"
+
+      - name: Render release manifests (clusterctl components + flat, digest-pinned)
         run: |
           VERSION="${GITHUB_REF_NAME}" \
           IMG_REGISTRY="${IMG_REGISTRY}" \
+          IMG_DIGEST="${{ steps.digest.outputs.digest }}" \
           make release-manifests
 
-      - name: Inspect rendered manifest
+      - name: Inspect and verify rendered manifests
         run: |
           echo "== dist contents =="
           ls -la dist/
-          echo
-          echo "== first lines =="
-          head -20 dist/kairos-capi-provider.yaml
-          echo
           echo "== checksums =="
           cat dist/sha256sums.txt
-          echo
-          echo "== image references =="
-          grep -nE "image:.*kairos-io" dist/kairos-capi-provider.yaml || true
-          echo
-          echo "== leftover placeholders (should be empty) =="
-          grep -nE "CERT_NAMESPACE|CERT_NAME[^=]|SERVICE_NAME[^S]|SERVICE_NAMESPACE" dist/kairos-capi-provider.yaml || echo "(none)"
+          echo "== controller image references (must all be @sha256 digest-pinned) =="
+          grep -REn "image:.*cluster-api-provider-kairos" dist/*.yaml || true
+          if grep -REh "image:.*cluster-api-provider-kairos" dist/*.yaml | grep -qv "@sha256:"; then
+            echo "::error::A released manifest references the controller image without an @sha256 digest."
+            grep -REn "image:.*cluster-api-provider-kairos" dist/*.yaml | grep -v "@sha256:"
+            exit 1
+          fi
+          echo "== leftover CA-injection placeholders (should be empty) =="
+          grep -REn "CERT_NAMESPACE|CERT_NAME[^=]|SERVICE_NAME[^S]|SERVICE_NAMESPACE" dist/*.yaml || echo "(none)"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -96,5 +107,8 @@ jobs:
           prerelease: true
           draft: false
           files: |
+            dist/bootstrap-components.yaml
+            dist/control-plane-components.yaml
+            dist/metadata.yaml
             dist/kairos-capi-provider.yaml
             dist/sha256sums.txt

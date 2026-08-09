@@ -7,6 +7,16 @@ IMG_REGISTRY ?= ghcr.io/kairos-io/cluster-api-provider-kairos
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo "dev")
 # Directory where release-manifests writes its artifacts.
 RELEASE_DIR ?= dist
+# Image reference stamped into released manifests. CI passes IMG_DIGEST (the
+# pushed multi-arch index digest, e.g. sha256:abc...) so every shipped manifest
+# pins the image by digest rather than a moving tag (rule 4 / config §3). Local
+# dry-runs leave IMG_DIGEST empty and fall back to the VERSION tag.
+IMG_DIGEST ?=
+ifeq ($(strip $(IMG_DIGEST)),)
+RELEASE_IMG_REF := $(IMG_REGISTRY):$(VERSION)
+else
+RELEASE_IMG_REF := $(IMG_REGISTRY)@$(IMG_DIGEST)
+endif
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:generateEmbeddedObjectMeta=true"
 
@@ -170,17 +180,27 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 ##@ Release
 
 .PHONY: release-manifests
-release-manifests: manifests kustomize ## Render the all-in-one provider manifest into $(RELEASE_DIR)/kairos-capi-provider.yaml.
+release-manifests: manifests kustomize ## Render clusterctl components (bootstrap + control-plane), metadata, and the flat manifest into $(RELEASE_DIR).
 	@mkdir -p $(RELEASE_DIR)
 	@# Render against a temporary copy of config/ so the source tree stays clean
-	@# (kustomize edit set image mutates config/manager/kustomization.yaml in place,
-	@# which would leave the working directory dirty after a local dry-run).
+	@# (kustomize edit set image mutates the kustomization in place, which would
+	@# otherwise leave the working directory dirty after a local dry-run).
+	@# The image is set in config/manager (the shared base): its transformer runs
+	@# first and renames controller -> the pinned ref, so all three overlays
+	@# (default, bootstrap, control-plane) that include ../manager inherit it.
 	@tmp=$$(mktemp -d) && \
 	  cp -r config "$$tmp/config" && \
-	  (cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=$(IMG_REGISTRY):$(VERSION)) && \
-	  $(KUSTOMIZE) build "$$tmp/config/default" > $(RELEASE_DIR)/kairos-capi-provider.yaml && \
+	  (cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=$(RELEASE_IMG_REF)) && \
+	  $(KUSTOMIZE) build "$$tmp/config/default"       > $(RELEASE_DIR)/kairos-capi-provider.yaml && \
+	  $(KUSTOMIZE) build "$$tmp/config/bootstrap"     > $(RELEASE_DIR)/bootstrap-components.yaml && \
+	  $(KUSTOMIZE) build "$$tmp/config/control-plane" > $(RELEASE_DIR)/control-plane-components.yaml && \
+	  cp config/clusterctl/metadata.yaml $(RELEASE_DIR)/metadata.yaml && \
 	  rm -rf "$$tmp"
-	@cd $(RELEASE_DIR) && sha256sum kairos-capi-provider.yaml > sha256sums.txt
+	@cd $(RELEASE_DIR) && sha256sum \
+	  kairos-capi-provider.yaml \
+	  bootstrap-components.yaml \
+	  control-plane-components.yaml \
+	  metadata.yaml > sha256sums.txt
 	@echo "Release artifacts in $(RELEASE_DIR):"
 	@ls -la $(RELEASE_DIR)
 
