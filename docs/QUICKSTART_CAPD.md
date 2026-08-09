@@ -60,7 +60,7 @@ Key components:
 - `Secret` — user password (referenced by `userPasswordSecretRef` in KairosConfigTemplate).
 - `Cluster` — references `DockerCluster` and `KairosControlPlane`.
 - `DockerCluster` — Docker infrastructure cluster.
-- `KairosControlPlane` — control plane with `replicas: 1` (this guide is single-node). HA (`replicas: 3`/`5`) is supported on CAPK, CAPV, and CAPM3 — see the [README HA section](../README.md#high-availability-control-planes). CAPD is dev-only and HA is not exercised on it; there is no CAPD HA sample.
+- `KairosControlPlane` — control plane with `replicas: 1` (this guide is single-node). HA (`replicas: 3`/`5`) is supported on CAPK, CAPV, and CAPM3 — see [docs/HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md). CAPD is dev-only and HA is not exercised on it; there is no CAPD HA sample.
 - `DockerMachineTemplate` — template for Docker machines.
 - `KairosConfigTemplate` — bootstrap configuration with `userPasswordSecretRef`.
 
@@ -150,7 +150,7 @@ This adds a `MachineDeployment` for worker nodes referencing a separate `KairosC
 
 - Configure additional Kubernetes manifests via `spec.manifests` in `KairosConfigTemplate`.
 - Scale worker nodes by updating `MachineDeployment.spec.replicas`.
-- HA control planes (`replicas: 3`/`5`) are supported on CAPK, CAPV, and CAPM3 — see the [README HA section](../README.md#high-availability-control-planes). CAPD is dev-only; HA is not exercised on it.
+- HA control planes (`replicas: 3`/`5`) are supported on CAPK, CAPV, and CAPM3 — see [docs/HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md). CAPD is dev-only; HA is not exercised on it.
 
 ## Cleanup
 
