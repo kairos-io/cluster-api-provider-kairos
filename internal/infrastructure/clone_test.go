@@ -129,3 +129,93 @@ func TestCloneMetal3MachineTemplate(t *testing.T) {
 		})
 	}
 }
+
+func makeKairosFleetMachineTemplate(version string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: version,
+		Kind:    "KairosFleetMachineTemplate",
+	})
+	obj.SetName("tmpl")
+	obj.SetNamespace("default")
+	_ = unstructured.SetNestedMap(obj.Object, map[string]interface{}{
+		"template": map[string]interface{}{
+			"spec": map[string]interface{}{
+				"group": "control-plane",
+			},
+		},
+	}, "spec")
+	return obj
+}
+
+func TestCloneKairosFleetMachineTemplate(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	labels := map[string]string{"cluster.x-k8s.io/cluster-name": "test-cluster"}
+	annotations := map[string]string{"test-key": "test-value"}
+
+	tests := []struct {
+		name            string
+		templateVersion string
+		wantVersion     string
+	}{
+		{
+			name:            "v1alpha1 template preserves version",
+			templateVersion: "v1alpha1",
+			wantVersion:     "v1alpha1",
+		},
+		{
+			name:            "versionless template defaults to v1alpha1",
+			templateVersion: "",
+			wantVersion:     "v1alpha1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			template := makeKairosFleetMachineTemplate(tc.templateVersion)
+
+			// cloneKairosFleetMachineTemplate does not call the API server; it only
+			// reads the in-memory template object.
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+			got, err := cloneKairosFleetMachineTemplate(ctx, fakeClient, scheme, template, "test-machine", "default", labels, annotations)
+			if err != nil {
+				t.Fatalf("cloneKairosFleetMachineTemplate() error = %v", err)
+			}
+
+			u, ok := got.(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("expected *unstructured.Unstructured, got %T", got)
+			}
+
+			gvk := u.GroupVersionKind()
+			if gvk.Group != "infrastructure.cluster.x-k8s.io" {
+				t.Errorf("Group = %q, want %q", gvk.Group, "infrastructure.cluster.x-k8s.io")
+			}
+			if gvk.Version != tc.wantVersion {
+				t.Errorf("Version = %q, want %q", gvk.Version, tc.wantVersion)
+			}
+			if gvk.Kind != "KairosFleetMachine" {
+				t.Errorf("Kind = %q, want %q", gvk.Kind, "KairosFleetMachine")
+			}
+
+			if u.GetName() != "test-machine" {
+				t.Errorf("Name = %q, want %q", u.GetName(), "test-machine")
+			}
+			if u.GetLabels()["cluster.x-k8s.io/cluster-name"] != "test-cluster" {
+				t.Errorf("Labels missing cluster name label")
+			}
+			if u.GetAnnotations()["test-key"] != "test-value" {
+				t.Errorf("Annotations missing test-key")
+			}
+
+			// spec.group was copied verbatim from spec.template.spec.group
+			group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
+			if group != "control-plane" {
+				t.Errorf("spec.group = %q, want %q", group, "control-plane")
+			}
+		})
+	}
+}
