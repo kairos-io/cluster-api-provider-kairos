@@ -108,6 +108,7 @@ rules:
   - infrastructure.cluster.x-k8s.io
   resources:
   - dockermachines
+  - kairosfleetmachines
   - kubevirtmachines
   - metal3machines
   - vspheremachines
@@ -119,6 +120,8 @@ rules:
   resources:
   - dockermachines/status
   - dockermachinetemplates
+  - kairosfleetmachines/status
+  - kairosfleetmachinetemplates
   - kubevirtmachines/status
   - kubevirtmachinetemplates
   - metal3machines/status

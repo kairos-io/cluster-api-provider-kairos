@@ -44,7 +44,7 @@ import (
 
 // getNodeIP retrieves the node IP from the infrastructure provider.
 // Supports CAPD (DockerMachine), CAPV (VSphereMachine/VSphereVM), CAPK (KubevirtMachine),
-// and CAPM3 (Metal3Machine).
+// CAPM3 (Metal3Machine), and the Kairos fleet provider (KairosFleetMachine).
 func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.Logger, machine *clusterv1.Machine) (string, error) {
 	switch machine.Spec.InfrastructureRef.Kind {
 	case "VSphereMachine":
@@ -116,6 +116,17 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 			return ip, nil
 		}
 		return "", fmt.Errorf("no IP address found in Metal3Machine status")
+	case "KairosFleetMachine":
+		// The Kairos fleet provider (cluster-api-provider-kairos-fleet) reports
+		// KairosFleetMachine.status.addresses as a Hostname only (no InternalIP in
+		// v0.1), and a fleet node self-discovers its providerID on-node rather than
+		// depending on an IP resolved here. There is thus no routable IP to return.
+		// Report "no IP" WITHOUT an error: the only consumer is the opt-in,
+		// non-fatal SSH-fallback path, which treats an empty address as "nothing to
+		// dial" rather than a failure. Returning a non-error empty string also keeps
+		// the switch from ever calling a supported provider "unsupported" if this
+		// helper is rewired. See ADR 0008.
+		return "", nil
 	default:
 		return "", fmt.Errorf("unsupported infrastructure provider: %s", machine.Spec.InfrastructureRef.Kind)
 	}

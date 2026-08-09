@@ -163,3 +163,41 @@ func TestGetNodeIP_Metal3Machine(t *testing.T) {
 		})
 	}
 }
+
+// TestGetNodeIP_KairosFleetMachine pins the fleet contract: a KairosFleetMachine
+// resolves to no routable IP but is NOT an error (ADR 0008). Fleet reports a
+// Hostname-only address and self-discovers its providerID on-node, so getNodeIP
+// returns ("", nil) — the opt-in SSH-fallback consumer treats an empty address as
+// "nothing to dial", never a failure, and the switch must not fall through to the
+// "unsupported infrastructure provider" default for a provider we support.
+func TestGetNodeIP_KairosFleetMachine(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = bootstrapv1beta2.AddToScheme(scheme)
+	_ = controlplanev1beta2.AddToScheme(scheme)
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
+		Spec: clusterv1.MachineSpec{
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "KairosFleetMachine",
+				Name:     "test-kfm",
+			},
+		},
+	}
+
+	// No infra object or CRD seeded: the fleet case returns before any Get, so a
+	// bare fake client is sufficient and proves the case does not depend on one.
+	r := &KairosControlPlaneReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		Scheme: scheme,
+	}
+
+	ip, err := r.getNodeIP(context.Background(), log.Log, machine)
+	if err != nil {
+		t.Fatalf("getNodeIP(KairosFleetMachine) unexpected error: %v", err)
+	}
+	if ip != "" {
+		t.Errorf("getNodeIP(KairosFleetMachine) = %q, want empty", ip)
+	}
+}
