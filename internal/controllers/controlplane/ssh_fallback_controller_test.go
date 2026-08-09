@@ -17,14 +17,18 @@ permissions and limitations under the License.
 package controlplane
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -174,6 +178,104 @@ func TestPreferredMachineAddress(t *testing.T) {
 			g := NewWithT(t)
 			m := &clusterv1.Machine{Status: clusterv1.MachineStatus{Addresses: tc.in}}
 			g.Expect(preferredMachineAddress(m)).To(Equal(tc.want))
+		})
+	}
+}
+
+// TestSSHFallbackOwnsKubeconfigCondition pins the predicate the main reconciler
+// uses to defer to the SSH-fallback sibling: only the SSH-fallback Reasons
+// (Dialing / Failed / Misconfigured) count as sibling-owned; WaitingForNodePush,
+// the ready Reason, and an unset condition do not.
+func TestSSHFallbackOwnsKubeconfigCondition(t *testing.T) {
+	cases := []struct {
+		name   string
+		set    bool
+		status corev1.ConditionStatus
+		reason string
+		want   bool
+	}{
+		{name: "no condition", set: false, want: false},
+		{name: "WaitingForNodePush", set: true, status: corev1.ConditionFalse, reason: controlplanev1beta2.WaitingForNodePushReason, want: false},
+		{name: "ready True", set: true, status: corev1.ConditionTrue, reason: controlplanev1beta2.KubeconfigReadyReason, want: false},
+		{name: "SSHFallbackDialing", set: true, status: corev1.ConditionFalse, reason: controlplanev1beta2.SSHFallbackDialingReason, want: true},
+		{name: "SSHFallbackFailed", set: true, status: corev1.ConditionFalse, reason: controlplanev1beta2.SSHFallbackFailedReason, want: true},
+		{name: "SSHFallbackMisconfigured", set: true, status: corev1.ConditionFalse, reason: controlplanev1beta2.SSHFallbackMisconfiguredReason, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kcp := &controlplanev1beta2.KairosControlPlane{}
+			if tc.set {
+				conditions.Set(kcp, &clusterv1.Condition{
+					Type:   controlplanev1beta2.KubeconfigReadyCondition,
+					Status: tc.status,
+					Reason: tc.reason,
+				})
+			}
+			if got := sshFallbackOwnsKubeconfigCondition(kcp); got != tc.want {
+				t.Errorf("sshFallbackOwnsKubeconfigCondition() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSSHFallbackReconciler_MissingSSHFallbackSecrets covers the synchronous
+// missing/empty-Secret detection that lets the reconciler decide
+// SSHFallbackMisconfigured without a worker round-trip.
+func TestSSHFallbackReconciler_MissingSSHFallbackSecrets(t *testing.T) {
+	const ns = "test-ns"
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 to scheme: %v", err)
+	}
+	secret := func(name, key string, val []byte) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Data:       map[string][]byte{key: val},
+		}
+	}
+	ref := func(name string) *controlplanev1beta2.SSHFallbackSecretReference {
+		return &controlplanev1beta2.SSHFallbackSecretReference{Name: name}
+	}
+
+	cases := []struct {
+		name    string
+		objs    []client.Object
+		spec    *controlplanev1beta2.SSHFallback
+		wantLen int
+	}{
+		{name: "nil spec", spec: nil, wantLen: 0},
+		{
+			name:    "both present and non-empty",
+			objs:    []client.Object{secret("kh", "known_hosts", []byte("host key")), secret("id", "ssh-privatekey", []byte("pem"))},
+			spec:    &controlplanev1beta2.SSHFallback{KnownHostsSecretRef: ref("kh"), IdentitySecretRef: ref("id")},
+			wantLen: 0,
+		},
+		{
+			name:    "both missing",
+			spec:    &controlplanev1beta2.SSHFallback{KnownHostsSecretRef: ref("kh"), IdentitySecretRef: ref("id")},
+			wantLen: 2,
+		},
+		{
+			name:    "known-hosts ref unset",
+			objs:    []client.Object{secret("id", "ssh-privatekey", []byte("pem"))},
+			spec:    &controlplanev1beta2.SSHFallback{IdentitySecretRef: ref("id")},
+			wantLen: 1,
+		},
+		{
+			name:    "known-hosts data key empty",
+			objs:    []client.Object{secret("kh", "known_hosts", []byte{}), secret("id", "ssh-privatekey", []byte("pem"))},
+			spec:    &controlplanev1beta2.SSHFallback{KnownHostsSecretRef: ref("kh"), IdentitySecretRef: ref("id")},
+			wantLen: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.objs...).Build()
+			r := &SSHFallbackReconciler{Client: c}
+			got := r.missingSSHFallbackSecrets(context.Background(), tc.spec, ns)
+			if len(got) != tc.wantLen {
+				t.Errorf("missingSSHFallbackSecrets() = %v (len %d), want len %d", got, len(got), tc.wantLen)
+			}
 		})
 	}
 }

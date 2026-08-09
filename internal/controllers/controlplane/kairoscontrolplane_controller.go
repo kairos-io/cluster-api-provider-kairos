@@ -1239,6 +1239,24 @@ func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Conte
 		now := metav1.Now()
 		kcp.Status.LastNodePushObserved = &now
 	}
+
+	// Defer to the SSH-fallback sibling once it owns KubeconfigReadyCondition.
+	// When Spec.SSHFallback is enabled and the eligibility gate has fired, the
+	// sibling reconciler (ssh_fallback_controller.go) drives this condition
+	// through Dialing -> Failed/Misconfigured. Re-asserting WaitingForNodePush
+	// here on every missing-Secret reconcile would fight the sibling for the
+	// same condition and make the Reason flap between WaitingForNodePush and the
+	// SSH-fallback Reasons: cosmetically confusing in production, and under
+	// workqueue contention on a busy runner enough to keep the envtest suite from
+	// ever snapshotting a stable SSH-fallback Reason (the
+	// TestSSHFallback_MisconfiguredSurfacesCondition flake). The main reconciler
+	// still owns the timestamp anchor above and the success transition (once a
+	// Secret appears, the ready path handles it before we reach here); it just
+	// stops clobbering the sibling's Reason.
+	if sshFallbackOwnsKubeconfigCondition(kcp) {
+		return false, nil
+	}
+
 	severity := clusterv1.ConditionSeverityInfo
 	message := fmt.Sprintf("Waiting for the workload node to push its kubeconfig as Secret %s/%s.", cluster.Namespace, secretName)
 	if elapsed := time.Since(kcp.Status.LastNodePushObserved.Time); elapsed > kubeconfigReadyTimeout {

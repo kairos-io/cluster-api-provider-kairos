@@ -242,21 +242,13 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 		return c.Status().Update(ctx, got)
 	}, 30*time.Second, time.Second).Should(Succeed())
 
-	// Eventually the worker fires, fails fast on the missing Secrets, and
-	// the result drain sets the Reason to SSHFallbackMisconfigured.
-	//
-	// Determinism: the sibling reconciler's time-based backstop is
-	// collapsed to EvalRequeue=2s in startKCPEnvtest, so once the gate is
-	// open the eligibility re-check fires within a couple of seconds
-	// rather than racing the 1-minute production cadence.
-	//
-	// The window is 180s (not the 2s cadence) because the SSH-fallback
-	// reconciler *shares the manager workqueue* with every other controller
-	// in this envtest suite (see its SetupWithManager note). On a busy/shared
-	// CI runner the full suite can starve its 2s requeues long enough to eat a
-	// tighter 90s window (observed: the same test passes on a quiet runner and
-	// intermittently times out on a contended one). 180s is headroom against
-	// that queue contention, not against the reconciler's own cadence.
+	// Once the gate is open the sibling reconciler decides the missing-Secret
+	// misconfiguration synchronously (missingSSHFallbackSecrets in
+	// ssh_fallback_controller.go) and sets SSHFallbackMisconfigured directly,
+	// without a reconcile -> worker -> result-drain round-trip that could be
+	// starved under workqueue contention. This makes the transition
+	// deterministic (seconds, not a race against queue pressure), so a modest
+	// window suffices even on a busy runner.
 	g.Eventually(func() string {
 		got := &controlplanev1beta2.KairosControlPlane{}
 		if err := c.Get(ctx, types.NamespacedName{Name: kcp.Name, Namespace: kcp.Namespace}, got); err != nil {
@@ -267,8 +259,28 @@ func TestSSHFallback_MisconfiguredSurfacesCondition(t *testing.T) {
 			return ""
 		}
 		return cond.Reason
-	}, 180*time.Second, 2*time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
+	}, 90*time.Second, 2*time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
 		"missing SSHFallback Secrets MUST surface SSHFallbackMisconfigured on KubeconfigReadyCondition")
+
+	// Regression pin for the de-flake: SSHFallbackMisconfigured must be STABLE.
+	// The main reconciler must not clobber it back to WaitingForNodePush (it
+	// defers to the sibling once an SSH-fallback Reason owns the condition), and
+	// the sibling must keep re-confirming it synchronously rather than flapping
+	// through Dialing. Before the fix the two reconcilers fought over
+	// KubeconfigReadyCondition and this Reason oscillated, which is what made
+	// the Eventually above flake under contention.
+	g.Consistently(func() string {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		if err := c.Get(ctx, types.NamespacedName{Name: kcp.Name, Namespace: kcp.Namespace}, got); err != nil {
+			return "ERR: " + err.Error()
+		}
+		cond := conditions.Get(got, controlplanev1beta2.KubeconfigReadyCondition)
+		if cond == nil {
+			return ""
+		}
+		return cond.Reason
+	}, 6*time.Second, time.Second).Should(Equal(controlplanev1beta2.SSHFallbackMisconfiguredReason),
+		"SSHFallbackMisconfigured must stay stable, not flap back to WaitingForNodePush or through Dialing")
 }
 
 // TestSSHFallback_AnnotationDrivesReason (PR-9, exercises commit 3's
