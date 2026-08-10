@@ -1105,6 +1105,18 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	kcp.Status.UnavailableReplicas = unavailableReplicas
 	kcp.Status.AvailableReplicas = availableReplicas
 
+	// status.version reports the observed control-plane version. It is part of the
+	// CAPI control-plane contract and is read by CAPI core's ControlPlaneIsStable
+	// preflight, which gates worker MachineDeployment scale-up: an unset (or
+	// mismatched) status.version reads as "the control plane is upgrading", so the
+	// preflight blocks every worker forever. The Kairos control plane runs at
+	// spec.version once provisioned (there is no in-place minor upgrade to track),
+	// so reflect spec.version as soon as a member is ready; leaving it empty while
+	// no member is ready correctly reads as "not yet stable".
+	if readyReplicas > 0 {
+		kcp.Status.Version = kcp.Spec.Version
+	}
+
 	selector := labels.SelectorFromSet(map[string]string{
 		clusterv1.ClusterNameLabel:         cluster.Name,
 		clusterv1.MachineControlPlaneLabel: "",
