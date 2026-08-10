@@ -1,32 +1,41 @@
 # Quick Start Guide - Fleet (Kairos fleet / AuroraBoot)
 
-Last verified against: Kairos fleet provider v0.1.0-beta.1
-(`cluster-api-provider-kairos-fleet`), this provider's fleet-support code
-(ADR 0008; unreleased at the time of writing — see the
-[v0.1.0-beta.3 release notes](release-notes/v0.1.0-beta.3.md)), Cluster API
-v1.13.4 (v1beta2 contract), Kairos v4.1.2, k3s. This walkthrough has not been
-run end to end against a live AuroraBoot instance in this repository's CI —
-it is assembled from the fleet provider's own documentation and from reading
+Last verified against: Kairos fleet provider v0.1.0-beta.2+
+(`cluster-api-provider-kairos-fleet`; do not use `v0.1.0-beta.1`, it
+crash-loops on a real management cluster), this repository's fleet-support
+code (ADR 0008, shipped in v0.1.0 — see the
+[v0.1.0 release notes](release-notes/v0.1.0.md)), Cluster API v1.13.4
+(v1beta2 contract), Kairos v4.1.2, k3s. This walkthrough has not been run
+end to end against a live AuroraBoot instance in this repository's CI — it
+is assembled from the fleet provider's own documentation and from reading
 both controllers' source. If a step does not match your observed behavior,
 treat this page as the thing that is wrong and file an issue.
 
 This guide walks you through provisioning a single control-plane machine plus
-one worker on Kairos using Cluster API with the **Kairos fleet** infrastructure
-provider (`cluster-api-provider-kairos-fleet`, clusterctl name `kairos-fleet`).
-Fleet does not create machines on demand: it claims an already-enrolled,
-unclaimed Kairos node from a named AuroraBoot group, hands it a bootstrap
-cloud-config, and reboots it. "No capacity in a group" is an expected,
-transient state — enroll more nodes or free one up — not a failure.
+a worker `MachineDeployment` on Kairos using Cluster API with the **Kairos
+fleet** infrastructure provider (`cluster-api-provider-kairos-fleet`,
+clusterctl name `kairos-fleet`). Fleet does not create machines on demand: it
+claims an already-enrolled, unclaimed Kairos node from a named AuroraBoot
+group, hands it a bootstrap cloud-config, and reboots it. "No capacity in a
+group" is an expected, transient state — enroll more nodes or free one up —
+not a failure.
 
 **Scope of this guide:**
 
 - Single control-plane machine (`replicas: 1`) plus a 1-replica worker
-  `MachineDeployment`. This is the only path exercised on fleet. HA
-  (`replicas: 3`/`5`) is mechanically reachable but **not exercised** — no
+  `MachineDeployment` (`kairos_cluster_{k0s,k3s}_with_workers.yaml`). This is
+  the validated, exercised topology on fleet. A standalone single node with
+  no workers (`kairos_cluster_k0s_single_node.yaml`) is also covered below.
+  HA (`replicas: 3`/`5`) is mechanically reachable but **not exercised** — no
   fleet HA sample is shipped (ADR 0008). See
   [docs/HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md).
 - k3s is the reference / most-exercised distribution. k0s is also supported
-  and newer; see the k0s sample and the notes below.
+  and newer; see the k0s samples and the notes below. A default single-node
+  k0s control plane is joinable and schedulable (`--enable-worker`), so the
+  shipped worker `MachineDeployment` can join it; set
+  `spec.k0sSingleNode: true` on the `KairosConfigTemplate` instead for a
+  standalone node that never gains workers — see
+  [kairos_cluster_k0s_single_node.yaml](../config/samples/fleet/kairos_cluster_k0s_single_node.yaml).
 - The control-plane endpoint is **operator-supplied**: fleet does not
   allocate or discover a VIP, load balancer, or DNS name. You must know the
   node's reachable endpoint before it is claimed — the same sharp edge as
@@ -107,7 +116,7 @@ metal and pre-provisioned edge nodes that phone home to AuroraBoot.
 
 6. **k3s is the reference path.** k0s fleet support is newer; prefer k3s
    unless you have a specific reason to choose k0s (see
-   [kairos_cluster_k0s_single_node.yaml](../config/samples/fleet/kairos_cluster_k0s_single_node.yaml)).
+   [kairos_cluster_k0s_with_workers.yaml](../config/samples/fleet/kairos_cluster_k0s_with_workers.yaml)).
 
 ---
 
@@ -141,9 +150,11 @@ not set `userPassword` inline.
 
 ### Step 3: Choose a sample manifest
 
-- k3s single control-plane + worker (reference path):
-  [`config/samples/fleet/kairos_cluster_k3s_single_node.yaml`](../config/samples/fleet/kairos_cluster_k3s_single_node.yaml)
-- k0s single control-plane + worker:
+- k3s control-plane + worker `MachineDeployment` (reference path):
+  [`config/samples/fleet/kairos_cluster_k3s_with_workers.yaml`](../config/samples/fleet/kairos_cluster_k3s_with_workers.yaml)
+- k0s control-plane + worker `MachineDeployment`:
+  [`config/samples/fleet/kairos_cluster_k0s_with_workers.yaml`](../config/samples/fleet/kairos_cluster_k0s_with_workers.yaml)
+- k0s standalone single node, no workers (`spec.k0sSingleNode: true`):
   [`config/samples/fleet/kairos_cluster_k0s_single_node.yaml`](../config/samples/fleet/kairos_cluster_k0s_single_node.yaml)
 
 ### Step 4: Customize the manifest
@@ -211,10 +222,16 @@ spec:
 ### Step 5: Apply the manifest
 
 ```bash
-kubectl apply -f config/samples/fleet/kairos_cluster_k3s_single_node.yaml
+kubectl apply -f config/samples/fleet/kairos_cluster_k3s_with_workers.yaml
 ```
 
-or for k0s:
+or for k0s with a worker:
+
+```bash
+kubectl apply -f config/samples/fleet/kairos_cluster_k0s_with_workers.yaml
+```
+
+or for a standalone k0s node with no workers:
 
 ```bash
 kubectl apply -f config/samples/fleet/kairos_cluster_k0s_single_node.yaml

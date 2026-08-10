@@ -1,6 +1,6 @@
 # Quickstart: CAPK (KubeVirt)
 
-Last verified against: Kairos v4.1.2, CAPI v1.13.4, KubeVirt v1.9, CAPK v0.1.x, provider v0.1.0-beta.2.
+Last verified against: Kairos v4.1.2, CAPI v1.13.4, KubeVirt v1.9, CAPK v0.1.x, provider v0.1.0.
 
 This guide covers two paths:
 

@@ -1,6 +1,6 @@
 # Testing
 
-Last verified against: Go toolchain 1.26.3, provider v0.1.0-beta.2.
+Last verified against: Go toolchain 1.26.3, provider v0.1.0.
 
 See [Install guide](INSTALL.md) for development install.
 
@@ -45,9 +45,9 @@ This is the highest-confidence gate but requires Docker and a host with enough m
 
 After the cluster is `Available=true`, drain a node via `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`, restart the underlying VM (`virtctl restart <vm>` for CAPK; vSphere "Restart Guest OS" for CAPV), uncordon, and verify `kubectl get nodes` shows `Ready` within 5 minutes. This validates KD-23's persistence injection — k0s/k3s state, SSH host keys, and CNI config must survive the reboot.
 
-## Supported configurations (v0.1.0-beta.2)
+## Supported configurations (v0.1.0)
 
-Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3, for both k0s and k3s. CAPD is dev-only (single-node); HA is not exercised on CAPD. CAPD is tested via unit/envtest rather than a live e2e run.
+Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3, for both k0s and k3s. CAPD is dev-only (single-node); HA is not exercised on CAPD. CAPD is tested via unit/envtest rather than a live e2e run. Fleet (Kairos fleet / AuroraBoot) supports a single control plane plus a worker `MachineDeployment`; HA is not exercised on fleet.
 
 | Infrastructure | Distribution | Single-node | HA (3-node) |
 |---|---|---|---|
@@ -58,5 +58,7 @@ Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3,
 | CAPK | k0s | Supported | Supported |
 | CAPK | k3s | Supported | Supported (KD-5d day-2 caveat) |
 | CAPD | k0s | Supported (dev only) | Not exercised |
+| Fleet | k0s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
+| Fleet | k3s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 
 Hadron is the musl-libc-based next-generation Kairos OS; it is exercised alongside standard (glibc) Kairos images to confirm compatibility with both targets.

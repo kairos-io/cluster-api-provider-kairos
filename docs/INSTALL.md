@@ -1,12 +1,13 @@
 # Install Guide
 
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
-provider v0.1.0-beta.2. The "Registering the Kairos fleet infrastructure
+provider v0.1.0. The "Registering the Kairos fleet infrastructure
 provider" section below documents `cluster-api-provider-kairos-fleet`
-v0.1.0-beta.1's own `clusterctl.yaml` entry; it has not been re-verified by
+v0.1.0-beta.2's own `clusterctl.yaml` entry; it has not been re-verified by
 running `clusterctl init --infrastructure kairos-fleet` in this repository's
 CI — see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the same
-caveat.
+caveat. Do not use fleet provider `v0.1.0-beta.1`: it crash-loops on a real
+management cluster and is not clusterctl-installable.
 
 Three install paths: `clusterctl` (recommended), the released flat artifact (`kubectl apply`), and a developer install from source. Path 1 and Path 2 are mutually exclusive on one management cluster: see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive) below before picking one.
 
@@ -57,11 +58,13 @@ providers:
 ```
 
 Point `url` at a specific tag instead of `latest` to pin a version, for
-example `.../releases/download/v0.1.0-beta.1/infrastructure-components.yaml`.
-Fleet claims already-enrolled AuroraBoot nodes rather than creating machines
-on demand; see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the full
-provisioning model and ADR 0008 (maintained in the repository's internal
-decision records) for how it integrates with the bootstrap and control-plane
+example `.../releases/download/v0.1.0-beta.2/infrastructure-components.yaml`.
+Do not pin `v0.1.0-beta.1`: that release crash-loops on a real management
+cluster and is not clusterctl-installable. Fleet claims already-enrolled
+AuroraBoot nodes rather than creating machines on demand; see
+[docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the full provisioning
+model and ADR 0008 (maintained in the repository's internal decision
+records) for how it integrates with the bootstrap and control-plane
 providers in this repo.
 
 ### Install
@@ -126,7 +129,7 @@ Use this if you want a single `kubectl apply -f` without configuring `clusterctl
 ### Install
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/kairos-capi-provider.yaml
 ```
 
 This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
@@ -148,7 +151,7 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 ### Uninstall
 
 ```bash
-kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
+kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/kairos-capi-provider.yaml
 ```
 
 **Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:
@@ -247,4 +250,4 @@ for the full configuration steps.
 - [CAPM3 Quickstart](QUICKSTART_CAPM3.md) — create a cluster on bare metal via Metal3.
 - [Fleet Quickstart](QUICKSTART_FLEET.md) — create a cluster from AuroraBoot-claimed nodes with the Kairos fleet infrastructure provider.
 
-For the current release status, breaking changes, and security caveats, read the [v0.1.0-beta.2 release notes](release-notes/v0.1.0-beta.2.md).
+For the current release status, breaking changes, and security caveats, read the [v0.1.0 release notes](release-notes/v0.1.0.md).

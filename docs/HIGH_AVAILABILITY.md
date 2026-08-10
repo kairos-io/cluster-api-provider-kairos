@@ -1,6 +1,6 @@
 # High-Availability Control Planes
 
-Last verified against: provider v0.1.0-beta.2, CAPI v1.13.4.
+Last verified against: provider v0.1.0, CAPI v1.13.4.
 
 This page covers `KairosControlPlane` HA configuration (`spec.replicas` and
 `spec.ha.vip`) and the day-2 etcd health and quorum-safe replacement

@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPD (Docker)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4, provider v0.1.0-beta.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4, provider v0.1.0.
 
 This guide walks you through creating a single-node k0s cluster on Kairos using Cluster API with the Docker provider (CAPD).
 
