@@ -34,7 +34,7 @@ namespace: capi-kairos-control-plane-system
 labels:
   - includeSelectors: false
     pairs:
-      cluster.x-k8s.io/provider: control-plane-kairos
+      cluster.x-k8s.io/provider: control-plane-kairos-io
       app.kubernetes.io/name: capi-kairos-control-plane
       app.kubernetes.io/component: controller-manager
 
