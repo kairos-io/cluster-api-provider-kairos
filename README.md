@@ -50,7 +50,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | CAPV | v1.11.x+ |
 | CAPK | KubeVirt v1.9.x / CAPK v0.1.x |
 | CAPM3 | v1.13+; BMO/Ironic v0.13+ |
-| kairos-fleet | v0.1.0-beta.2+ (`cluster-api-provider-kairos-fleet`); AuroraBoot — do not use v0.1.0-beta.1, it crash-loops on a real management cluster |
+| kairos-fleet | v0.1.0+ (`cluster-api-provider-kairos-fleet`); AuroraBoot — do not use v0.1.0-beta.1, it crash-loops on a real management cluster |
 | k0s | ~v1.36.1+k0s |
 | k3s | ~v1.36.1+k3s1 |
 | Kairos | v4.1.2 (standard and Hadron images) |
