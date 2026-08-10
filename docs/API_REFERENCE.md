@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.0-beta.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.0.
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
@@ -30,7 +30,8 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `role` | `string` | Yes | `"worker"` | Node role: `"control-plane"` or `"worker"`. |
 | `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"` or `"k3s"`. |
 | `kubernetesVersion` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). The value is informational — the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. |
-| `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. For k0s, this adds `--single`; for k3s, it enables cluster-init mode. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. Applies to both k0s and k3s distributions. Tracked as a deprecation candidate in KD-39. |
+| `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. What single-node mode renders is distribution- and infrastructure-specific: for k3s it enables cluster-init mode on every infrastructure provider; for k0s on CAPK it renders `--single`; for k0s on the generic / CAPV / CAPM3 / fleet render path it renders `--enable-worker` by default, or `--single` when `k0sSingleNode` is also `true` (see `k0sSingleNode` below). Tracked as a deprecation candidate in KD-39. |
+| `k0sSingleNode` | `*bool` | No | `false` | For a single-node k0s control plane (`singleNode: true`, `distribution: k0s`) on the generic / CAPV / CAPM3 / fleet render path, selects which k0s single-node flag is rendered. `false` (the default) renders `--enable-worker`: a joinable, schedulable controller that runs workloads itself and accepts worker joins, so a control-plane-plus-worker cluster works out of the box. `true` renders `--single`: a standalone all-in-one node that refuses all joins ("cannot join into a single node cluster") — use this only for a node that will never gain workers. Ignored by k3s and by worker/join nodes, and has no effect on CAPK, which always renders `--single` for single-node k0s. |
 | `userName` | `string` | No | `"kairos"` | Username for the default OS user. |
 | `userPassword` | `string` | No | — | Password for the default OS user, specified inline. Inline values are stored in the resource and visible to anyone with read access to KairosConfig objects. Prefer `userPasswordSecretRef`. At least one of `userPassword`, `userPasswordSecretRef`, `sshPublicKey`, or `githubUser` must be set; the validating webhook enforces this. If both `userPassword` and `userPasswordSecretRef` are set, `userPasswordSecretRef` takes precedence. |
 | `userPasswordSecretRef` | `UserPasswordSecretReference` | No | — | Reference to a Secret containing the OS user password. The Secret must have a key matching `userPasswordSecretRef.key` (default: `"password"`). Preferred over inline `userPassword`. |
@@ -497,7 +498,15 @@ The controller fails reconciliation if no token is provided for a worker.
 
 ### Single-Node Mode
 
-When `KairosControlPlane.spec.replicas == 1`, the controller automatically sets `KairosConfig.spec.singleNode = true` on the created control-plane Machine's config. For k0s this adds the `--single` flag; for k3s it enables single-node cluster-init mode. The `singleNode` field applies to both distributions. Setting it manually on a `KairosConfigTemplate` is unnecessary when managed by `KairosControlPlane`.
+When `KairosControlPlane.spec.replicas == 1`, the controller automatically sets `KairosConfig.spec.singleNode = true` on the created control-plane Machine's config. Setting it manually on a `KairosConfigTemplate` is unnecessary when managed by `KairosControlPlane`.
+
+`singleNode` decides *whether* single-node mode applies; for k0s, `k0sSingleNode` separately decides *which* k0s flag single-node mode renders:
+
+- **k3s**, on every infrastructure provider: `singleNode` enables single-node cluster-init mode. `k0sSingleNode` has no effect.
+- **k0s on CAPK**: `singleNode` renders `--single`, unconditionally. `k0sSingleNode` has no effect.
+- **k0s on the generic / CAPV / CAPM3 / fleet render path**: `singleNode` alone renders `--enable-worker` — a joinable, schedulable controller, so a control-plane-plus-worker cluster works with no further configuration. Setting `k0sSingleNode: true` renders `--single` instead: a standalone all-in-one node that refuses all worker joins. Use `k0sSingleNode: true` only for a node that is meant to stay standalone forever.
+
+See the `k0sSingleNode` row above for the field reference, and `config/samples/fleet/kairos_cluster_k0s_single_node.yaml` for a worked standalone-node example.
 
 ### Multi-Node Control Planes
 

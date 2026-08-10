@@ -1,21 +1,15 @@
 # ============================================================================
-# Fleet Sample: Standalone Single-Node k0s Cluster on Kairos OS
+# Fleet Sample: k0s Control Plane + Worker on Kairos OS
 # (Kairos fleet / AuroraBoot infrastructure provider)
 # ============================================================================
 #
-# This is the opt-in counterpart to kairos_cluster_k0s_with_workers.yaml in
-# this directory. A default single-node k0s control plane is joinable and
-# schedulable (k0s "--enable-worker"), so it can accept a worker
-# MachineDeployment. This manifest instead sets
-# KairosConfigTemplate.spec.template.spec.k0sSingleNode: true, which renders
-# k0s "--single" — a standalone all-in-one node that REFUSES all joins
-# ("cannot join into a single node cluster"). Use this only for a node that
-# is meant to stay standalone forever; do not add a worker MachineDeployment
-# to a cluster built from this file.
-#
-# k0sSingleNode is k0s-only: k3s has no equivalent field, because k3s
-# single-node mode already accepts worker joins by default (see
-# kairos_cluster_k3s_with_workers.yaml).
+# NOTE: k0s uses the identical fleet claim/apply/reboot flow as the k3s
+# variant (kairos_cluster_k3s_with_workers.yaml); only spec.distribution,
+# spec.version/kubernetesVersion, and the worker join-token field differ. k3s
+# is the reference / most-exercised fleet distribution; k0s fleet support is
+# newer. Prefer k3s if you do not have a specific reason to choose k0s. Read
+# the k3s sample's header comments in full before using this file — all
+# prerequisites and constraints described there apply equally here.
 #
 # PREREQUISITES (all must be satisfied before applying this manifest):
 #
@@ -27,9 +21,10 @@
 #          --infrastructure kairos-fleet
 #      See docs/QUICKSTART_FLEET.md and docs/INSTALL.md.
 #
-#   3. An AuroraBoot instance reachable from the management cluster, with an
-#      admin bearer token and at least one enrolled, unclaimed node in the
-#      "control-plane" group. No "workers" group is needed for this file.
+#   3. An AuroraBoot instance reachable from the management cluster, with:
+#        - an admin bearer token
+#        - at least one enrolled, unclaimed node in the "control-plane" group
+#        - at least one enrolled, unclaimed node in the "workers" group
 #
 #   4. A control-plane endpoint (host:port) that you manage: a kube-vip VIP,
 #      a load balancer, or a DNS name, pointed at the control-plane node once
@@ -48,15 +43,21 @@
 #      shell environment, not a hard-coded value.
 #
 # APPLY:
-#   kubectl apply -f config/samples/fleet/kairos_cluster_k0s_single_node.yaml
+#   kubectl apply -f config/samples/fleet/kairos_cluster_k0s_with_workers.yaml
 #
 # ============================================================================
 #
-# SCOPE: a single, standalone control-plane machine (replicas: 1), no worker
-# MachineDeployment. Fleet HA (KairosControlPlane.spec.replicas: 3 or 5) is
-# mechanically reachable but is NOT exercised on fleet — no fleet HA sample
-# is shipped (ADR 0008, "HA scope (decision)"). See
-# docs/HIGH_AVAILABILITY.md.
+# SCOPE: a single control-plane machine (replicas: 1) plus a worker
+# MachineDeployment — fleet's validated topology. Fleet HA
+# (KairosControlPlane.spec.replicas: 3 or 5) is mechanically reachable but is
+# NOT exercised on fleet — no fleet HA sample is shipped (ADR 0008, "HA scope
+# (decision)"). See docs/HIGH_AVAILABILITY.md.
+#
+# The worker below can join because a single-node k0s control plane defaults
+# to k0s "--enable-worker" (joinable, schedulable) rather than the standalone
+# "--single" mode. For a node that must never accept a worker join, see the
+# sibling sample kairos_cluster_k0s_single_node.yaml, which sets
+# KairosConfigTemplate.spec.template.spec.k0sSingleNode: true.
 #
 # NO install: block anywhere below. AuroraBoot nodes are already enrolled and
 # installed; the bootstrap cloud-config is staged to the node's existing
@@ -67,7 +68,8 @@
 # IMPORTANT: replace `password:` below with a strong value before applying.
 # `openssl rand -base64 32` generates a suitable value. Inline userPassword
 # in KairosConfig is deprecated; this Secret pattern is the recommended way
-# to provide it.
+# to provide it. Both KairosConfigTemplates (control plane and worker) below
+# reference this Secret.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -136,8 +138,8 @@ metadata:
   name: fleet-demo-control-plane
   namespace: default
 spec:
-  # Single, standalone control plane. Fleet HA (replicas: 3/5) is unexercised
-  # — see the header comment above and docs/HIGH_AVAILABILITY.md. Do not set
+  # Single control-plane only. Fleet HA (replicas: 3/5) is unexercised — see
+  # the header comment above and docs/HIGH_AVAILABILITY.md. Do not set
   # spec.ha.vip here: it is unnecessary for a single control-plane node and
   # setHAConditions is a no-op at replicas <= 1.
   replicas: 1
@@ -179,12 +181,6 @@ spec:
       distribution: k0s
       kubernetesVersion: "v1.34.1+k0s.1"
       # NO install: block — see the header comment above.
-      # Renders k0s "--single": a standalone all-in-one node that refuses all
-      # worker joins. This is the field this sample exists to demonstrate; see
-      # the header comment above. Omit (or set false) for the default
-      # joinable, schedulable "--enable-worker" behavior — see
-      # kairos_cluster_k0s_with_workers.yaml.
-      k0sSingleNode: true
       userName: kairos
       # Password comes from the Secret defined at the top of this file.
       # Alternative: set sshPublicKey: and omit userPasswordSecretRef.
@@ -196,3 +192,79 @@ spec:
       # sshPublicKey: "ssh-rsa AAAAB3NzaC1yc2E..."
       # Optional: import SSH public keys from a GitHub user's profile.
       # githubUser: "your-github-username"
+---
+# k0s workers join using this token (k0s calls it a worker token). Create it
+# out of band from an existing k0s controller:
+#   k0s token create --role=worker
+# Do not commit a real token to version control.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fleet-demo-worker-token
+  namespace: default
+type: Opaque
+stringData:
+  token: "REPLACE-WITH-K0S-WORKER-TOKEN"
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: fleet-demo-md-0
+  namespace: default
+spec:
+  clusterName: fleet-demo
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: fleet-demo
+      cluster.x-k8s.io/deployment-name: fleet-demo-md-0
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: fleet-demo
+        cluster.x-k8s.io/deployment-name: fleet-demo-md-0
+    spec:
+      clusterName: fleet-demo
+      version: "v1.34.1+k0s.1"
+      bootstrap:
+        configRef:
+          apiGroup: bootstrap.cluster.x-k8s.io
+          kind: KairosConfigTemplate
+          name: fleet-demo-md-0
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: KairosFleetMachineTemplate
+        name: fleet-demo-md-0
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KairosFleetMachineTemplate
+metadata:
+  name: fleet-demo-md-0
+  namespace: default
+spec:
+  template:
+    spec:
+      # AuroraBoot group worker machines are claimed from. Must have at
+      # least one enrolled, unclaimed node per desired worker replica.
+      group: workers
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: fleet-demo-md-0
+  namespace: default
+spec:
+  template:
+    spec:
+      role: worker
+      distribution: k0s
+      kubernetesVersion: "v1.34.1+k0s.1"
+      # NO install: block — see the header comment above.
+      workerTokenSecretRef:
+        name: fleet-demo-worker-token
+        key: token
+      userName: kairos
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin

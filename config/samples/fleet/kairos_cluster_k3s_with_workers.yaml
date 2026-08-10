@@ -1,5 +1,5 @@
 # ============================================================================
-# Fleet Sample: Single Control-Plane k3s Cluster on Kairos OS
+# Fleet Sample: k3s Control Plane + Worker on Kairos OS
 # (Kairos fleet / AuroraBoot infrastructure provider)
 # ============================================================================
 #
@@ -12,9 +12,12 @@
 # cloud-config, and reboots it. See ADR 0008 and docs/QUICKSTART_FLEET.md.
 #
 # k3s is the reference / most-exercised fleet distribution. k0s is also
-# supported and newer; see kairos_cluster_k0s_single_node.yaml in this
+# supported and newer; see kairos_cluster_k0s_with_workers.yaml in this
 # directory for the k0s variant (identical shape; only distribution and
-# version fields differ).
+# version fields differ). k3s has no k0sSingleNode equivalent — k3s single-node
+# mode already accepts worker joins by default; see
+# kairos_cluster_k0s_single_node.yaml for the standalone-node case, which is
+# k0s-only.
 #
 # PREREQUISITES (all must be satisfied before applying this manifest):
 #
@@ -49,11 +52,12 @@
 #      shell environment, not a hard-coded value.
 #
 # APPLY:
-#   kubectl apply -f config/samples/fleet/kairos_cluster_k3s_single_node.yaml
+#   kubectl apply -f config/samples/fleet/kairos_cluster_k3s_with_workers.yaml
 #
 # ============================================================================
 #
-# SCOPE: single control plane only (replicas: 1) plus one worker. Fleet HA
+# SCOPE: a single control-plane machine (replicas: 1) plus a worker
+# MachineDeployment — fleet's validated topology. Fleet HA
 # (KairosControlPlane.spec.replicas: 3 or 5) is mechanically reachable but is
 # NOT exercised on fleet — no fleet HA sample is shipped (ADR 0008, "HA scope
 # (decision)"). See docs/HIGH_AVAILABILITY.md.
