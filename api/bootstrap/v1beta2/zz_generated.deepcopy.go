@@ -188,6 +188,11 @@ func (in *KairosConfigSpec) DeepCopyInto(out *KairosConfigSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.K0sSingleNode != nil {
+		in, out := &in.K0sSingleNode, &out.K0sSingleNode
+		*out = new(bool)
+		**out = **in
+	}
 	if in.UserPasswordSecretRef != nil {
 		in, out := &in.UserPasswordSecretRef, &out.UserPasswordSecretRef
 		*out = new(UserPasswordSecretReference)

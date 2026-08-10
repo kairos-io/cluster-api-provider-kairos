@@ -159,8 +159,11 @@ type KairosConfigSpec struct {
 	// +optional
 	Pause bool `json:"pause,omitempty"`
 
-	// SingleNode indicates this is a single-node control plane cluster.
-	// When true, k0s will be configured with --single flag.
+	// SingleNode indicates this is a single-node control plane cluster
+	// (spec.replicas==1). For k0s, the rendered flag depends on K0sSingleNode:
+	// by default a single k0s control plane is a joinable, schedulable controller
+	// (--enable-worker) so workers can still join; set K0sSingleNode to true to
+	// render the standalone --single mode instead.
 	//
 	// Deprecated: SingleNode is derived by the KairosControlPlane controller
 	// from spec.replicas (true when replicas==1) and will be removed in a
@@ -170,6 +173,21 @@ type KairosConfigSpec struct {
 	// SingleNode.
 	// +optional
 	SingleNode bool `json:"singleNode,omitempty"`
+
+	// K0sSingleNode opts a single-control-plane k0s cluster into the k0s
+	// "--single" mode: a standalone all-in-one node that does NOT accept any
+	// joins. It only affects k0s control-plane machines; k3s and worker/join
+	// nodes ignore it.
+	//
+	// It is opt-in and defaults to false. When false (the default), a
+	// single-control-plane k0s node is rendered as a joinable, schedulable
+	// controller (k0s "--enable-worker"): it runs workloads itself AND accepts
+	// worker joins, so a control-plane-plus-worker (multi-node) cluster works.
+	// Setting "--single" would make k0s refuse worker joins entirely ("cannot
+	// join into a single node cluster"), so it is only appropriate for a truly
+	// standalone single node that will never gain workers.
+	// +optional
+	K0sSingleNode *bool `json:"k0sSingleNode,omitempty"`
 
 	// ControlPlaneRole is the init/join/single discriminator for this
 	// control-plane machine. Set by the KairosControlPlane controller;

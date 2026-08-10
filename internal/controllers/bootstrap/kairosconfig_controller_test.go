@@ -106,7 +106,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
 	g.Expect(cloudConfig).To(ContainSubstring("#cloud-config"))
 	g.Expect(cloudConfig).To(ContainSubstring("k0s:"))
 	g.Expect(cloudConfig).To(ContainSubstring("enabled: true"))
-	g.Expect(cloudConfig).To(ContainSubstring("--single"))
+	// A default single control plane (K0sSingleNode unset) renders as a joinable,
+	// schedulable controller (--enable-worker), not the standalone --single mode.
+	g.Expect(cloudConfig).To(ContainSubstring("--enable-worker"))
+	g.Expect(cloudConfig).NotTo(ContainSubstring("--single"))
 	g.Expect(cloudConfig).NotTo(ContainSubstring("k0s-worker:"))
 }
 

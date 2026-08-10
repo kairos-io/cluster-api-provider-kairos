@@ -40,16 +40,21 @@ var templateFS embed.FS
 // representation for Content automatically; per-field hand-assembly with
 // `quote` is NOT used for Files (KD-Files design).
 type TemplateData struct {
-	Role         string
-	SingleNode   bool
-	Hostname     string
-	UserName     string
-	UserPassword string
-	UserGroups   []string
-	GitHubUser   string
-	SSHPublicKey string
-	WorkerToken  string
-	Manifests    []bootstrapv1beta2.Manifest
+	Role       string
+	SingleNode bool
+	// K0sSingleNode opts a single-control-plane k0s node into "--single"
+	// (standalone, no joins). Default false renders "--enable-worker" (joinable
+	// + schedulable), so k0s control-plane-plus-worker clusters work. See
+	// KairosConfigSpec.K0sSingleNode.
+	K0sSingleNode bool
+	Hostname      string
+	UserName      string
+	UserPassword  string
+	UserGroups    []string
+	GitHubUser    string
+	SSHPublicKey  string
+	WorkerToken   string
+	Manifests     []bootstrapv1beta2.Manifest
 	// Files are additional files written to the node via write_files:. Each
 	// entry is rendered as a whole slice by toYaml — never assembled per-field.
 	// Path/Permissions/Owner are validated by validateTemplateData and the

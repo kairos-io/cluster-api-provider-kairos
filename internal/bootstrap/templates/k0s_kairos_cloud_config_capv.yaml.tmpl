@@ -74,7 +74,20 @@ k0s:
   {{- if or .SingleNode .PodCIDR .ServiceCIDR .ProviderID .IsHAControlPlane }}
   args:
   {{- if .SingleNode }}
+  {{- if .K0sSingleNode }}
+    # Opt-in standalone single node (KairosConfig spec.k0sSingleNode: true): k0s
+    # "--single" is an all-in-one node that REFUSES all joins ("cannot join into a
+    # single node cluster"), so it can never gain workers. Use only for a node
+    # that will stay standalone.
     - --single
+  {{- else }}
+    # Default single control plane: a joinable, schedulable controller
+    # (--enable-worker), matching k3s --cluster-init. The node runs workloads AND
+    # accepts worker joins, so a control-plane-plus-worker (multi-node) cluster
+    # works out of the box. (RenderKubeVIP is false for single-node, so the HA
+    # --enable-worker branch below never doubles this.)
+    - --enable-worker
+  {{- end }}
   {{- end }}
   {{- if or .PodCIDR .ServiceCIDR .IsInitControlPlane }}
     - --config /etc/k0s/k0s.yaml

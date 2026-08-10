@@ -139,9 +139,13 @@ func TestHA_WorkerIgnoresControlPlaneRole(t *testing.T) {
 
 // TestHA_InitVsSingle_K0s asserts the documented init-vs-single delta for k0s:
 // init drops --single, keeps managed etcd, and emits api.sans for the endpoint.
+// The "single" side uses the opt-in K0sSingleNode mode, which is the only path
+// that still renders the standalone --single flag (the default single control
+// plane renders --enable-worker so it can accept worker joins).
 func TestHA_InitVsSingle_K0s(t *testing.T) {
 	single := haCPData("single", false)
 	single.SingleNode = true
+	single.K0sSingleNode = true
 	single.VIP = nil // single never renders kube-vip
 	single.ManagementEndpoint = nil
 	sOut, err := RenderK0sCloudConfig(single)
@@ -149,7 +153,7 @@ func TestHA_InitVsSingle_K0s(t *testing.T) {
 		t.Fatalf("render single: %v", err)
 	}
 	if !strings.Contains(sOut, "- --single") {
-		t.Error("k0s single must contain --single")
+		t.Error("k0s single (K0sSingleNode opt-in) must contain --single")
 	}
 
 	iOut, err := RenderK0sCloudConfig(haCPData("init", false))
