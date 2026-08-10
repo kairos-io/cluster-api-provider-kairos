@@ -1,6 +1,6 @@
 # Quick Start Guide - Fleet (Kairos fleet / AuroraBoot)
 
-Last verified against: Kairos fleet provider v0.1.0-beta.2+
+Last verified against: Kairos fleet provider v0.1.0+
 (`cluster-api-provider-kairos-fleet`; do not use `v0.1.0-beta.1`, it
 crash-loops on a real management cluster), this repository's fleet-support
 code (ADR 0008, shipped in v0.1.0 — see the

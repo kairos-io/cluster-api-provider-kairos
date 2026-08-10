@@ -206,7 +206,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
    kubectl get crd metal3clusters.infrastructure.cluster.x-k8s.io
    ```
 
-5. **Kairos CAPI Provider**: v0.1.0-beta.2+ installed (see [INSTALL.md](INSTALL.md)).
+5. **Kairos CAPI Provider**: v0.1.0+ installed (see [INSTALL.md](INSTALL.md)).
 
 6. **Fully-installed Kairos disk image**: See "Building the disk image" above.
 
@@ -221,7 +221,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 Install CAPM3 using `clusterctl` or the upstream manifests. Refer to the [Metal3 documentation](https://book.metal3.io/capm3/introduction) for the current install procedure. The Kairos CAPI provider is installed separately:
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/kairos-capi-provider.yaml
 ```
 
 See [INSTALL.md](INSTALL.md) for the full provider install and verification steps.

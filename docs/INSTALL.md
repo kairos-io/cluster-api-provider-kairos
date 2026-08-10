@@ -3,7 +3,7 @@
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
 provider v0.1.0. The "Registering the Kairos fleet infrastructure
 provider" section below documents `cluster-api-provider-kairos-fleet`
-v0.1.0-beta.2's own `clusterctl.yaml` entry; it has not been re-verified by
+v0.1.0's own `clusterctl.yaml` entry; it has not been re-verified by
 running `clusterctl init --infrastructure kairos-fleet` in this repository's
 CI — see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the same
 caveat. Do not use fleet provider `v0.1.0-beta.1`: it crash-loops on a real
@@ -58,7 +58,7 @@ providers:
 ```
 
 Point `url` at a specific tag instead of `latest` to pin a version, for
-example `.../releases/download/v0.1.0-beta.2/infrastructure-components.yaml`.
+example `.../releases/download/v0.1.0/infrastructure-components.yaml`.
 Do not pin `v0.1.0-beta.1`: that release crash-loops on a real management
 cluster and is not clusterctl-installable. Fleet claims already-enrolled
 AuroraBoot nodes rather than creating machines on demand; see
