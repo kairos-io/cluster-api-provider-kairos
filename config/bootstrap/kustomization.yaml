@@ -35,7 +35,7 @@ namespace: capi-kairos-bootstrap-system
 labels:
   - includeSelectors: false
     pairs:
-      cluster.x-k8s.io/provider: bootstrap-kairos
+      cluster.x-k8s.io/provider: bootstrap-kairos-io
       app.kubernetes.io/name: capi-kairos-bootstrap
       app.kubernetes.io/component: controller-manager
 
