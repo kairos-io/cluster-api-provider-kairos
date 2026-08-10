@@ -8,6 +8,24 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.1.1] — 2026-08-10
+
+A small maintenance release; no functional change to the controllers or CRDs.
+No migration steps from v0.1.0. See the
+[v0.1.1 release notes](docs/release-notes/v0.1.1.md).
+
+### Changed
+
+- The clusterctl provider identity is now `kairos-io`: the
+  `cluster.x-k8s.io/provider` label on the clusterctl bootstrap and
+  control-plane components changed from `bootstrap-kairos` /
+  `control-plane-kairos` to `bootstrap-kairos-io` / `control-plane-kairos-io`,
+  ahead of registering the provider in the upstream clusterctl built-in list as
+  `kairos-io`. Applied with `includeSelectors: false`, so Deployment selectors
+  are unchanged. The flat `kubectl apply` manifest keeps its `kairos` identity.
+- Docs: corrected stale `v0.1.0-beta.2` install references to `v0.1.0` and the
+  fleet-provider floor to `v0.1.0+`.
+
 ## [v0.1.0] — 2026-08-10
 
 The first non-beta 0.1.0 release. Adds the **Kairos fleet (AuroraBoot)
@@ -333,6 +351,7 @@ CAPD (Docker), CAPV (vSphere), and CAPK (KubeVirt). See the
 [release notes](docs/release-notes/v0.1.0-alpha.1.md) for the full feature list
 and the alpha-1 security notices.
 
+[v0.1.1]: https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.1
 [v0.1.0]: https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0
 [v0.1.0-beta.2]: https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-beta.2
 [v0.1.0-beta.1]: https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.0-beta.1
