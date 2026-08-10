@@ -364,6 +364,15 @@ type KairosControlPlaneStatus struct {
 	// +optional
 	Replicas int32 `json:"replicas,omitempty"`
 
+	// Version is the observed version of the control plane. It is part of the
+	// Cluster API control-plane contract: CAPI core's ControlPlaneIsStable
+	// preflight reads it to decide whether the control plane is stable (versus
+	// mid-upgrade) before allowing worker MachineDeployment scale-up. The
+	// controller sets it to spec.version once at least one control-plane member
+	// is ready; it stays empty while none is ready, which reads as "not stable".
+	// +optional
+	Version string `json:"version,omitempty"`
+
 	// UpdatedReplicas is the number of control plane machines that have been updated
 	// Contract: ControlPlane MUST expose updatedReplicas
 	// A machine is considered updated when its spec matches the desired state.

@@ -15,7 +15,12 @@ users:
 k0s:
   enabled: true
   args:
-    - --single
+    # Default single control plane: a joinable, schedulable controller
+    # (--enable-worker), matching k3s --cluster-init. The node runs workloads AND
+    # accepts worker joins, so a control-plane-plus-worker (multi-node) cluster
+    # works out of the box. (RenderKubeVIP is false for single-node, so the HA
+    # --enable-worker branch below never doubles this.)
+    - --enable-worker
 
 write_files:
   - path: /system/oem/12_kairos-capi-persistency.yaml

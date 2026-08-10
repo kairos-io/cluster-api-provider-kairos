@@ -63,9 +63,14 @@ func TestRenderK0sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
 		t.Error("Missing k0s enabled flag")
 	}
 
-	// Check for --single arg
-	if !strings.Contains(result, "--single") {
-		t.Error("Missing --single arg for single-node mode")
+	// A default single control plane (K0sSingleNode unset) renders as a
+	// joinable, schedulable controller (--enable-worker), NOT the standalone
+	// --single mode, so workers can still join it.
+	if !strings.Contains(result, "--enable-worker") {
+		t.Error("Missing --enable-worker arg for default single control plane")
+	}
+	if strings.Contains(result, "--single") {
+		t.Error("Default single control plane must not render --single (it refuses worker joins)")
 	}
 
 	// Check for user configuration
@@ -81,6 +86,30 @@ func TestRenderK0sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
 	// Check for capk groups list
 	if !strings.Contains(result, "groups: [users, admin]") {
 		t.Error("Missing capk groups list")
+	}
+}
+
+func TestRenderK0sCloudConfig_ControlPlaneK0sSingleNodeOptIn(t *testing.T) {
+	data := TemplateData{
+		Role:          "control-plane",
+		SingleNode:    true,
+		K0sSingleNode: true,
+		Hostname:      "kairos-standalone-0",
+		UserName:      "kairos",
+	}
+
+	result, err := RenderK0sCloudConfig(data)
+	if err != nil {
+		t.Fatalf("Failed to render template: %v", err)
+	}
+
+	// Opting in (K0sSingleNode: true) renders the standalone --single mode,
+	// which refuses worker joins.
+	if !strings.Contains(result, "--single") {
+		t.Error("K0sSingleNode: true must render --single")
+	}
+	if strings.Contains(result, "--enable-worker") {
+		t.Error("K0sSingleNode: true must not render --enable-worker (standalone node)")
 	}
 }
 
@@ -949,9 +978,10 @@ func TestRenderK0sCloudConfig_ControlPlaneWithoutProviderID(t *testing.T) {
 	if strings.Contains(result, "--kubelet-extra-args=--provider-id=") {
 		t.Error("k0s args MUST NOT include --kubelet-extra-args=--provider-id= when ProviderID is empty (would emit a malformed flag)")
 	}
-	// SingleNode=true should still render --single, so the args block exists.
-	if !strings.Contains(result, "--single") {
-		t.Error("SingleNode=true must still render --single")
+	// A default single control plane renders --enable-worker, so the args block
+	// exists even though ProviderID is empty.
+	if !strings.Contains(result, "--enable-worker") {
+		t.Error("default single control plane must render --enable-worker (the args block must exist)")
 	}
 }
 

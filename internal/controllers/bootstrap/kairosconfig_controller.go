@@ -990,6 +990,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	// 1. Explicit flag in KairosConfig.spec.singleNode
 	// 2. Or if this is a control-plane and we can check the owning KairosControlPlane
 	singleNode := kairosConfig.Spec.SingleNode
+	k0sSingleNode := kairosConfig.Spec.K0sSingleNode != nil && *kairosConfig.Spec.K0sSingleNode
 	if !singleNode && role == "control-plane" && machine != nil {
 		// Try to find the owning KairosControlPlane to check replicas
 		ownerRef := metav1.GetControllerOf(machine)
@@ -1102,6 +1103,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	templateData := bootstrap.TemplateData{
 		Role:                           role,
 		SingleNode:                     singleNode,
+		K0sSingleNode:                  k0sSingleNode,
 		Hostname:                       hostname,
 		UserName:                       userName,
 		UserPassword:                   userPassword,
@@ -1179,6 +1181,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
 	// Determine single-node mode
 	singleNode := kairosConfig.Spec.SingleNode
+	k0sSingleNode := kairosConfig.Spec.K0sSingleNode != nil && *kairosConfig.Spec.K0sSingleNode
 	if !singleNode && role == "control-plane" && machine != nil {
 		ownerRef := metav1.GetControllerOf(machine)
 		if ownerRef != nil && ownerRef.Kind == "KairosControlPlane" {
@@ -1285,6 +1288,7 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 	templateData := bootstrap.TemplateData{
 		Role:                           role,
 		SingleNode:                     singleNode,
+		K0sSingleNode:                  k0sSingleNode,
 		Hostname:                       hostname,
 		UserName:                       userName,
 		UserPassword:                   userPassword,
