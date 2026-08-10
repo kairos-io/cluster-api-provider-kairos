@@ -104,7 +104,11 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           body_path: docs/release-notes/${{ github.ref_name }}.md
-          prerelease: true
+          # Pre-release tags carry a suffix (-alpha.N, -beta.N, -rc.N) and publish
+          # as GitHub pre-releases; a clean vX.Y.Z tag (e.g. the v0.1.0 GA) publishes
+          # as a full release so it surfaces as "Latest release" instead of being
+          # hidden as a preview.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           draft: false
           files: |
             dist/bootstrap-components.yaml

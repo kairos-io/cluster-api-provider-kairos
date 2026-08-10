@@ -226,6 +226,9 @@ GOLANGCI_LINT_VERSION ?= v1.60.0
 # Pinned so `make test-envtest` is reproducible (rule 4: no unpinned @latest / floating envtest assets).
 # ENVTEST_K8S_VERSION is the Kubernetes API-server/etcd binary version the controllers are tested
 # against; 1.36 is the top of Cluster API v1.13's supported management-cluster band. Bump deliberately.
+# NOTE: the k8s.io/* CLIENT libraries in go.mod are v0.35.x (Kubernetes 1.35) — the version Cluster
+# API v1.13.4 itself pins. Testing against a 1.36 apiserver here is intentional, supported client/server
+# skew (one minor), NOT a mismatch to "fix" by bumping go.mod: MVS would revert it to CAPI's requirement.
 SETUP_ENVTEST_VERSION ?= v0.24.1
 ENVTEST_K8S_VERSION ?= 1.36.2
 
