@@ -22,11 +22,15 @@ import (
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/contract"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -1242,11 +1246,15 @@ func TestReconcile_SuccessClearsFailureFields(t *testing.T) {
 	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(5)))
 }
 
-// TestSupportsManagementEndpoint exhaustively pins the truth table for the
-// gate that decides whether a control-plane Machine's render gets a
-// kubeconfig-push block. The matrix is small and explicit on purpose: a new
-// infrastructure kind needs an entry here as well as in the templates, and
-// the test surfaces the omission.
+// TestSupportsManagementEndpoint pins the truth table for the gate that decides
+// whether a control-plane Machine's render gets a kubeconfig-push block.
+//
+// The gate is an OPT-OUT: an unknown infrastructure kind gets the push block.
+// It used to be an allowlist, which silently withheld the block from every
+// provider not named in it — their control-plane nodes never published a
+// kubeconfig and the KairosControlPlane never reached Initialized, with nothing
+// in the logs to explain why. A kind belongs in the exclusion list only when it
+// is known NOT to support the block.
 func TestSupportsManagementEndpoint(t *testing.T) {
 	mkMachine := func(kind string) *clusterv1.Machine {
 		return &clusterv1.Machine{
@@ -1266,8 +1274,12 @@ func TestSupportsManagementEndpoint(t *testing.T) {
 		{name: "KubeVirtMachine (CAPK uppercase V)", machine: mkMachine("KubeVirtMachine"), want: true},
 		{name: "VSphereMachine (CAPV)", machine: mkMachine("VSphereMachine"), want: true},
 		{name: "KairosFleetMachine (fleet)", machine: mkMachine("KairosFleetMachine"), want: true},
-		{name: "DockerMachine (unsupported today)", machine: mkMachine("DockerMachine"), want: false},
-		{name: "AWSMachine (unsupported today)", machine: mkMachine("AWSMachine"), want: false},
+		{name: "Metal3Machine (CAPM3)", machine: mkMachine("Metal3Machine"), want: true},
+		{name: "DockerMachine (explicitly excluded)", machine: mkMachine("DockerMachine"), want: false},
+		// The point of the opt-out: providers this package has never heard of are
+		// enabled rather than silently skipped.
+		{name: "AWSMachine (unknown kind -> enabled)", machine: mkMachine("AWSMachine"), want: true},
+		{name: "Beskar7Machine (unknown kind -> enabled)", machine: mkMachine("Beskar7Machine"), want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1459,4 +1471,112 @@ func TestBootstrapSecretBelongsTo(t *testing.T) {
 	kcNoUID := &bootstrapv1beta2.KairosConfig{ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "ns"}}
 	g.Expect(bootstrapSecretBelongsTo(secretWith("", ""), kcNoUID, clusterName)).To(BeFalse())
 	g.Expect(bootstrapSecretBelongsTo(secretWith("", clusterName), kcNoUID, clusterName)).To(BeTrue())
+}
+
+// mkInfraMachine builds an infra machine of an arbitrary kind, optionally Ready.
+func mkInfraMachine(kind, name, namespace string, ready bool) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    kind,
+	})
+	obj.SetName(name)
+	obj.SetNamespace(namespace)
+	if ready {
+		_ = unstructured.SetNestedField(obj.Object, true, "status", "ready")
+	}
+	return obj
+}
+
+// TestWaitForInfraProviderID_AnyProvider pins the generalized wait. It used to
+// be gated on Kind == VSphereMachine / KubevirtMachine, so a third-party
+// provider skipped it entirely and rendered a bootstrap config with no
+// providerID — the window in which a stale or fabricated value can win on the
+// node.
+func TestWaitForInfraProviderID_AnyProvider(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apiextensionsv1.AddToScheme(scheme)
+
+	cases := []struct {
+		name        string
+		kind        string
+		ready       bool
+		providerID  string
+		seedInfra   bool
+		wantRequeue bool
+	}{
+		{
+			// The regression: an unknown provider, infra Ready, providerID not yet
+			// published. Must wait rather than render a config without it.
+			name: "unknown provider, ready, no providerID -> wait",
+			kind: "Beskar7Machine", ready: true, seedInfra: true, wantRequeue: true,
+		},
+		{
+			// Must NOT wait, or we deadlock: the infra machine cannot become Ready
+			// until the bootstrap secret it needs exists.
+			name: "unknown provider, not ready -> proceed",
+			kind: "Beskar7Machine", ready: false, seedInfra: true, wantRequeue: false,
+		},
+		{
+			name: "providerID already known -> proceed",
+			kind: "Beskar7Machine", ready: true, providerID: "b7://ns/host", seedInfra: true, wantRequeue: false,
+		},
+		{
+			name: "infra machine absent -> proceed",
+			kind: "Beskar7Machine", ready: true, seedInfra: false, wantRequeue: false,
+		},
+		{
+			// Metal3 and fleet deliberately never embed a providerID, so waiting
+			// for one would never terminate.
+			name: "Metal3 is exempt -> proceed",
+			kind: "Metal3Machine", ready: true, seedInfra: true, wantRequeue: false,
+		},
+		{
+			name: "fleet is exempt -> proceed",
+			kind: "KairosFleetMachine", ready: true, seedInfra: true, wantRequeue: false,
+		},
+		{
+			// The kinds that used to be the entire allowlist must still behave.
+			name: "vSphere still waits",
+			kind: "VSphereMachine", ready: true, seedInfra: true, wantRequeue: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			machine := &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
+				Spec: clusterv1.MachineSpec{
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						APIGroup: "infrastructure.cluster.x-k8s.io",
+						Kind:     tc.kind,
+						Name:     "infra",
+					},
+				},
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tc.seedInfra {
+				builder = builder.WithObjects(
+					makeInfraCRDForBootstrap("infrastructure.cluster.x-k8s.io", tc.kind, "v1beta1"),
+					mkInfraMachine(tc.kind, "infra", "default", tc.ready),
+				)
+			}
+			r := &KairosConfigReconciler{Client: builder.Build(), Scheme: scheme}
+
+			_, wait := r.waitForInfraProviderID(context.Background(), log.Log, machine, tc.providerID)
+			g.Expect(wait).To(Equal(tc.wantRequeue))
+		})
+	}
+}
+
+// makeInfraCRDForBootstrap seeds the CRD that GetObjectFromContractVersionedRef
+// consults to resolve the ref's apiVersion from the contract label.
+func makeInfraCRDForBootstrap(group, kind, contractAPIVersion string) *unstructured.Unstructured {
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
+	crd.SetName(contract.CalculateCRDName(group, kind))
+	crd.SetLabels(map[string]string{clusterv1.GroupVersion.String(): contractAPIVersion})
+	return crd
 }

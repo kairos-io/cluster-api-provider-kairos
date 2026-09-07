@@ -109,24 +109,9 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
-  - dockermachines
-  - vspheremachines/status
+  - '*'
   verbs:
   - get
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - kubevirtmachines
-  - vspheremachines
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - metal3machines
-  verbs:
   - list
   - watch
 - apiGroups:
