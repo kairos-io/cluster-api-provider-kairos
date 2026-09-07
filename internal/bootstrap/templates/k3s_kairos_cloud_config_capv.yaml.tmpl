@@ -444,6 +444,23 @@ write_files:
     content: |
       #!/bin/bash
       set -e
+      # vSphere-only. This template is the DEFAULT for every infrastructure
+      # provider that is not KubeVirt, so it also renders for Metal3, CAPD and
+      # any third-party provider. Fabricating a vsphere:// providerID on those
+      # is actively harmful: Node.spec.providerID is IMMUTABLE once the node
+      # registers, so a wrong value permanently breaks Machine-to-Node matching
+      # and the Machine never leaves Provisioning.
+      if [ -r /sys/class/dmi/id/sys_vendor ] && ! grep -qi vmware /sys/class/dmi/id/sys_vendor; then
+        echo "not a VMware VM; leaving providerID to the infrastructure provider"
+        exit 0
+      fi
+      # Never clobber a providerID the controller already wrote: the bootstrap
+      # config is re-rendered once the infra provider assigns one, and this
+      # script runs on every k3s start.
+      if [ -s /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml ]; then
+        echo "providerID already set; leaving it alone"
+        exit 0
+      fi
       # Read DMI product_uuid (vSphere VMs expose VM UUID here)
       # DMI uses mixed-endian for first 3 groups; vSphere expects RFC/ISO (big-endian) - convert byte order
       if [ -f /sys/class/dmi/id/product_uuid ]; then
