@@ -1096,3 +1096,111 @@ func TestHA_CapkK3sSingleHasNoNodeIP(t *testing.T) {
 		t.Error("k3s CAPK single must NOT render the k3s.service ExecStartPre drop-in (HA-only)")
 	}
 }
+
+// TestHA_K3sDatastoreFlagsPinnedInConfigDir is the regression guard for the
+// init-ordering bug measured on the beskar7/CAPV HA lab (2026-09-07).
+//
+// provider-kairos delivers `k3s.args:` as a systemd drop-in
+// (/etc/systemd/system/k3s.service.d/override.conf). On an instrumented run that
+// file landed at 23:10:16 — three seconds AFTER k3s.service had already been
+// started at 23:10:13. k3s selects its datastore on its FIRST start and never
+// migrates, so it came up as a plain `k3s server` on SQLite with a random server
+// token; --cluster-init / --server / --token-file were ignored for the life of
+// the node. The failure is silent: the init node reports "etcd disabled" and
+// every joiner forms its OWN single-node cluster.
+//
+// The boot-stage write_files, by contrast, landed at 23:10:13.318 — BEFORE the
+// first start — and k3s re-reads config.yaml.d on every start. So the flags that
+// must be right on the first start are pinned there too. This test asserts the
+// drop-in exists with the correct content for init and join on both infra
+// flavours, and that it is absent for single-node and workers (which have no
+// datastore choice to get wrong).
+func TestHA_K3sDatastoreFlagsPinnedInConfigDir(t *testing.T) {
+	const path = "/etc/rancher/k3s/config.yaml.d/93-ha-datastore.yaml"
+	const tokenLine = "token-file: /etc/rancher/k3s/server-token"
+
+	for _, kv := range []bool{false, true} { // CAPV, CAPK
+		infra := "capv"
+		if kv {
+			infra = "capk"
+		}
+
+		t.Run(infra+"/init", func(t *testing.T) {
+			d := haCPData("init", kv)
+			d.JoinToken = "K10shared::server:tokenvalue"
+			out, err := RenderK3sCloudConfig(d)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			content := extractWriteFile(t, out, path)
+			if content == "" {
+				t.Fatalf("init render missing %q — --cluster-init would arrive too late to pick the datastore", path)
+			}
+			if !strings.Contains(content, "cluster-init: true") {
+				t.Errorf("init %s missing cluster-init: true, got:\n%s", path, content)
+			}
+			if !strings.Contains(content, tokenLine) {
+				t.Errorf("init %s missing %q — init would generate a random server token, got:\n%s", path, tokenLine, content)
+			}
+			if strings.Contains(content, "server:") {
+				t.Errorf("init %s must not set server: (it bootstraps, it does not join), got:\n%s", path, content)
+			}
+		})
+
+		t.Run(infra+"/join", func(t *testing.T) {
+			d := haCPData("join", kv)
+			out, err := RenderK3sCloudConfig(d)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			content := extractWriteFile(t, out, path)
+			if content == "" {
+				t.Fatalf("join render missing %q — --server would arrive too late and the node would form its own cluster", path)
+			}
+			// The join URL must be the same stable endpoint the k3s.args --server
+			// uses, so the late override is a no-op when it finally lands.
+			endpoint := d.ManagementEndpoint.ControlPlaneEndpointHost
+			if kv {
+				endpoint = d.ControlPlaneLBEndpoint
+			}
+			want := "server: https://" + endpoint + ":6443"
+			if !strings.Contains(content, want) {
+				t.Errorf("join %s missing %q, got:\n%s", path, want, content)
+			}
+			if !strings.Contains(content, tokenLine) {
+				t.Errorf("join %s missing %q, got:\n%s", path, tokenLine, content)
+			}
+			if strings.Contains(content, "cluster-init") {
+				t.Errorf("join %s must not set cluster-init (it joins, it does not bootstrap), got:\n%s", path, content)
+			}
+			if !strings.Contains(out, "--server=https://"+endpoint+":6443") {
+				t.Errorf("join k3s.args --server must match the config.yaml.d server: value (%s)", endpoint)
+			}
+		})
+
+		t.Run(infra+"/single", func(t *testing.T) {
+			d := haCPData("single", kv)
+			out, err := RenderK3sCloudConfig(d)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			if strings.Contains(out, path) {
+				t.Errorf("single-node render must not write %q — it has no HA datastore to pin", path)
+			}
+		})
+
+		t.Run(infra+"/worker", func(t *testing.T) {
+			d := haCPData("init", kv)
+			d.Role = "worker"
+			d.K3sServerURL = "https://192.168.1.240:6443"
+			d.K3sToken = "K10worker::server:token"
+			out, err := RenderK3sCloudConfig(d)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			if strings.Contains(out, path) {
+				t.Errorf("worker render must not write %q — agents hold no datastore", path)
+			}
+		})
+	}
+}

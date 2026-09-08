@@ -31,6 +31,11 @@ k3s:
     # Without this, k3s --cluster-init auto-generates a random server token that
     # the joiners can never match, so the cluster never forms. (ADR 0005 Phase 3,
     # BLOCKER-1.)
+    #
+    # NOTE: these args reach the node via a systemd override that
+    # provider-kairos writes ~3s AFTER k3s.service first starts, which is too
+    # late to choose the datastore. 93-ha-datastore.yaml (write_files, below)
+    # pins the same flags in config.yaml.d, which k3s reads on every start.
     - --cluster-init
     - --token-file=/etc/rancher/k3s/server-token
     - --tls-san=192.168.1.240
@@ -85,6 +90,30 @@ write_files:
     group: root
     content: |
       
+  # ADR 0005 (HA) datastore/join flags — INIT-ORDERING (bare-metal lab,
+  # 2026-09-07).
+  # k3s picks its datastore on its FIRST start and never migrates. On an
+  # instrumented HA run the boot-stage write_files landed at 23:10:13.318 and
+  # k3s.service started at 23:10:13 — but provider-kairos only wrote the
+  # `k3s.args:` systemd override at 23:10:16, THREE SECONDS TOO LATE. k3s had
+  # already come up as a plain `k3s server`, created a SQLite datastore and
+  # generated a random server token; --cluster-init / --server / --token-file
+  # were silently ignored on every restart after that. The failure is silent and
+  # unrecoverable: the init node reports "etcd disabled" and each joiner forms
+  # its OWN single-node cluster.
+  #
+  # config.yaml.d is read by k3s on EVERY start and write_files delivers it
+  # BEFORE the first one, so the datastore/join flags are pinned here as well as
+  # in k3s.args — the same belt-and-braces the kubelet-arg (90) and tls-san (91)
+  # drop-ins above already rely on. Values are identical to the k3s.args ones, so
+  # when the override finally lands the two agree and nothing changes.
+  - path: /etc/rancher/k3s/config.yaml.d/93-ha-datastore.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      cluster-init: true
+      token-file: /etc/rancher/k3s/server-token
   # ADR 0005 § D.1 (HA) kube-vip DaemonSet + RBAC (CAPV/CAPM3 only; CAPK uses its
   # built-in LoadBalancer Service per OQ-5 and never reaches this block).
   # k3s auto-applies manifests under /var/lib/rancher/k3s/server/manifests at
