@@ -186,10 +186,19 @@ write_files:
         echo "k0s-api-addr: api.address and etcd peerAddress set to ${ADDR}"
       else
         # Fail open. An unsubstituted sentinel makes k0s reject the config and
-        # crash-loop; dropping the line just returns k0s to auto-detection.
+        # crash-loop, so the settings are removed instead. The two halves need
+        # different surgery: an empty `api:` is re-defaulted by k0s, but an
+        # empty `etcd:` is not — its storage defaulting only repairs kine, so
+        # spec.storage.etcd stays nil and the etcd component dereferences it
+        # at start, after `k0s config validate` has passed. The storage section
+        # exists only to carry peerAddress, so drop the whole section and let
+        # k0s fall back to its default etcd config. The range delete runs only
+        # when its closing line is present, so it can never run to end of file.
         sed -i "/^[[:space:]]*address: ${SENTINEL}\$/d" "${CFG}"
-        sed -i "/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d" "${CFG}"
-        echo "k0s-api-addr: no routable address found; removed api.address and peerAddress, k0s will auto-detect"
+        if grep -qE "^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$" "${CFG}"; then
+          sed -i "/^[[:space:]]*storage:\$/,/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d" "${CFG}"
+        fi
+        echo "k0s-api-addr: no routable address found; removed api.address and the etcd storage section, k0s will auto-detect"
       fi
   - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-api-addr.conf
     permissions: "0644"

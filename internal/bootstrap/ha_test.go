@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1739,7 +1740,9 @@ func TestHA_K0sApiAddressResolved(t *testing.T) {
 			// Fail open rather than leave a sentinel in place — either of them.
 			for _, del := range []string{
 				`sed -i "/^[[:space:]]*address: ${SENTINEL}\$/d"`,
-				`sed -i "/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d"`,
+				// The etcd side drops the whole storage section, not just its
+				// value line — see TestHA_K0sApiAddressResolverRuns for why.
+				`sed -i "/^[[:space:]]*storage:\$/,/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d"`,
 			} {
 				if !strings.Contains(out, del) {
 					t.Errorf("resolver must DELETE the line when no address is found (%s); an "+
@@ -1766,4 +1769,188 @@ func TestHA_K0sApiAddressResolved(t *testing.T) {
 func cfgBody(out string) string {
 	body, _ := writeFileBody(out, "/etc/k0s/k0s.yaml")
 	return body
+}
+
+// writeFileContent returns the de-indented file content of a write_files entry,
+// i.e. the bytes yip would put on disk.
+func writeFileContent(out, path string) (string, bool) {
+	body, ok := writeFileBody(out, path)
+	if !ok {
+		return "", false
+	}
+	i := strings.Index(body, "content: |\n")
+	if i < 0 {
+		return "", false
+	}
+	lines := strings.Split(body[i+len("content: |\n"):], "\n")
+	indent := -1
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		if n := len(l) - len(strings.TrimLeft(l, " ")); indent < 0 || n < indent {
+			indent = n
+		}
+	}
+	var b strings.Builder
+	for _, l := range lines {
+		if len(l) >= indent {
+			b.WriteString(l[indent:])
+		} else {
+			b.WriteString(strings.TrimLeft(l, " "))
+		}
+		b.WriteString("\n")
+	}
+	return b.String(), true
+}
+
+// TestHA_K0sApiAddressResolverRuns executes the rendered resolver against the
+// rendered k0s.yaml, because the string-level assertions in
+// TestHA_K0sApiAddressResolved cannot see what the script does to the file.
+//
+//   - resolves: `ip route get` answers with a source address, and both
+//     spec.api.address and spec.storage.etcd.peerAddress end up equal to it.
+//   - fails open: there is no `ip` at all. The address line goes, and the
+//     WHOLE storage section goes with it. Deleting only the peerAddress line
+//     leaves `etcd:` as an explicit null, and k0s does not repair that:
+//     StorageSpec.UnmarshalJSON re-defaults etcd only for kine, so
+//     spec.storage.etcd stays nil, `k0s config validate` passes, and the etcd
+//     component dereferences it at start (k0s v1.34.8:
+//     cmd/controller/controller.go:264 hands the nil through and
+//     pkg/component/controller/etcd.go:167 calls GetPeerURL on it). A nil
+//     spec.api, by contrast, is restored by ClusterConfig.UnmarshalJSON, so
+//     the address line alone is fine to drop. Caught in review of the first
+//     version of this resolver.
+//
+// Each run gets a PATH holding only what that path needs, so the fail-open run
+// never sleeps: without `seq` the wait loop has nothing to iterate and without
+// `ip` there is nothing to detect. Every run is repeated once to prove the
+// script is a no-op on a resolved file.
+func TestHA_K0sApiAddressResolverRuns(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	const resolverPath = "/usr/local/bin/kairos-k0s-api-addr.sh"
+
+	for _, tc := range goldenCases() {
+		if !strings.HasPrefix(tc.name, "k0s_capv_") {
+			continue
+		}
+		if !strings.HasSuffix(tc.name, "_init") && !strings.HasSuffix(tc.name, "_join") {
+			continue
+		}
+		out, err := tc.render(tc.data)
+		if err != nil {
+			t.Fatalf("render %s: %v", tc.name, err)
+		}
+		resolver, ok := writeFileContent(out, resolverPath)
+		if !ok {
+			t.Fatalf("%s: no resolver script in render", tc.name)
+		}
+		cfg, ok := writeFileContent(out, "/etc/k0s/k0s.yaml")
+		if !ok {
+			t.Fatalf("%s: no k0s.yaml in render", tc.name)
+		}
+
+		run := func(t *testing.T, tools []string, fakeIP string) map[string]any {
+			t.Helper()
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for _, tool := range tools {
+				p, err := exec.LookPath(tool)
+				if err != nil {
+					t.Skipf("%s not available", tool)
+				}
+				if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fakeIP != "" {
+				if err := os.WriteFile(filepath.Join(bin, "ip"), []byte(fakeIP), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfgPath := filepath.Join(dir, "k0s.yaml")
+			if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			script := strings.Replace(resolver, "CFG=/etc/k0s/k0s.yaml\n", "CFG="+cfgPath+"\n", 1)
+			if script == resolver {
+				t.Fatal("resolver does not declare CFG=/etc/k0s/k0s.yaml; cannot redirect it")
+			}
+			scriptPath := filepath.Join(dir, "resolver.sh")
+			if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var first []byte
+			for i := 0; i < 2; i++ {
+				cmd := exec.Command(bash, scriptPath)
+				cmd.Env = []string{"PATH=" + bin}
+				if b, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("run %d: %v\n%s", i+1, err, b)
+				}
+				got, err := os.ReadFile(cfgPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if i == 0 {
+					first = got
+				} else if string(got) != string(first) {
+					t.Errorf("second run changed the file; the resolver must be a no-op once resolved")
+				}
+			}
+			if strings.Contains(string(first), "__") {
+				t.Errorf("a placeholder survived:\n%s", first)
+			}
+			var doc map[string]any
+			if err := yaml.Unmarshal(first, &doc); err != nil {
+				t.Fatalf("result is not YAML: %v\n%s", err, first)
+			}
+			spec, _ := doc["spec"].(map[string]any)
+			if spec == nil {
+				t.Fatalf("result has no spec mapping:\n%s", first)
+			}
+			return spec
+		}
+
+		t.Run(tc.name+"/resolves", func(t *testing.T) {
+			spec := run(t, []string{"sed", "grep", "seq", "head", "cut", "awk"},
+				"#!/bin/sh\necho '192.168.1.240 via 10.9.8.1 dev eth0 src 10.9.8.7 uid 0'\n")
+			api, _ := spec["api"].(map[string]any)
+			if api == nil || api["address"] != "10.9.8.7" {
+				t.Errorf("spec.api = %v; want address 10.9.8.7 from the route source", spec["api"])
+			}
+			storage, _ := spec["storage"].(map[string]any)
+			etcd, _ := storage["etcd"].(map[string]any)
+			if etcd == nil || etcd["peerAddress"] != "10.9.8.7" {
+				t.Errorf("spec.storage = %v; want etcd.peerAddress 10.9.8.7 from the same source", spec["storage"])
+			}
+		})
+
+		t.Run(tc.name+"/fails open", func(t *testing.T) {
+			spec := run(t, []string{"sed", "grep"}, "")
+			if api, present := spec["api"]; present && api != nil {
+				if _, isMap := api.(map[string]any); !isMap {
+					t.Errorf("spec.api is %T after fail-open; must be a mapping or absent", api)
+				}
+			}
+			storage, present := spec["storage"]
+			if !present {
+				return
+			}
+			m, isMap := storage.(map[string]any)
+			if !isMap {
+				t.Fatalf("spec.storage is an explicit null after fail-open; k0s keeps a StorageSpec "+
+					"with a nil etcd and the etcd component dereferences it at start (got %T)", storage)
+			}
+			if etcd, ok := m["etcd"]; ok && etcd == nil {
+				t.Errorf("spec.storage.etcd is an explicit null after fail-open; k0s's StorageSpec " +
+					"defaulting only repairs kine, so this passes `k0s config validate` and then panics at etcd start")
+			}
+		})
+	}
 }
