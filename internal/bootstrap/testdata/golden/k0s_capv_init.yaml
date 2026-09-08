@@ -41,6 +41,44 @@ write_files:
           - environment_file: /run/cos/extra-layout.env
             environment:
               PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # INIT-ORDERING (bare-metal lab, 2026-09-08). provider-kairos turns `k0s.args:`
+  # into /etc/systemd/system/k0scontroller.service.d/override.conf, and it writes
+  # that file AFTER enabling the unit. It usually wins by a fraction of a second,
+  # but not always — measured across four k0s boots on identical images:
+  #
+  #   07:12:16.064 override / 07:12:16 start   args applied
+  #   07:19:25.756 override / 07:19:25 start   args applied
+  #   08:08:12.016 override / 08:08:12 start   args applied
+  #   08:35:04.287 override / 08:35:01 start   args LOST  (3.3s late)
+  #
+  # On the boot that lost, /proc/<pid>/cmdline was a bare `k0s controller` with
+  # every flag missing: no worker role, so no kubelet, so the Node never
+  # registered and the whole control plane stalled. On a JOIN node the casualty
+  # is the join-token flag, which is the k3s split-brain failure in k0s clothing.
+  #
+  # write_files lands in the boot stage, before the unit is enabled, so a drop-in
+  # written here is always present at the first start. It sorts after
+  # override.conf, so it wins whenever both exist and is harmless when the plugin
+  # never gets there. Same belt-and-braces as the k3s 93-ha-datastore.yaml pin —
+  # k0s has no config.yaml.d equivalent for CLI-only flags, so the drop-in is the
+  # available mechanism. Keep this list identical to `k0s.args:` above;
+  # TestHA_K0sArgsDropInMatchesK0sArgs fails the build if they drift.
+  - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-args.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      # Never start with these arguments inside a recovery/install boot: on
+      # a join node that is a real controller-join, registered as a voter,
+      # that the installer then reboots out from under the cluster (measured
+      # on the beskar7 lab, 2026-09-08). The bare first start cannot join —
+      # it has no token and this drop-in is not loaded yet — and every start
+      # that carries the token follows a reload that also loads this file.
+      ConditionPathExists=!/run/cos/recovery_mode
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/k0s controller --config /etc/k0s/k0s.yaml --enable-worker
   - path: /etc/k0s/k0s.yaml
     permissions: "0644"
     content: |
@@ -203,8 +241,9 @@ write_files:
       # up cloud-init's runcmd and preventing kairos-agent from rebooting
       # into the installed system. (KD-3b lab finding on Hadron.)
       ConditionKernelCommandLine=!cdroot
-      After=k0s.service
-      Wants=k0s.service
+      ConditionPathExists=!/run/cos/recovery_mode
+      After=k0scontroller.service
+      Wants=k0scontroller.service
 
       [Service]
       Type=oneshot
@@ -223,6 +262,7 @@ write_files:
       # Skip on live installer; pairs with the same gate on the main
       # post-bootstrap service. (KD-3b.)
       ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
       After=systemd-udev-settle.service
       Before=multi-user.target
 
@@ -302,8 +342,9 @@ write_files:
       [Unit]
       Description=Kairos k0s etcd-leave responder (ADR 0005 §E.3)
       ConditionKernelCommandLine=!cdroot
-      After=k0s.service
-      Wants=k0s.service
+      ConditionPathExists=!/run/cos/recovery_mode
+      After=k0scontroller.service
+      Wants=k0scontroller.service
 
       [Service]
       Type=oneshot
@@ -316,6 +357,7 @@ write_files:
       [Unit]
       Description=Poll for Kairos k0s etcd-leave requests (ADR 0005 §E.3)
       ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
 
       [Timer]
       OnBootSec=60
@@ -323,6 +365,57 @@ write_files:
 
       [Install]
       WantedBy=timers.target
+  # INIT-ORDERING (bare-metal lab, 2026-09-08). k0scontroller is enabled and
+  # started before the arguments meant for it exist on disk. BOTH delivery paths
+  # land afterwards: provider-kairos writes override.conf 3-4s late, and the
+  # write_files drop-in lands within the same second as the start, i.e. after
+  # systemd has loaded the unit. systemd picks the files up — the EFFECTIVE
+  # ExecStart is correct — but the running process keeps its original argv:
+  #
+  #   systemctl show -p ExecStart  ->  the full, correct command line
+  #   /proc/<pid>/cmdline          ->  k0s controller          (bare)
+  #
+  # Consequence: no worker role, so no kubelet, so the Node never registers, so
+  # the providerID patch times out and the control plane stalls at 0/3 joined.
+  # On a join node the missing flag is the token, and the controller initialises
+  # a cluster of its own instead of joining.
+  #
+  # NOT the mechanism ADR 0004 removed. That one was a oneshot ordered ahead of
+  # the k0s unit, which is an ordering cycle by construction and deadlocked the
+  # node with the apiserver down. This runs from the post-bootstrap unit, which is
+  # After=/Wants= only, and detaches the restart through systemd-run --no-block
+  # so the restart job is never part of the caller's transaction. It is also a
+  # no-op whenever the argv already matches, so a boot that won the race and
+  # every subsequent boot are untouched.
+  - path: /usr/local/bin/kairos-k0s-apply-args.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+      UNIT=k0scontroller.service
+
+      pid="$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)"
+      if [ -z "${pid}" ] || [ "${pid}" = "0" ] || [ ! -r "/proc/${pid}/cmdline" ]; then
+        exit 0
+      fi
+      running="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+      wanted="$(systemctl show -p ExecStart --value "${UNIT}" 2>/dev/null |
+                sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' || true)"
+      [ -n "${running}" ] && [ -n "${wanted}" ] || exit 0
+
+      # Collapse whitespace so a formatting difference is not read as a drift.
+      r="$(echo ${running})"
+      w="$(echo ${wanted})"
+      if [ "${r}" = "${w}" ]; then
+        exit 0
+      fi
+
+      echo "k0s started before its arguments existed; applying them"
+      echo "  running: ${r}"
+      echo "  wanted:  ${w}"
+      systemctl restart "${UNIT}" || true
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
     permissions: "0755"
     owner: root
@@ -330,6 +423,27 @@ write_files:
     content: |
       #!/bin/bash
       set -e
+      # Apply the k0s arguments if systemd started the controller before they
+      # existed (see /usr/local/bin/kairos-k0s-apply-args.sh). This has to happen
+      # before anything below: without the worker role there is no kubelet, so
+      # the Node never registers and every step that waits for it times out.
+      #
+      # Detached through systemd-run so the restart is its own transaction and
+      # can never block this unit; then wait for k0s to answer again.
+      if [ -x /usr/local/bin/kairos-k0s-apply-args.sh ]; then
+        if command -v systemd-run >/dev/null 2>&1; then
+          systemd-run --no-block --unit=kairos-k0s-apply-args --collect \
+            /usr/local/bin/kairos-k0s-apply-args.sh || true
+        else
+          setsid /usr/local/bin/kairos-k0s-apply-args.sh >/dev/null 2>&1 &
+        fi
+        for i in {1..60}; do
+          if k0s status >/dev/null 2>&1; then
+            break
+          fi
+          sleep 5
+        done
+      fi
       # CAPV self-discovery: ProviderID was not available at render time (assigned
       # after VM clone), so compute vsphere://<uuid> from DMI at boot.
       # KD-55: fail-OPEN. If the UUID is absent or malformed, warn and continue so
@@ -420,7 +534,7 @@ write_files:
       # host (set by the infrastructure provider) instead of an LB IP.
       push_kubeconfig() {
         local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
-        # Wait up to 5min for k0s to write admin.conf. After=k0s.service only
+        # Wait up to 5min for k0s to write admin.conf. After=k0scontroller.service only
         # orders against service activation, not bootstrap completion, so on
         # slower hosts (Hadron+CAPV lab finding) the file is not yet present
         # when this unit fires. Without this wait the unit silently abandons
@@ -684,6 +798,20 @@ write_files:
       chmod 0644 /run/cluster-api/bootstrap-success.complete
 
       echo "k0s post-bootstrap tasks completed successfully"
+  # Written LAST, deliberately. Everything k0s needs at start — the argument
+  # drop-ins, k0s.yaml, the join/worker token, the address resolver — is above
+  # this point, and yip writes files in order. An image can gate its k0s units on
+  # this path (ConditionPathExists=/etc/k0s/.capi-args-ready) so the unit can
+  # never start before this config has fully landed; the beskar7 image does
+  # exactly that at its initramfs stage. Without such a gate this file is inert.
+  # Rendered for every role: a worker needs it for k0sworker.service.
+  - path: /etc/k0s/.capi-args-ready
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      written by cluster-api-provider-kairos as the last of its write_files;
+      k0s may start once this exists
 stages:
   boot:
     - name: "Ensure SSH service is enabled"
