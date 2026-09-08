@@ -1183,9 +1183,22 @@ func TestRenderMetal3_K0sControlPlane(t *testing.T) {
 			t.Errorf("Metal3 k0s: removed pre-start mechanism must NOT appear: %q", gone)
 		}
 	}
-	if strings.Contains(result, "systemctl restart k0scontroller") {
-		t.Error("Metal3 k0s: must NOT restart k0scontroller (the pre-start restart deadlocked); providerID is set via post-bootstrap patch")
-	}
+	// The mechanism ADR 0004 removed was a PRE-START restart: a
+	// Before=k0scontroller oneshot, which is an ordering cycle by construction
+	// and deadlocked the node with the apiserver down. That ordering is already
+	// forbidden by the loop above, which is the part that actually matters.
+	//
+	// A restart from the post-bootstrap unit is a different thing and is now
+	// required: k0s is started before its arguments exist on disk, and systemd
+	// loading the drop-in afterwards does not change the argv of a process that
+	// is already running (measured 2026-09-08 — effective ExecStart correct,
+	// /proc/<pid>/cmdline bare). kairos-k0s-apply-args.sh restarts only when the
+	// live argv differs, from a unit that is After=/Wants= only, detached via
+	// systemd-run --no-block so it is never part of the caller's transaction.
+	//
+	// The invariant that survived is the ordering one, and the `gone` loop above
+	// already asserts it: Before=k0scontroller.service must not appear. The
+	// providerID is still set by the post-bootstrap patch, asserted below.
 
 	// (b) The post-bootstrap patch mechanism must be present: the function, the
 	// config-drive read (mounted ro,nodev,nosuid,noexec), the fail-closed UUID

@@ -1453,3 +1453,70 @@ func TestHA_K0sArgsDropInMatchesK0sArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestHA_K0sAppliesArgsAfterLateStart guards the corrective path for the k0s
+// init-ordering race.
+//
+// k0scontroller is enabled and started before the arguments meant for it exist
+// on disk, and BOTH delivery paths land afterwards. systemd loads the drop-ins —
+// the effective ExecStart is correct — but a process already running keeps its
+// original argv, measured on the lab as `systemctl show` returning the full
+// command line while /proc/<pid>/cmdline was a bare `k0s controller`. Only a
+// restart applies them.
+//
+// The restart must not look like the mechanism ADR 0004 removed: that was a
+// oneshot ordered ahead of the k0s unit, an ordering cycle by construction. This
+// one runs from the post-bootstrap unit (After=/Wants= only) and detaches via
+// systemd-run --no-block, and it must be conditional so a boot that won the race
+// is untouched.
+func TestHA_K0sAppliesArgsAfterLateStart(t *testing.T) {
+	for _, tc := range goldenCases() {
+		if !strings.HasPrefix(tc.name, "k0s_") {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render(tc.data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			for _, want := range []string{
+				"/usr/local/bin/kairos-k0s-apply-args.sh",
+				"systemd-run --no-block",
+				// conditional: compares live argv against the effective ExecStart
+				"/proc/${pid}/cmdline",
+				"systemctl show -p ExecStart --value",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("k0s control-plane render missing %q", want)
+				}
+			}
+
+			// The removed pre-start ordering must never come back.
+			if strings.Contains(out, "Before=k0scontroller.service") {
+				t.Error("reintroduced the pre-start ordering ADR 0004 removed (deadlocks the node)")
+			}
+
+			// The destructive branch exists only where it is provably safe: a JOIN
+			// controller whose live argv lacks the token flag did not join, so the
+			// state it created is a cluster of its own. It must never render for an
+			// init or single node, which legitimately own their state.
+			isJoin := strings.HasSuffix(tc.name, "_join")
+			hasWipe := strings.Contains(out, "self-initialised without its token")
+			if isJoin && !hasWipe {
+				t.Error("join render is missing the self-initialised-state reset; restarting with the " +
+					"token alone would leave it in the rival cluster it created")
+			}
+			if !isJoin && hasWipe {
+				t.Error("non-join render must NOT carry the state reset — an init node owns its own datastore")
+			}
+			if hasWipe {
+				for _, keep := range []string{"! -name bin", "! -name manifests"} {
+					if !strings.Contains(out, keep) {
+						t.Errorf("state reset must preserve %q (k0s binaries / the kube-vip manifest)", keep)
+					}
+				}
+			}
+		})
+	}
+}

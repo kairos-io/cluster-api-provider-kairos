@@ -119,6 +119,57 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
+  # INIT-ORDERING (bare-metal lab, 2026-09-08). k0scontroller is enabled and
+  # started before the arguments meant for it exist on disk. BOTH delivery paths
+  # land afterwards: provider-kairos writes override.conf 3-4s late, and the
+  # write_files drop-in lands within the same second as the start, i.e. after
+  # systemd has loaded the unit. systemd picks the files up — the EFFECTIVE
+  # ExecStart is correct — but the running process keeps its original argv:
+  #
+  #   systemctl show -p ExecStart  ->  the full, correct command line
+  #   /proc/<pid>/cmdline          ->  k0s controller          (bare)
+  #
+  # Consequence: no worker role, so no kubelet, so the Node never registers, so
+  # the providerID patch times out and the control plane stalls at 0/3 joined.
+  # On a join node the missing flag is the token, and the controller initialises
+  # a cluster of its own instead of joining.
+  #
+  # NOT the mechanism ADR 0004 removed. That one was a oneshot ordered ahead of
+  # the k0s unit, which is an ordering cycle by construction and deadlocked the
+  # node with the apiserver down. This runs from the post-bootstrap unit, which is
+  # After=/Wants= only, and detaches the restart through systemd-run --no-block
+  # so the restart job is never part of the caller's transaction. It is also a
+  # no-op whenever the argv already matches, so a boot that won the race and
+  # every subsequent boot are untouched.
+  - path: /usr/local/bin/kairos-k0s-apply-args.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+      UNIT=k0scontroller.service
+
+      pid="$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)"
+      if [ -z "${pid}" ] || [ "${pid}" = "0" ] || [ ! -r "/proc/${pid}/cmdline" ]; then
+        exit 0
+      fi
+      running="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+      wanted="$(systemctl show -p ExecStart --value "${UNIT}" 2>/dev/null |
+                sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' || true)"
+      [ -n "${running}" ] && [ -n "${wanted}" ] || exit 0
+
+      # Collapse whitespace so a formatting difference is not read as a drift.
+      r="$(echo ${running})"
+      w="$(echo ${wanted})"
+      if [ "${r}" = "${w}" ]; then
+        exit 0
+      fi
+
+      echo "k0s started before its arguments existed; applying them"
+      echo "  running: ${r}"
+      echo "  wanted:  ${w}"
+      systemctl restart "${UNIT}" || true
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
     permissions: "0755"
     owner: root
@@ -126,6 +177,27 @@ write_files:
     content: |
       #!/bin/bash
       set -e
+      # Apply the k0s arguments if systemd started the controller before they
+      # existed (see /usr/local/bin/kairos-k0s-apply-args.sh). This has to happen
+      # before anything below: without the worker role there is no kubelet, so
+      # the Node never registers and every step that waits for it times out.
+      #
+      # Detached through systemd-run so the restart is its own transaction and
+      # can never block this unit; then wait for k0s to answer again.
+      if [ -x /usr/local/bin/kairos-k0s-apply-args.sh ]; then
+        if command -v systemd-run >/dev/null 2>&1; then
+          systemd-run --no-block --unit=kairos-k0s-apply-args --collect \
+            /usr/local/bin/kairos-k0s-apply-args.sh || true
+        else
+          setsid /usr/local/bin/kairos-k0s-apply-args.sh >/dev/null 2>&1 &
+        fi
+        for i in {1..60}; do
+          if k0s status >/dev/null 2>&1; then
+            break
+          fi
+          sleep 5
+        done
+      fi
       # CAPV self-discovery: ProviderID was not available at render time (assigned
       # after VM clone), so compute vsphere://<uuid> from DMI at boot.
       # KD-55: fail-OPEN. If the UUID is absent or malformed, warn and continue so
