@@ -19,6 +19,7 @@ package infrastructure
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -64,12 +65,63 @@ func CloneInfrastructureMachine(ctx context.Context, c client.Client, scheme *ru
 	case "KairosFleetMachineTemplate":
 		return cloneKairosFleetMachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
 	default:
-		return nil, fmt.Errorf("unsupported infrastructure provider: %s (Group: %s, Version: %s, FullGVK: %s)",
-			kind,
-			templateRef.GroupVersionKind().Group,
-			templateRef.GroupVersionKind().Version,
-			templateRef.GroupVersionKind().String())
+		// Any other CAPI-conformant infrastructure provider. The provider contract
+		// requires <Kind>MachineTemplate.spec.template.spec to be the spec of the
+		// <Kind>Machine it produces, which is exactly what the cases above do, so a
+		// kind we have never heard of needs no bespoke code. Erroring here instead
+		// meant every new infrastructure provider was locked out until this switch
+		// was edited — the same defect that blocked KairosFleetMachineTemplate in
+		// v0.1.0 and, before this change, Beskar7MachineTemplate.
+		//
+		// The named cases stay because they carry behaviour this cannot infer: a
+		// fallback apiVersion for templates fetched without one, and KubeVirt's
+		// cloud-init filtering.
+		logger.Info("Cloning via the generic template contract", "kind", kind)
+		return cloneGenericMachineTemplate(ctx, c, scheme, templateObj, machineName, namespace, labels, annotations)
 	}
+}
+
+// cloneGenericMachineTemplate clones any <Kind>MachineTemplate into the
+// <Kind>Machine the CAPI contract pairs it with, by stripping the "Template"
+// suffix and copying spec.template.spec verbatim.
+//
+// Group and version come from the template object itself rather than a hardcoded
+// default: for an unknown provider we have no basis to guess a version, and the
+// object we were handed is authoritative.
+func cloneGenericMachineTemplate(ctx context.Context, c client.Client, scheme *runtime.Scheme, template *unstructured.Unstructured, machineName, namespace string, labels, annotations map[string]string) (client.Object, error) {
+	gvk := template.GroupVersionKind()
+
+	machineKind, ok := strings.CutSuffix(gvk.Kind, "Template")
+	if !ok || machineKind == "" {
+		return nil, fmt.Errorf("cannot derive an infrastructure machine kind from %q: "+
+			"the CAPI contract requires the template kind to be the machine kind plus a %q suffix", gvk.Kind, "Template")
+	}
+	if gvk.Version == "" {
+		return nil, fmt.Errorf("infrastructure template %s/%s has no apiVersion; cannot determine the machine apiVersion", namespace, template.GetName())
+	}
+
+	machine := &unstructured.Unstructured{}
+	machine.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   gvk.Group,
+		Version: gvk.Version,
+		Kind:    machineKind,
+	})
+	machine.SetName(machineName)
+	machine.SetNamespace(namespace)
+	machine.SetLabels(labels)
+	machine.SetAnnotations(annotations)
+
+	// Copy spec from template. An absent spec.template.spec is left alone rather
+	// than treated as an error, matching the named cases: some providers have a
+	// legitimately empty machine spec and take everything from the template's
+	// metadata or from the claimed host.
+	if spec, ok, _ := unstructured.NestedMap(template.UnstructuredContent(), "spec", "template", "spec"); ok {
+		if err := unstructured.SetNestedMap(machine.UnstructuredContent(), spec, "spec"); err != nil {
+			return nil, fmt.Errorf("failed to set spec: %w", err)
+		}
+	}
+
+	return machine, nil
 }
 
 func getTemplateObject(ctx context.Context, c client.Client, ref corev1.ObjectReference) (*unstructured.Unstructured, error) {

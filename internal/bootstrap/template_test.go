@@ -1643,3 +1643,48 @@ func TestRenderMetal3_NonMetal3RendersUnchanged(t *testing.T) {
 		})
 	}
 }
+
+// TestNoUnguardedVSphereProviderIDMint is a structural invariant, not a snapshot:
+// wherever a rendered cloud-config MINTS a providerID by reading the local DMI
+// product_uuid, that mint must be preceded by a vendor guard proving the node is
+// actually on vSphere.
+//
+// The catch-all render branch is "not Metal3, not fleet", which covers beskar7 and
+// any other third-party infrastructure provider — and every VM plus most bare
+// metal exposes a DMI product_uuid, so an unguarded mint hands those nodes
+// vsphere://<their-own-uuid>. Node.spec.providerID is immutable once the node
+// registers, so the node can never be matched to its Machine and the Machine never
+// leaves Provisioning.
+//
+// Reproduced on a beskar7 bare-metal k0s HA lab, 2026-09-08: sys_vendor "QEMU",
+// Node.spec.providerID set to vsphere://ecf16ed9-0c6a-a944-bf46-d1193f3ca762. The
+// k3s template had carried the guard since the CAPV fix; the k0s template had not,
+// which is exactly the drift this test exists to catch. It asserts the property
+// across BOTH distributions and BOTH infra variants, so a future mint added to any
+// one of the four templates cannot ship unguarded.
+func TestNoUnguardedVSphereProviderIDMint(t *testing.T) {
+	const mint = `PROVIDER_ID="vsphere://`
+	const guard = "sys_vendor"
+
+	for _, tc := range goldenCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render(tc.data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			rest := out
+			for n := 1; ; n++ {
+				i := strings.Index(rest, mint)
+				if i < 0 {
+					return // no (more) mints in this render
+				}
+				if !strings.Contains(rest[:i], guard) {
+					t.Errorf("mint #%d of %q is not preceded by a %q vendor guard — "+
+						"a non-vSphere node would be given vsphere://<its own DMI uuid>, "+
+						"which is immutable once the Node registers", n, mint, guard)
+				}
+				rest = rest[i+len(mint):]
+			}
+		})
+	}
+}

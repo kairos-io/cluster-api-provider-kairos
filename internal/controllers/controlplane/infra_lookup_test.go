@@ -201,3 +201,83 @@ func TestGetNodeIP_KairosFleetMachine(t *testing.T) {
 		t.Errorf("getNodeIP(KairosFleetMachine) = %q, want empty", ip)
 	}
 }
+
+// makeThirdPartyInfraMachine builds an infra machine for a provider getNodeIP has
+// no case for. Beskar7 is the concrete example: a bare-metal provider whose nodes
+// self-discover their providerID on-node.
+func makeThirdPartyInfraMachine(kind, name, namespace string, addresses []map[string]interface{}) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    kind,
+	})
+	obj.SetName(name)
+	obj.SetNamespace(namespace)
+	if len(addresses) > 0 {
+		addrs := make([]interface{}, len(addresses))
+		for i, a := range addresses {
+			addrs[i] = a
+		}
+		_ = unstructured.SetNestedSlice(obj.Object, addrs, "status", "addresses")
+	}
+	return obj
+}
+
+// An infrastructure provider with no case of its own must go through the generic
+// contract path: read the contract-mandated status.addresses, and report "no IP"
+// without an error when there is none. Previously this returned "unsupported
+// infrastructure provider", which turned a healthy control plane into a failure.
+func TestGetNodeIP_UnknownProviderUsesContractAddresses(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = bootstrapv1beta2.AddToScheme(scheme)
+	_ = controlplanev1beta2.AddToScheme(scheme)
+	_ = apiextensionsv1.AddToScheme(scheme)
+
+	for _, tc := range []struct {
+		name      string
+		addresses []map[string]interface{}
+		wantIP    string
+	}{
+		{
+			name:      "InternalIP is returned",
+			addresses: []map[string]interface{}{{"type": "InternalIP", "address": "192.168.190.60"}},
+			wantIP:    "192.168.190.60",
+		},
+		{
+			// The self-discovering case: Beskar7 injects the providerID on-node, so
+			// a host that publishes no address is normal, not broken.
+			name:      "no addresses is not an error",
+			addresses: nil,
+			wantIP:    "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			machine := &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Namespace: "default"},
+				Spec: clusterv1.MachineSpec{
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						APIGroup: "infrastructure.cluster.x-k8s.io",
+						Kind:     "Beskar7Machine",
+						Name:     "test-b7m",
+					},
+				},
+			}
+			infra := makeThirdPartyInfraMachine("Beskar7Machine", "test-b7m", "default", tc.addresses)
+			crd := makeInfraCRD("infrastructure.cluster.x-k8s.io", "Beskar7Machine", "v1beta1")
+
+			r := &KairosControlPlaneReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(crd, infra).Build(),
+				Scheme: scheme,
+			}
+
+			ip, err := r.getNodeIP(context.Background(), log.Log, machine)
+			if err != nil {
+				t.Fatalf("getNodeIP(Beskar7Machine) unexpected error: %v", err)
+			}
+			if ip != tc.wantIP {
+				t.Errorf("getNodeIP(Beskar7Machine) = %q, want %q", ip, tc.wantIP)
+			}
+		})
+	}
+}

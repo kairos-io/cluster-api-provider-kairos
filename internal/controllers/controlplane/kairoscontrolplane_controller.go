@@ -119,10 +119,15 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 // create;get access as the other infra kinds. Metal3Cluster, KairosFleetCluster, and
 // BareMetalHost are deliberately absent: we never read them (CAPI core copies the
 // endpoint per KD-12; CAPM3 mediates BMH; the fleet provider owns its own Cluster).
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines;metal3machines;kairosfleetmachines,verbs=create;get
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status;kubevirtmachines/status;dockermachines/status;metal3machines/status;kairosfleetmachines/status,verbs=get
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates;kubevirtmachinetemplates;dockermachinetemplates;metal3machinetemplates;kairosfleetmachinetemplates,verbs=get
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,verbs=get
+// Infrastructure resources are granted by GROUP, not by an enumerated list of
+// resource names. A control-plane provider has to clone a machine template and
+// read the machine for whichever infrastructure provider the user picked, and
+// that set is open-ended: enumerating it meant every new provider was denied at
+// the API server until this line was edited, with the failure surfacing only as
+// an opaque "is forbidden" on the KairosControlPlane. Cluster API's own core
+// controller grants the infrastructure group the same way and for the same
+// reason. Verbs stay minimal — this is a wildcard over resources, not verbs.
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
 // customresourcedefinitions (contract-versioned ref resolution, ADR 0006) and
 // events both live in internal/controllers/shared — both managers need them.
 // services;endpoints: the control-plane manager owns the LB Service and reads

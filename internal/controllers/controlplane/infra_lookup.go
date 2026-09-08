@@ -128,7 +128,22 @@ func (r *KairosControlPlaneReconciler) getNodeIP(ctx context.Context, log logr.L
 		// helper is rewired. See ADR 0008.
 		return "", nil
 	default:
-		return "", fmt.Errorf("unsupported infrastructure provider: %s", machine.Spec.InfrastructureRef.Kind)
+		// Any other CAPI-conformant infrastructure provider. status.addresses is
+		// contract-mandated on an infra machine and uses the standard
+		// MachineAddresses shape, so the generic extractor already understands it —
+		// there is nothing provider-specific left to special-case.
+		//
+		// Report "no IP" WITHOUT an error when nothing is published, for the same
+		// reason as KairosFleetMachine above: the only consumer is the opt-in,
+		// non-fatal SSH-fallback path, which treats an empty address as "nothing to
+		// dial". Providers whose nodes self-discover their providerID on-node (the
+		// Kairos fleet provider, Beskar7) legitimately publish no routable address,
+		// and that must not be reported as a failure.
+		infraMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+		if err != nil {
+			return "", fmt.Errorf("failed to get %s: %w", machine.Spec.InfrastructureRef.Kind, err)
+		}
+		return r.extractIPFromUnstructured(infraMachine), nil
 	}
 }
 

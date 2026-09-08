@@ -94,9 +94,11 @@ type KairosConfigReconciler struct {
 // providerID, so getProviderID has no Metal3 case (ADR 0004); the control-plane
 // getNodeIP path is what Gets Metal3Machine. No create/update/patch/delete on
 // infra Machines from this controller.
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;dockermachines,verbs=get
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines;kubevirtmachines;metal3machines,verbs=list;watch
-//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachines/status,verbs=get
+// Read-only across the infrastructure group: the bootstrap controller inspects
+// whichever infra machine backs the Machine to decide whether to wait for a
+// providerID, and that kind is chosen by the user. See the note on the
+// control-plane controller's marker.
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=*,verbs=get;list;watch
 //+kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
 // Secrets: this controller writes and owns the bootstrap-data Secret (and the
 // CAPK kubeconfig-push Secret). events lives in internal/controllers/shared
@@ -261,92 +263,20 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		currentProviderID = ""
 	}
 
-	// For VSphere: Only wait for providerID if VSphereMachine is Ready (VM already provisioned)
-	// If VSphereMachine is not Ready yet, allow secret creation so VM can be provisioned
-	// This avoids circular dependency: VM needs bootstrap secret to be created, but providerID is set after VM creation
-	if machine != nil && machine.Spec.InfrastructureRef.Kind == "VSphereMachine" && currentProviderID == "" {
-		vsphereMachine := &unstructured.Unstructured{}
-		vsphereMachine.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "infrastructure.cluster.x-k8s.io",
-			Version: "v1beta1",
-			Kind:    "VSphereMachine",
-		})
-		vsphereMachineKey := types.NamespacedName{
-			Name:      machine.Spec.InfrastructureRef.Name,
-			Namespace: machine.Namespace,
-		}
-
-		if err := r.Get(ctx, vsphereMachineKey, vsphereMachine); err == nil {
-			// Check if VSphereMachine is Ready (VM provisioned)
-			// Look for Ready condition in status.conditions array
-			conditions, found, _ := unstructured.NestedSlice(vsphereMachine.Object, "status", "conditions")
-			isReady := false
-			if found {
-				for _, cond := range conditions {
-					condMap, ok := cond.(map[string]interface{})
-					if ok {
-						condType, _ := condMap["type"].(string)
-						condStatus, _ := condMap["status"].(string)
-						if condType == "Ready" && condStatus == "True" {
-							isReady = true
-							break
-						}
-					}
-				}
-			}
-
-			// Only wait for providerID if VM is already Ready (provisioned)
-			// If VM is not Ready yet, proceed with secret creation (VM needs bootstrap secret to be created first)
-			if isReady {
-				log.V(4).Info("VSphereMachine is Ready but providerID not yet set, waiting briefly for CAPV to set it",
-					"machine", machine.Name,
-					"vsphereMachine", vsphereMachineKey.Name)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			// If VM is not Ready yet, proceed with secret creation - this allows VM to be provisioned
-			log.V(5).Info("VSphereMachine not Ready yet, proceeding with bootstrap secret creation",
-				"machine", machine.Name,
-				"vsphereMachine", vsphereMachineKey.Name)
-		}
-	}
-
-	// For CAPK: Only wait for providerID if KubevirtMachine is Ready (VM already provisioned)
-	// If KubevirtMachine is not Ready yet, allow secret creation so VM can be provisioned
-	if machine != nil && (machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine") && currentProviderID == "" {
-		kubevirtMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
-		if err == nil {
-			isReady := false
-			if ready, found, _ := unstructured.NestedBool(kubevirtMachine.Object, "status", "ready"); found && ready {
-				isReady = true
-			}
-			if !isReady {
-				conditions, found, _ := unstructured.NestedSlice(kubevirtMachine.Object, "status", "conditions")
-				if found {
-					for _, cond := range conditions {
-						condMap, ok := cond.(map[string]interface{})
-						if ok {
-							condType, _ := condMap["type"].(string)
-							condStatus, _ := condMap["status"].(string)
-							if condType == "Ready" && condStatus == "True" {
-								isReady = true
-								break
-							}
-						}
-					}
-				}
-			}
-
-			if isReady {
-				log.V(4).Info("KubevirtMachine is Ready but providerID not yet set, waiting briefly for CAPK to set it",
-					"machine", machine.Name,
-					"kubevirtMachine", machine.Spec.InfrastructureRef.Name)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-
-			log.V(5).Info("KubevirtMachine not Ready yet, proceeding with bootstrap secret creation",
-				"machine", machine.Name,
-				"kubevirtMachine", machine.Spec.InfrastructureRef.Name)
-		}
+	// Wait briefly for the infrastructure provider to publish a providerID, for
+	// ANY provider rather than a hardcoded list of kinds.
+	//
+	// The rule is a property of the CAPI contract, not of a particular provider:
+	// while the infra machine is not Ready the bootstrap secret must be created,
+	// because the machine cannot be provisioned without it — waiting there would
+	// deadlock. Once the infra machine IS Ready the providerID is imminent, so a
+	// short requeue avoids baking a config that lacks it.
+	//
+	// Gating this on kind meant third-party providers skipped the wait entirely
+	// and rendered a config with no providerID, which is exactly the window in
+	// which a stale or fabricated value can win on the node.
+	if res, wait := r.waitForInfraProviderID(ctx, log, machine, currentProviderID); wait {
+		return res, nil
 	}
 
 	// If Machine has a bootstrap dataSecretName that differs from status, align to Machine to avoid duplicates.
@@ -663,6 +593,72 @@ func isKubevirtMachine(machine *clusterv1.Machine) bool {
 	return machine.Spec.InfrastructureRef.Kind == "KubevirtMachine" || machine.Spec.InfrastructureRef.Kind == "KubeVirtMachine"
 }
 
+// waitForInfraProviderID reports whether to requeue while the infrastructure
+// provider finishes publishing a providerID.
+//
+// It returns (result, true) to requeue, or (zero, false) to proceed. Proceeding
+// is the default: the infra machine cannot become Ready until the bootstrap
+// secret exists, so blocking on a providerID that only appears after
+// provisioning would deadlock.
+//
+// Metal3 and the Kairos fleet provider are exempt because they deliberately do
+// not embed a providerID in the secret at all — CAPM3 owns Node.spec.providerID
+// (ADR 0004) and a fleet node self-discovers it (ADR 0008) — so waiting for one
+// would never terminate.
+func (r *KairosConfigReconciler) waitForInfraProviderID(ctx context.Context, log logr.Logger, machine *clusterv1.Machine, currentProviderID string) (ctrl.Result, bool) {
+	if machine == nil || currentProviderID != "" {
+		return ctrl.Result{}, false
+	}
+	if isMetal3Machine(machine) || isFleetMachine(machine) {
+		return ctrl.Result{}, false
+	}
+
+	infraMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+	if err != nil {
+		// Not yet created, or not readable. Proceed — the secret is a
+		// precondition for it existing at all.
+		return ctrl.Result{}, false
+	}
+
+	if !infraMachineReady(infraMachine) {
+		log.V(5).Info("Infrastructure machine not Ready yet, proceeding with bootstrap secret creation",
+			"machine", machine.Name,
+			"infrastructureKind", machine.Spec.InfrastructureRef.Kind,
+			"infrastructureMachine", machine.Spec.InfrastructureRef.Name)
+		return ctrl.Result{}, false
+	}
+
+	log.V(4).Info("Infrastructure machine is Ready but providerID not yet set, waiting briefly for the provider to set it",
+		"machine", machine.Name,
+		"infrastructureKind", machine.Spec.InfrastructureRef.Kind,
+		"infrastructureMachine", machine.Spec.InfrastructureRef.Name)
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, true
+}
+
+// infraMachineReady reports readiness from either status.ready or a Ready
+// condition. Both are in use across providers, so check both.
+func infraMachineReady(infraMachine *unstructured.Unstructured) bool {
+	if ready, found, _ := unstructured.NestedBool(infraMachine.Object, "status", "ready"); found && ready {
+		return true
+	}
+	conditions, found, _ := unstructured.NestedSlice(infraMachine.Object, "status", "conditions")
+	if !found {
+		return false
+	}
+	for _, cond := range conditions {
+		condMap, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := condMap["type"].(string); t == "Ready" {
+			if st, _ := condMap["status"].(string); st == "True" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // supportsManagementEndpoint returns true for infrastructure kinds whose
 // control-plane Machines run the in-node kubeconfig-push block (KD-3b).
 //
@@ -685,11 +681,33 @@ func supportsManagementEndpoint(machine *clusterv1.Machine) bool {
 	if machine == nil {
 		return false
 	}
-	switch machine.Spec.InfrastructureRef.Kind {
-	case "KubevirtMachine", "KubeVirtMachine", "VSphereMachine", "Metal3Machine", "KairosFleetMachine":
-		return true
+	// Opt-out, not an allowlist. The rationale above — a node with a routable
+	// address pushing its kubeconfig back because the management cluster cannot
+	// always dial the workload API server — is a property of the topology, not of
+	// any particular infrastructure provider, and it is if anything MORE true for
+	// bare-metal providers on isolated provisioning networks.
+	//
+	// An allowlist silently withheld the push block from every provider not named
+	// here, so their control-plane nodes never published a kubeconfig and the
+	// KairosControlPlane never reached Initialized — with no error to explain it.
+	// Defaulting to enabled is safe because the resolver may return (nil, nil) as
+	// a "disabled" signal, which is already handled as "no push block".
+	//
+	// An absent kind means there is no infrastructure ref to reason about; do not
+	// enable the push block on the strength of a blank.
+	if machine.Spec.InfrastructureRef.Kind == "" {
+		return false
 	}
-	return false
+
+	// List a kind here only if it is known NOT to support the push block.
+	switch machine.Spec.InfrastructureRef.Kind {
+	case "DockerMachine":
+		// CAPD containers share the management cluster's network namespace only
+		// incidentally, and the docker provider is a test harness rather than a
+		// deployment target; keep its previous behaviour.
+		return false
+	}
+	return true
 }
 
 // isMetal3Machine reports whether machine is backed by CAPM3 (Metal3Machine).

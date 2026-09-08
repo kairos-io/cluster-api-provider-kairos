@@ -20,6 +20,8 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -217,5 +219,115 @@ func TestCloneKairosFleetMachineTemplate(t *testing.T) {
 				t.Errorf("spec.group = %q, want %q", group, "control-plane")
 			}
 		})
+	}
+}
+
+// makeThirdPartyMachineTemplate builds a template for an infrastructure provider
+// this package has never heard of. Beskar7 (a bare-metal provider) is used as the
+// concrete example because it is what exposed the defect.
+func makeThirdPartyMachineTemplate(kind, version string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: version,
+		Kind:    kind,
+	})
+	obj.SetName("tmpl")
+	obj.SetNamespace("default")
+	_ = unstructured.SetNestedMap(obj.Object, map[string]interface{}{
+		"template": map[string]interface{}{
+			"spec": map[string]interface{}{
+				"inspectionImageURL": "http://boot.example:8090",
+				"targetImageURL":     "http://boot.example:8090/os.raw",
+				"targetImageDigest":  "sha256:deadbeef",
+			},
+		},
+	}, "spec")
+	return obj
+}
+
+// An infrastructure provider with no case in the switch must still clone, via the
+// generic template->machine contract. Before this, CloneInfrastructureMachine
+// returned "unsupported infrastructure provider" and no third-party provider
+// could back a KairosControlPlane.
+func TestCloneInfrastructureMachine_UnknownProviderUsesGenericContract(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		kind        string
+		version     string
+		wantKind    string
+		wantVersion string
+	}{
+		{"beskar7 v1beta1", "Beskar7MachineTemplate", "v1beta1", "Beskar7Machine", "v1beta1"},
+		{"version is taken from the template, not guessed", "Beskar7MachineTemplate", "v1beta2", "Beskar7Machine", "v1beta2"},
+		{"any other provider", "AcmeMachineTemplate", "v1alpha7", "AcmeMachine", "v1alpha7"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpl := makeThirdPartyMachineTemplate(tc.kind, tc.version)
+			c := fake.NewClientBuilder().WithRuntimeObjects(tmpl).Build()
+
+			obj, err := CloneInfrastructureMachine(context.Background(), c, runtime.NewScheme(),
+				templateRef(tc.kind, tc.version), "test-machine", "default",
+				map[string]string{"cluster.x-k8s.io/cluster-name": "test-cluster"},
+				map[string]string{"test-key": "test-value"})
+			if err != nil {
+				t.Fatalf("CloneInfrastructureMachine() error = %v, want nil", err)
+			}
+
+			u, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("got %T, want *unstructured.Unstructured", obj)
+			}
+			gvk := u.GroupVersionKind()
+			if gvk.Kind != tc.wantKind {
+				t.Errorf("Kind = %q, want %q", gvk.Kind, tc.wantKind)
+			}
+			if gvk.Version != tc.wantVersion {
+				t.Errorf("Version = %q, want %q — the template's version must be preserved", gvk.Version, tc.wantVersion)
+			}
+			if gvk.Group != "infrastructure.cluster.x-k8s.io" {
+				t.Errorf("Group = %q, want infrastructure.cluster.x-k8s.io", gvk.Group)
+			}
+			if u.GetName() != "test-machine" || u.GetNamespace() != "default" {
+				t.Errorf("name/namespace = %q/%q, want test-machine/default", u.GetName(), u.GetNamespace())
+			}
+			if u.GetLabels()["cluster.x-k8s.io/cluster-name"] != "test-cluster" {
+				t.Errorf("labels not propagated")
+			}
+			if u.GetAnnotations()["test-key"] != "test-value" {
+				t.Errorf("annotations not propagated")
+			}
+
+			// spec.template.spec copied verbatim to spec.
+			got, _, _ := unstructured.NestedString(u.Object, "spec", "targetImageURL")
+			if got != "http://boot.example:8090/os.raw" {
+				t.Errorf("spec.targetImageURL = %q, want the value from spec.template.spec", got)
+			}
+			if _, found, _ := unstructured.NestedMap(u.Object, "spec", "template"); found {
+				t.Errorf("spec.template must not be carried onto the machine")
+			}
+		})
+	}
+}
+
+// A kind that is not <Something>Template cannot be mapped to a machine kind, and
+// must fail loudly rather than producing a nonsense object.
+func TestCloneInfrastructureMachine_KindWithoutTemplateSuffix(t *testing.T) {
+	tmpl := makeThirdPartyMachineTemplate("Beskar7Machine", "v1beta1") // not a Template
+	c := fake.NewClientBuilder().WithRuntimeObjects(tmpl).Build()
+
+	_, err := CloneInfrastructureMachine(context.Background(), c, runtime.NewScheme(),
+		templateRef("Beskar7Machine", "v1beta1"), "test-machine", "default", nil, nil)
+	if err == nil {
+		t.Fatal("expected an error for a kind without a Template suffix, got nil")
+	}
+}
+
+func templateRef(kind, version string) corev1.ObjectReference {
+	return corev1.ObjectReference{
+		APIVersion: "infrastructure.cluster.x-k8s.io/" + version,
+		Kind:       kind,
+		Name:       "tmpl",
+		Namespace:  "default",
 	}
 }

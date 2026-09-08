@@ -343,7 +343,20 @@ write_files:
       # used in the k3s CAPV template.
       export KUBECONFIG=/var/lib/k0s/pki/admin.conf
       PROVIDER_ID=""
-      if [ -f /sys/class/dmi/id/product_uuid ]; then
+      # This branch is the CATCH-ALL for every non-Metal3, non-Fleet provider, not
+      # just CAPV — so it must prove it is on vSphere before minting a vsphere://
+      # providerID. Every VM and most bare metal exposes a DMI product_uuid, so
+      # without this guard a beskar7 (or any other) node is handed
+      # vsphere://<its-own-DMI-uuid>. Node.spec.providerID is IMMUTABLE once the
+      # node registers, so a wrong value permanently breaks Machine-to-Node
+      # matching and the Machine never leaves Provisioning.
+      #
+      # Same guard as the k3s CAPV template; reproduced on a beskar7 bare-metal
+      # k0s HA lab on 2026-09-08, where this branch was the only providerID path
+      # the render produced.
+      if [ -r /sys/class/dmi/id/sys_vendor ] && ! grep -qi vmware /sys/class/dmi/id/sys_vendor; then
+        echo "not a VMware VM; leaving providerID to the infrastructure provider"
+      elif [ -f /sys/class/dmi/id/product_uuid ]; then
         RAW=$(cat /sys/class/dmi/id/product_uuid | tr -d ' \n\r')
         HEX=$(echo "$RAW" | tr -d '-' | tr '[:upper:]' '[:lower:]')
         if [ -n "$HEX" ] && [ ${#HEX} -eq 32 ]; then
