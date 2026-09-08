@@ -1520,3 +1520,128 @@ func TestHA_K0sAppliesArgsAfterLateStart(t *testing.T) {
 		})
 	}
 }
+
+// k0sRenders returns every k0s golden render plus a worker render, so
+// worker-only units (k0sworker.service) are covered as well.
+func k0sRenders(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, tc := range goldenCases() {
+		if !strings.HasPrefix(tc.name, "k0s_") {
+			continue
+		}
+		s, err := tc.render(tc.data)
+		if err != nil {
+			t.Fatalf("render %s: %v", tc.name, err)
+		}
+		out[tc.name] = s
+	}
+	w := haCPData("single", false)
+	w.Role = "worker"
+	w.ControlPlaneRole = ""
+	w.WorkerToken = "k0s-worker-join-token"
+	s, err := RenderK0sCloudConfig(w)
+	if err != nil {
+		t.Fatalf("render k0s worker: %v", err)
+	}
+	out["k0s_capv_worker"] = s
+	return out
+}
+
+// TestK0s_ArgsReadyMarkerIsLastFile guards the contract an image gate relies on:
+// /etc/k0s/.capi-args-ready is written LAST, after every file k0s needs at
+// start. yip writes files in order, so "the marker exists" means "the drop-ins,
+// k0s.yaml, the token and the resolver all exist". The beskar7 image gates its
+// k0s units on this path at the initramfs stage, which is what stops the
+// installer-boot join and the bare first start (2026-09-08 lab).
+func TestK0s_ArgsReadyMarkerIsLastFile(t *testing.T) {
+	for name, out := range k0sRenders(t) {
+		t.Run(name, func(t *testing.T) {
+			var last string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "  - path: ") {
+					last = strings.TrimPrefix(line, "  - path: ")
+				}
+			}
+			if last != "/etc/k0s/.capi-args-ready" {
+				t.Errorf("last write_files entry is %q, want /etc/k0s/.capi-args-ready — a gate on the "+
+					"marker would then admit a k0s start before %q has landed", last, last)
+			}
+		})
+	}
+}
+
+// TestK0s_UnitsNameRealServices: the post-bootstrap units ordered on
+// `k0s.service` / `k0s-worker.service`, neither of which exists — the units are
+// k0scontroller.service and k0sworker.service. systemd keeps unknown names in
+// After= without effect, so the post-bootstrap script, and everything it
+// spawns, ran with no ordering against the controller at all.
+func TestK0s_UnitsNameRealServices(t *testing.T) {
+	for name, out := range k0sRenders(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, phantom := range []string{"After=k0s.service", "Wants=k0s.service", "k0s-worker.service"} {
+				if strings.Contains(out, phantom) {
+					t.Errorf("render orders on %q, a unit that does not exist", phantom)
+				}
+			}
+			want := "After=k0scontroller.service"
+			if strings.HasSuffix(name, "_worker") {
+				want = "After=k0sworker.service"
+			}
+			if !strings.Contains(out, want) {
+				t.Errorf("render missing %q", want)
+			}
+			if strings.Contains(out, "Before=k0scontroller.service") {
+				t.Error("must not order ahead of the controller (ADR 0004 deadlock)")
+			}
+		})
+	}
+}
+
+// TestK0s_UnitsSkipRecoveryBoot: every unit the provider writes that already
+// skips the live installer (!cdroot) must also skip a recovery/install boot,
+// which does not carry cdroot, and the args drop-in must refuse to start k0s
+// with its arguments there. Observed: a join node registered as a voting etcd
+// member from its recovery boot and was rebooted 19s later by the installer.
+func TestK0s_UnitsSkipRecoveryBoot(t *testing.T) {
+	const cdroot = "ConditionKernelCommandLine=!cdroot"
+	const recovery = "ConditionPathExists=!/run/cos/recovery_mode"
+	for name, out := range k0sRenders(t) {
+		t.Run(name, func(t *testing.T) {
+			nc, nr := strings.Count(out, cdroot), strings.Count(out, recovery)
+			if nc == 0 {
+				t.Fatal("no live-installer condition rendered at all — template shape changed")
+			}
+			// one recovery condition per cdroot site, plus one on the args drop-in
+			// (control-plane renders only; workers have no controller drop-in)
+			wantExtra := 1
+			if strings.HasSuffix(name, "_worker") {
+				wantExtra = 0
+			}
+			if nr != nc+wantExtra {
+				t.Errorf("%d recovery-mode conditions for %d live-installer conditions (want %d)", nr, nc, nc+wantExtra)
+			}
+			if wantExtra == 1 {
+				body, ok := writeFileBody(out, "/etc/systemd/system/k0scontroller.service.d/zz-capi-args.conf")
+				if !ok || !strings.Contains(body, recovery) {
+					t.Error("args drop-in lacks the recovery-mode condition; the plugin's restart would join from an installer boot")
+				}
+			}
+		})
+	}
+}
+
+// writeFileBody returns the `content:` body of a write_files entry for path.
+func writeFileBody(out, path string) (string, bool) {
+	marker := "- path: " + path + "\n"
+	i := strings.Index(out, marker)
+	if i < 0 {
+		return "", false
+	}
+	rest := out[i+len(marker):]
+	// The entry ends at the next list item at the same indentation.
+	if j := strings.Index(rest, "\n  - path: "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest, true
+}

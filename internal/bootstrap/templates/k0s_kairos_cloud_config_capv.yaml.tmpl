@@ -180,6 +180,14 @@ write_files:
     owner: root
     group: root
     content: |
+      [Unit]
+      # Never start with these arguments inside a recovery/install boot: on
+      # a join node that is a real controller-join, registered as a voter,
+      # that the installer then reboots out from under the cluster (measured
+      # on the beskar7 lab, 2026-09-08). The bare first start cannot join —
+      # it has no token and this drop-in is not loaded yet — and every start
+      # that carries the token follows a reload that also loads this file.
+      ConditionPathExists=!/run/cos/recovery_mode
       [Service]
       ExecStart=
       ExecStart=/usr/bin/k0s controller{{ if .SingleNode }}{{ if .K0sSingleNode }} --single{{ else }} --enable-worker{{ end }}{{ end }}{{ if or .PodCIDR .ServiceCIDR .IsInitControlPlane }} --config /etc/k0s/k0s.yaml{{ end }}{{ if .IsJoinControlPlane }} --token-file=/etc/k0s/controller-token{{ end }}{{ if .RenderKubeVIP }} --enable-worker{{ end }}{{ if and .ProviderID (not .Metal3) }} --kubelet-extra-args=--provider-id={{ .ProviderID }}{{ end }}
@@ -358,12 +366,13 @@ write_files:
       # up cloud-init's runcmd and preventing kairos-agent from rebooting
       # into the installed system. (KD-3b lab finding on Hadron.)
       ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
       {{- if eq .Role "control-plane" }}
-      After=k0s.service
-      Wants=k0s.service
+      After=k0scontroller.service
+      Wants=k0scontroller.service
       {{- else }}
-      After=k0s-worker.service
-      Wants=k0s-worker.service
+      After=k0sworker.service
+      Wants=k0sworker.service
       {{- end }}
 
       [Service]
@@ -383,6 +392,7 @@ write_files:
       # Skip on live installer; pairs with the same gate on the main
       # post-bootstrap service. (KD-3b.)
       ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
       After=systemd-udev-settle.service
       Before=multi-user.target
 
@@ -469,8 +479,9 @@ write_files:
       [Unit]
       Description=Kairos k0s etcd-leave responder (ADR 0005 §E.3)
       ConditionKernelCommandLine=!cdroot
-      After=k0s.service
-      Wants=k0s.service
+      ConditionPathExists=!/run/cos/recovery_mode
+      After=k0scontroller.service
+      Wants=k0scontroller.service
 
       [Service]
       Type=oneshot
@@ -483,6 +494,7 @@ write_files:
       [Unit]
       Description=Poll for Kairos k0s etcd-leave requests (ADR 0005 §E.3)
       ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
 
       [Timer]
       OnBootSec=60
@@ -959,7 +971,7 @@ MANIFEST_EOF
       # host (set by the infrastructure provider) instead of an LB IP.
       push_kubeconfig() {
         local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
-        # Wait up to 5min for k0s to write admin.conf. After=k0s.service only
+        # Wait up to 5min for k0s to write admin.conf. After=k0scontroller.service only
         # orders against service activation, not bootstrap completion, so on
         # slower hosts (Hadron+CAPV lab finding) the file is not yet present
         # when this unit fires. Without this wait the unit silently abandons
@@ -1239,6 +1251,20 @@ MANIFEST_EOF
   {{- end }}
 
 {{- /* DNS overrides */}}
+  # Written LAST, deliberately. Everything k0s needs at start — the argument
+  # drop-ins, k0s.yaml, the join/worker token, the address resolver — is above
+  # this point, and yip writes files in order. An image can gate its k0s units on
+  # this path (ConditionPathExists=/etc/k0s/.capi-args-ready) so the unit can
+  # never start before this config has fully landed; the beskar7 image does
+  # exactly that at its initramfs stage. Without such a gate this file is inert.
+  # Rendered for every role: a worker needs it for k0sworker.service.
+  - path: /etc/k0s/.capi-args-ready
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      written by cluster-api-provider-kairos as the last of its write_files;
+      k0s may start once this exists
 stages:
   boot:
     {{- if and .IsFleet (not .ProviderID) (ne .Role "control-plane") }}
