@@ -79,6 +79,10 @@ k3s:
     # file the joiners read (written below for every HA role). Without it
     # --cluster-init auto-generates a random token the joiners can never match.
     # (ADR 0005 Phase 3, BLOCKER-1.)
+    #
+    # NOTE: these args arrive via a systemd override written ~3s AFTER
+    # k3s.service first starts — too late to choose the datastore.
+    # 93-ha-datastore.yaml (write_files, below) pins them in config.yaml.d.
     - --cluster-init
     - --token-file=/etc/rancher/k3s/server-token
   {{- else if .IsJoinControlPlane }}
@@ -260,6 +264,31 @@ write_files:
     group: root
     content: |
       {{ .JoinToken }}
+  {{- end }}
+  {{- if .IsHAControlPlane }}
+  # ADR 0005 (HA) datastore/join flags on CAPK — INIT-ORDERING (bare-metal
+  # lab, 2026-09-07).
+  # Same root cause as the CAPV template: k3s selects its datastore on its FIRST
+  # start and never migrates, but provider-kairos writes the `k3s.args:` systemd
+  # override ~3s AFTER k3s.service has already started. k3s therefore comes up as
+  # a plain `k3s server` on SQLite with a random server token, and --cluster-init
+  # / --server / --token-file are ignored for the life of the node: the init node
+  # reports "etcd disabled" and every joiner forms its own single-node cluster.
+  #
+  # config.yaml.d is read on EVERY start and write_files lands before the first
+  # one, so the datastore/join flags are pinned here too. Values match the
+  # k3s.args ones exactly, so the late override is a no-op when it arrives.
+  - path: /etc/rancher/k3s/config.yaml.d/93-ha-datastore.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      {{- if .IsInitControlPlane }}
+      cluster-init: true
+      {{- else if .ControlPlaneLBEndpoint }}
+      server: {{ printf "https://%s:6443" .ControlPlaneLBEndpoint | quote }}
+      {{- end }}
+      token-file: /etc/rancher/k3s/server-token
   {{- end }}
   {{- if and (ne .Role "control-plane") .K3sToken }}
   - path: /etc/rancher/k3s/token
