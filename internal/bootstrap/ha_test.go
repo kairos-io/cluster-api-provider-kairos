@@ -1645,3 +1645,125 @@ func writeFileBody(out, path string) (string, bool) {
 	}
 	return rest, true
 }
+
+// TestHA_K0sApiAddressResolved guards the CAPV port of CAPK's api.address
+// mechanism, and the invariant that makes it safe: a sentinel is only ever
+// written together with something that resolves it.
+//
+// A bare-metal HA node is dual-homed — an isolated provisioning NIC plus a
+// routable one — exactly like a KubeVirt node behind masquerade. With no
+// spec.api.address, k0s picks an advertise address itself. On the beskar7 lab
+// (2026-09-08) it chose the provisioning address, `k0s token create` baked that
+// into the controller-join token, and every joiner failed with
+//
+//	failed to join existing cluster via https://192.168.190.61:9443:
+//	  Get ".../v1beta1/ca": context deadline exceeded
+//
+// while the join API answered 401 (i.e. healthy) when probed on the node itself.
+// The CAPK template had carried api.address since its own masquerade lab; the
+// CAPV template never got it.
+//
+// The failure mode to guard hardest is an unsubstituted sentinel: k0s rejects
+// the config and crash-loops. So the sentinel must never be rendered without
+// both the resolver script and the ExecStartPre that runs it, and the resolver
+// must delete the line rather than leave it if no address can be found.
+func TestHA_K0sApiAddressResolved(t *testing.T) {
+	const sentinel = "__API_ADDR__"
+
+	for _, tc := range goldenCases() {
+		if !strings.HasPrefix(tc.name, "k0s_capv_") {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render(tc.data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			hasSentinel := strings.Contains(out, "address: "+sentinel)
+			isHA := strings.HasSuffix(tc.name, "_init") || strings.HasSuffix(tc.name, "_join")
+
+			if isHA && !hasSentinel {
+				t.Error("HA control-plane render has no api.address; k0s will advertise an " +
+					"address of its own choosing and bake it into join tokens")
+			}
+			if !isHA && hasSentinel {
+				t.Error("non-HA render must not carry api.address — there are no joiners to reach it")
+			}
+			if !hasSentinel {
+				return
+			}
+
+			// A sentinel without its resolver is a crash-looping node.
+			for _, required := range []string{
+				// The write_files entry itself, not just a mention of the path —
+				// matching the path alone also matches the ExecStartPre line, which
+				// would let a missing script slip through.
+				"- path: /usr/local/bin/kairos-k0s-api-addr.sh",
+				"- path: /etc/systemd/system/k0scontroller.service.d/zz-capi-api-addr.conf",
+				"ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k0s-api-addr.sh || true'",
+			} {
+				if !strings.Contains(out, required) {
+					t.Errorf("api.address sentinel rendered without %q — k0s would reject the config", required)
+				}
+			}
+
+			// Selected by routing to the control-plane endpoint, never by interface
+			// name, and never advertising the VIP itself as a per-node address.
+			for _, want := range []string{
+				`ip -4 route get "${ENDPOINT}"`,
+				`[ "${src}" != "${ENDPOINT}" ]`,
+				"ip -4 route show default",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("api.address resolver missing %q", want)
+				}
+			}
+
+			// Exactly one occurrence INSIDE the config file. The resolver anchors on
+			// the address line, so a stray copy elsewhere in k0s.yaml would be
+			// rewritten by the substitution and would keep the "already done" check
+			// alive forever. Observed on-node before this was anchored: the
+			// explanatory comment came out reading "172.16.56.47 is a sentinel
+			// replaced with...". The resolver's own SENTINEL= assignment is a
+			// separate file and does not count.
+			if cfg, ok := writeFileBody(out, "/etc/k0s/k0s.yaml"); ok {
+				if n := strings.Count(cfg, sentinel); n != 1 {
+					t.Errorf("sentinel %s appears %d times inside k0s.yaml; it must appear exactly "+
+						"once, on the address line", sentinel, n)
+				}
+			} else {
+				t.Error("api.address rendered but /etc/k0s/k0s.yaml was not written")
+			}
+
+			// Fail open rather than leave a sentinel in place — either of them.
+			for _, del := range []string{
+				`sed -i "/^[[:space:]]*address: ${SENTINEL}\$/d"`,
+				`sed -i "/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d"`,
+			} {
+				if !strings.Contains(out, del) {
+					t.Errorf("resolver must DELETE the line when no address is found (%s); an "+
+						"unsubstituted sentinel makes k0s reject the config and crash-loop", del)
+				}
+			}
+
+			// etcd peerAddress must be set too, not just api.address. The API
+			// advertise address gets a joiner as far as talking to the init; the peer
+			// address is how members reach each OTHER. CAPK sets both, and a port that
+			// takes only half leaves etcd peering on whichever interface k0s picks.
+			if !strings.Contains(cfgBody(out), "peerAddress: __ETCD_PEER_ADDR__") {
+				t.Error("HA render sets api.address but not storage.etcd.peerAddress — " +
+					"etcd members would peer over an arbitrary interface")
+			}
+			if !strings.Contains(out, `sed -i "s|^\([[:space:]]*peerAddress: \)${PEER_SENTINEL}\$|\1${ADDR}|"`) {
+				t.Error("resolver does not substitute the etcd peerAddress sentinel")
+			}
+		})
+	}
+}
+
+// cfgBody returns the /etc/k0s/k0s.yaml write_files body, or "" if absent.
+func cfgBody(out string) string {
+	body, _ := writeFileBody(out, "/etc/k0s/k0s.yaml")
+	return body
+}

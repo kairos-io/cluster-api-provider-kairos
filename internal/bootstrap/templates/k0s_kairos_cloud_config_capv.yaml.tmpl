@@ -199,7 +199,8 @@ write_files:
     as before (.IsInitControlPlane is false for single/join/worker/empty role).
   */ -}}
   {{- $haSans := and .IsInitControlPlane .ManagementEndpoint .ManagementEndpoint.ControlPlaneEndpointHost }}
-  {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR $haSans) }}
+  {{- $apiAddr := and .IsHAControlPlane .ManagementEndpoint .ManagementEndpoint.ControlPlaneEndpointHost }}
+  {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR $haSans $apiAddr) }}
   - path: /etc/k0s/k0s.yaml
     permissions: "0644"
     content: |
@@ -207,12 +208,34 @@ write_files:
       kind: ClusterConfig
       metadata:
         name: k0s
-      {{- if or .PodCIDR .ServiceCIDR $haSans }}
+      {{- if or .PodCIDR .ServiceCIDR $haSans $apiAddr }}
       spec:
-      {{- if $haSans }}
+      {{- if or $haSans $apiAddr }}
         api:
+      {{- if $apiAddr }}
+          # Per-node API advertise address, same requirement the CAPK template
+          # already meets for KubeVirt masquerade. A bare-metal node is dual-homed
+          # too — an isolated provisioning NIC plus a routable LAN NIC — and with
+          # no api.address k0s picks one itself. Observed on the beskar7 lab
+          # (2026-09-08): it chose the provisioning address, `k0s token create`
+          # baked that into the controller-join token, and every joiner then failed
+          # with "failed to join existing cluster via https://192.168.190.61:9443:
+          # context deadline exceeded" while the join API answered perfectly well
+          # on the node itself.
+          #
+          # The placeholder below is replaced with this node's routable address by
+          # the k0scontroller ExecStartPre. It is deliberately the ONLY occurrence
+          # in this file: the resolver anchors on the address line, and its
+          # "already done" check keys on the same thing, so a stray copy in prose
+          # would make it re-run on every boot. Leaving a placeholder in place
+          # would make k0s reject the config, so when no address can be found the
+          # resolver deletes this line instead (KD-55 fail-open).
+          address: __API_ADDR__
+      {{- end }}
+      {{- if $haSans }}
           sans:
             - {{ .ManagementEndpoint.ControlPlaneEndpointHost | quote }}
+      {{- end }}
       {{- end }}
       {{- if or .PodCIDR .ServiceCIDR }}
         network:
@@ -223,9 +246,102 @@ write_files:
           serviceCIDR: {{ .ServiceCIDR | quote }}
       {{ end }}
       {{- end }}
+      {{- if $apiAddr }}
+        storage:
+          etcd:
+            # Per-node etcd peer address. The API advertise address alone is not
+            # enough: members also have to reach each OTHER, and on a dual-homed
+            # node k0s will otherwise peer over whichever interface it picks. Set
+            # from the same routable address, resolved by the same ExecStartPre
+            # before k0s starts, because etcd reads peerAddress at init/join and
+            # cannot be corrected afterwards. CAPK sets both for the same reason.
+            peerAddress: __ETCD_PEER_ADDR__
+      {{- end }}
       {{- else }}
       spec: {}
       {{- end }}
+  {{- end }}
+  {{- if $apiAddr }}
+  - path: /usr/local/bin/kairos-k0s-api-addr.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+
+      CFG=/etc/k0s/k0s.yaml
+      SENTINEL=__API_ADDR__
+      PEER_SENTINEL=__ETCD_PEER_ADDR__
+      ENDPOINT={{ .ManagementEndpoint.ControlPlaneEndpointHost | shquote }}
+
+      [ -f "${CFG}" ] || exit 0
+      # Idempotent: both addresses are fixed once the API and etcd have
+      # initialised, and this runs on every k0s start. Anchored to the value
+      # lines so nothing else in the file can keep this alive.
+      if ! grep -qE "^[[:space:]]*(address|peerAddress): (${SENTINEL}|${PEER_SENTINEL})\$" "${CFG}"; then
+        exit 0
+      fi
+
+      detect_addr() {
+        local src dev
+        # The address the kernel would use to reach the control-plane endpoint.
+        # That is by definition the one joiners can reach, which is what has to
+        # end up in the join token. Selected by routing, never by interface name.
+        src="$(ip -4 route get "${ENDPOINT}" 2>/dev/null |
+               sed -n 's/.*[[:space:]]src[[:space:]]\{1,\}\([0-9.]\{1,\}\).*/\1/p' | head -1)"
+        # If the endpoint is already local — kube-vip claimed the VIP on an earlier
+        # boot — the kernel answers with the VIP itself, which is not a per-node
+        # address and must not be advertised as one.
+        if [ -n "${src}" ] && [ "${src}" != "${ENDPOINT}" ]; then
+          echo "${src}"
+          return 0
+        fi
+        # Fall back to whichever interface carries the default route. An isolated
+        # provisioning network advertises no gateway, so this lands on the routable
+        # one.
+        dev="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+        if [ -n "${dev}" ]; then
+          src="$(ip -4 -o addr show dev "${dev}" scope global 2>/dev/null |
+                 awk '{print $4}' | cut -d/ -f1 | head -1)"
+          if [ -n "${src}" ]; then
+            echo "${src}"
+            return 0
+          fi
+        fi
+        return 1
+      }
+
+      # Bounded wait: the DHCP lease can lag the ExecStartPre by a few seconds, and
+      # k0s reads this address at first init/join so it must be right by then.
+      ADDR=""
+      for i in $(seq 1 30); do
+        ADDR="$(detect_addr || true)"
+        if [ -n "${ADDR}" ]; then
+          break
+        fi
+        echo "k0s-api-addr: waiting for a routable address (${i}/30)..."
+        sleep 2
+      done
+
+      if [ -n "${ADDR}" ]; then
+        sed -i "s|^\([[:space:]]*address: \)${SENTINEL}\$|\1${ADDR}|" "${CFG}"
+        sed -i "s|^\([[:space:]]*peerAddress: \)${PEER_SENTINEL}\$|\1${ADDR}|" "${CFG}"
+        echo "k0s-api-addr: api.address and etcd peerAddress set to ${ADDR}"
+      else
+        # Fail open. An unsubstituted sentinel makes k0s reject the config and
+        # crash-loop; dropping the line just returns k0s to auto-detection.
+        sed -i "/^[[:space:]]*address: ${SENTINEL}\$/d" "${CFG}"
+        sed -i "/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d" "${CFG}"
+        echo "k0s-api-addr: no routable address found; removed api.address and peerAddress, k0s will auto-detect"
+      fi
+  - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-api-addr.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k0s-api-addr.sh || true'
   {{- end }}
   {{- if .IsJoinControlPlane }}
   # ADR 0005 (HA) join node: k0s controller-role join token. Sourced from
