@@ -1282,3 +1282,87 @@ func assertK0sJoinTokenRetries(t *testing.T, kubevirt bool) {
 		}
 	}
 }
+
+// extractShellFunc returns the body of a rendered shell function `name() { ... }`,
+// matching the closing brace at the same indentation as the opening line.
+func extractShellFunc(out, name string) (string, bool) {
+	marker := name + "() {"
+	i := strings.Index(out, marker)
+	if i < 0 {
+		return "", false
+	}
+	lineStart := strings.LastIndex(out[:i], "\n") + 1
+	indent := out[lineStart:i]
+	closer := "\n" + indent + "}"
+	j := strings.Index(out[i:], closer)
+	if j < 0 {
+		return "", false
+	}
+	return out[i : i+j], true
+}
+
+// TestHA_NodePushStepsRetry is a structural invariant over every HA render: the
+// post-bootstrap script's pushes to the MANAGEMENT cluster must retry, not give
+// up after one attempt.
+//
+// Both pushes gate HA formation. initMachineJoinable holds every joiner until
+// the controller-join Secret is non-empty AND (on k0s) the init node's etcd
+// member is reported healthy and voting. The script runs in a oneshot unit with
+// no timer behind it, so a single failed attempt strands the cluster
+// permanently — the old "will retry on next boot" message described a reboot
+// that never happens.
+//
+// Observed for the join token on a bare-metal k0s HA lab (2026-09-08): create
+// returned empty at T+4s, the joiner gate then held for 45 minutes. The
+// etcd-status reporter is the same shape and is covered here so it cannot drift
+// back. Asserting the property rather than the wording means a third push added
+// later is covered on the day it is written.
+func TestHA_NodePushStepsRetry(t *testing.T) {
+	pushFns := []string{"push_join_token", "push_etcd_status"}
+
+	for _, tc := range goldenCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render(tc.data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			if strings.Contains(out, "will retry on next boot") {
+				t.Error("a push still claims it 'will retry on next boot' — the post-bootstrap " +
+					"unit is a oneshot and nothing reboots the node, so that retry never happens")
+			}
+
+			seen := 0
+			for _, fn := range pushFns {
+				body, ok := extractShellFunc(out, fn)
+				if !ok {
+					continue // not rendered for this role/infra combination
+				}
+				seen++
+				if !strings.Contains(body, "for i in {1..") {
+					t.Errorf("%s() makes a single attempt — a transient failure strands every joiner", fn)
+				}
+				// An empty status from a failed curl must not reach an arithmetic
+				// comparison; the 2xx check has to be a glob.
+				if !strings.Contains(body, "2[0-9][0-9])") {
+					t.Errorf("%s() does not use a glob 2xx check — an empty status would abort the loop", fn)
+				}
+				if strings.Contains(body, `"${status}" -ge 200`) {
+					t.Errorf("%s() still arithmetic-compares status; an empty value errors under set -e", fn)
+				}
+			}
+
+			// Every HA render carries the etcd reporter; only the init node pushes
+			// a join token. Guard against the extractor silently matching nothing.
+			if isHAGolden(tc.name) && seen == 0 {
+				t.Errorf("no push function found in HA render %s — extractor or template changed shape", tc.name)
+			}
+		})
+	}
+}
+
+// isHAGolden reports whether a golden case name is one of the HA (init/join)
+// renders, which are the only ones that carry the node-push block.
+func isHAGolden(name string) bool {
+	return strings.HasSuffix(name, "_init") || strings.HasSuffix(name, "_join")
+}

@@ -403,23 +403,41 @@ write_files:
         local patch
         patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
-        local status
-        status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
-          -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/strategic-merge-patch+json" \
-          -X PATCH \
-          --data "${patch}" \
-          "${url}" || true)
+        # A dropped report blocks HA formation exactly like a dropped join token:
+        # initMachineJoinable treats "member not reported" as not-joinable on k0s,
+        # so the KCP holds every joiner until some node reports. This reporter runs
+        # ONCE, from a oneshot unit, with no timer behind it — "retry on next boot"
+        # described behaviour that does not exist, since nothing reboots the node.
+        # Retry here on the same cadence as the join-token push. The 2xx test is a
+        # glob, not an arithmetic comparison, so an empty status from a failed curl
+        # cannot abort the loop.
+        local status="" reported=""
+        for i in {1..30}; do
+          status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            -X PATCH \
+            --data "${patch}" \
+            "${url}" || true)
+          case "${status}" in
+            2[0-9][0-9]) reported=yes ;;
+          esac
+          if [ -n "${reported}" ]; then
+            break
+          fi
+          echo "Attempt $i/30: etcd-status report returned '${status}', retrying in 5 seconds..."
+          sleep 5
+        done
         unset token
-        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+        if [ -n "${reported}" ]; then
           echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
           return 0
         fi
-        echo "WARN: failed to report etcd status (status ${status})"
+        echo "WARN: failed to report etcd status after 30 attempts (last status '${status}')"
         return 1
       }
       if ! push_etcd_status; then
-        echo "WARN: etcd-status report failed; will retry on next boot"
+        echo "WARN: etcd-status report failed after retries; the joiner gate will hold until a member is reported"
       fi
 
       # Mark bootstrap success for CAPI/CAPK consumers
