@@ -1204,3 +1204,81 @@ func TestHA_K3sDatastoreFlagsPinnedInConfigDir(t *testing.T) {
 		})
 	}
 }
+
+// TestHA_K0sJoinTokenPushRetries guards the k0s HA deadlock found on the
+// bare-metal lab (2026-09-08).
+//
+// initMachineJoinable blocks every k0s joiner until the per-cluster
+// controller-join Secret is non-empty, and only the init node can fill it. The
+// push ran in a oneshot unit that made ONE attempt at `k0s token create`, four
+// seconds after k0s started. The bootstrap-token machinery was not serving yet,
+// create returned empty, and the script logged "will retry on next boot" — but
+// nothing reboots the node, so the unit stayed `active (exited)` and the gate
+// held for 45 minutes. The identical command run by hand afterwards returned a
+// 1738-byte token, so the failure was purely a startup race with a permanent
+// consequence.
+//
+// Both steps must retry: an empty create and a failed PATCH strand the cluster
+// identically. The sibling providerID patch in the same script already retries
+// 30x/5s and node registration waits 300s; this asserts the token path is no
+// longer the one step that gives up immediately.
+func TestHA_K0sJoinTokenPushRetries(t *testing.T) {
+	for _, kv := range []bool{false, true} { // CAPV, CAPK — both carry the block
+		infra := "capv"
+		if kv {
+			infra = "capk"
+		}
+		t.Run(infra, func(t *testing.T) { assertK0sJoinTokenRetries(t, kv) })
+	}
+}
+
+func assertK0sJoinTokenRetries(t *testing.T, kubevirt bool) {
+	t.Helper()
+	d := haCPData("init", kubevirt)
+	d.ManagementEndpoint.JoinTokenSecretName = "ha-cluster-control-plane-join-token"
+	out, err := RenderK0sCloudConfig(d)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	if !strings.Contains(out, "k0s token create --role=controller") {
+		t.Fatal("k0s init render lost the controller-join token creation entirely")
+	}
+
+	// The message that described behaviour which does not exist must be gone.
+	// Scoped to the token create: an identically-worded message on the
+	// etcd-status reporter is a separate concern and deliberately untouched here.
+	if strings.Contains(out, "k0s token create returned empty; will retry on next boot") {
+		t.Error("the token create still claims it 'will retry on next boot' — nothing reboots " +
+			"the node, so a single failed create strands every joiner")
+	}
+
+	for _, want := range []string{
+		// create is retried rather than attempted once
+		"for i in {1..60}; do",
+		"k0s token create not ready yet, retrying in 5 seconds...",
+		"still empty after 60 attempts",
+		// the PATCH is retried too
+		"for i in {1..30}; do",
+		"join-token push returned",
+		"after 30 attempts",
+		// a failed curl yields an empty status; the 2xx test must tolerate it
+		// rather than run an arithmetic comparison on "".
+		"2[0-9][0-9]) pushed=yes ;;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("k0s init render missing %q", want)
+		}
+	}
+
+	// The token must still never be echoed, only enveloped (TOKEN-INV).
+	for _, forbidden := range []string{
+		`echo "${jt}"`,
+		"echo ${jt}",
+		`echo "token: ${jt}"`,
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("join token is logged via %q — it must only ever be base64-enveloped", forbidden)
+		}
+	}
+}
