@@ -34,6 +34,36 @@ write_files:
           - environment_file: /run/cos/extra-layout.env
             environment:
               PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # INIT-ORDERING (bare-metal lab, 2026-09-08). provider-kairos turns `k0s.args:`
+  # into /etc/systemd/system/k0scontroller.service.d/override.conf, and it writes
+  # that file AFTER enabling the unit. It usually wins by a fraction of a second,
+  # but not always — measured across four k0s boots on identical images:
+  #
+  #   07:12:16.064 override / 07:12:16 start   args applied
+  #   07:19:25.756 override / 07:19:25 start   args applied
+  #   08:08:12.016 override / 08:08:12 start   args applied
+  #   08:35:04.287 override / 08:35:01 start   args LOST  (3.3s late)
+  #
+  # On the boot that lost, /proc/<pid>/cmdline was a bare `k0s controller` with
+  # every flag missing: no worker role, so no kubelet, so the Node never
+  # registered and the whole control plane stalled. On a JOIN node the casualty
+  # is the join-token flag, which is the k3s split-brain failure in k0s clothing.
+  #
+  # write_files lands in the boot stage, before the unit is enabled, so a drop-in
+  # written here is always present at the first start. It sorts after
+  # override.conf, so it wins whenever both exist and is harmless when the plugin
+  # never gets there. Same belt-and-braces as the k3s 93-ha-datastore.yaml pin —
+  # k0s has no config.yaml.d equivalent for CLI-only flags, so the drop-in is the
+  # available mechanism. Keep this list identical to `k0s.args:` above;
+  # TestHA_K0sArgsDropInMatchesK0sArgs fails the build if they drift.
+  - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-args.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/k0s controller --enable-worker
   - path: /usr/local/etc/hostname
     permissions: "0644"
     owner: root

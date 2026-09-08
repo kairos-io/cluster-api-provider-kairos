@@ -1366,3 +1366,90 @@ func TestHA_NodePushStepsRetry(t *testing.T) {
 func isHAGolden(name string) bool {
 	return strings.HasSuffix(name, "_init") || strings.HasSuffix(name, "_join")
 }
+
+// k0sArgsFromBlock returns the `k0s:` -> `args:` list from a rendered
+// cloud-config, joined the way they appear on a command line.
+func k0sArgsFromBlock(out string) (string, bool) {
+	i := strings.Index(out, "\nk0s:\n")
+	if i < 0 {
+		return "", false
+	}
+	var args []string
+	inArgs := false
+	for _, line := range strings.Split(out[i+1:], "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !inArgs {
+			if trimmed == "args:" {
+				inArgs = true
+			} else if trimmed != "" && !strings.HasPrefix(trimmed, "#") &&
+				!strings.HasPrefix(trimmed, "k0s:") && !strings.HasPrefix(trimmed, "enabled:") {
+				return "", false // left the k0s block before finding args
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "- --"):
+			args = append(args, strings.TrimPrefix(trimmed, "- "))
+		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+			// comments and blanks are interleaved through the args list
+		default:
+			return strings.Join(args, " "), true // end of the args list
+		}
+	}
+	return strings.Join(args, " "), true
+}
+
+// TestHA_K0sArgsDropInMatchesK0sArgs guards the fix for the k0s init-ordering
+// race by guarding the thing that makes it fragile: two copies of the same
+// argument list.
+//
+// provider-kairos translates `k0s.args:` into k0scontroller.service.d/
+// override.conf, but writes it AFTER enabling the unit. Measured across four
+// boots on identical images, three won the race by a fraction of a second and
+// one lost by 3.3s — that boot ran a bare `k0s controller`, so no kubelet, no
+// Node, and a stalled control plane. On a join node the casualty would be
+// --token-file, which is the k3s split-brain failure wearing k0s clothes.
+//
+// The zz-capi-args.conf drop-in is written by write_files (boot stage, always
+// before the unit is enabled) and sorts after override.conf, so it wins whenever
+// both exist. That only helps while the two lists agree, hence this test: it
+// re-derives the command line from `k0s.args:` and requires the drop-in's
+// ExecStart to match it exactly, for every rendered case.
+func TestHA_K0sArgsDropInMatchesK0sArgs(t *testing.T) {
+	const prefix = "ExecStart=/usr/bin/k0s controller"
+
+	for _, tc := range goldenCases() {
+		if !strings.HasPrefix(tc.name, "k0s_") {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render(tc.data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			args, ok := k0sArgsFromBlock(out)
+			if !ok {
+				t.Fatalf("could not locate the k0s args block in %s", tc.name)
+			}
+
+			var execStart string
+			for _, line := range strings.Split(out, "\n") {
+				if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, prefix) {
+					execStart = strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+					break
+				}
+			}
+			if execStart == "" && args == "" {
+				return // nothing to deliver, nothing to pin
+			}
+			if execStart == "" {
+				t.Fatalf("k0s.args carries %q but no zz-capi-args.conf drop-in was written — "+
+					"those args reach the node only through the plugin's late override", args)
+			}
+			if execStart != args {
+				t.Errorf("drop-in ExecStart has drifted from k0s.args\n  k0s.args:  %q\n  ExecStart: %q", args, execStart)
+			}
+		})
+	}
+}
