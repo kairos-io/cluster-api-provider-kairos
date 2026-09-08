@@ -921,11 +921,33 @@ MANIFEST_EOF
           echo "WARN: base64 not available; cannot push join token"
           return 1
         fi
-        local jt
+        local jt=""
+        # `k0s token create` needs more than "the apiserver is up" — the bootstrap
+        # token machinery has to be serving too, and that lags k0s start by a few
+        # seconds. This script runs immediately after the kubeconfig push, i.e.
+        # within seconds of k0s starting, so the first attempt loses that race
+        # often enough to matter.
+        #
+        # This token is the ONLY gate on HA formation: initMachineJoinable holds
+        # every joiner until the Secret is non-empty. The unit is a oneshot, so a
+        # single failed attempt used to strand the cluster permanently: the old
+        # code deferred to a next boot that never comes, since nothing reboots
+        # the node. Observed on a bare-metal k0s HA
+        # lab: create returned empty at T+4s, the joiner gate then held for 45
+        # minutes, and the identical command run by hand afterwards succeeded.
+        #
+        # Bounded on the same 300s budget as the node-registration waits above.
         # Long expiry so the token stays valid across the whole HA join window.
-        jt=$(k0s token create --role=controller --expiry=24h 2>/dev/null || true)
+        for i in {1..60}; do
+          jt=$(k0s token create --role=controller --expiry=24h 2>/dev/null || true)
+          if [ -n "${jt}" ]; then
+            break
+          fi
+          echo "Attempt $i/60: k0s token create not ready yet, retrying in 5 seconds..."
+          sleep 5
+        done
         if [ -z "${jt}" ]; then
-          echo "WARN: k0s token create returned empty; will retry on next boot"
+          echo "WARN: k0s token create still empty after 60 attempts (300s); joiners will block"
           return 1
         fi
         local jt_b64
@@ -945,20 +967,34 @@ MANIFEST_EOF
         local patch
         patch="{\"data\":{\"token\":\"${jt_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${jt_name}"
-        local status
-        status=$(curl -k -sS -o /tmp/kairos-jointoken-push.log -w "%{http_code}" \
-          -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/strategic-merge-patch+json" \
-          -X PATCH \
-          --data "${patch}" \
-          "${url}" || true)
+        # Same reasoning as the create loop: a transient failure here strands every
+        # joiner just as permanently, so retry rather than give up after one shot.
+        # The 2xx test is a glob, not an arithmetic comparison, so an empty status
+        # from a failed curl cannot abort the loop.
+        local status="" pushed=""
+        for i in {1..30}; do
+          status=$(curl -k -sS -o /tmp/kairos-jointoken-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            -X PATCH \
+            --data "${patch}" \
+            "${url}" || true)
+          case "${status}" in
+            2[0-9][0-9]) pushed=yes ;;
+          esac
+          if [ -n "${pushed}" ]; then
+            break
+          fi
+          echo "Attempt $i/30: join-token push returned '${status}', retrying in 5 seconds..."
+          sleep 5
+        done
         # Scrub the enveloped token too.
         unset jt_b64 patch
-        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+        if [ -n "${pushed}" ]; then
           echo "Pushed controller-join token to management secret ${ns}/${jt_name}"
           return 0
         fi
-        echo "WARN: failed to push controller-join token (status ${status})"
+        echo "WARN: failed to push controller-join token after 30 attempts (last status '${status}')"
         return 1
       }
       if ! push_join_token; then
@@ -1023,23 +1059,41 @@ MANIFEST_EOF
         local patch
         patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
-        local status
-        status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
-          -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/strategic-merge-patch+json" \
-          -X PATCH \
-          --data "${patch}" \
-          "${url}" || true)
+        # A dropped report blocks HA formation exactly like a dropped join token:
+        # initMachineJoinable treats "member not reported" as not-joinable on k0s,
+        # so the KCP holds every joiner until some node reports. This reporter runs
+        # ONCE, from a oneshot unit, with no timer behind it — "retry on next boot"
+        # described behaviour that does not exist, since nothing reboots the node.
+        # Retry here on the same cadence as the join-token push. The 2xx test is a
+        # glob, not an arithmetic comparison, so an empty status from a failed curl
+        # cannot abort the loop.
+        local status="" reported=""
+        for i in {1..30}; do
+          status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            -X PATCH \
+            --data "${patch}" \
+            "${url}" || true)
+          case "${status}" in
+            2[0-9][0-9]) reported=yes ;;
+          esac
+          if [ -n "${reported}" ]; then
+            break
+          fi
+          echo "Attempt $i/30: etcd-status report returned '${status}', retrying in 5 seconds..."
+          sleep 5
+        done
         unset token
-        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+        if [ -n "${reported}" ]; then
           echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
           return 0
         fi
-        echo "WARN: failed to report etcd status (status ${status})"
+        echo "WARN: failed to report etcd status after 30 attempts (last status '${status}')"
         return 1
       }
       if ! push_etcd_status; then
-        echo "WARN: etcd-status report failed; will retry on next boot"
+        echo "WARN: etcd-status report failed after retries; the joiner gate will hold until a member is reported"
       fi
       {{- end }}
 
