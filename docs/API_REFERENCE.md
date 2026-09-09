@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.0.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.2.
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
@@ -27,7 +27,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `role` | `string` | Yes | `"worker"` | Node role: `"control-plane"` or `"worker"`. |
+| `role` | `string` | No | `"worker"` | Node role: `"control-plane"` or `"worker"`. |
 | `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"` or `"k3s"`. |
 | `kubernetesVersion` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). The value is informational — the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. |
 | `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. What single-node mode renders is distribution- and infrastructure-specific: for k3s it enables cluster-init mode on every infrastructure provider; for k0s on CAPK it renders `--single`; for k0s on the generic / CAPV / CAPM3 / fleet render path it renders `--enable-worker` by default, or `--single` when `k0sSingleNode` is also `true` (see `k0sSingleNode` below). Tracked as a deprecation candidate in KD-39. |
@@ -230,12 +230,13 @@ spec:
 | `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | — | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
 | `rolloutStrategy` | `RolloutStrategy` | No | — | Strategy for rolling out updates. |
 | `ha` | `HAConfig` | No | — | High-availability configuration, used when `replicas` is `3` or `5`. Ignored when `replicas` is `1`; setting it on a single-node control plane produces a non-blocking admission warning. See [HAConfig](#haconfig). |
+| `sshFallback` | `SSHFallback` | No | — | Opt-in SSH-pull fallback for retrieving the workload-cluster kubeconfig when the in-VM node-push path is unreachable (typically air-gapped deployments). Off by default. See [SSHFallback](#sshfallback). |
 
 #### KairosControlPlaneMachineTemplate
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`). |
+| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. |
 | `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates. |
 | `metadata` | `ObjectMeta` | No | Metadata to apply to created Machines. |
 
@@ -275,6 +276,29 @@ The `namespace` field is not part of this reference. The namespace defaults to t
 | `address` | `string` | Yes | — | The virtual IP address or DNS hostname for the control-plane endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname (max 253 characters). For `mode: ARP`, must be an IP address reachable on the same L2 segment as the control-plane nodes. Must equal the host portion of the InfraCluster's `controlPlaneEndpoint` (e.g., `VSphereCluster.spec.controlPlaneEndpoint.host`) so that CAPI core copies the correct address into `Cluster.spec.controlPlaneEndpoint`. This cross-object match is not enforced at admission — a mismatch will not be rejected, but the cluster endpoint will point at the wrong address. |
 | `interface` | `string` | Yes | — | The Linux network interface name on which kube-vip advertises the VIP (e.g., `"eth0"`, `"ens192"`, `"bond0"`). Must be 1-15 characters, starting with a letter, followed by letters, digits, dots, underscores, or hyphens. Verify the interface name against your Kairos image with `ip link` before setting this field. |
 | `mode` | `string` | No | `"ARP"` | VIP advertisement mode: `"ARP"` (L2, requires the control-plane nodes to share an L2 segment) or `"BGP"` (L3, requires a BGP peer; intended for routed bare-metal fabrics). |
+
+#### SSHFallback
+
+Opt-in escape hatch for retrieving the workload-cluster kubeconfig by SSH when the normal in-VM node-push path cannot reach the management cluster's API server (typically an air-gapped CAPV deployment). Off by default; enabling it does not disable the node-push path — the fallback only activates after node-push has been failing for `activateAfter`. See [INSTALL.md — Network reachability requirement](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) and [QUICKSTART_CAPV.md — Air-gapped fallback](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback) for the full walkthrough and the `KubeconfigReady` condition reasons this path produces.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | `bool` | No | `false` | Toggles the SSH fallback path. When `false`, the controller never opens an SSH connection regardless of any other field in this block. When `true`, `identitySecretRef` and `knownHostsSecretRef` are required — the validating webhook rejects `enabled: true` with either unset. |
+| `identitySecretRef` | `SSHFallbackSecretReference` | Required when `enabled: true` | — | Reference to a Secret containing the SSH private key used to authenticate to the workload node. Must contain a key named `ssh-privatekey` (matches the `kubernetes.io/ssh-auth` Secret convention) unless overridden via `key`. The matching public key must already be installed on the node via `KairosConfig.spec.sshPublicKey` / `githubUser` — this provider does not push it. |
+| `knownHostsSecretRef` | `SSHFallbackSecretReference` | Required when `enabled: true` | — | Reference to a Secret containing one or more OpenSSH `known_hosts` lines. The controller verifies the workload node's offered host key against this set before any data is exchanged. **There is no trust-on-first-use path** — a node whose host key is not in this Secret is refused. Defaults to the `known_hosts` key unless overridden via `key`. |
+| `user` | `string` | No | `"kairos"` | SSH login user. Must be a Kairos OS user with read access to the distribution's admin-kubeconfig file. Validated against a POSIX-username pattern at admission; shell-metacharacter values are rejected. |
+| `port` | `int32` | No | `22` | SSH port on the workload node. Must be between `1` and `65535`. |
+| `activateAfter` | `Duration` | No | `"15m"` | Elapsed time since `KubeconfigReady` first went `False(WaitingForNodePush)` after which the SSH fallback becomes eligible to run. Must be strictly greater than the controller's internal node-push timeout (10 minutes) — the webhook rejects a value at or below that bound, because the fallback is meant to fire after the Info-to-Warning escalation on `KubeconfigReady`, not before it. |
+
+#### SSHFallbackSecretReference
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | `string` | Yes | — | Name of the Secret. |
+| `key` | `string` | No | `ssh-privatekey` for `identitySecretRef`, `known_hosts` for `knownHostsSecretRef` | Key within the Secret that contains the value. |
+| `namespace` | `string` | No | Same as `KairosControlPlane` | Namespace of the Secret. Cross-namespace references are rejected by the validating webhook in this release. |
+
+Cross-field validation (enforced by the validating webhook, not expressible as kubebuilder markers): `enabled: true` requires both secret refs to be set with a non-empty `name`; both secret refs are rejected if they specify a `namespace` other than the `KairosControlPlane`'s own; `activateAfter` is rejected if it is not strictly greater than the controller's node-push timeout. `enabled: false` is always valid regardless of what else is set, so a configured-but-disabled block can be staged ahead of time.
 
 ### Status Fields
 
@@ -476,7 +500,7 @@ This is a known limitation of post-boot file writes for network configuration on
 
 - **Kairos CAPI Provider APIs**: `bootstrap.cluster.x-k8s.io/v1beta2` and `controlplane.cluster.x-k8s.io/v1beta2`.
 - **CAPI Core Types**: The wire API version for `Cluster`, `Machine`, and related resources is `v1beta2` (`cluster.x-k8s.io/v1beta2`). `go.mod` imports `sigs.k8s.io/cluster-api v1.13.4` and this provider's controllers use the `ContractVersionedObjectReference` / `MachineNodeReference` value types introduced by that contract. CAPI core v1.13.4+ is required at runtime.
-- **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK and the Kairos fleet provider use `infrastructure.cluster.x-k8s.io/v1alpha1`).
+- **Infrastructure Providers**: Use their respective API versions (e.g., CAPD/CAPV use `infrastructure.cluster.x-k8s.io/v1beta1`, CAPK and the Kairos fleet provider use `infrastructure.cluster.x-k8s.io/v1alpha1`). Any other CAPI-conformant infrastructure provider is cloned through a generic path that reads group and version from the `<Kind>MachineTemplate` object itself, so it is not limited to these versions.
 
 ### Credential Requirements
 

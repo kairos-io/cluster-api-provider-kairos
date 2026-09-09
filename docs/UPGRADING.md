@@ -1,5 +1,47 @@
 # Upgrading Kairos CAPI Provider
 
+## v0.1.1 → v0.1.2
+
+Full release notes: [v0.1.2](release-notes/v0.1.2.md).
+
+No CRD changes, no API changes, and no migration steps. A `clusterctl upgrade`,
+or re-applying the flat manifest, is enough:
+
+```bash
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.2/kairos-capi-provider.yaml
+```
+
+Two behaviour changes are worth knowing about before you next scale a control
+plane.
+
+### HA joiners are now created one at a time
+
+A 3 or 5-replica control plane provisions its joiners serially rather than all
+at once, because two concurrent `etcd member add` calls against a one-member
+cluster break quorum and the cluster does not recover. Scale-up therefore takes
+longer, and a joiner that never comes up now holds the next one back with a
+visible reason on the `KairosControlPlane` instead of taking the cluster down.
+See [High-Availability control planes](HIGH_AVAILABILITY.md#scale-up-joiners-are-created-one-at-a-time).
+
+Nothing to do on upgrade; existing clusters are unaffected.
+
+### CAPK k0s HA needs an image start gate
+
+This is not new in v0.1.2, but it is newly documented, and it is the reason a
+CAPK k0s HA control plane can fail in a way nothing surfaces. The image must
+stop k0s starting during the install boot. See
+[the CAPK quickstart](QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate) for the
+mechanism, the failure signature, and how to verify your image has it. The fix
+is image-side, so upgrading the provider does not supply it.
+
+### If you use the Kairos fleet provider
+
+Fleet provider v0.1.2 is recommended alongside this release: before it, the
+cluster template it ships could not create worker machines at all. See its own
+[release notes](https://github.com/kairos-io/cluster-api-provider-kairos-fleet/blob/main/docs/release-notes/v0.1.2.md).
+
+---
+
 ## v0.1.0-alpha.1 → v0.1.0-alpha.2
 
 ### Credential migration: default credentials removed

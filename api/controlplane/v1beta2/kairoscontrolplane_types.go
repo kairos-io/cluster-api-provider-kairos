@@ -208,8 +208,18 @@ type SSHFallbackSecretReference struct {
 
 // KairosControlPlaneMachineTemplate defines the template for control plane machines
 type KairosControlPlaneMachineTemplate struct {
-	// InfrastructureRef is a reference to a resource that provides infrastructure
-	// Contract: ControlPlane MUST reference an infrastructure template
+	// InfrastructureRef is a reference to a <Kind>MachineTemplate that provides
+	// infrastructure for each control-plane Machine (for example
+	// DockerMachineTemplate, VSphereMachineTemplate, KubevirtMachineTemplate,
+	// Metal3MachineTemplate, KairosFleetMachineTemplate, or any other
+	// CAPI-conformant infrastructure provider's own template kind).
+	//
+	// If Namespace is omitted, it defaults to this KairosControlPlane's own
+	// namespace at reconcile time, matching the CAPI convention that
+	// `clusterctl generate cluster` templates rely on. The KairosControlPlane
+	// spec itself is not mutated by this default.
+	//
+	// Contract: ControlPlane MUST reference an infrastructure template.
 	InfrastructureRef corev1.ObjectReference `json:"infrastructureRef"`
 
 	// NodeDrainTimeout is the total amount of time that the controller will spend
