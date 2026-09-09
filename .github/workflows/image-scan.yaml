@@ -1,0 +1,61 @@
+# Vulnerability scan of the controller image this repository publishes.
+#
+# This exists because a CRITICAL authentication-bypass CVE in
+# golang.org/x/crypto/ssh — a package the SSH fallback worker authenticates
+# with — sat in a shipping image unnoticed until someone scanned it by hand
+# while preparing v0.1.2. Nothing in CI looked at the artifact.
+#
+# Two triggers, because they catch different things:
+#
+#   * push / pull_request — a change that introduces a vulnerable dependency
+#     or base image fails before it merges.
+#   * schedule — a CVE disclosed against code that has not changed. This is the
+#     case that bit us: the vulnerable dependency was merged long before the
+#     advisory existed, so no code-triggered run would ever have flagged it.
+#     Scheduled runs only fire on the default branch, which is what ships.
+#
+# The gate is deliberately narrow: fixable CRITICAL and HIGH only. An
+# unfixable finding cannot be actioned here and would wedge every PR until
+# upstream published a fix, so it is reported by the scan output but does not
+# fail the job.
+name: Image scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Mondays, 06:17 UTC. Off the hour so it does not land in the spike of
+    # everyone else's hourly cron.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trivy:
+    name: trivy image scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Built the same way the release workflow builds it, so the scan sees the
+      # artifact that would actually ship: the same Dockerfile, the same
+      # builder and runtime base images.
+      - name: Build the manager image
+        run: docker build -t cluster-api-provider-kairos:scan .
+
+      - name: Scan the image (fail on fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: cluster-api-provider-kairos:scan
+          format: table
+          severity: CRITICAL,HIGH
+          # Only gate on vulnerabilities that have a fix available; unfixed
+          # ones can't be actioned here and would just wedge CI.
+          ignore-unfixed: true
+          exit-code: "1"
+          scanners: vuln

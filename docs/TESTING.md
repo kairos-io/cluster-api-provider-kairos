@@ -28,7 +28,33 @@ make test-envtest
 
 `make test-envtest` installs `setup-envtest` if needed, downloads Kubernetes API server binaries, and runs the `envtest`-tagged tests. This is the local integration gate and covers the full reconcile + webhook path without a real cluster.
 
-**Note (KD-19):** The CI envtest job is permanently gated with `if: false` — it is not run in CI at present. `make test-envtest` is the integration gate for local development until KD-19 is resolved.
+The same suite runs in CI as the `test-envtest` job, against real API server
+binaries; it is a required check, not an optional one. (This note previously
+said the CI job was gated off with `if: false`. That was true when KD-19 was
+open; the job has since been enabled and there is no such gate in
+`.github/workflows/ci.yaml`.)
+
+## Image scanning
+
+Every push and pull request builds the controller image from the release
+`Dockerfile` and scans it, failing on any **fixable** CRITICAL or HIGH finding
+in either the runtime base layer or the manager binary:
+
+```bash
+docker build -t cluster-api-provider-kairos:scan .
+trivy image --severity CRITICAL,HIGH --ignore-unfixed --scanners vuln \
+  --exit-code 1 cluster-api-provider-kairos:scan
+```
+
+Run exactly that locally to reproduce a CI failure. Unfixable findings are
+reported but do not fail the job: there is nothing to do about them here, and
+gating on them would wedge every PR until upstream shipped a fix.
+
+The same workflow also runs weekly on `main`. That is the trigger that matters
+most, and it is not redundant with the per-PR run: a CVE is usually disclosed
+long after the vulnerable dependency merged, so no code-triggered run would
+ever flag it. The v0.1.2 `golang.org/x/crypto` fix came from exactly that
+situation, found by a manual scan rather than by CI.
 
 ## End-to-end (KubeVirt)
 

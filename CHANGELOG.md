@@ -79,6 +79,13 @@ migration steps from v0.1.1. See the
 - `golang.org/x/net` v0.55.0 to v0.57.0 (CVE-2026-46600, HIGH) and
   `golang.org/x/text` v0.38.0 to v0.41.0 (CVE-2026-56852, HIGH). Scanning the
   release image for fixable CRITICAL and HIGH findings now reports zero.
+- **CI now scans the controller image.** Nothing looked at the published
+  artifact before, which is how the CVE above reached a shipping image. A new
+  `Image scan` workflow builds the image from the release `Dockerfile` on every
+  push and pull request and fails on any fixable CRITICAL or HIGH finding, and
+  runs weekly on `main` as well — a CVE is normally disclosed long after the
+  vulnerable dependency merged, so a code-triggered run alone would never catch
+  it.
 
 ### Documentation
 
