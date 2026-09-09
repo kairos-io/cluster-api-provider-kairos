@@ -8,6 +8,90 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.1.2] — 2026-09-09
+
+A fix release, driven by running the providers against real infrastructure for
+both k0s and k3s, single-node and highly available. No CRD or API change; no
+migration steps from v0.1.1. See the
+[v0.1.2 release notes](docs/release-notes/v0.1.2.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md).
+
+### Added
+
+- Support for **any CAPI-conformant infrastructure provider**. The infra-machine
+  cloner and the control plane's node-IP lookup each hardcoded a list of
+  provider kinds, so an unlisted provider was rejected with
+  `unsupported infrastructure provider: <Kind>MachineTemplate`. Both now fall
+  back to the CAPI contract — a `<Kind>MachineTemplate`'s `spec.template.spec`
+  is the spec of the `<Kind>Machine` it produces, and `status.addresses` is
+  mandatory on an InfraMachine — taking group and version from the template
+  object itself. Verified end to end against Beskar7. CAPD, CAPV, CAPK, CAPM3
+  and the Kairos fleet provider remain the first-class path.
+
+### Fixed
+
+- **k3s HA came up as three unrelated single-node clusters.** `k3s.args` is
+  delivered as a systemd drop-in, which on an instrumented run landed three
+  seconds after `k3s.service` had already started. k3s selects its datastore on
+  first start and never migrates, so `--cluster-init`, `--server` and
+  `--token-file` were ignored for the life of the node, silently: the init node
+  reported "etcd disabled", every joiner bootstrapped its own cluster with its
+  own CA, and the control plane reported Ready with no quorum anywhere. The
+  flags that must be right on the first start are now also pinned in
+  `config.yaml.d`, which k3s re-reads on every start.
+- **k0s controller arguments were lost on a losing race.** The same drop-in
+  timing cost k0s its flags on two of five measured boots, leaving a bare
+  `k0s controller`: no worker role, so no kubelet, so no Node, so no
+  `providerID` patch. Arguments now go in a drop-in that sorts last, and a
+  post-bootstrap check compares the live argv against the effective `ExecStart`
+  and restarts only when they differ.
+- **A single lost race stranded a k0s HA cluster permanently.** The
+  controller-join token push made one attempt and, on failure, logged "will
+  retry on next boot" from a oneshot unit that exited zero with nothing to
+  reboot the node. The push and the etcd-status report now retry.
+- **k0s advertised an unroutable address on CAPV.** The CAPV template — the
+  default for every non-KubeVirt provider — carried neither `spec.api.address`
+  nor `spec.storage.etcd.peerAddress`, so on a dual-homed bare-metal node k0s
+  advertised its provisioning address and baked it into the join token. Both
+  are now resolved before k0s starts, by routing; when no address can be found
+  the settings are removed and k0s auto-detects, rather than wedging the node.
+- **Concurrent HA joiners could destroy etcd quorum.** The joinable gate only
+  inspected the init machine, so every joiner was created in the same second;
+  two `etcd member add` calls against a one-member cluster leave quorum unmet
+  and the cluster does not recover. Joiners are now created one at a time,
+  strictly for k0s and advisorily for k3s, which joins as a learner. The
+  rollout surge path, which had no quorum check at all, gets the same gate.
+- **A `machineTemplate.infrastructureRef` without a namespace failed to
+  resolve.** It is now resolved in the `KairosControlPlane`'s own namespace, as
+  the CAPI convention requires and as clusterctl-generated templates rely on.
+  Previously this surfaced only as `Ready=False` with no Machine and no
+  infrastructure object created.
+- The CAPK HA samples pointed all three control-plane VMs at the same two named
+  DataVolumes. Those PVCs are ReadWriteOnce, so the samples could not work as
+  written; both now use `dataVolumeTemplates`.
+
+### Security
+
+- `golang.org/x/crypto` v0.53.0 to v0.55.0, fixing **CVE-2026-56854
+  (CRITICAL)** — an authentication bypass in `golang.org/x/crypto/ssh` from
+  unenforced source-address restrictions. The SSH fallback worker authenticates
+  with that package, so this is on a code path the provider uses.
+- `golang.org/x/net` v0.55.0 to v0.57.0 (CVE-2026-46600, HIGH) and
+  `golang.org/x/text` v0.38.0 to v0.41.0 (CVE-2026-56852, HIGH). Scanning the
+  release image for fixable CRITICAL and HIGH findings now reports zero.
+
+### Documentation
+
+- The CAPK quickstart documents the **k0s image start gate** a 3-node k0s
+  control plane needs, the failure it prevents, and how to verify an image has
+  it. The fix is image-side, so this provider cannot ship it.
+- `docs/HIGH_AVAILABILITY.md` explains serial joiner creation and what it means
+  for scale-up time and for diagnosing a stalled rollout.
+- `docs/API_REFERENCE.md` gains the `KairosControlPlane.spec.sshFallback` block,
+  which was implemented and referenced from the CAPV quickstart but had no
+  entry in the CRD reference, and corrects `role` from required to optional.
+- Bug reports are directed at [kairos-io/kairos](https://github.com/kairos-io/kairos/issues).
+
 ## [v0.1.1] — 2026-08-10
 
 A small maintenance release; no functional change to the controllers or CRDs.

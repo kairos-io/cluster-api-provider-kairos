@@ -15,8 +15,8 @@
 #   3. baremetal-operator (BMO) v0.13+ and Ironic running and accessible.
 #      Verify: kubectl get baremetalhosts -A
 #
-#   4. Kairos CAPI provider v0.1.0-beta.2+ installed.
-#      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0-beta.2/kairos-capi-provider.yaml
+#   4. Kairos CAPI provider v0.1.2+ installed.
+#      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.2/kairos-capi-provider.yaml
 #
 #   5. A fully-installed Kairos k3s disk image served over HTTP.
 #      See the "Building the disk image" section in docs/QUICKSTART_CAPM3.md.

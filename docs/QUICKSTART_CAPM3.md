@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPM3 (Metal3 / bare metal)
 
-Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.0. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
+Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.2. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
 
 This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). k0s and k3s use the identical flow and differ only in distribution and version fields. For a 3-node HA control plane, see [High-Availability control plane](#high-availability-control-plane) below.
 
@@ -221,7 +221,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 Install CAPM3 using `clusterctl` or the upstream manifests. Refer to the [Metal3 documentation](https://book.metal3.io/capm3/introduction) for the current install procedure. The Kairos CAPI provider is installed separately:
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.2/kairos-capi-provider.yaml
 ```
 
 See [INSTALL.md](INSTALL.md) for the full provider install and verification steps.

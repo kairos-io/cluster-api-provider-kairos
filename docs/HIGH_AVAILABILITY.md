@@ -1,6 +1,6 @@
 # High-Availability Control Planes
 
-Last verified against: provider v0.1.0, CAPI v1.13.4.
+Last verified against: provider v0.1.2, CAPI v1.13.4.
 
 This page covers `KairosControlPlane` HA configuration (`spec.replicas` and
 `spec.ha.vip`) and the day-2 etcd health and quorum-safe replacement
@@ -35,6 +35,33 @@ Worked samples:
 - [`config/samples/capm3/kairos_cluster_k0s_ha.yaml`](../config/samples/capm3/kairos_cluster_k0s_ha.yaml) / [`kairos_cluster_k3s_ha.yaml`](../config/samples/capm3/kairos_cluster_k3s_ha.yaml)
 
 See the [CAPV HA quickstart walkthrough](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane) for the full procedure.
+
+## Scale-up: joiners are created one at a time
+
+Bringing up a 3 or 5-replica control plane provisions the init node first, then
+each joiner in turn — never two at once. This is deliberate. Every joiner runs
+`etcd member add` as it boots, so two adds against a one-member cluster raise
+the configured voter count to three while a single member is still serving:
+quorum `(N/2)+1` is unmet, etcd stops serving, and on k0s the join API, which
+needs the apiserver to validate a join token, hangs. Neither joiner completes
+and the cluster does not recover on its own.
+
+The gate is strict for k0s: the next joiner is not created until the previous
+one has registered a Node and reported a healthy voting etcd member. For k3s it
+is advisory — k3s joins as a learner, which does not count toward quorum and so
+cannot strand the cluster — and only an explicitly unhealthy member holds the
+next joiner back.
+
+Two practical consequences:
+
+- Scale-up takes longer than provisioning the same machines in parallel would.
+  That is the cost of not being able to lose the cluster to a race.
+- A joiner that never comes up stalls the rest of the scale-up rather than
+  taking the cluster down with it. The `KairosControlPlane` says which machine
+  it is waiting on and why, so check its conditions before assuming the
+  rollout is wedged.
+
+The same gate applies to the surge machine created during a rolling update.
 
 ## Day-2: etcd health and quorum-safe replacement
 

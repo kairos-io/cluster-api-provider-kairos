@@ -58,7 +58,7 @@ providers:
 ```
 
 Point `url` at a specific tag instead of `latest` to pin a version, for
-example `.../releases/download/v0.1.0/infrastructure-components.yaml`.
+example `.../releases/download/v0.1.2/infrastructure-components.yaml`.
 Do not pin `v0.1.0-beta.1`: that release crash-loops on a real management
 cluster and is not clusterctl-installable. Fleet claims already-enrolled
 AuroraBoot nodes rather than creating machines on demand; see
@@ -129,7 +129,7 @@ Use this if you want a single `kubectl apply -f` without configuring `clusterctl
 ### Install
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.2/kairos-capi-provider.yaml
 ```
 
 This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
@@ -151,7 +151,7 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 ### Uninstall
 
 ```bash
-kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.0/kairos-capi-provider.yaml
+kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.2/kairos-capi-provider.yaml
 ```
 
 **Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:

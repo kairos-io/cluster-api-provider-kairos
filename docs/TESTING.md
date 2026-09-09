@@ -1,6 +1,6 @@
 # Testing
 
-Last verified against: Go toolchain 1.26.3, provider v0.1.0.
+Last verified against: Go toolchain 1.26.3, provider v0.1.2.
 
 See [Install guide](INSTALL.md) for development install.
 

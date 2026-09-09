@@ -62,8 +62,10 @@ spec:
   template:
     spec:
       # Custom image can be specified here
-      # For Kairos, you would use a Kairos-based image
-      # Example: image: "quay.io/kairos/kairos-opensuse-leap:latest"
+      # For Kairos, you would use a Kairos-based image.
+      # Example: image: "quay.io/kairos/kairos-opensuse-leap:<pinned-release-tag>"
+      # Do not use :latest — pin an explicit released tag so re-applying this
+      # manifest later does not silently change the OS image.
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
