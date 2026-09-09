@@ -28,27 +28,50 @@
 #     the same image, so an explicit hostname would collide every Node name.
 #
 # PREREQUISITES:
-#   - Everything from kubevirt_cluster_k0s_single_node.yaml (CDI, the blank
-#     install-target DataVolume, a LoadBalancer implementation such as
-#     MetalLB).
+#   - Everything from kubevirt_cluster_k0s_single_node.yaml EXCEPT the blank
+#     install-target DataVolume: CDI, the uploaded Kairos image DataVolume
+#     (kairos-rootdisk), and a LoadBalancer implementation such as MetalLB.
+#     Do NOT apply kairos-install-disk.yaml — this sample creates per-VM
+#     disks via dataVolumeTemplates (see the KubevirtMachineTemplate below).
 #   - A second, routable Multus NetworkAttachmentDefinition reachable from
 #     every KubeVirt node that will host a control-plane VM. This is the
 #     etcd peering path; it must let the 3 control-plane VMs reach each
 #     other directly (not through the pod-network masquerade NAT).
+#   - A Kairos image carrying the k0s start gate — a hard requirement; see
+#     the CRITICAL note below.
 #
-# SETUP INSTRUCTIONS (same pattern as the single-node sample):
+# SETUP INSTRUCTIONS:
 #
-# 1. Apply the blank install-target DataVolume:
-#      kubectl apply -f config/samples/capk/kairos-install-disk.yaml
-#
-# 2. Replace every TODO-REPLACE placeholder below: the secondary network
+# 1. Replace every TODO-REPLACE placeholder below: the secondary network
 #    name, CPU/memory sizing, and (if not all nodes have KVM) nodeSelector.
 #
-# 3. Apply this manifest:
+# 2. Apply this manifest:
 #      kubectl apply -f config/samples/capk/kubevirt_cluster_k0s_ha.yaml
 #
 # See docs/QUICKSTART_CAPK.md#high-availability-control-plane for the full
 # walkthrough.
+#
+# ============================================================================
+#
+# !! CRITICAL: THE KAIROS IMAGE MUST CARRY THE k0s START GATE !!
+#
+# Without it a 3-node k0s control plane DEADLOCKS UNRECOVERABLY, and no error
+# is surfaced to CAPI — the cluster reports Available=True throughout.
+#
+# Kairos applies the cloud-config on every boot that carries it, including the
+# install boot, so k0s starts inside the installer, joins, and is registered
+# on the init node as a VOTING etcd member (k0s has no learner join). The
+# installer then reboots, leaving a configured-but-dead voter: quorum rises to
+# 2 with one member serving, etcd stalls, the API server dies, and the real
+# join from the installed system can never complete because it needs that same
+# API.
+#
+# This affects install.auto: true images only. It does not affect k3s (which
+# joins as a learner) or pre-installed images that never run an installer
+# boot. The fix is image-side, so this provider cannot ship it: see
+# docs/QUICKSTART_CAPK.md section "k0s HA: the image start gate" for the yip
+# stage to bake in and how to verify it.
+#
 # ============================================================================
 
 # IMPORTANT: replace `password:` below with a strong value before applying.
@@ -127,6 +150,38 @@ spec:
       virtualMachineTemplate:
         spec:
           runStrategy: Always
+          # HA-CRITICAL: per-VM disks. Every machine cloned from this template
+          # gets its OWN installeriso and rootdisk, named <vm-name>-<template>.
+          # Naming shared DataVolumes under volumes: below instead would point
+          # all three VMs at the same ReadWriteOnce PVC, which only one can
+          # attach — the other two never start.
+          dataVolumeTemplates:
+            - metadata:
+                name: installeriso
+              spec:
+                pvc:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 5Gi
+                source:
+                  # Must be at least as large as the source DataVolume
+                  # (virtctl-upload.sh uploads at 4Gi); a smaller clone fails.
+                  # Clone from the uploaded Kairos live-installer image.
+                  pvc:
+                    name: kairos-rootdisk
+                    namespace: default
+            - metadata:
+                name: rootdisk
+              spec:
+                pvc:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 40Gi
+                source:
+                  # Blank install target — the OS is installed onto this disk.
+                  blank: {}
           template:
             metadata:
               labels:
@@ -178,12 +233,14 @@ spec:
                   # can reach directly (not through pod-network masquerade).
                   networkName: TODO-REPLACE-SECONDARY-NETWORK
               volumes:
+              # These resolve to the per-VM dataVolumeTemplates above, NOT to
+              # shared cluster-wide DataVolumes.
               - name: installeriso
                 dataVolume:
-                  name: kairos-rootdisk
+                  name: installeriso
               - name: rootdisk
                 dataVolume:
-                  name: kairos-install-disk
+                  name: rootdisk
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate

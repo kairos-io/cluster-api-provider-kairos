@@ -31,28 +31,35 @@
 #     the same image, so an explicit hostname would collide every Node name.
 #
 # PREREQUISITES:
-#   - Everything from kubevirt_cluster_k3s_single_node.yaml (CDI, the blank
-#     install-target DataVolume, a LoadBalancer implementation such as
-#     MetalLB).
+#   - Everything from kubevirt_cluster_k3s_single_node.yaml EXCEPT the blank
+#     install-target DataVolume: CDI, the uploaded Kairos image DataVolume
+#     (kairos-k3s-rootdisk), and a LoadBalancer implementation such as
+#     MetalLB. Do NOT apply kairos-install-disk.yaml — this sample creates
+#     per-VM disks via dataVolumeTemplates (see the KubevirtMachineTemplate
+#     below).
 #   - A second, routable Multus NetworkAttachmentDefinition reachable from
 #     every KubeVirt node that will host a control-plane VM. This is the
 #     etcd peering path; it must let the 3 control-plane VMs reach each
 #     other directly (not through the pod-network masquerade NAT).
+#
+# NOTE: the k0s HA sample requires a Kairos image carrying a "k0s start gate"
+# to stop k0s joining from the install boot. k3s does NOT need it — k3s joins
+# as an etcd learner, which does not raise the quorum requirement, so a join
+# attempted from the installer cannot strand the cluster below quorum. See
+# kubevirt_cluster_k0s_ha.yaml and docs/QUICKSTART_CAPK.md section "k0s HA:
+# the image start gate" if you are comparing the two samples.
 #
 # KNOWN LIMITATION (KD-5d): k3s embedded etcd has no supported clean
 # member-remove. Replacing a k3s control-plane node leaves an orphaned etcd
 # member requiring manual `etcdctl member remove`. See the limitations
 # footer at the bottom of this file and docs/QUICKSTART_CAPK.md.
 #
-# SETUP INSTRUCTIONS (same pattern as the single-node sample):
+# SETUP INSTRUCTIONS:
 #
-# 1. Apply the blank install-target DataVolume:
-#      kubectl apply -f config/samples/capk/kairos-install-disk.yaml
-#
-# 2. Replace every TODO-REPLACE placeholder below: the secondary network
+# 1. Replace every TODO-REPLACE placeholder below: the secondary network
 #    name, CPU/memory sizing, and (if not all nodes have KVM) nodeSelector.
 #
-# 3. Apply this manifest:
+# 2. Apply this manifest:
 #      kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_ha.yaml
 #
 # See docs/QUICKSTART_CAPK.md#high-availability-control-plane for the full
@@ -136,6 +143,38 @@ spec:
       virtualMachineTemplate:
         spec:
           runStrategy: Always
+          # HA-CRITICAL: per-VM disks. Every machine cloned from this template
+          # gets its OWN installeriso and rootdisk, named <vm-name>-<template>.
+          # Naming shared DataVolumes under volumes: below instead would point
+          # all three VMs at the same ReadWriteOnce PVC, which only one can
+          # attach — the other two never start.
+          dataVolumeTemplates:
+            - metadata:
+                name: installeriso
+              spec:
+                pvc:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 5Gi
+                source:
+                  # Must be at least as large as the source DataVolume
+                  # (virtctl-upload.sh uploads at 4Gi); a smaller clone fails.
+                  # Clone from the uploaded Kairos k3s live-installer image.
+                  pvc:
+                    name: kairos-k3s-rootdisk
+                    namespace: default
+            - metadata:
+                name: rootdisk
+              spec:
+                pvc:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 40Gi
+                source:
+                  # Blank install target — the OS is installed onto this disk.
+                  blank: {}
           template:
             metadata:
               labels:
@@ -187,12 +226,14 @@ spec:
                   # can reach directly (not through pod-network masquerade).
                   networkName: TODO-REPLACE-SECONDARY-NETWORK
               volumes:
+              # These resolve to the per-VM dataVolumeTemplates above, NOT to
+              # shared cluster-wide DataVolumes.
               - name: installeriso
                 dataVolume:
-                  name: kairos-k3s-rootdisk
+                  name: installeriso
               - name: rootdisk
                 dataVolume:
-                  name: kairos-install-disk
+                  name: rootdisk
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
