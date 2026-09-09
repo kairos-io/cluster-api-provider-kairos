@@ -926,6 +926,17 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machineName string) (client.Object, error) {
 	infraRef := kcp.Spec.MachineTemplate.InfrastructureRef
 
+	// CAPI convention: a reference that omits the namespace resolves in the
+	// owner's namespace. clusterctl cluster templates routinely rely on this
+	// and leave it unset — the Kairos fleet provider's cluster-template.yaml
+	// does. Passing an empty namespace straight through makes the template
+	// lookup fail with "an empty namespace may not be set when a resource name
+	// is provided", which surfaces only as a failed control-plane machine.
+	// infraRef is a value copy, so this does not mutate the KCP spec.
+	if infraRef.Namespace == "" {
+		infraRef.Namespace = kcp.Namespace
+	}
+
 	// Prepare labels and annotations
 	labels := map[string]string{
 		clusterv1.ClusterNameLabel:         cluster.Name,

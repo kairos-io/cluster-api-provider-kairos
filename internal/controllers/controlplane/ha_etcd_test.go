@@ -21,9 +21,12 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -212,6 +215,57 @@ func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 	joinable, _, err = r2.initMachineJoinable(context.Background(), kcp, cluster, []*clusterv1.Machine{init})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(joinable).To(BeTrue())
+}
+
+// TestCreateInfrastructureMachine_DefaultsTemplateNamespace pins CAPI's
+// namespace convention: a machineTemplate.infrastructureRef that omits the
+// namespace resolves in the KairosControlPlane's own namespace. clusterctl
+// cluster templates routinely leave it unset (the Kairos fleet provider's
+// cluster-template.yaml does), and passing the empty value through made the
+// template lookup fail with "an empty namespace may not be set when a resource
+// name is provided" — visible only as a failed control-plane machine.
+//
+// Every hand-written sample in this repo sets the namespace explicitly, which
+// is why this went unnoticed until a generated template was used.
+func TestCreateInfrastructureMachine_DefaultsTemplateNamespace(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+
+	const ns = "fleet-demo"
+	tmpl := &unstructured.Unstructured{}
+	tmpl.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: "v1alpha1",
+		Kind:    "KairosFleetMachineTemplate",
+	})
+	tmpl.SetName("cp-tmpl")
+	tmpl.SetNamespace(ns)
+	g.Expect(unstructured.SetNestedMap(tmpl.Object, map[string]interface{}{"group": "control-plane"},
+		"spec", "template", "spec")).To(Succeed())
+
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: ns}}
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: ns},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				// Deliberately no Namespace — this is the case under test.
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1alpha1",
+					Kind:       "KairosFleetMachineTemplate",
+					Name:       "cp-tmpl",
+				},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tmpl).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	obj, err := r.createInfrastructureMachine(context.Background(), logr.Discard(), kcp, cluster, "cp-0")
+	g.Expect(err).ToNot(HaveOccurred(), "a namespace-less infrastructureRef must resolve in the KCP's namespace")
+	g.Expect(obj).ToNot(BeNil())
+	g.Expect(obj.GetNamespace()).To(Equal(ns))
+	g.Expect(obj.GetName()).To(Equal("cp-0"))
 }
 
 // TestInitMachineJoinable_SequencesJoiners pins the quorum-safety fix for
