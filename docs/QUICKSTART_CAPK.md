@@ -17,7 +17,7 @@ Both paths use the 2-disk Kairos installer pattern, described below.
 
 Kairos image DataVolumes (DVs) are **live-installer images**. When a KubeVirt VM boots from a Kairos image DV, the VM runs a live environment that installs Kairos OS onto a separate blank disk. The cloud-config's `install.device` field points at that blank disk.
 
-The two-disk layout the samples use:
+The two-disk layout the single-node samples use:
 
 | Disk | Role | bootOrder | DataVolume |
 |------|------|-----------|------------|
@@ -25,6 +25,8 @@ The two-disk layout the samples use:
 | `rootdisk` (virtio) | Blank install target | 1 | `kairos-install-disk` (blank, 40Gi) |
 
 The blank install-target disk boots first (bootOrder 1) but has no OS — the firmware falls through to bootOrder 2, the Kairos installer. Kairos installs to `/dev/vda` (the blank disk), then reboots. After reboot, the blank disk now holds the installed OS and boots first.
+
+The HA samples use the same layout but create both disks per VM via `dataVolumeTemplates` rather than referencing shared DataVolumes, so `kairos-install-disk.yaml` is not applied for HA. See [High-availability control plane](#high-availability-control-plane).
 
 The KairosConfigTemplate must include:
 
@@ -219,6 +221,53 @@ kubectl apply -f config/samples/capk/kubevirt_cluster_k3s_ha.yaml
 
 Prerequisite specific to CAPK HA: etcd peers over each control-plane VM's own IP. KubeVirt's default `masquerade` interface gives every VM the same self-address (`10.0.2.2`), so etcd cannot peer across nodes on that interface alone. Each control-plane VM needs a second, routable NIC (a Multus-attached bridge network or equivalent) in addition to the default masquerade interface. See the header comments in the HA sample files for the exact `interfaces`/`networks` shape.
 
+Each control-plane VM also needs its **own** disks. The HA samples declare `dataVolumeTemplates` in the `KubevirtMachineTemplate`, so every cloned VM gets a private `installeriso` and `rootdisk`; the shared `kairos-install-disk` DataVolume used by the single-node samples is not applied here. Pointing all three VMs at one shared `ReadWriteOnce` DataVolume instead means only one can attach it and the other two never start.
+
+### k0s HA: the image start gate
+
+A 3-node **k0s** control plane on CAPK needs a Kairos image that stops k0s from starting during the install boot. Without it the cluster deadlocks unrecoverably, and nothing surfaces the fault — the `KairosControlPlane` reports `Available=True` while etcd is below quorum.
+
+This applies to images that install to disk (`install.auto: true`, the CAPK pattern). It does **not** affect k3s, which joins as an etcd learner, nor pre-installed images that never run an installer boot — which is why CAPV and CAPM3 are unaffected.
+
+It is also HA-only. Single-node CAPK k0s (`spec.replicas: 1`) needs no gated image: the harm comes from the installer's join registering a *remote* voting member on another node, and a single-node cluster has no one to join.
+
+**What goes wrong:** Kairos applies the cloud-config on every boot that carries it, the install boot included. The k0s plugin therefore starts `k0scontroller` inside the installer, which joins and is registered on the init node as a *voting* etcd member — k0s has no learner join. The installer then reboots, leaving a configured-but-dead voter. Quorum rises to 2 with a single member serving, etcd stalls, the API server dies, and the real join from the installed system can never complete because it needs that same API.
+
+**How to recognize it:** on the joiner, `/var/lib/k0s/etcd` is empty, and its journal from the previous boot (a second machine-id under `/var/log/journal/`) shows `Started k0s` and `Joining existing cluster`. On the init node, `k0s etcd member-list` shows two members while only one is running, and nothing listens on `6443` or `9443`.
+
+**The fix** is image-side, so the provider cannot ship it: a yip stage baked into the image at `/system/oem`, applied at the `initramfs` stage — before systemd loads any unit. A drop-in delivered through cloud-config `write_files` is too late, and a `stages:` block inside a `#cloud-config` is silently ignored.
+
+```yaml
+# /system/oem/91_k0s_start_gate.yaml
+name: "CAPI k0s start gate"
+stages:
+  initramfs:
+    - name: "Block k0s during install/live/recovery boots"
+      directories:
+        - path: /etc/systemd/system/k0scontroller.service.d
+          permissions: 0755
+      files:
+        - path: /etc/systemd/system/k0scontroller.service.d/00-capi-start-gate.conf
+          permissions: 0644
+          content: |
+            [Unit]
+            ConditionKernelCommandLine=!cdroot
+            ConditionPathExists=!/run/cos/recovery_mode
+            ConditionPathExists=!/run/cos/live_mode
+```
+
+Add the same drop-in under `k0sworker.service.d` for worker images. A failed `Condition` makes systemd *skip* the start rather than fail it, so `Restart=` never re-triggers, and the Kairos plugin's own restart starts k0s normally once the installed system is running.
+
+**To verify:** on a provisioned node, the install boot should show no k0s activity at all.
+
+```bash
+# from the node; the non-current machine-id is the install boot
+sudo journalctl -D /var/log/journal/<other-machine-id> -u k0scontroller \
+  | grep -cE 'Started k0s|Joining existing cluster'   # expect 0
+```
+
+### Day-2 limitation: replacing a k3s control-plane node
+
 k3s HA has the same day-2 limitation as other providers: replacing a k3s control-plane node leaves an orphaned etcd member requiring manual cleanup (KD-5d). See [docs/HIGH_AVAILABILITY.md — Day-2](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement).
 
 ---
@@ -239,6 +288,8 @@ Also check controller logs:
 ```bash
 kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager
 ```
+
+**3-node k0s control plane never converges**: if `KairosControlPlane` reports `Available=True` but the workload API server is unreachable, the Kairos image is likely missing the k0s start gate. See [k0s HA: the image start gate](#k0s-ha-the-image-start-gate) for the diagnosis and the image-side fix.
 
 **LoadBalancer Service has no external IP**: ensure MetalLB (or equivalent) is installed and has an address pool configured. Without a LoadBalancer IP, the control-plane endpoint is not resolvable and `KairosControlPlane.status.initialized` will not become `true`.
 

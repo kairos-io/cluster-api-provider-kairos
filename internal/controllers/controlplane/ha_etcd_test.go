@@ -21,9 +21,12 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -212,6 +215,189 @@ func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 	joinable, _, err = r2.initMachineJoinable(context.Background(), kcp, cluster, []*clusterv1.Machine{init})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(joinable).To(BeTrue())
+}
+
+// TestCreateInfrastructureMachine_DefaultsTemplateNamespace pins CAPI's
+// namespace convention: a machineTemplate.infrastructureRef that omits the
+// namespace resolves in the KairosControlPlane's own namespace. clusterctl
+// cluster templates routinely leave it unset (the Kairos fleet provider's
+// cluster-template.yaml does), and passing the empty value through made the
+// template lookup fail with "an empty namespace may not be set when a resource
+// name is provided" — visible only as a failed control-plane machine.
+//
+// Every hand-written sample in this repo sets the namespace explicitly, which
+// is why this went unnoticed until a generated template was used.
+func TestCreateInfrastructureMachine_DefaultsTemplateNamespace(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+
+	const ns = "fleet-demo"
+	tmpl := &unstructured.Unstructured{}
+	tmpl.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infrastructure.cluster.x-k8s.io",
+		Version: "v1alpha1",
+		Kind:    "KairosFleetMachineTemplate",
+	})
+	tmpl.SetName("cp-tmpl")
+	tmpl.SetNamespace(ns)
+	g.Expect(unstructured.SetNestedMap(tmpl.Object, map[string]interface{}{"group": "control-plane"},
+		"spec", "template", "spec")).To(Succeed())
+
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: ns}}
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: ns},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				// Deliberately no Namespace — this is the case under test.
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1alpha1",
+					Kind:       "KairosFleetMachineTemplate",
+					Name:       "cp-tmpl",
+				},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tmpl).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	obj, err := r.createInfrastructureMachine(context.Background(), logr.Discard(), kcp, cluster, "cp-0")
+	g.Expect(err).ToNot(HaveOccurred(), "a namespace-less infrastructureRef must resolve in the KCP's namespace")
+	g.Expect(obj).ToNot(BeNil())
+	g.Expect(obj.GetNamespace()).To(Equal(ns))
+	g.Expect(obj.GetName()).To(Equal("cp-0"))
+}
+
+// TestInitMachineJoinable_SequencesJoiners pins the quorum-safety fix for
+// concurrent joiner creation: with the init node fully healthy, the gate must
+// still refuse to open while a previously created joiner has not finished
+// joining. Without this the gate opens twice in consecutive reconciles (the
+// init is genuinely healthy the whole time), both joiners run `etcd member add`
+// before either serves, and quorum is lost unrecoverably.
+func TestInitMachineJoinable_SequencesJoiners(t *testing.T) {
+	scheme := haTestScheme(NewWithT(t))
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"}}
+
+	mkKCP := func(dist string) *controlplanev1beta2.KairosControlPlane {
+		kcp := &controlplanev1beta2.KairosControlPlane{
+			ObjectMeta: metav1.ObjectMeta{Name: "kcp", Namespace: "default"},
+			Spec:       controlplanev1beta2.KairosControlPlaneSpec{Distribution: dist, Replicas: ptr.To(int32(3))},
+		}
+		conditions.MarkTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition)
+		return kcp
+	}
+	mkMachine := func(name, node string, deleting bool) *clusterv1.Machine {
+		m := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
+		if node != "" {
+			m.Status.NodeRef = clusterv1.MachineNodeReference{Name: node}
+		}
+		if deleting {
+			now := metav1.Now()
+			m.DeletionTimestamp = &now
+			m.Finalizers = []string{"test.kairos.io/hold"}
+		}
+		return m
+	}
+	healthy := func(node string) string {
+		return `{"name":"` + node + `","healthy":true,"voting":true,"members":1,"reportedAt":"t"}`
+	}
+	jt := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: joinTokenSecretName("c"), Namespace: "default"},
+		Data:       map[string][]byte{joinTokenSecretDataKey: []byte("tok")},
+	}
+	// etcdStatus always carries a healthy init; only the joiners vary.
+	esWith := func(extra map[string]string) *corev1.Secret {
+		data := map[string][]byte{"cp-0": []byte(healthy("cp-0"))}
+		for node, raw := range extra {
+			data[node] = []byte(raw)
+		}
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: etcdStatusSecretName("c"), Namespace: "default"},
+			Data:       data,
+		}
+	}
+	init := mkMachine("cp-0", "cp-0", false)
+
+	tests := []struct {
+		name         string
+		distribution string
+		machines     []*clusterv1.Machine
+		etcdExtra    map[string]string
+		wantJoinable bool
+		wantReason   string
+	}{
+		{
+			name:         "k0s: joiner still booting, no NodeRef yet — blocked",
+			distribution: "k0s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "", false)},
+			wantJoinable: false,
+			wantReason:   "has not registered a Node",
+		},
+		{
+			name:         "k0s: joiner registered but etcd not reported — blocked",
+			distribution: "k0s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "cp-1", false)},
+			wantJoinable: false,
+			wantReason:   "healthy voting etcd member",
+		},
+		{
+			name:         "k0s: joiner reported unhealthy — blocked",
+			distribution: "k0s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "cp-1", false)},
+			etcdExtra:    map[string]string{"cp-1": `{"name":"cp-1","healthy":false,"voting":true,"members":2,"reportedAt":"t"}`},
+			wantJoinable: false,
+			wantReason:   "healthy voting etcd member",
+		},
+		{
+			name:         "k0s: joiner fully joined — next joiner allowed",
+			distribution: "k0s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "cp-1", false)},
+			etcdExtra:    map[string]string{"cp-1": healthy("cp-1")},
+			wantJoinable: true,
+		},
+		{
+			name:         "a terminating joiner does not block scale-up",
+			distribution: "k0s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "", true)},
+			wantJoinable: true,
+		},
+		{
+			name:         "k3s: missing etcd report is advisory, NodeRef is enough",
+			distribution: "k3s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "cp-1", false)},
+			wantJoinable: true,
+		},
+		{
+			name:         "k3s: joiner not registered yet still blocks",
+			distribution: "k3s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "", false)},
+			wantJoinable: false,
+			wantReason:   "has not registered a Node",
+		},
+		{
+			name:         "k3s: explicit unhealthy joiner blocks",
+			distribution: "k3s",
+			machines:     []*clusterv1.Machine{init, mkMachine("cp-1", "cp-1", false)},
+			etcdExtra:    map[string]string{"cp-1": `{"name":"cp-1","healthy":false,"voting":true,"members":2,"reportedAt":"t"}`},
+			wantJoinable: false,
+			wantReason:   "unhealthy etcd member",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(jt, esWith(tc.etcdExtra)).Build()
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+			joinable, reason, err := r.initMachineJoinable(context.Background(), mkKCP(tc.distribution), cluster, tc.machines)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(joinable).To(Equal(tc.wantJoinable), "reason: %s", reason)
+			if tc.wantReason != "" {
+				g.Expect(reason).To(ContainSubstring(tc.wantReason))
+			}
+		})
+	}
 }
 
 // TestCanRemoveMember pins the ADR 0005 §E.2/§E.5 quorum guard: exact teardown
