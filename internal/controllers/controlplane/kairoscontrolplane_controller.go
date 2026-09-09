@@ -593,6 +593,20 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	if len(outdatedMachines) > 0 {
 		if currentReplicas < desiredReplicas+maxSurge {
 			role := r.controlPlaneRoleForNewMachine(desiredReplicas, machines)
+			// The surge machine is a joiner like any other: it runs `etcd member
+			// add` on boot, so it needs the same quorum-safety gate as the plain
+			// scale-up path below. Without it a rollout can add a member while a
+			// previous joiner is still booting and break quorum (ADR 0005 §E.1).
+			if role == bootstrapv1beta2.ControlPlaneRoleJoin {
+				joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
+				}
+				if !joinable {
+					log.Info("Holding back rollout surge machine until it is safe to add a member", "reason", reason)
+					return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+				}
+			}
 			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
 			}
@@ -693,8 +707,8 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 	return bootstrapv1beta2.ControlPlaneRoleJoin
 }
 
-// initMachineJoinable reports whether the HA init machine (the oldest CP
-// machine) is ready to accept joiners. The gate is (ADR 0005 Phase 3, OQ-A):
+// initMachineJoinable reports whether it is safe to create another join
+// machine. The gate is (ADR 0005 Phase 3, OQ-A):
 //   - the init machine has Status.NodeRef set (it registered as a Node), AND
 //   - KubeconfigReadyCondition is True on the KCP (the node pushed its
 //     kubeconfig — KD-3b), AND
@@ -704,7 +718,12 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 //   - the init node has reported a healthy voting etcd member into the
 //     etcd-status Secret (ADR 0005 §E.1) — strict for k0s (authoritative
 //     `k0s etcd member-list`), advisory for k3s (block only on an explicit
-//     unhealthy report; a missing report never regresses k3s bring-up).
+//     unhealthy report; a missing report never regresses k3s bring-up), AND
+//   - every joiner created so far has finished joining, by the same per-node
+//     test. This is what makes scale-up one-at-a-time; without it the init-node
+//     clauses above stay true while a joiner is still booting and a second
+//     joiner is cut loose, so two concurrent `etcd member add`s break quorum
+//     before either member serves. See the loop below for the full failure mode.
 //
 // reason is a short human-readable explanation when not joinable (for
 // logging/conditions).
@@ -755,6 +774,41 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 		// so k3s bring-up is never regressed by the reporter's best-effort nature.
 		if reported && (!initMember.Healthy || !initMember.Voting) {
 			return false, "init node reported an unhealthy etcd member", nil
+		}
+	}
+
+	// Sequence joiners one at a time (ADR 0005 §E.1, quorum safety).
+	//
+	// The init-node checks above cannot see a joiner that has already been
+	// created but whose etcd has not started yet: while that joiner is still
+	// booting, the init remains a perfectly healthy single-member cluster and
+	// reports healthy+voting, so the gate would open again and a second joiner
+	// would be created. Each joiner runs `etcd member add` on boot, and two adds
+	// against a one-member cluster raise the configured voter count to three
+	// while one member is serving. Quorum ((N/2)+1 = 2) is then unmet, etcd stops
+	// serving, the apiserver fails, and the k0s join API — which needs the
+	// apiserver to validate the join token — hangs. Neither joiner can complete
+	// and the cluster does not recover.
+	//
+	// Upstream KubeadmControlPlane sequences members for exactly this reason.
+	// Blocking here is fail-safe: a joiner that never comes up stalls scale-up
+	// (visible via this reason string) rather than destroying the cluster.
+	for _, m := range machines[1:] {
+		if !m.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if !m.Status.NodeRef.IsDefined() {
+			return false, fmt.Sprintf("joiner %s has not registered a Node yet", m.Name), nil
+		}
+		member, memberReported := etcdStatus[m.Status.NodeRef.Name]
+		if distribution == "k0s" {
+			if !memberReported || !member.Healthy || !member.Voting {
+				return false, fmt.Sprintf("joiner %s has not yet reported a healthy voting etcd member", m.Name), nil
+			}
+		} else if memberReported && (!member.Healthy || !member.Voting) {
+			// k3s: same best-effort treatment as the init node above — a missing
+			// report never blocks, an explicit unhealthy one does.
+			return false, fmt.Sprintf("joiner %s reported an unhealthy etcd member", m.Name), nil
 		}
 	}
 	return true, "", nil
