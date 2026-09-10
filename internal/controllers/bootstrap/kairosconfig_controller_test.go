@@ -32,6 +32,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/contract"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -1194,6 +1195,16 @@ func TestReconcile_SuccessClearsFailureFields(t *testing.T) {
 			Name:      "test-cluster",
 			Namespace: "default",
 		},
+		// Reconcile refuses to render until the infrastructure is provisioned
+		// and (for control-plane roles) the endpoint is published.
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "172.16.56.45", Port: 6443},
+		},
+		Status: clusterv1.ClusterStatus{
+			Initialization: clusterv1.ClusterInitializationStatus{
+				InfrastructureProvisioned: ptr.To(true),
+			},
+		},
 	}
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1579,4 +1590,301 @@ func makeInfraCRDForBootstrap(group, kind, contractAPIVersion string) *unstructu
 	crd.SetName(contract.CalculateCRDName(group, kind))
 	crd.SetLabels(map[string]string{clusterv1.GroupVersion.String(): contractAPIVersion})
 	return crd
+}
+
+// haInitFixture builds the object graph for a k0s HA-init control-plane
+// KairosConfig owned by a CAPV Machine, mirroring the beskar7 lab topology
+// that surfaced the bootstrap-ordering bug: a 3-replica k0s control plane whose
+// endpoint (the kube-vip VIP) is published by the infrastructure cluster.
+//
+// The returned Cluster deliberately starts un-provisioned and endpoint-less —
+// exactly the state CAPI leaves it in between "Cluster created" and the
+// reconcile pass that copies InfraCluster.spec.controlPlaneEndpoint across and
+// flips status.initialization.infrastructureProvisioned.
+func haInitFixture() (*clusterv1.Cluster, *clusterv1.Machine, *bootstrapv1beta2.KairosConfig) {
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-cp-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:             "test-cluster",
+				clusterv1.MachineControlPlaneNameLabel: "test-cluster-cp",
+			},
+		},
+		Spec: clusterv1.MachineSpec{
+			ClusterName:       "test-cluster",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{Kind: "VSphereMachine", Name: "test-cluster-cp-0"},
+		},
+	}
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-cluster-cp-0",
+			Namespace:  "default",
+			Generation: 1,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(machine, clusterv1.GroupVersion.WithKind("Machine")),
+			},
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "control-plane",
+			Distribution:      "k0s",
+			KubernetesVersion: "v1.30.0+k0s.0",
+			ControlPlaneRole:  bootstrapv1beta2.ControlPlaneRoleInit,
+			ControlPlaneVIP: &bootstrapv1beta2.ControlPlaneVIP{
+				Address:   "172.16.56.45",
+				Interface: "eth0",
+				Mode:      "ARP",
+			},
+			UserName:     "kairos",
+			UserPassword: "kairos",
+			UserGroups:   []string{"admin"},
+		},
+	}
+	return cluster, machine, kairosConfig
+}
+
+// findCondition returns the named condition, or nil.
+func findCondition(kc *bootstrapv1beta2.KairosConfig, condType clusterv1.ConditionType) *clusterv1.Condition {
+	for i := range kc.Status.Conditions {
+		if kc.Status.Conditions[i].Type == condType {
+			return &kc.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// TestReconcile_WaitsForClusterInfrastructureThenRendersEndpoint is the
+// regression test for the bootstrap-ordering bug observed on the beskar7 lab.
+//
+// CAPI publishes Cluster.spec.controlPlaneEndpoint in the same reconcile pass
+// that flips status.initialization.infrastructureProvisioned, and the endpoint
+// is baked into the render: the k0s `api.sans` entry that puts the VIP in the
+// apiserver serving cert, and the `cp_endpoint_host=` rewrite that decides what
+// `server:` URL the node pushes into <cluster>-kubeconfig. Because a node
+// installs from the FIRST bootstrap Secret it is handed, rendering before that
+// pass permanently poisons the cluster — a later regeneration is too late.
+//
+// So: no Secret at all while the Cluster is un-provisioned, and a correct
+// render once it is.
+func TestReconcile_WaitsForClusterInfrastructureThenRendersEndpoint(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	cluster, machine, kairosConfig := haInitFixture()
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, machine, kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{
+		Client: c,
+		Scheme: scheme,
+		MgmtEndpointResolver: &stubResolver{endpoint: &ManagementEndpoint{
+			APIServer:                 "https://mgmt.example.com:6443",
+			Token:                     "test-token",
+			KubeconfigSecretName:      "test-cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+		}},
+	}
+	key := types.NamespacedName{Name: "test-cluster-cp-0", Namespace: "default"}
+	ctx := context.Background()
+
+	// Phase 1: infrastructure not provisioned yet. Nothing may be rendered.
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.IsZero()).To(BeTrue(), "the Cluster watch re-enqueues us; no requeue should be requested")
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(ctx, key, got)).To(Succeed())
+	g.Expect(got.Status.DataSecretName).To(BeNil(), "no bootstrap data secret may be referenced before the infrastructure is provisioned")
+
+	cond := findCondition(got, bootstrapv1beta2.DataSecretAvailableCondition)
+	g.Expect(cond).NotTo(BeNil(), "DataSecretAvailable must be reported while waiting")
+	g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+	g.Expect(cond.Reason).To(Equal(bootstrapv1beta2.WaitingForClusterInfrastructureReason))
+	g.Expect(cond.Severity).To(Equal(clusterv1.ConditionSeverityInfo))
+	for _, condType := range []clusterv1.ConditionType{clusterv1.ReadyCondition, bootstrapv1beta2.BootstrapReadyCondition} {
+		other := findCondition(got, condType)
+		g.Expect(other).NotTo(BeNil(), "%s must be reported while waiting", condType)
+		g.Expect(other.Status).To(Equal(corev1.ConditionFalse))
+		g.Expect(other.Reason).To(Equal(bootstrapv1beta2.WaitingForClusterInfrastructureReason))
+	}
+
+	secrets := &corev1.SecretList{}
+	g.Expect(c.List(ctx, secrets, client.InNamespace("default"))).To(Succeed())
+	g.Expect(secrets.Items).To(BeEmpty(), "no bootstrap Secret may exist before the infrastructure is provisioned")
+
+	// Phase 2: CAPI publishes the endpoint and flips infrastructureProvisioned
+	// in one pass, exactly as the cluster controller does.
+	live := &clusterv1.Cluster{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: "test-cluster", Namespace: "default"}, live)).To(Succeed())
+	live.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: "172.16.56.45", Port: 6443}
+	live.Status.Initialization.InfrastructureProvisioned = ptr.To(true)
+	g.Expect(c.Update(ctx, live)).To(Succeed())
+
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	g.Expect(c.Get(ctx, key, got)).To(Succeed())
+	g.Expect(got.Status.DataSecretName).NotTo(BeNil(), "bootstrap data secret must be rendered once the infrastructure is provisioned")
+
+	secret := &corev1.Secret{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: *got.Status.DataSecretName, Namespace: "default"}, secret)).To(Succeed())
+	cloudConfig := string(secret.Data["value"])
+
+	// The two endpoint-dependent artifacts that were missing in the lab render.
+	g.Expect(cloudConfig).To(ContainSubstring("- path: /etc/k0s/k0s.yaml"),
+		"HA-init render must write /etc/k0s/k0s.yaml so api.sans can cover the endpoint")
+	// Tolerant of the YAML quoting style the `quote` template func picks.
+	g.Expect(cloudConfig).To(MatchRegexp(`sans:\s*\n\s*- "?172\.16\.56\.45"?`),
+		"the control-plane endpoint host must appear in k0s api.sans")
+	g.Expect(cloudConfig).To(ContainSubstring("local cp_endpoint_host='172.16.56.45'"),
+		"push_kubeconfig must rewrite the kubeconfig server: URL to the control-plane endpoint")
+}
+
+// TestReconcile_ControlPlaneWaitsForControlPlaneEndpoint covers the
+// defence-in-depth half of the gate: an infrastructure provider that reports
+// provisioned without ever publishing spec.controlPlaneEndpoint must not get a
+// control-plane render, because that render silently drops api.sans and the
+// kubeconfig rewrite.
+func TestReconcile_ControlPlaneWaitsForControlPlaneEndpoint(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	cluster, machine, kairosConfig := haInitFixture()
+	cluster.Status.Initialization.InfrastructureProvisioned = ptr.To(true)
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, machine, kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: "test-cluster-cp-0", Namespace: "default"}
+	ctx := context.Background()
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(ctx, key, got)).To(Succeed())
+	g.Expect(got.Status.DataSecretName).To(BeNil(), "a control-plane render must not proceed without an endpoint")
+
+	cond := findCondition(got, bootstrapv1beta2.DataSecretAvailableCondition)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+	g.Expect(cond.Reason).To(Equal(bootstrapv1beta2.WaitingForClusterInfrastructureReason))
+	g.Expect(cond.Message).To(ContainSubstring("controlPlaneEndpoint"),
+		"the endpoint wait must be distinguishable from the infrastructure wait")
+}
+
+// TestReconcile_WorkerNotGatedOnControlPlaneEndpoint pins the deliberate
+// asymmetry: workers render without an endpoint (generateCloudConfig simply
+// leaves serverAddress empty for them), so only the infrastructure-provisioned
+// gate applies to them.
+func TestReconcile_WorkerNotGatedOnControlPlaneEndpoint(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Status: clusterv1.ClusterStatus{
+			Initialization: clusterv1.ClusterInitializationStatus{
+				InfrastructureProvisioned: ptr.To(true),
+			},
+		},
+	}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-md-0",
+			Namespace: "default",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
+		},
+		Spec: clusterv1.MachineSpec{ClusterName: "test-cluster"},
+	}
+	kairosConfig := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-md-0",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(machine, clusterv1.GroupVersion.WithKind("Machine")),
+			},
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "worker",
+			Distribution:      "k0s",
+			KubernetesVersion: "v1.30.0+k0s.0",
+			WorkerToken:       "tok",
+			UserName:          "kairos",
+			UserPassword:      "kairos",
+			UserGroups:        []string{"admin"},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, machine, kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: "test-cluster-md-0", Namespace: "default"}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(context.Background(), key, got)).To(Succeed())
+	g.Expect(got.Status.DataSecretName).NotTo(BeNil(), "a worker must render without a control-plane endpoint")
+}
+
+// TestClusterToKairosConfigs pins the Cluster watch mapper: it must fan a
+// Cluster event out to the KairosConfigs of that cluster's Machines only.
+func TestClusterToKairosConfigs(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	machineWithConfig := func(name, clusterName, configName string) *clusterv1.Machine {
+		m := &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+			},
+			Spec: clusterv1.MachineSpec{ClusterName: clusterName},
+		}
+		if configName != "" {
+			m.Spec.Bootstrap.ConfigRef = clusterv1.ContractVersionedObjectReference{
+				APIGroup: bootstrapv1beta2.GroupVersion.Group,
+				Kind:     "KairosConfig",
+				Name:     configName,
+			}
+		}
+		return m
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			machineWithConfig("cp-0", "test-cluster", "cp-0-config"),
+			machineWithConfig("md-0", "test-cluster", "md-0-config"),
+			machineWithConfig("no-bootstrap", "test-cluster", ""),
+			machineWithConfig("other-cp-0", "other-cluster", "other-cp-0-config"),
+		).
+		Build()
+	r := &KairosConfigReconciler{Client: c, Scheme: scheme}
+
+	requests := r.clusterToKairosConfigs(context.Background(), &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+	})
+	g.Expect(requests).To(ConsistOf(
+		ctrl.Request{NamespacedName: types.NamespacedName{Name: "cp-0-config", Namespace: "default"}},
+		ctrl.Request{NamespacedName: types.NamespacedName{Name: "md-0-config", Namespace: "default"}},
+	))
+
+	// A non-Cluster object is inert.
+	g.Expect(r.clusterToKairosConfigs(context.Background(), &clusterv1.Machine{})).To(BeNil())
 }
