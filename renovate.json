@@ -1,0 +1,115 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+  "schedule": [
+    "after 11pm every weekday",
+    "before 7am every weekday",
+    "every weekend"
+  ],
+  "timezone": "Europe/Brussels",
+  "rebaseWhen": "behind-base-branch",
+  "semanticCommits": "enabled",
+  "commitBody": "Signed-off-by: {{{gitAuthor}}}",
+  "osvVulnerabilityAlerts": true,
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "packageRules": [
+    {
+      "description": "Supply-chain inputs (actions, container images) are always human-reviewed; label them for triage.",
+      "matchManagers": [
+        "github-actions",
+        "dockerfile"
+      ],
+      "addLabels": [
+        "supply-chain"
+      ]
+    },
+    {
+      "description": "Org practice: automerge patch-level Go module updates once every check passes. platformAutomerge=false makes Renovate itself wait for all checks, independent of repo auto-merge settings.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "require",
+        "indirect"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "automerge": true,
+      "platformAutomerge": false
+    },
+    {
+      "description": "Let new module and action releases age before proposing them, so a compromised or yanked release is usually caught upstream first. Docker registries without timestamps are excluded.",
+      "matchDatasources": [
+        "go",
+        "github-tags",
+        "github-releases"
+      ],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Actions are pinned to full-semver tags, so a digest-only change means the tag was moved (the tj-actions pattern). Never a routine PR: require explicit approval on the dependency dashboard.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "action",
+        "workflow"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "dependencyDashboardApproval": true,
+      "addLabels": [
+        "tag-moved"
+      ]
+    },
+    {
+      "description": "Cluster API and the Kubernetes client libraries move together: sigs.k8s.io/cluster-api vN is built against one k8s.io/* minor and one controller-runtime minor, and mixing them breaks the v1beta2 contract. Group them so a bump is reviewed as the single decision it is, never as separate automerged patches.",
+      "groupName": "Cluster API and Kubernetes libraries",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "sigs.k8s.io/cluster-api",
+        "sigs.k8s.io/controller-runtime",
+        "k8s.io/api",
+        "k8s.io/apiextensions-apiserver",
+        "k8s.io/apimachinery",
+        "k8s.io/client-go",
+        "k8s.io/component-base",
+        "k8s.io/utils"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "The go directive, the CI go-version pins and the builder image are one decision, not three. Hold them for explicit approval: the ceiling is set by the tooling that has to parse the module, not by what Go has released.",
+      "groupName": "Go toolchain",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "golang"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "groupName": "Go toolchain",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "golang"
+      ]
+    }
+  ]
+}
