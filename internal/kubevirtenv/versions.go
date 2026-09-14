@@ -1,5 +1,7 @@
 package kubevirtenv
 
+import "fmt"
+
 // Manifest versions and URLs (keep aligned with historical kubevirt-env defaults).
 
 const (
@@ -46,6 +48,18 @@ const (
 	// KairosOperatorGitRef pins kairos-io/kairos-operator for kubectl apply -k (CRDs, controller, nginx).
 	KairosOperatorGitRef = "v0.1.0-beta4"
 )
+
+// CDIOperatorManifestURL and CDICRManifestURL resolve the pinned CDI manifests.
+// The URL constants are format strings, so building them in one place keeps the
+// version out of four call sites in cdi.go and gives the formatting a seam a
+// unit test can reach without a cluster.
+func CDIOperatorManifestURL() string {
+	return fmt.Sprintf(CDIOperatorURL, CDIVersion)
+}
+
+func CDICRManifestURL() string {
+	return fmt.Sprintf(CDICRURL, CDIVersion)
+}
 
 // KairosOperatorKustomizeDefaultURL is operator + CRDs + RBAC (namespace operator-system).
 func KairosOperatorKustomizeDefaultURL() string {

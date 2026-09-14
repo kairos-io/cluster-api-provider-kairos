@@ -1,19 +1,17 @@
 package kubevirtenv
 
 import (
-	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-// The manifest URLs in this package are format strings consumed with
-// fmt.Sprintf at their call sites. That makes a specific mistake easy and
-// silent: drop the %s while editing a URL and the version is never
-// interpolated, so the e2e cluster installs from a URL that is merely wrong
-// rather than obviously broken, and the failure surfaces much later as a
-// download error inside BeforeAll.
+// The manifest URLs in this package are format strings taking a pinned
+// version. That makes a specific mistake easy and silent: drop the %s while
+// editing a URL and the version is never interpolated, so the e2e cluster
+// installs from a URL that is merely wrong rather than obviously broken, and
+// the failure surfaces much later as a download error inside BeforeAll.
 //
 // These tests pin the shape of the constants, not upstream's behaviour: they
 // make no network calls and will not start failing because a project cut a
@@ -65,12 +63,12 @@ func TestPinnedVersionsAreReleasesNotFloatingTags(t *testing.T) {
 }
 
 func TestCDIURLsResolveToThePinnedRelease(t *testing.T) {
-	for name, raw := range map[string]string{
-		"CDIOperatorURL": CDIOperatorURL,
-		"CDICRURL":       CDICRURL,
+	// Exercises the helpers the installer actually calls, so this covers the
+	// formatting as it is used rather than re-implementing it here.
+	for name, got := range map[string]string{
+		"CDIOperatorManifestURL": CDIOperatorManifestURL(),
+		"CDICRManifestURL":       CDICRManifestURL(),
 	} {
-		got := fmt.Sprintf(raw, CDIVersion)
-
 		u, err := url.Parse(got)
 		if err != nil {
 			t.Errorf("%s formatted to an unparseable URL %q: %v", name, got, err)
