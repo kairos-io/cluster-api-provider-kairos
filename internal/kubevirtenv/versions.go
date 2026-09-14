@@ -1,5 +1,7 @@
 package kubevirtenv
 
+import "fmt"
+
 // Manifest versions and URLs (keep aligned with historical kubevirt-env defaults).
 
 const (
@@ -10,8 +12,16 @@ const (
 	LocalPathNamespace   = "local-path-storage"
 	LocalPathClassName   = "local-path"
 
-	CDIOperatorURL = "https://github.com/kubevirt/containerized-data-importer/releases/latest/download/cdi-operator.yaml"
-	CDICRURL       = "https://github.com/kubevirt/containerized-data-importer/releases/latest/download/cdi-cr.yaml"
+	// CDIVersion pins containerized-data-importer. Everything else in this file
+	// names a release; CDI used releases/latest/download, so an upstream release
+	// could change what the e2e management cluster installed with no commit here,
+	// and a bad or incompatible CDI release would surface as a mystery e2e
+	// failure. v1.66.1 is what `latest` resolved to when this was pinned, so the
+	// pin is behaviour-preserving. Bump it together with KubeVirtVersion, and
+	// check CDI still supports the Kubernetes version KindNodeImage ships.
+	CDIVersion     = "v1.66.1"
+	CDIOperatorURL = "https://github.com/kubevirt/containerized-data-importer/releases/download/%s/cdi-operator.yaml"
+	CDICRURL       = "https://github.com/kubevirt/containerized-data-importer/releases/download/%s/cdi-cr.yaml"
 
 	// KubeVirtVersion: v1.9.0 is the KubeVirt release built for Kubernetes 1.36
 	// (it supports k8s 1.34-1.36). The e2e management cluster now runs k8s 1.36
@@ -38,6 +48,18 @@ const (
 	// KairosOperatorGitRef pins kairos-io/kairos-operator for kubectl apply -k (CRDs, controller, nginx).
 	KairosOperatorGitRef = "v0.1.0-beta4"
 )
+
+// CDIOperatorManifestURL and CDICRManifestURL resolve the pinned CDI manifests.
+// The URL constants are format strings, so building them in one place keeps the
+// version out of four call sites in cdi.go and gives the formatting a seam a
+// unit test can reach without a cluster.
+func CDIOperatorManifestURL() string {
+	return fmt.Sprintf(CDIOperatorURL, CDIVersion)
+}
+
+func CDICRManifestURL() string {
+	return fmt.Sprintf(CDICRURL, CDIVersion)
+}
 
 // KairosOperatorKustomizeDefaultURL is operator + CRDs + RBAC (namespace operator-system).
 func KairosOperatorKustomizeDefaultURL() string {
