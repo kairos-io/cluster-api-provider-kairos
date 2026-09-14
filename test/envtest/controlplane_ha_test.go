@@ -52,9 +52,13 @@ func haFixture(t *testing.T, ctx context.Context, c client.Client, nsName, clust
 				Kind:     "KairosControlPlane",
 				Name:     kcpName,
 			},
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
 		},
 	}
 	g.Expect(c.Create(ctx, cluster)).To(Succeed())
+	// No infrastructure provider runs in envtest, so stand in for CAPI's cluster
+	// controller: the bootstrap controller renders nothing until this is set.
+	g.Expect(markClusterInfrastructureProvisioned(ctx, c, cluster)).To(Succeed())
 
 	kcp := &controlplanev1beta2.KairosControlPlane{
 		ObjectMeta: metav1.ObjectMeta{

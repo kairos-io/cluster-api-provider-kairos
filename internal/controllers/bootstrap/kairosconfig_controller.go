@@ -33,11 +33,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -210,6 +212,46 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if cluster == nil {
 		log.Info("Cluster is not available yet")
+		return ctrl.Result{}, nil
+	}
+
+	// Wait for the cluster infrastructure to be provisioned before rendering
+	// anything. This is the CAPI bootstrap-provider contract (CABPK gates on
+	// the same field) and it is load-bearing here, not ceremony: CAPI's cluster
+	// controller copies InfraCluster.spec.controlPlaneEndpoint into
+	// Cluster.spec.controlPlaneEndpoint in the SAME reconcile pass that flips
+	// status.initialization.infrastructureProvisioned, and the endpoint is
+	// baked into the render (k0s api.sans, the kubeconfig `server:` rewrite in
+	// push_kubeconfig). Rendering before that pass produced userdata with an
+	// empty endpoint; because the node installs from the FIRST bootstrap
+	// Secret it ever sees, a later regeneration with the correct endpoint is
+	// too late — the control plane comes up with no VIP in its serving cert
+	// and pushes `server: https://localhost:6443` into <cluster>-kubeconfig.
+	// The Cluster watch added in SetupWithManager re-enqueues us the moment
+	// the Cluster is provisioned, so this returns without a requeue.
+	if !ptr.Deref(cluster.Status.Initialization.InfrastructureProvisioned, false) {
+		log.Info("Cluster infrastructure is not ready, waiting")
+		const msg = "Waiting for Cluster status.initialization.infrastructureProvisioned to be true"
+		conditions.MarkFalse(kairosConfig, clusterv1.ReadyCondition, bootstrapv1beta2.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "%s", msg)
+		conditions.MarkFalse(kairosConfig, bootstrapv1beta2.BootstrapReadyCondition, bootstrapv1beta2.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "%s", msg)
+		conditions.MarkFalse(kairosConfig, bootstrapv1beta2.DataSecretAvailableCondition, bootstrapv1beta2.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "%s", msg)
+		return ctrl.Result{}, nil
+	}
+
+	// Defence in depth for control-plane Machines: infrastructureProvisioned
+	// being true normally implies the endpoint is already persisted (CAPI
+	// writes spec before status), but an infrastructure provider that reports
+	// provisioned without ever publishing an endpoint would otherwise let the
+	// broken render through again. Workers are deliberately NOT gated: their
+	// render tolerates an absent endpoint (generateCloudConfig simply leaves
+	// serverAddress empty) and the CAPI Machine controller does not create
+	// them before the control plane is initialized anyway.
+	if resolveRole(kairosConfig, machine) == "control-plane" && !cluster.Spec.ControlPlaneEndpoint.IsValid() {
+		log.Info("Cluster control plane endpoint is not set, waiting")
+		const msg = "Waiting for the infrastructure provider to populate Cluster.spec.controlPlaneEndpoint"
+		conditions.MarkFalse(kairosConfig, clusterv1.ReadyCondition, bootstrapv1beta2.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "%s", msg)
+		conditions.MarkFalse(kairosConfig, bootstrapv1beta2.BootstrapReadyCondition, bootstrapv1beta2.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "%s", msg)
+		conditions.MarkFalse(kairosConfig, bootstrapv1beta2.DataSecretAvailableCondition, bootstrapv1beta2.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "%s", msg)
 		return ctrl.Result{}, nil
 	}
 
@@ -856,17 +898,24 @@ func sanitizeCapkUserdata(content string) (string, bool) {
 	return strings.Join(updated, "\n"), changed
 }
 
+// resolveRole returns the effective node role for a KairosConfig: the explicit
+// spec.role when set, otherwise inferred from the owning Machine's labels.
+// Reconcile needs the role before it renders (to decide whether the
+// control-plane endpoint is a precondition), so this lives outside
+// generateCloudConfig and both call it.
+func resolveRole(kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) string {
+	if role := kairosConfig.Spec.Role; role != "" {
+		return role
+	}
+	if util.IsControlPlaneMachine(machine) {
+		return "control-plane"
+	}
+	return "worker"
+}
+
 func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (string, error) {
 	// Determine role
-	role := kairosConfig.Spec.Role
-	if role == "" {
-		// Infer from machine labels
-		if util.IsControlPlaneMachine(machine) {
-			role = "control-plane"
-		} else {
-			role = "worker"
-		}
-	}
+	role := resolveRole(kairosConfig, machine)
 
 	// Determine distribution
 	distribution := kairosConfig.Spec.Distribution
@@ -1507,6 +1556,18 @@ func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.machineToKairosConfig),
+		).
+		// Cluster watch (bootstrap-ordering fix). Reconcile refuses to render
+		// until Cluster.status.initialization.infrastructureProvisioned is true;
+		// without this watch a KairosConfig that arrived early would sit in that
+		// state until some unrelated event happened to re-enqueue it. The
+		// predicate is the same one CABPK uses, and fires on the paused
+		// transitions and on infrastructure becoming provisioned — which is the
+		// exact pass in which CAPI also publishes spec.controlPlaneEndpoint.
+		Watches(
+			&clusterv1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(r.clusterToKairosConfigs),
+			ctrlbuilder.WithPredicates(predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), log)),
 		)
 
 	for _, gvk := range optionalInfraWatches {
@@ -1646,6 +1707,35 @@ func (r *KairosConfigReconciler) machineToKairosConfig(ctx context.Context, o cl
 			},
 		},
 	}
+}
+
+// clusterToKairosConfigs maps a Cluster to every KairosConfig owned by one of
+// its Machines, so a config parked on the "cluster infrastructure is not ready"
+// path is re-reconciled the moment the Cluster becomes provisioned instead of
+// waiting for an unrelated event.
+//
+// It routes through the Machine list rather than listing KairosConfigs by the
+// cluster-name label directly: a Machine always carries that label (CAPI
+// guarantees it), and Machine.spec.bootstrap.configRef is the same edge
+// Reconcile itself walks, so the mapper cannot drift from the set of configs
+// this controller actually acts on.
+func (r *KairosConfigReconciler) clusterToKairosConfigs(ctx context.Context, o client.Object) []reconcile.Request {
+	cluster, ok := o.(*clusterv1.Cluster)
+	if !ok {
+		return nil
+	}
+
+	machineList := &clusterv1.MachineList{}
+	if err := r.List(ctx, machineList, client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: cluster.Name}); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range machineList.Items {
+		requests = append(requests, r.machineToKairosConfig(ctx, &machineList.Items[i])...)
+	}
+	return requests
 }
 
 // infraMachineToKairosConfig maps any infrastructure machine (VSphereMachine, KubevirtMachine, etc.)

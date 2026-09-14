@@ -128,9 +128,13 @@ func TestBootstrapIntegration(t *testing.T) {
 				Kind:     "DockerCluster",
 				Name:     "test-cluster",
 			},
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
 		},
 	}
 	g.Expect(mgr.GetClient().Create(ctx, cluster)).To(Succeed())
+	// No DockerCluster controller runs here, so stand in for CAPI: the bootstrap
+	// controller renders nothing until the infrastructure is provisioned.
+	g.Expect(markClusterInfrastructureProvisioned(ctx, mgr.GetClient(), cluster)).To(Succeed())
 
 	// Create Machine
 	machine := &clusterv1.Machine{
@@ -349,9 +353,11 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 				Kind:     "DockerCluster",
 				Name:     clusterName,
 			},
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
 		},
 	}
 	g.Expect(mgr.GetClient().Create(ctx, cluster)).To(Succeed())
+	g.Expect(markClusterInfrastructureProvisioned(ctx, mgr.GetClient(), cluster)).To(Succeed())
 
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
