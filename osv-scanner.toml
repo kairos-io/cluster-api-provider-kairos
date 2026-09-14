@@ -1,0 +1,25 @@
+# OSV-Scanner ignores.
+#
+# Only for advisories that cannot be actioned by updating a dependency. Anything
+# with a fixed version gets the update instead; nothing here is a way to defer
+# real work. Each entry states why it does not apply and how that was checked,
+# so it can be re-verified rather than taken on trust.
+
+[[IgnoredVulns]]
+id = "GO-2026-5932"
+reason = """
+Not a CVE and not fixable: the advisory records that golang.org/x/crypto/openpgp
+is unmaintained and unsafe by design, and it is declared against every version of
+golang.org/x/crypto from 0 onwards, with no fixed version now or ever.
+
+It applies only to code that imports the openpgp packages. This module does not.
+The scanner resolves it at module granularity and so flags it regardless of which
+packages are actually reached.
+
+Verified with `go list -deps ./... | grep openpgp`, which returns nothing. The
+only golang.org/x/crypto packages in the build graph are ssh, ssh/knownhosts and
+the primitives they pull in (chacha20, curve25519, blowfish, cryptobyte,
+poly1305, bcrypt_pbkdf). Re-run that command before assuming this entry is still
+correct; if openpgp ever enters the graph, this ignore must go and the import
+must be removed instead.
+"""
