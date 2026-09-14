@@ -1,0 +1,37 @@
+name: OSV-Scanner
+
+# Dependency vulnerability scan (OpenSSF / CNCF requirement), following the
+# kairos-io org practice: Google's reusable OSV-Scanner workflow, full scan,
+# failing on any known vulnerability. Results land in Security > Code scanning.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  # New advisories are published against code that has not changed; rescan main
+  # weekly so they surface without waiting for the next PR.
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: osv-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default; only the scan job below is granted what the reusable
+# workflow needs to upload SARIF.
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: osv-scanner
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    # The reusable workflow is SHA-pinned (and SHA-pins its own actions), but its
+    # scanner steps pull docker://ghcr.io/google/osv-scanner-action:v2.5.1 by tag.
+    # Residual risk accepted for org consistency; release builds do not consume
+    # Actions caches (release.yaml), which bounds what a repointed image could reach.
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1

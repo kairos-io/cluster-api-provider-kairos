@@ -34,27 +34,37 @@ said the CI job was gated off with `if: false`. That was true when KD-19 was
 open; the job has since been enabled and there is no such gate in
 `.github/workflows/ci.yaml`.)
 
-## Image scanning
+## Dependency vulnerability scanning
 
-Every push and pull request builds the controller image from the release
-`Dockerfile` and scans it, failing on any **fixable** CRITICAL or HIGH finding
-in either the runtime base layer or the manager binary:
+Every pull request, every push to `main`, and a weekly run scan the module's
+declared dependencies against the OSV database, following the kairos-io org
+practice. Findings appear under Security > Code scanning rather than only in a
+job log.
+
+Reproduce a CI finding locally with the same scanner:
 
 ```bash
-docker build -t cluster-api-provider-kairos:scan .
-trivy image --severity CRITICAL,HIGH --ignore-unfixed --scanners vuln \
-  --exit-code 1 cluster-api-provider-kairos:scan
+go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+osv-scanner scan source -r .
 ```
 
-Run exactly that locally to reproduce a CI failure. Unfixable findings are
-reported but do not fail the job: there is nothing to do about them here, and
-gating on them would wedge every PR until upstream shipped a fix.
+The weekly run on `main` is the trigger that matters most, and it is not
+redundant with the per-PR run: an advisory is usually published long after the
+vulnerable dependency merged, so no code-triggered run would ever flag it. The
+v0.1.2 `golang.org/x/crypto` fix came from exactly that situation, found by a
+manual scan rather than by CI.
 
-The same workflow also runs weekly on `main`. That is the trigger that matters
-most, and it is not redundant with the per-PR run: a CVE is usually disclosed
-long after the vulnerable dependency merged, so no code-triggered run would
-ever flag it. The v0.1.2 `golang.org/x/crypto` fix came from exactly that
-situation, found by a manual scan rather than by CI.
+This scans dependencies, not the runtime base image's OS packages. Base image
+CVEs are addressed by the digest bumps Renovate proposes for the `Dockerfile`.
+
+## Dependency updates
+
+Renovate keeps the Go modules, GitHub Actions and base images current; its
+configuration is `renovate.json` at the repository root. Its commits carry a
+`Signed-off-by` trailer so they satisfy the DCO check. The Go toolchain and the
+Cluster API / Kubernetes library set are deliberately held for explicit
+approval on the dependency dashboard rather than bumped automatically, because
+each is a single coordinated decision rather than an independent patch.
 
 ## End-to-end (KubeVirt)
 
