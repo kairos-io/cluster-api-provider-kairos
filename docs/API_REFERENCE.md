@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.2.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.3.
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
 
@@ -108,10 +108,35 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `ready` | `bool` | `true` when bootstrap data has been generated and the bootstrap Secret is available for the CAPI Machine controller. |
 | `dataSecretName` | `*string` | Name of the Secret containing the bootstrap cloud-config. |
 | `initialization.dataSecretCreated` | `bool` | v1beta2 contract field: `true` when the bootstrap Secret has been created. |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) for the reasons these carry before the bootstrap Secret is written. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable string indicating the last failure reason. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable description of the last failure. Cleared automatically on the next successful reconcile. If non-empty, check the owning Machine's events for context. |
+
+### Waiting for cluster infrastructure
+
+A `KairosConfig` does not render bootstrap data the moment its Machine appears.
+It first waits for `Cluster.status.initialization.infrastructureProvisioned`,
+and a control-plane role additionally waits for a usable
+`Cluster.spec.controlPlaneEndpoint`. Until then `Ready`, `BootstrapReady` and
+`DataSecretAvailable` are all `False` with reason
+`WaitingForClusterInfrastructure` at severity `Info`, and the message says which
+of the two it is waiting on.
+
+This is normal during provisioning and clears on its own: the controller watches
+the `Cluster` and re-reconciles the moment it is provisioned.
+
+The wait exists because the endpoint is baked into the render and a node
+installs from the first bootstrap Secret it is handed. Rendering early produced
+a node whose k0s API SANs omitted the control-plane VIP and which pushed
+`server: https://localhost:6443` into the cluster kubeconfig; regenerating the
+Secret later did not help, because the node had already installed. Worker roles
+are not gated on the endpoint, since their render tolerates its absence.
+
+If a `KairosConfig` stays in this state, the cluster's infrastructure provider
+has not reported `infrastructureProvisioned`, or (for a control plane) has
+reported it without publishing `spec.controlPlaneEndpoint`. Check the
+InfraCluster, not the `KairosConfig`.
 
 ### Example
 

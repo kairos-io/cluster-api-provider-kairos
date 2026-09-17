@@ -8,6 +8,69 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.1.3] — 2026-09-17
+
+A fix and supply-chain release. One real bootstrap bug, found on bare metal,
+plus the migration to the kairos-io org's scanning and dependency tooling. No
+CRD or API change; no migration steps from v0.1.2. See the
+[v0.1.3 release notes](docs/release-notes/v0.1.3.md).
+
+### Fixed
+
+- **A `KairosConfig` could render its bootstrap data before Cluster API had
+  published the control-plane endpoint**, and a node installs from the first
+  bootstrap Secret it is handed, so regenerating it later did not help.
+  Observed on a 3-replica k0s control plane using `spec.ha.vip`: the Secret was
+  written 23 seconds before CAPI wrote `spec.controlPlaneEndpoint`, so the node
+  installed with no `/etc/k0s/k0s.yaml`, k0s came up with API SANs that omitted
+  the VIP, and the node pushed `server: https://localhost:6443` into the cluster
+  kubeconfig. CAPI could never reach the workload cluster and the control plane
+  held every joiner indefinitely. `Reconcile` now waits for
+  `Cluster.status.initialization.infrastructureProvisioned`, and a control-plane
+  role additionally waits for a usable `Cluster.spec.controlPlaneEndpoint`,
+  reporting `WaitingForClusterInfrastructure` (severity `Info`) meanwhile. A
+  `Cluster` watch re-reconciles waiting configs as soon as the cluster is
+  provisioned rather than relying on an unrelated event.
+
+### Security
+
+- `golang.org/x/crypto` v0.55.0 to v0.56.0 and `golang.org/x/mod` v0.38.0 to
+  v0.40.0, clearing GO-2026-6354, GO-2026-6355, GO-2026-6179 and GO-2026-6180.
+  Two of those were published against the `x/crypto` version this project moved
+  to for v0.1.2, three days after that release.
+- Both base images in the `Dockerfile` are now pinned by digest — the multi-arch
+  index digest, so the `linux/arm64` half of the release build is unaffected —
+  so a repointed upstream tag cannot change what ships.
+
+### Changed
+
+- **Scanning and dependency updates now follow the kairos-io org practice.**
+  Trivy is replaced by Google's reusable OSV-Scanner workflow, which runs on
+  pull requests, on pushes to `main`, and weekly, and reports into Security >
+  Code scanning. Dependabot is replaced by Renovate (`renovate.json`), with the
+  Go toolchain and the Cluster API / Kubernetes library set held for explicit
+  approval because each is one coordinated decision rather than a set of
+  independent patches. Dependabot security updates are disabled at the
+  repository level.
+  - Scope note: OSV-Scanner reads declared dependencies, where Trivy read the
+    built image including its base layer. Base-image CVEs are now addressed by
+    the digest bumps Renovate proposes rather than by a scanner.
+  - `osv-scanner.toml` ignores `GO-2026-5932` only. It is not a CVE and has no
+    fixed version in any release: it records that `golang.org/x/crypto/openpgp`
+    is unmaintained, and applies only to code importing those packages, which
+    this module does not. The file carries the verification command.
+- The e2e harness pins the CDI manifests to `v1.66.1` instead of fetching
+  `releases/latest/download`, which was the last input to the e2e cluster that
+  could change with no commit. Unit tests now guard every manifest URL in that
+  package against a silent return to a floating tag.
+
+### Documentation
+
+- `docs/API_REFERENCE.md` documents the new waiting behaviour and the
+  `WaitingForClusterInfrastructure` reason, including what to check if a
+  `KairosConfig` stays in that state.
+- `docs/TESTING.md` covers dependency scanning and how updates now arrive.
+
 ## [v0.1.2] — 2026-09-09
 
 A fix release, driven by running the providers against real infrastructure for
