@@ -18,11 +18,11 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 ## Status
 
-**Latest release**: [`v0.1.2`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.2) — pre-1.0; API surface may still change before v1.0.
+**Latest release**: [`v0.1.3`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.3) — pre-1.0; API surface may still change before v1.0.
 
 Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal), plus single-control-plane clusters with the Kairos fleet infrastructure provider (AuroraBoot-claimed nodes; ADR 0008, maintained in the repository's internal decision records). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPK k0s HA additionally requires a Kairos image carrying a k0s start gate, which this project does not publish — see [the CAPK quickstart](docs/QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate). CAPD is dev-only; HA is not exercised on CAPD. Fleet HA is not yet exercised — fleet is single-control-plane only today. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
 
-Read the [v0.1.2 release notes](docs/release-notes/v0.1.2.md) before installing, and the [v0.1.0 release notes](docs/release-notes/v0.1.0.md) if you are coming from before v0.1.0. If you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place.
+Read the [v0.1.3 release notes](docs/release-notes/v0.1.3.md) before installing, and the [v0.1.0 release notes](docs/release-notes/v0.1.0.md) if you are coming from before v0.1.0. If you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place.
 
 The control plane provider is no longer limited to a fixed provider allowlist: any infrastructure provider that implements the standard CAPI `<Kind>MachineTemplate` contract works through a generic clone path, verified end-to-end against Beskar7 (a bare-metal provider outside the list above). CAPD, CAPV, CAPK, CAPM3, and the Kairos fleet provider remain the first-class path — HA support, worked samples, and a quickstart — because they carry behavior the generic path cannot infer (e.g. KubeVirt's cloud-init volume handling); other CAPI-conformant providers get the generic path with no dedicated sample or quickstart yet.
 
@@ -33,7 +33,7 @@ The control plane provider is no longer limited to a fixed provider allowlist: a
 The provider ships two ways; pick one per management cluster, they are mutually exclusive:
 
 - **clusterctl (recommended)**: register the provider, then run `clusterctl init --bootstrap kairos --control-plane kairos`.
-- **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.2/kairos-capi-provider.yaml`.
+- **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.3/kairos-capi-provider.yaml`.
 
 See the [install guide](docs/INSTALL.md) for provider registration, the full procedure for both paths, and why they cannot be mixed on one management cluster.
 

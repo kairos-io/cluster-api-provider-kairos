@@ -1,5 +1,44 @@
 # Upgrading Kairos CAPI Provider
 
+## v0.1.2 → v0.1.3
+
+Full release notes: [v0.1.3](release-notes/v0.1.3.md).
+
+No CRD changes, no API changes, and no migration steps. A `clusterctl upgrade`,
+or re-applying the flat manifest, is enough:
+
+```bash
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.3/kairos-capi-provider.yaml
+```
+
+### One new waiting state to expect
+
+A `KairosConfig` now waits for its `Cluster` to report
+`status.initialization.infrastructureProvisioned` before rendering bootstrap
+data, and a control-plane config additionally waits for a usable
+`Cluster.spec.controlPlaneEndpoint`. While waiting, `Ready`, `BootstrapReady`
+and `DataSecretAvailable` are `False` with reason
+`WaitingForClusterInfrastructure` at severity `Info`.
+
+During normal provisioning this clears within seconds and needs no action. It
+exists because the control-plane endpoint is baked into the render and a node
+installs from the first bootstrap Secret it is handed, so rendering early
+produced a node that could never join — see the release notes for the full
+sequence.
+
+If a config stays in this state, the problem is upstream of it: the
+infrastructure provider has not reported the cluster provisioned, or has
+reported it without publishing `spec.controlPlaneEndpoint`. Inspect the
+InfraCluster rather than the `KairosConfig`.
+
+### Nothing to do about the scanning change
+
+Trivy was replaced by OSV-Scanner and Dependabot by Renovate. Both are
+repository-side CI and dependency tooling; neither affects an installed
+provider or a workload cluster.
+
+---
+
 ## v0.1.1 → v0.1.2
 
 Full release notes: [v0.1.2](release-notes/v0.1.2.md).
