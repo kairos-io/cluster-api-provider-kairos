@@ -304,6 +304,14 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
+	// Make the referenced templates owned by the Cluster so `clusterctl move`
+	// carries them; without it a moved control plane lands on the target naming
+	// templates that stayed behind. Done before any machine work so a template
+	// is owned from the first reconcile, not only once a clone happens.
+	if err := r.reconcileTemplateOwnerRefs(ctx, kcp, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Resolve + persist the effective distribution BEFORE any machine creation
 	// or etcd-leave logic, so every downstream call to distributionOf(kcp) —
 	// createControlPlaneMachine, the join gate, the etcd-leave handshake — sees
