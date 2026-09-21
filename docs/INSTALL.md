@@ -1,9 +1,9 @@
 # Install Guide
 
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
-provider v0.1.0. The "Registering the Kairos fleet infrastructure
+provider v0.1.3. The "Registering the Kairos fleet infrastructure
 provider" section below documents `cluster-api-provider-kairos-fleet`
-v0.1.0's own `clusterctl.yaml` entry; it has not been re-verified by
+v0.1.3's own `clusterctl.yaml` entry; it has not been re-verified by
 running `clusterctl init --infrastructure kairos-fleet` in this repository's
 CI — see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the same
 caveat. Do not use fleet provider `v0.1.0-beta.1`: it crash-loops on a real
@@ -33,14 +33,32 @@ This provider is not yet in the upstream `clusterctl` provider list, so add it e
 # ~/.cluster-api/clusterctl.yaml (or pass --config <path> to clusterctl)
 providers:
   - name: "kairos"
-    url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/download/bootstrap-components.yaml"
+    url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/bootstrap-components.yaml"
     type: "BootstrapProvider"
   - name: "kairos"
-    url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/download/control-plane-components.yaml"
+    url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/control-plane-components.yaml"
     type: "ControlPlaneProvider"
 ```
 
 `clusterctl` discovers `metadata.yaml` next to each components file in the same GitHub release; it does not need its own entry in this file.
+
+Point `url` at a specific tag instead of `latest` to pin a version, for example
+`https://github.com/kairos-io/cluster-api-provider-kairos/releases/v0.1.3/bootstrap-components.yaml`.
+
+A `clusterctl` provider `url` is not a browser download link: `clusterctl`
+parses it as
+`https://github.com/{owner}/{repo}/releases/{latest|tag}/{components-file}` and
+reads everything after `releases/` as the version. The
+`releases/download/<tag>/<file>` form that `kubectl apply -f` and `curl` use
+elsewhere in this guide is correct for them, but wrong here in both of its
+variants: `releases/download/v0.1.3/...` fails immediately with `release not
+found for version download` (`clusterctl` reads the literal string `download`
+as the version), and `releases/latest/download/...` is the more dangerous case
+— it appears to work, because `clusterctl`'s fast path builds its own download
+URL from the file name alone, and only fails once it falls back to the GitHub
+API — on a failed direct download, under `GOPROXY=off`, or on a rate-limited or
+proxied network — with `failed to get file "metadata.yaml" from "v0.1.3"
+release`.
 
 ### Registering the Kairos fleet infrastructure provider
 
@@ -58,7 +76,8 @@ providers:
 ```
 
 Point `url` at a specific tag instead of `latest` to pin a version, for
-example `.../releases/download/v0.1.3/infrastructure-components.yaml`.
+example `.../releases/v0.1.3/infrastructure-components.yaml` — the same URL
+shape described above, with no `download/` segment.
 Do not pin `v0.1.0-beta.1`: that release crash-loops on a real management
 cluster and is not clusterctl-installable. Fleet claims already-enrolled
 AuroraBoot nodes rather than creating machines on demand; see

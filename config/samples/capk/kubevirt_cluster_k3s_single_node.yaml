@@ -220,14 +220,21 @@ spec:
         cluster.x-k8s.io/cluster-name: kairos-cluster-kv
         cluster.x-k8s.io/deployment-name: kairos-workers
     spec:
+      # Required here as well as on spec.clusterName above; omitting it is
+      # rejected with "spec.template.spec.clusterName: Required value".
+      clusterName: kairos-cluster-kv
       version: "v1.33.5+k3s1"
       bootstrap:
         configRef:
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          # In v1beta2 these are contract-versioned references: apiGroup, kind
+          # and name only. An apiVersion or namespace here is rejected with
+          # "strict decoding error: unknown field ...". The referenced object
+          # is always resolved in the MachineDeployment's own namespace.
+          apiGroup: bootstrap.cluster.x-k8s.io
           kind: KairosConfigTemplate
           name: kairos-config-template-workers-capk
       infrastructureRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+        apiGroup: infrastructure.cluster.x-k8s.io
         kind: KubevirtMachineTemplate
         name: kairos-worker-template-capk
 ---
