@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -89,10 +90,15 @@ func (r *KairosControlPlaneReconciler) ensureTemplateOwnedByCluster(ctx context.
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(ref.GroupVersionKind())
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, obj); err != nil {
-		if apierrors.IsNotFound(err) {
-			// A template that does not exist yet is not an error here: the clone
-			// path reports it with far better context, and failing this early
-			// would mask that message.
+		// Two ways a template can be absent, and neither is this helper's error
+		// to report: the object does not exist (NotFound), or its CRD is not
+		// installed at all, so the kind is not served and the REST mapper
+		// refuses the request before it reaches the API server (NoKindMatch --
+		// note this is *not* a NotFound). The latter is the ordinary state of a
+		// cluster where the infrastructure provider has not been installed yet.
+		// The clone path reports both with far better context, and failing here
+		// would abort the whole reconcile and mask that message.
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			return nil
 		}
 		return fmt.Errorf("get template %s %s/%s for owner reference: %w", ref.Kind, namespace, ref.Name, err)

@@ -2,17 +2,22 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -157,6 +162,82 @@ func TestReconcileTemplateOwnerRefs_ToleratesMissingTemplate(t *testing.T) {
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.reconcileTemplateOwnerRefs(context.Background(), kcp, cluster)).To(Succeed())
+}
+
+// A template whose CRD is not installed is absent in a second, distinct way:
+// the REST mapper refuses the request before it reaches the API server, and
+// that error is NOT a NotFound. This is the ordinary state of a cluster where
+// the infrastructure provider has not been installed yet, and it must be
+// tolerated exactly like a missing object.
+//
+// The fake client cannot reproduce it -- it resolves unstructured kinds
+// permissively and answers NotFound -- so the error is injected. Shipping
+// without this test cost a full envtest run: twelve control-plane tests failed
+// because the suite deliberately does not install the CAPD CRDs, every Get on
+// DockerMachineTemplate came back NoKindMatch, and the reconcile aborted before
+// it created any Machine.
+func TestReconcileTemplateOwnerRefs_ToleratesKindNotServed(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newKCPTestScheme(t)
+
+	cluster, kcp := ownerTestCluster(), ownerTestKCP()
+	configTmpl := &bootstrapv1beta2.KairosConfigTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "config-tmpl", Namespace: "default"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, kcp, configTmpl).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				gvk := obj.GetObjectKind().GroupVersionKind()
+				if gvk.Kind == "DockerMachineTemplate" {
+					// What a real API server's REST mapper returns when the
+					// CAPD CRDs are not installed.
+					return &meta.NoKindMatchError{
+						GroupKind:        gvk.GroupKind(),
+						SearchedVersions: []string{gvk.Version},
+					}
+				}
+				// This provider's own kinds are served; leave them alone so the
+				// test isolates the uninstalled-infrastructure case.
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	g.Expect(r.reconcileTemplateOwnerRefs(context.Background(), kcp, cluster)).To(Succeed(),
+		"an uninstalled infrastructure provider must not abort the whole reconcile")
+
+	gotCfg := &bootstrapv1beta2.KairosConfigTemplate{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "config-tmpl", Namespace: "default"}, gotCfg)).To(Succeed())
+	g.Expect(gotCfg.GetOwnerReferences()).To(HaveLen(1),
+		"one unserved kind must not stop the templates that are served from being owned")
+}
+
+// Any other API error is a real failure and must surface, so a broken owner
+// reference cannot silently let `clusterctl move` regress.
+func TestReconcileTemplateOwnerRefs_PropagatesRealErrors(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newKCPTestScheme(t)
+
+	cluster, kcp := ownerTestCluster(), ownerTestKCP()
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, kcp, infraTemplateObj()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+				if obj.GetObjectKind().GroupVersionKind().Kind == "DockerMachineTemplate" {
+					return apierrors.NewForbidden(
+						schema.GroupResource{Group: "infrastructure.cluster.x-k8s.io", Resource: "dockermachinetemplates"},
+						"infra-tmpl", errors.New("nope"))
+				}
+				return nil
+			},
+		}).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	err := r.reconcileTemplateOwnerRefs(context.Background(), kcp, cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(apierrors.IsForbidden(err)).To(BeTrue(), "the cause must stay unwrappable for callers")
+	g.Expect(err.Error()).To(ContainSubstring("infra-tmpl"), "the message must name the template that failed")
 }
 
 // The same field can name a concrete InfraMachine rather than a template; that
