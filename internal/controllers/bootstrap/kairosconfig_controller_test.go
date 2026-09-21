@@ -1888,3 +1888,54 @@ func TestClusterToKairosConfigs(t *testing.T) {
 	// A non-Cluster object is inert.
 	g.Expect(r.clusterToKairosConfigs(context.Background(), &clusterv1.Machine{})).To(BeNil())
 }
+
+// clusterctl move pauses the Cluster, copies every object to the target
+// management cluster, then deletes the originals here. Rendering bootstrap data
+// into a Secret during that window races the move, so the CAPI contract
+// requires providers to respect Cluster.spec.paused.
+//
+// The discriminator is the bootstrap Secret: the fixture is otherwise complete
+// and provisioned, so an unpaused reconcile renders one. Nothing rendered means
+// the gate fired.
+func TestReconcile_RespectsClusterPaused(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newBootstrapTestScheme(t)
+
+	cluster, machine, kairosConfig := haInitFixture()
+	cluster.Status.Initialization.InfrastructureProvisioned = ptr.To(true)
+	cluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: "172.16.56.45", Port: 6443}
+	cluster.Spec.Paused = ptr.To(true)
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, machine, kairosConfig).
+		WithStatusSubresource(&bootstrapv1beta2.KairosConfig{}).
+		Build()
+	r := &KairosConfigReconciler{
+		Client: c,
+		Scheme: scheme,
+		MgmtEndpointResolver: &stubResolver{endpoint: &ManagementEndpoint{
+			APIServer:                 "https://mgmt.example.com:6443",
+			Token:                     "test-token",
+			KubeconfigSecretName:      "test-cluster-kubeconfig",
+			KubeconfigSecretNamespace: "default",
+		}},
+	}
+	key := types.NamespacedName{Name: "test-cluster-cp-0", Namespace: "default"}
+	ctx := context.Background()
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(ctx, key, got)).To(Succeed())
+	g.Expect(got.Status.DataSecretName).To(BeNil(),
+		"a paused Cluster must not have bootstrap data rendered; the fixture is provisioned, so a Secret here means the gate did not fire")
+
+	secrets := &corev1.SecretList{}
+	g.Expect(c.List(ctx, secrets, client.InNamespace("default"))).To(Succeed())
+	g.Expect(secrets.Items).To(BeEmpty(), "no bootstrap Secret may be written while the Cluster is paused")
+
+	// observedGeneration still flushes on the paused path (KD-14).
+	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(1)))
+}

@@ -692,3 +692,158 @@ func TestSecretToKairosControlPlane_UsesClusterNameLabel(t *testing.T) {
 	got = r.secretToKairosControlPlane(context.Background(), unlabelled)
 	g.Expect(got).To(BeEmpty())
 }
+
+// clusterctl move pauses the Cluster, copies every object to the target
+// management cluster, then deletes the originals here. A control plane that
+// keeps reconciling through that window creates and deletes Machines against a
+// cluster being moved out from under it, so the CAPI contract requires
+// providers to respect Cluster.spec.paused. It matters outside move too:
+// spec.paused is how an operator stops reconciliation for any maintenance, and
+// this controller creates and deletes infrastructure.
+func TestReconcile_RespectsClusterPaused(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newKCPTestScheme(t)
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "paused-cluster", Namespace: "default"},
+		Spec: clusterv1.ClusterSpec{
+			Paused: ptr.To(true),
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     "paused-kcp",
+			},
+		},
+	}
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "paused-kcp",
+			Namespace:  "default",
+			Generation: 3,
+			Labels:     map[string]string{clusterv1.ClusterNameLabel: "paused-cluster"},
+		},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			Replicas: ptr.To(int32(3)),
+			Version:  "v1.30.0+k0s.0",
+			// Deliberately empty: the reconcile persists the inherited value
+			// immediately after the paused gate, so it stays empty if and only
+			// if the gate fired.
+			KairosConfigTemplate: controlplanev1beta2.KairosConfigTemplateReference{Name: "paused-tmpl"},
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+					Kind:       "DockerMachineTemplate",
+					Name:       "test-template",
+					Namespace:  "default",
+				},
+			},
+		},
+	}
+	tmpl := &bootstrapv1beta2.KairosConfigTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "paused-tmpl", Namespace: "default"},
+		Spec: bootstrapv1beta2.KairosConfigTemplateSpec{
+			Template: bootstrapv1beta2.KairosConfigTemplateResource{
+				Spec: bootstrapv1beta2.KairosConfigSpec{Distribution: "k3s"},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, kcp, tmpl).
+		WithStatusSubresource(&controlplanev1beta2.KairosControlPlane{}).
+		Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "paused-kcp", Namespace: "default"},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &controlplanev1beta2.KairosControlPlane{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "paused-kcp", Namespace: "default"}, got)).To(Succeed())
+
+	// The discriminator: resolving and persisting spec.distribution from the
+	// referenced template is the first thing the reconcile does after the gate.
+	// Empty here means the gate short-circuited; "k3s" means it ran on.
+	g.Expect(got.Spec.Distribution).To(BeEmpty(),
+		"a paused Cluster must not have its spec reconciled; distribution was inherited, so the gate did not fire")
+
+	machines := &clusterv1.MachineList{}
+	g.Expect(c.List(context.Background(), machines, client.InNamespace("default"))).To(Succeed())
+	g.Expect(machines.Items).To(BeEmpty(), "a paused Cluster must not have Machines created under it")
+
+	// observedGeneration still flushes on the paused path (KD-14): an operator
+	// watching the object should see it was looked at, not that it went stale.
+	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(3)))
+}
+
+// The per-object cluster.x-k8s.io/paused annotation pauses a single control
+// plane without pausing the whole Cluster; annotations.IsPaused covers both and
+// clusterctl sets the Cluster-level one.
+func TestReconcile_RespectsPausedAnnotation(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newKCPTestScheme(t)
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "ann-cluster", Namespace: "default"},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     "ann-kcp",
+			},
+		},
+	}
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ann-kcp",
+			Namespace:   "default",
+			Generation:  2,
+			Labels:      map[string]string{clusterv1.ClusterNameLabel: "ann-cluster"},
+			Annotations: map[string]string{clusterv1.PausedAnnotation: ""},
+		},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			Replicas:             ptr.To(int32(1)),
+			Version:              "v1.30.0+k0s.0",
+			KairosConfigTemplate: controlplanev1beta2.KairosConfigTemplateReference{Name: "ann-tmpl"},
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+					Kind:       "DockerMachineTemplate",
+					Name:       "test-template",
+					Namespace:  "default",
+				},
+			},
+		},
+	}
+	tmpl := &bootstrapv1beta2.KairosConfigTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "ann-tmpl", Namespace: "default"},
+		Spec: bootstrapv1beta2.KairosConfigTemplateSpec{
+			Template: bootstrapv1beta2.KairosConfigTemplateResource{
+				Spec: bootstrapv1beta2.KairosConfigSpec{Distribution: "k3s"},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, kcp, tmpl).
+		WithStatusSubresource(&controlplanev1beta2.KairosControlPlane{}).
+		Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "ann-kcp", Namespace: "default"},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &controlplanev1beta2.KairosControlPlane{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "ann-kcp", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Spec.Distribution).To(BeEmpty(),
+		"a paused KairosControlPlane must not have its spec reconciled")
+
+	machines := &clusterv1.MachineList{}
+	g.Expect(c.List(context.Background(), machines, client.InNamespace("default"))).To(Succeed())
+	g.Expect(machines.Items).To(BeEmpty(), "a paused KairosControlPlane must not have Machines created under it")
+}

@@ -37,6 +37,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -212,6 +213,23 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if cluster == nil {
 		log.Info("Cluster is not available yet")
+		return ctrl.Result{}, nil
+	}
+
+	// Respect Cluster.spec.paused and the cluster.x-k8s.io/paused annotation.
+	// spec.Pause above is this provider's own per-object switch; this is the
+	// CAPI one, and it is load-bearing for `clusterctl move`, which pauses the
+	// Cluster, copies every object to the target management cluster, then
+	// deletes the originals here. Rendering bootstrap data into a Secret in
+	// that window races the move.
+	//
+	// Checked after the Cluster is resolved because that is what carries the
+	// flag. CABPK uses paused.EnsurePausedCondition, which also surfaces a
+	// Paused condition; it needs v1beta2 metav1.Conditions and these types
+	// still carry v1beta1 clusterv1.Conditions, so adopt it with the
+	// conditions migration (KD-13) rather than before it.
+	if annotations.IsPaused(cluster, kairosConfig) {
+		log.Info("Reconciliation is paused for this KairosConfig")
 		return ctrl.Result{}, nil
 	}
 

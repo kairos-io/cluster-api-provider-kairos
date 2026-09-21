@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -272,6 +273,33 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if cluster == nil {
 		log.Info("Cluster is not available yet")
 		// Flush observedGeneration via the deferred Patch.
+		patchOnExit = true
+		return ctrl.Result{}, nil
+	}
+
+	// Respect Cluster.spec.paused and the cluster.x-k8s.io/paused annotation.
+	// This is the CAPI provider contract, and it is load-bearing for
+	// `clusterctl move`: move pauses the Cluster, copies every object to the
+	// target management cluster, then deletes the originals here. A control
+	// plane that keeps reconciling through that window creates and deletes
+	// Machines against a cluster that is being moved out from under it.
+	//
+	// It matters outside move too — spec.paused is how an operator stops
+	// reconciliation for any maintenance, and this controller creates and
+	// deletes infrastructure.
+	//
+	// observedGeneration was already set above; the deferred Patch flushes it
+	// with any condition transitions a previous Reconcile left in flight.
+	// FailureReason/FailureMessage are deliberately not cleared: latched
+	// failure state still reflects the last real observation and clears on the
+	// first successful Reconcile after resume.
+	//
+	// CABPK uses paused.EnsurePausedCondition here, which also surfaces a
+	// Paused condition. That helper needs v1beta2 metav1.Conditions and these
+	// types still carry v1beta1 clusterv1.Conditions, so adopt it with the
+	// conditions migration (KD-13) rather than before it.
+	if annotations.IsPaused(cluster, kcp) {
+		log.Info("Reconciliation is paused for this KairosControlPlane")
 		patchOnExit = true
 		return ctrl.Result{}, nil
 	}
