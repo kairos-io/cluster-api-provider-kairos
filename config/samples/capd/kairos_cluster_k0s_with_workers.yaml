@@ -61,12 +61,19 @@ metadata:
   namespace: default
 spec:
   template:
-    spec:
-      # Custom image can be specified here
-      # For Kairos, you would use a Kairos-based image.
-      # Example: image: "quay.io/kairos/kairos-opensuse-leap:<pinned-release-tag>"
-      # Do not use :latest — pin an explicit released tag so re-applying this
-      # manifest later does not silently change the OS image.
+    # `spec` is required and must be an object. Leaving it as comments alone
+    # makes it null, which the API server rejects with
+    # "spec.template.spec: Required value", so keep the explicit `{}`.
+    spec: {}
+    # CAPD runs each machine as a container and picks the node image itself.
+    # To override it, replace the line above with:
+    #   spec:
+    #     customImage: "<registry>/<node-image>:<pinned-tag>"
+    # Do not use :latest — pin an explicit tag so re-applying this manifest
+    # later does not silently change the image. Note this is CAPD's node
+    # container image, not a Kairos OS image: CAPD exists to exercise the
+    # Cluster API contract, and the quickstarts for CAPV, CAPK, CAPM3, and the
+    # Kairos fleet provider are the paths that boot real Kairos nodes.
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
@@ -109,15 +116,17 @@ spec:
       clusterName: kairos-cluster
       bootstrap:
         configRef:
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          # In v1beta2 these are contract-versioned references: apiGroup, kind
+          # and name only. An apiVersion or namespace here is rejected with
+          # "strict decoding error: unknown field ...". The referenced object
+          # is always resolved in the MachineDeployment's own namespace.
+          apiGroup: bootstrap.cluster.x-k8s.io
           kind: KairosConfigTemplate
           name: kairos-config-template-worker
-          namespace: default
       infrastructureRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        apiGroup: infrastructure.cluster.x-k8s.io
         kind: DockerMachineTemplate
         name: kairos-worker-template
-        namespace: default
       version: "v1.30.0+k0s.0"
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
@@ -127,9 +136,12 @@ metadata:
   namespace: default
 spec:
   template:
-    spec:
-      # Custom image can be specified here
-      # For Kairos, you would use a Kairos-based image
+    # Required and must be an object; see the control-plane template above,
+    # including the tag-pinning note.
+    spec: {}
+    # To override CAPD's node container image:
+    #   spec:
+    #     customImage: "<registry>/<node-image>:<pinned-tag>"
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KairosConfigTemplate
