@@ -576,6 +576,14 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		return ctrl.Result{}, err
 	}
 
+	// Carry the current machineTemplate.metadata onto the Machines that already
+	// exist, so an edited label reaches a running cluster without a rollout.
+	// Runs before the etcd-leave sweep so a terminating Machine keeps its hook:
+	// the merge is additive and never removes an annotation.
+	if err := r.reconcileMachineMetadata(ctx, log, kcp, cluster, machines); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// HA (ADR 0005 §E.3): before any scale/rollout math, progress the etcd-leave
 	// pre-terminate handshake for every owned control-plane Machine that is
 	// terminating and still carries our hook. This single sweep covers the
@@ -920,14 +928,17 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	}
 
 	// Create Machine
+	// machineTemplate.metadata is documented as "metadata to apply to created
+	// Machines", and this is the object it names. CAPI's Machine controller
+	// reads machine.Labels, and nothing else, to decide which labels to sync
+	// onto the Node (util/labels.GetManagedLabels), so a label that stops here
+	// never reaches the node it was written for.
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      machineName,
-			Namespace: kcp.Namespace,
-			Labels: map[string]string{
-				clusterv1.ClusterNameLabel:         cluster.Name,
-				clusterv1.MachineControlPlaneLabel: "",
-			},
+			Name:        machineName,
+			Namespace:   kcp.Namespace,
+			Labels:      controlPlaneMachineLabels(kcp, cluster.Name),
+			Annotations: controlPlaneMachineAnnotations(kcp),
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
 			},
@@ -985,25 +996,10 @@ func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.C
 		infraRef.Namespace = kcp.Namespace
 	}
 
-	// Prepare labels and annotations
-	labels := map[string]string{
-		clusterv1.ClusterNameLabel:         cluster.Name,
-		clusterv1.MachineControlPlaneLabel: "",
-	}
-	// Merge with template metadata labels (Metadata is an optional pointer).
-	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
-		for k, v := range md.Labels {
-			labels[k] = v
-		}
-	}
-
-	annotations := map[string]string{}
-	// Merge with template metadata annotations (Metadata is an optional pointer).
-	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
-		for k, v := range md.Annotations {
-			annotations[k] = v
-		}
-	}
+	// Same metadata the Machine gets, from the same two helpers, so the pair
+	// cannot drift apart again.
+	labels := controlPlaneMachineLabels(kcp, cluster.Name)
+	annotations := controlPlaneMachineAnnotations(kcp)
 
 	// Clone infrastructure machine using the helper
 	infraMachine, err := infrastructure.CloneInfrastructureMachine(
