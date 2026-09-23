@@ -19,6 +19,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,18 +30,36 @@ import (
 )
 
 // nodeDrainTimeoutSeconds converts the machine template's nodeDrainTimeout into
-// the unit the CAPI Machine contract uses. A nil timeout stays nil, which is
-// CAPI's "drain with no deadline". A negative duration would mean "never drain"
-// rather than "no deadline", so it is clamped to zero, matching the CRD's own
-// intent that the field bounds the drain.
+// the unit the CAPI Machine contract uses. A nil timeout stays nil.
+//
+// Cluster API reads the result in nodeDrainTimeoutExceeded, which treats every
+// value <= 0 the same as an unset one and drains with no deadline. So zero does
+// not bound the drain, and a negative duration never meant "never drain"
+// either: both already land on CAPI's default.
+//
+// The value is nonetheless clamped into [0, math.MaxInt32], because the Machine
+// CRD declares nodeDrainTimeoutSeconds with minimum: 0. Out of that range the
+// API server rejects the object, which costs every create and patch of the
+// Machine rather than merely mis-timing a drain.
+//
+// Bounding the int64 before it is narrowed is what closes the overflow.
+// metav1.Duration carries int64 nanoseconds, so a timeout past roughly 68
+// years exceeds math.MaxInt32 seconds, and int32 would wrap it into a short
+// deadline or a rejected negative one: the one input that inverts the field's
+// meaning instead of just rounding it.
 func nodeDrainTimeoutSeconds(d *metav1.Duration) *int32 {
 	if d == nil {
 		return nil
 	}
+
 	seconds := int64(d.Duration.Seconds())
-	if seconds < 0 {
+	switch {
+	case seconds < 0:
 		seconds = 0
+	case seconds > math.MaxInt32:
+		seconds = math.MaxInt32
 	}
+
 	out := int32(seconds)
 	return &out
 }
