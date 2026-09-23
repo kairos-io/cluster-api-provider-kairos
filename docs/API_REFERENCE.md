@@ -262,7 +262,7 @@ spec:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. |
-| `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates. |
+| `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates and scale-down. Propagated to `Machine.spec.deletion.nodeDrainTimeoutSeconds`, which is where Cluster API reads the deadline from, so the value is truncated to whole seconds. Unset means CAPI's default: drain with no deadline. Editing it applies to the Machines that already exist, including one that is draining right now. |
 | `metadata` | `ObjectMeta` | No | Metadata to apply to created Machines. |
 
 #### KairosConfigTemplateReference

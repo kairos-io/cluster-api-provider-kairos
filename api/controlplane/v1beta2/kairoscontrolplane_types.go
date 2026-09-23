@@ -223,7 +223,11 @@ type KairosControlPlaneMachineTemplate struct {
 	InfrastructureRef corev1.ObjectReference `json:"infrastructureRef"`
 
 	// NodeDrainTimeout is the total amount of time that the controller will spend
-	// on draining a controlplane node
+	// on draining a controlplane node.
+	//
+	// It is propagated to Machine.spec.deletion.nodeDrainTimeoutSeconds, which is
+	// where Cluster API reads the deadline from, so the value is truncated to
+	// whole seconds. Unset keeps CAPI's default of draining with no deadline.
 	// +optional
 	NodeDrainTimeout *metav1.Duration `json:"nodeDrainTimeout,omitempty"`
 

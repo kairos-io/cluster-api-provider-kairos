@@ -569,6 +569,13 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	log.Info("Reconciling control plane machines", "desired", desiredReplicas, "current", currentReplicas)
 
+	// Carry the current machineTemplate.nodeDrainTimeout onto the Machines that
+	// already exist. This runs before the etcd-leave sweep below so a Machine
+	// that is terminating right now picks up an edited deadline.
+	if err := r.reconcileNodeDrainTimeout(ctx, log, kcp, machines); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// HA (ADR 0005 §E.3): before any scale/rollout math, progress the etcd-leave
 	// pre-terminate handshake for every owned control-plane Machine that is
 	// terminating and still carries our hook. This single sweep covers the
@@ -942,6 +949,11 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 			},
 		},
 	}
+
+	// CAPI reads the drain deadline off the Machine, not off the control plane,
+	// so machineTemplate.nodeDrainTimeout has to be carried across here or it
+	// does nothing (KCP does the same in its own machine spec).
+	applyNodeDrainTimeout(&machine.Spec, kcp)
 
 	// HA (ADR 0005 §E.3): stamp the etcd-leave pre-terminate hook on k0s HA
 	// control-plane Machines so CAPI pauses termination after drain (node still
