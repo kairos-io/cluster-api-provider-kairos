@@ -1045,12 +1045,9 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 // to "kairos" when no password was set.
 func (r *KairosConfigReconciler) resolveUserPassword(ctx context.Context, kairosConfig *bootstrapv1beta2.KairosConfig) (string, error) {
 	if ref := kairosConfig.Spec.UserPasswordSecretRef; ref != nil && ref.Name != "" {
-		secretKey := types.NamespacedName{
-			Namespace: kairosConfig.Namespace,
-			Name:      ref.Name,
-		}
-		if ref.Namespace != "" {
-			secretKey.Namespace = ref.Namespace
+		secretKey, err := secretRefKey(kairosConfig.Namespace, ref.Namespace, ref.Name)
+		if err != nil {
+			return "", fmt.Errorf("user password: %w", err)
 		}
 		secret := &corev1.Secret{}
 		if err := r.Get(ctx, secretKey, secret); err != nil {

@@ -995,6 +995,13 @@ func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.C
 	if infraRef.Namespace == "" {
 		infraRef.Namespace = kcp.Namespace
 	}
+	// A template in another namespace is refused here as well as at admission,
+	// in case the webhook was not in the path: cloning it would copy another
+	// namespace's machine template into this cluster.
+	if infraRef.Namespace != kcp.Namespace {
+		return nil, fmt.Errorf("machineTemplate.infrastructureRef names namespace %q: cross-namespace references are not allowed, the template must be in namespace %q",
+			infraRef.Namespace, kcp.Namespace)
+	}
 
 	// Same metadata the Machine gets, from the same two helpers, so the pair
 	// cannot drift apart again.

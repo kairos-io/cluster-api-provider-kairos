@@ -18,6 +18,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -117,18 +118,15 @@ func (r *KairosConfigReconciler) resolveWorkerToken(ctx context.Context, kc *boo
 }
 
 // tokenFromWorkerRef reads a WorkerTokenSecretReference-shaped ref. The Secret's
-// namespace defaults to the KairosConfig namespace; the data key defaults to
+// Secret must be in the KairosConfig namespace (see secretRefKey); the data key defaults to
 // "token". A 404 surfaces as errTokenNotReady (requeue); a present-but-keyless
 // Secret is a hard error. label is a human-readable noun for error messages
 // ("worker token" / "k3s token") and is the only thing logged — never the
 // resolved value.
-func (r *KairosConfigReconciler) tokenFromWorkerRef(ctx context.Context, defaultNamespace string, ref *bootstrapv1beta2.WorkerTokenSecretReference, label string) (string, error) {
-	secretKey := types.NamespacedName{
-		Namespace: defaultNamespace,
-		Name:      ref.Name,
-	}
-	if ref.Namespace != "" {
-		secretKey.Namespace = ref.Namespace
+func (r *KairosConfigReconciler) tokenFromWorkerRef(ctx context.Context, ownerNamespace string, ref *bootstrapv1beta2.WorkerTokenSecretReference, label string) (string, error) {
+	secretKey, err := secretRefKey(ownerNamespace, ref.Namespace, ref.Name)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", label, err)
 	}
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, secretKey, secret); err != nil {
@@ -146,6 +144,28 @@ func (r *KairosConfigReconciler) tokenFromWorkerRef(ctx context.Context, default
 		return "", fmt.Errorf("%s secret %s/%s does not contain key '%s'", label, secretKey.Namespace, secretKey.Name, key)
 	}
 	return string(tokenData), nil
+}
+
+// errCrossNamespaceSecretRef reports a Secret reference that names a namespace
+// other than the KairosConfig's own.
+var errCrossNamespaceSecretRef = errors.New("cross-namespace Secret references are not allowed")
+
+// secretRefKey resolves a Secret reference in ownerNamespace, the namespace of
+// the KairosConfig that holds it. An empty reference namespace means that one;
+// any other namespace is refused.
+//
+// The controller reads Secrets cluster-wide and copies what these references
+// point at into the bootstrap Secret beside the KairosConfig, so honouring a
+// foreign namespace would copy another namespace's Secret into data the
+// KairosConfig's author can read. The KairosConfig webhook rejects such a
+// reference at admission; this refuses it again here, because a webhook is not
+// always in the path (not yet installed, failurePolicy, direct etcd writes).
+func secretRefKey(ownerNamespace, refNamespace, name string) (types.NamespacedName, error) {
+	if refNamespace != "" && refNamespace != ownerNamespace {
+		return types.NamespacedName{}, fmt.Errorf("%w: Secret %s/%s is outside namespace %s",
+			errCrossNamespaceSecretRef, refNamespace, name, ownerNamespace)
+	}
+	return types.NamespacedName{Namespace: ownerNamespace, Name: name}, nil
 }
 
 // tokenFromLegacyRef reads the legacy TokenSecretRef (a bare
