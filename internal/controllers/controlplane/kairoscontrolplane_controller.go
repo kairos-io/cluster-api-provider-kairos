@@ -201,6 +201,21 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// deferred Patch should flush observedGeneration/conditions on the
 	// non-terminal drain-requeue path.
 	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+		// A paused Cluster holds deletion too, as it does for upstream
+		// KubeadmControlPlane. Deleting the control plane marks every
+		// control-plane Machine for deletion and strips their etcd-leave hooks,
+		// neither of which can be undone, so an operator who paused the cluster
+		// (maintenance, a manual migration) must not have that happen under
+		// them. The finalizer stays, and deletion resumes on unpause.
+		paused, err := r.deletionPaused(ctx, kcp)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if paused {
+			log.Info("Deletion is paused for this KairosControlPlane")
+			patchOnExit = true
+			return ctrl.Result{}, nil
+		}
 		res, skipPatch, derr := r.reconcileDelete(ctx, log, kcp)
 		if !skipPatch {
 			patchOnExit = true

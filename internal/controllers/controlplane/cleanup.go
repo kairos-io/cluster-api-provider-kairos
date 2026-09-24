@@ -18,11 +18,14 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -167,4 +170,23 @@ func ownedByKCP(machine *clusterv1.Machine, kcpUID types.UID) bool {
 		}
 	}
 	return false
+}
+
+// deletionPaused reports whether deletion of the KairosControlPlane has to wait
+// because it, or its Cluster, is paused.
+//
+// A Cluster that no longer exists holds nothing back: deletion runs before the
+// Cluster lookup precisely so a control plane whose Cluster was deleted first
+// still finishes, and this must not turn that case into a hang. Any other lookup
+// error is returned, so the reconcile retries rather than deleting while unsure.
+func (r *KairosControlPlaneReconciler) deletionPaused(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane) (bool, error) {
+	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, kcp.ObjectMeta)
+	switch {
+	case err == nil:
+		return annotations.IsPaused(cluster, kcp), nil
+	case apierrors.IsNotFound(err) || errors.Is(err, util.ErrNoCluster):
+		return annotations.HasPaused(kcp), nil
+	default:
+		return false, err
+	}
 }
