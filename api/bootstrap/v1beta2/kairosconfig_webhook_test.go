@@ -21,7 +21,9 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 // newValidKairosConfig returns a control-plane KairosConfig that satisfies
@@ -332,5 +334,94 @@ func TestKairosConfig_Validate_BackwardCompat_SingleNodeNoRole(t *testing.T) {
 
 	if err := kc.validate(); err != nil {
 		t.Fatalf("validate() returned %v; existing single-node KairosConfig (SingleNode=true, ControlPlaneRole empty) must continue to validate cleanly", err)
+	}
+}
+
+// TestKairosConfig_Validate_WarnsOnUnimplementedCAFields covers spec.caCertHashes
+// and spec.caCertSecretRef, which are served by the CRD but read by no controller
+// and rendered into no cloud-config. See kairos-io/kairos#4937. The webhook must
+// warn rather than reject, so objects that already carry the fields keep applying.
+func TestKairosConfig_Validate_WarnsOnUnimplementedCAFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		mutate   func(kc *KairosConfig)
+		wantWarn []string
+	}{
+		{
+			name:     "neither field set produces no warning",
+			mutate:   func(_ *KairosConfig) {},
+			wantWarn: nil,
+		},
+		{
+			name:     "caCertHashes set is warned about",
+			mutate:   func(kc *KairosConfig) { kc.Spec.CACertHashes = []string{"sha256:abc"} },
+			wantWarn: []string{"spec.caCertHashes"},
+		},
+		{
+			name: "caCertSecretRef set is warned about",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.CACertSecretRef = &corev1.ObjectReference{Name: "cluster-ca"}
+			},
+			wantWarn: []string{"spec.caCertSecretRef"},
+		},
+		{
+			name: "an empty caCertHashes list is not a warning",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.CACertHashes = []string{}
+			},
+			wantWarn: nil,
+		},
+		{
+			name: "a caCertSecretRef with no name is not a warning",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.CACertSecretRef = &corev1.ObjectReference{}
+			},
+			wantWarn: nil,
+		},
+		{
+			name: "both fields set are both named",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.CACertHashes = []string{"sha256:abc"}
+				kc.Spec.CACertSecretRef = &corev1.ObjectReference{Name: "cluster-ca"}
+			},
+			wantWarn: []string{"spec.caCertHashes", "spec.caCertSecretRef"},
+		},
+	}
+
+	v := &kairosConfigValidator{}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			kc := newValidKairosConfig()
+			tc.mutate(kc)
+
+			for _, call := range []struct {
+				verb string
+				run  func() (admission.Warnings, error)
+			}{
+				{"create", func() (admission.Warnings, error) { return v.ValidateCreate(context.Background(), kc) }},
+				{"update", func() (admission.Warnings, error) { return v.ValidateUpdate(context.Background(), kc, kc) }},
+			} {
+				warns, err := call.run()
+				if err != nil {
+					t.Fatalf("Validate%s returned an error: %v; the fields must warn, not reject", call.verb, err)
+				}
+				if len(warns) != len(tc.wantWarn) {
+					t.Fatalf("Validate%s returned %d warnings (%v); want %d", call.verb, len(warns), warns, len(tc.wantWarn))
+				}
+				for _, want := range tc.wantWarn {
+					found := false
+					for _, w := range warns {
+						if strings.Contains(w, want) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("Validate%s warnings %v do not name %q", call.verb, warns, want)
+					}
+				}
+			}
+		})
 	}
 }
