@@ -91,19 +91,54 @@ var _ admission.Validator[*KairosConfig] = &kairosConfigValidator{}
 // ValidateCreate implements admission.Validator[*KairosConfig].
 func (*kairosConfigValidator) ValidateCreate(_ context.Context, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate create", "name", r.Name)
-	return nil, r.validate()
+	return r.warnings(), r.validate()
 }
 
 // ValidateUpdate implements admission.Validator[*KairosConfig].
 func (*kairosConfigValidator) ValidateUpdate(_ context.Context, _, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate update", "name", r.Name)
-	return nil, r.validate()
+	return r.warnings(), r.validate()
 }
 
 // ValidateDelete implements admission.Validator[*KairosConfig].
 func (*kairosConfigValidator) ValidateDelete(_ context.Context, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate delete", "name", r.Name)
 	return nil, nil
+}
+
+// warnings reports non-fatal problems with the spec, surfaced to the operator
+// as admission warnings at apply time.
+//
+// spec.caCertHashes and spec.caCertSecretRef are served by the CRD and were
+// documented as securing the node join, but no controller reads them and no
+// cloud-config template renders them (kairos-io/kairos#4937). Neither
+// distribution can consume them either: a k0s worker joins with the bundle
+// `k0s token create` produces, which already carries the cluster CA, and a k3s
+// agent takes no CA-hash flag at all. It validates the server only when the
+// token it is given is the full `K10<hash>::server:<password>` node-token.
+//
+// Warning rather than rejecting is deliberate: the fields have been served
+// since v1beta2 shipped, so an error would stop objects that already carry
+// them from being re-applied. Removing them is a breaking change to a served
+// API version and belongs in v1beta3.
+func (r *KairosConfig) warnings() admission.Warnings {
+	var warns admission.Warnings
+
+	if len(r.Spec.CACertHashes) > 0 {
+		warns = append(warns, "spec.caCertHashes is not implemented: it is accepted and stored, "+
+			"but no controller reads it and it is rendered into no cloud-config, so the node join "+
+			"is not pinned to it. For k3s, pass the server's full node-token "+
+			"(K10<hash>::server:<password>) as spec.k3sToken or spec.k3sTokenSecretRef instead; "+
+			"the k0s join token already carries the cluster CA.")
+	}
+
+	if r.Spec.CACertSecretRef != nil && r.Spec.CACertSecretRef.Name != "" {
+		warns = append(warns, "spec.caCertSecretRef is not implemented: it is accepted and stored, "+
+			"but no controller reads the referenced Secret and its contents reach no node. "+
+			"Use spec.files to place a CA certificate on the node.")
+	}
+
+	return warns
 }
 
 // validate performs validation on the KairosConfig spec

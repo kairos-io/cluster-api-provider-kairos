@@ -45,8 +45,8 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `workerTokenSecretRef` | `WorkerTokenSecretReference` | No | — | Reference to a Secret containing the k0s worker join token. Required for k0s workers; prefer this over inline `workerToken`. |
 | `k3sToken` | `string` | No | — | k3s join token, inline. Prefer `k3sTokenSecretRef`. If both are set, `k3sTokenSecretRef` takes precedence. |
 | `k3sTokenSecretRef` | `WorkerTokenSecretReference` | No | — | Reference to a Secret containing the k3s join token. Required for k3s workers; prefer this over inline `k3sToken`. |
-| `caCertHashes` | `[]string` | No | — | CA certificate hashes for secure node join. |
-| `caCertSecretRef` | `ObjectReference` | No | — | Reference to a Secret containing the CA certificate. |
+| `caCertHashes` | `[]string` | No | — | Reserved; not implemented. The value is accepted and stored, but no controller reads it and it is rendered into no cloud-config, so setting it does not pin the join to a CA. Setting it produces an admission warning. Neither distribution can consume it: a k0s worker joins with the bundle `k0s token create` produces, which already carries the cluster CA, and a k3s agent takes no CA-hash flag. To get k3s to validate the server, pass the server's full node-token (`K10<hash>::server:<password>`) as `k3sToken` / `k3sTokenSecretRef`. See kairos-io/kairos#4937. |
+| `caCertSecretRef` | `ObjectReference` | No | — | Reserved; not implemented. The reference is accepted and stored, but no controller reads the Secret and its contents reach no node. Setting it produces an admission warning. Use `files` to place a CA certificate on the node. See kairos-io/kairos#4937. |
 | `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. |
 | `hostnamePrefix` | `string` | No | `"metal-"` | Prefix for the auto-generated hostname. The final hostname is `{hostnamePrefix}{4-char-machine-id}`. |
 | `dnsServers` | `[]string` | No | — | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). |

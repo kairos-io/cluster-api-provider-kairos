@@ -57,14 +57,26 @@ spec:
                     description: Spec is the specification of the KairosConfig
                     properties:
                       caCertHashes:
-                        description: CACertHashes are the CA certificate hashes for
-                          secure join
+                        description: |-
+                          CACertHashes was meant to carry the CA certificate hashes for a secure
+                          join. It is not implemented: the value is accepted and stored, but no
+                          controller reads it and no cloud-config template renders it, so setting
+                          it does not pin the join to a CA. Setting it produces an admission
+                          warning. Neither supported distribution can consume it: a k0s worker
+                          joins with the bundle `k0s token create` produces, which already carries
+                          the cluster CA, and a k3s agent takes no CA-hash flag at all. It validates
+                          the server only when its token is the full K10<hash>::server:<password>
+                          node-token. See kairos-io/kairos#4937.
                         items:
                           type: string
                         type: array
                       caCertSecretRef:
-                        description: CACertSecretRef is a reference to a Secret containing
-                          the CA certificate
+                        description: |-
+                          CACertSecretRef was meant to reference a Secret containing the CA
+                          certificate. It is not implemented: the reference is accepted and
+                          stored, but no controller reads the Secret and its contents reach no
+                          node. Setting it produces an admission warning. Use Files to place a CA
+                          certificate on the node. See kairos-io/kairos#4937.
                         properties:
                           apiVersion:
                             description: API version of the referent.
