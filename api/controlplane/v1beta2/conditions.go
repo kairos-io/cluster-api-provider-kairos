@@ -50,6 +50,13 @@ const (
 	// when quorum holds but a member is degraded; False(Warning) at or below the
 	// (N/2)+1 quorum minimum. Not surfaced for single-node control planes.
 	EtcdHealthyCondition = "EtcdHealthy"
+
+	// MachinesUpToDateCondition reports whether every control-plane Machine runs
+	// spec.version. True when none is outdated. False(Info, RollingOutReason)
+	// while outdated machines are being replaced one at a time; False(Warning,
+	// SingleNodeRolloutUnsupportedReason) when a single-node control plane has
+	// an outdated machine, which is left unchanged rather than replaced.
+	MachinesUpToDateCondition = "MachinesUpToDate"
 )
 
 // Condition reasons
@@ -109,6 +116,18 @@ const (
 
 	// ScalingDownReason indicates that the control plane is scaling down
 	ScalingDownReason = "ScalingDown"
+
+	// RollingOutReason is the False(Info) reason for MachinesUpToDateCondition
+	// while outdated control-plane machines are being replaced.
+	RollingOutReason = "RollingOut"
+
+	// SingleNodeRolloutUnsupportedReason is the False(Warning) reason for
+	// MachinesUpToDateCondition when a single-node control plane has an outdated
+	// machine. Replacement is refused: the single machine runs the whole cluster
+	// with no etcd membership another node could join, so a new machine would
+	// start a separate, empty cluster, and removing the original afterwards would
+	// destroy everything the cluster held.
+	SingleNodeRolloutUnsupportedReason = "SingleNodeRolloutUnsupported"
 
 	// WaitingForNodePushReason is the False reason for KubeconfigReadyCondition
 	// while the workload-cluster kubeconfig Secret has not yet been observed
