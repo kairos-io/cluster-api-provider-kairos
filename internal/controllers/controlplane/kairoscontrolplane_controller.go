@@ -134,6 +134,15 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 // services;endpoints: the control-plane manager owns the LB Service and reads
 // its Endpoints to discover the control-plane endpoint.
 //+kubebuilder:rbac:groups="",resources=services;endpoints,verbs=get;list;watch;create;update;patch
+// virtualmachineinstances: on CAPK the controller fills that LB Service's
+// Endpoints, and resolves a node's IP, from each control-plane VMI
+// (getKubevirtVMIIP in infra_lookup.go). Unstructured reads bypass the
+// manager's cache, so get is enough. The bootstrap controller declares the same
+// rule for its own reads, and the flat install merges the two roles, so the gap
+// only showed under clusterctl: each provider there gets only its own
+// package's markers, and without this one every VMI read was forbidden and the
+// CAPK API load balancer never got a backend.
+//+kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
 // Secrets: the KCP controller reads the workload kubeconfig Secret (KD-3b node
 // push) and rewrites its server URL, and creates/owns the HA join-token Secret
 // (ADR 0005 Phase 3) and the CAPK kubeconfig rewrite. It previously relied on
@@ -1544,6 +1553,15 @@ func (r *KairosControlPlaneReconciler) ensureControlPlaneLBEndpoints(ctx context
 			continue
 		}
 		ip, err := r.getKubevirtVMIIP(ctx, log, machine)
+		if apierrors.IsForbidden(err) {
+			// Not "no IP yet": the controller may not read VMIs at all, so this
+			// backend will never be added and the API load balancer stays empty.
+			// That used to be logged only at V(4), which is how a missing RBAC
+			// rule under clusterctl went unnoticed. Report it at the default level.
+			log.Error(err, "Cannot read the VirtualMachineInstance for the control-plane load balancer; check the control-plane manager's RBAC",
+				"machine", machine.Name)
+			continue
+		}
 		if err != nil || ip == "" {
 			log.V(4).Info("No VMI IP yet for control plane endpoint", "machine", machine.Name, "error", err)
 			continue
