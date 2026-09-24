@@ -18,6 +18,7 @@ package controlplane
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -218,8 +219,37 @@ func TestNodeDrainTimeoutSeconds(t *testing.T) {
 	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: 90 * time.Second})).To(Equal(int32(90)))
 	// Sub-second precision the Machine contract cannot carry truncates down.
 	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: 1500 * time.Millisecond})).To(Equal(int32(1)))
-	// A negative duration means "bound the drain", not "never drain".
+	// Zero and a negative duration both mean "no deadline" to CAPI, which reads
+	// every value <= 0 as unset. The clamp is here so the Machine CRD's
+	// minimum: 0 accepts the object, not to bound the drain.
+	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: 0})).To(Equal(int32(0)))
 	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: -5 * time.Minute})).To(Equal(int32(0)))
+}
+
+// TestNodeDrainTimeoutSecondsDoesNotOverflow pins the ceiling. Without it,
+// int32 narrowing wraps a timeout past math.MaxInt32 seconds, so the longest
+// deadline an operator can express becomes either a very short one or a
+// negative the API server rejects for minimum: 0. The assertions on the
+// unclamped arithmetic are what make the difference visible.
+func TestNodeDrainTimeoutSecondsDoesNotOverflow(t *testing.T) {
+	g := NewWithT(t)
+
+	// One second past the ceiling: int32 would wrap this to math.MinInt32.
+	justOver := time.Duration(math.MaxInt32+1) * time.Second
+	g.Expect(int32(int64(justOver.Seconds()))).To(Equal(int32(math.MinInt32)), "precondition: the unclamped narrowing wraps to a negative")
+	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: justOver})).To(Equal(int32(math.MaxInt32)))
+
+	// Twice the ceiling wraps to zero instead, which CAPI reads as "no
+	// deadline": an asked-for bound silently becoming an unbounded drain.
+	twiceOver := time.Duration(2*(math.MaxInt32+1)) * time.Second
+	g.Expect(int32(int64(twiceOver.Seconds()))).To(Equal(int32(0)), "precondition: the unclamped narrowing wraps to zero")
+	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: twiceOver})).To(Equal(int32(math.MaxInt32)))
+
+	// The largest duration metav1.Duration can hold still clamps.
+	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: time.Duration(math.MaxInt64)})).To(Equal(int32(math.MaxInt32)))
+
+	// Exactly the ceiling is passed through untouched.
+	g.Expect(*nodeDrainTimeoutSeconds(&metav1.Duration{Duration: time.Duration(math.MaxInt32) * time.Second})).To(Equal(int32(math.MaxInt32)))
 }
 
 func ptrInt32(v int32) *int32 { return &v }
