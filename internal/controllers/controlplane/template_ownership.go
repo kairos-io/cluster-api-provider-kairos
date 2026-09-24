@@ -86,6 +86,16 @@ func (r *KairosControlPlaneReconciler) ensureTemplateOwnedByCluster(ctx context.
 		// resolves in the owner's namespace.
 		namespace = defaultNamespace
 	}
+	// Never make the Cluster an owner of an object in another namespace.
+	// Kubernetes treats an owner reference to a namespaced object in a different
+	// namespace as absent, so the garbage collector would be free to delete the
+	// template, which belongs to someone else. Such a reference is rejected at
+	// admission and refused by the clone path; this is the last line.
+	if namespace != cluster.Namespace {
+		log.Info("Not taking ownership of a template in another namespace",
+			"kind", ref.Kind, "name", ref.Name, "namespace", namespace, "cluster", cluster.Name)
+		return nil
+	}
 
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(ref.GroupVersionKind())

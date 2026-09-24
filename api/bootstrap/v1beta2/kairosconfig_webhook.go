@@ -141,6 +141,42 @@ func (r *KairosConfig) warnings() admission.Warnings {
 	return warns
 }
 
+// validateSecretRefNamespaces rejects a Secret reference that names a namespace
+// other than the KairosConfig's own.
+//
+// The bootstrap controller can read Secrets in every namespace, and it copies
+// what these references point at into the bootstrap Secret it writes next to
+// the KairosConfig: the password into the rendered cloud-config, a token into
+// the join configuration. Honouring a foreign namespace therefore let anyone who
+// can create a KairosConfig copy another namespace's Secret into data they can
+// read. The KairosControlPlane webhook already refuses the same thing for its
+// SSH-fallback references, with the same message.
+//
+// tokenSecretRef is deliberately absent: the controller ignores its namespace
+// and always reads from the Cluster's.
+func (r *KairosConfig) validateSecretRefNamespaces() field.ErrorList {
+	var errs field.ErrorList
+	forbidden := func(p *field.Path, ns string) {
+		if ns != "" && ns != r.Namespace {
+			errs = append(errs, field.Forbidden(p.Child("namespace"),
+				"cross-namespace Secret references are not allowed in this release"))
+		}
+	}
+	if ref := r.Spec.UserPasswordSecretRef; ref != nil {
+		forbidden(field.NewPath("spec", "userPasswordSecretRef"), ref.Namespace)
+	}
+	if ref := r.Spec.WorkerTokenSecretRef; ref != nil {
+		forbidden(field.NewPath("spec", "workerTokenSecretRef"), ref.Namespace)
+	}
+	if ref := r.Spec.K3sTokenSecretRef; ref != nil {
+		forbidden(field.NewPath("spec", "k3sTokenSecretRef"), ref.Namespace)
+	}
+	if ref := r.Spec.ControlPlaneJoinTokenSecretRef; ref != nil {
+		forbidden(field.NewPath("spec", "controlPlaneJoinTokenSecretRef"), ref.Namespace)
+	}
+	return errs
+}
+
 // validate performs validation on the KairosConfig spec
 func (r *KairosConfig) validate() error {
 	var allErrs field.ErrorList
@@ -254,6 +290,8 @@ func (r *KairosConfig) validate() error {
 			))
 		}
 	}
+
+	allErrs = append(allErrs, r.validateSecretRefNamespaces()...)
 
 	if len(allErrs) > 0 {
 		return errors.NewInvalid(

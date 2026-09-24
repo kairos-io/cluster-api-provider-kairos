@@ -213,6 +213,8 @@ func (r *KairosControlPlane) validate() error {
 
 	allErrs = append(allErrs, validateHA(r.Spec.HA, field.NewPath("spec", "ha"))...)
 	allErrs = append(allErrs, validateSSHFallback(r.Spec.SSHFallback, r.Namespace, field.NewPath("spec", "sshFallback"))...)
+	allErrs = append(allErrs, validateInfrastructureRefNamespace(r.Spec.MachineTemplate.InfrastructureRef.Namespace, r.Namespace,
+		field.NewPath("spec", "machineTemplate", "infrastructureRef", "namespace"))...)
 
 	if len(allErrs) > 0 {
 		return errors.NewInvalid(
@@ -343,4 +345,20 @@ func validateSSHFallback(s *SSHFallback, ownerNamespace string, base *field.Path
 	}
 
 	return errs
+}
+
+// validateInfrastructureRefNamespace rejects a machine-template reference into
+// another namespace. Cluster API's own v1beta2 references carry no namespace at
+// all, and honouring one here did real damage: the controller cloned another
+// namespace's template, and it also made the Cluster an owner of that template
+// so clusterctl move carries it. Kubernetes treats an owner reference to a
+// namespaced object in a different namespace as absent, so the garbage collector
+// was free to delete the other namespace's template. An empty namespace keeps
+// meaning "the KairosControlPlane's own".
+func validateInfrastructureRefNamespace(refNamespace, ownerNamespace string, p *field.Path) field.ErrorList {
+	if refNamespace == "" || refNamespace == ownerNamespace {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(p,
+		"cross-namespace references are not allowed: the infrastructure template must be in the KairosControlPlane's namespace")}
 }

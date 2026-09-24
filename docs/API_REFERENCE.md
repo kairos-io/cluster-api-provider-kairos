@@ -66,7 +66,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 |-------|------|----------|---------|-------------|
 | `name` | `string` | Yes | — | Name of the Secret. |
 | `key` | `string` | No | `"password"` | Key within the Secret that contains the password. |
-| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. |
+| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. It must be the KairosConfig's own namespace: a different one is rejected by the validating webhook and refused by the controller, because the value it points at is copied into the bootstrap Secret beside the KairosConfig. |
 
 #### WorkerTokenSecretReference
 
@@ -74,7 +74,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 |-------|------|----------|---------|-------------|
 | `name` | `string` | Yes | — | Name of the Secret. |
 | `key` | `string` | No | `"token"` | Key within the Secret containing the token. |
-| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. |
+| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. It must be the KairosConfig's own namespace: a different one is rejected by the validating webhook and refused by the controller, because the value it points at is copied into the bootstrap Secret beside the KairosConfig. |
 
 #### InstallConfig
 
@@ -249,7 +249,7 @@ spec:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `replicas` | `*int32` | No | `1` | Number of control plane machines. One of `1`, `3`, or `5` — the validating webhook rejects even counts (they provide the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance). `1` configures a single-node control plane. `3` or `5` configure a highly-available control plane; set `ha.vip` for infrastructure providers that do not supply a load-balanced endpoint (CAPV, CAPM3, CAPD). |
-| `version` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. |
+| `version` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. Changing it on an HA control plane replaces the control-plane Machines one at a time. On a single-node control plane it replaces nothing, because a replacement would start a separate, empty cluster; see [MachinesUpToDate condition](#machinesuptodate-condition). |
 | `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d — see [Multi-Node Control Planes](#multi-node-control-planes)). |
 | `machineTemplate` | `KairosControlPlaneMachineTemplate` | Yes | — | Template for creating control plane Machines. |
 | `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | — | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
@@ -261,7 +261,7 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. |
+| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. A different namespace is rejected: the template must live beside the `KairosControlPlane`. |
 | `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates and scale-down. Propagated to `Machine.spec.deletion.nodeDrainTimeoutSeconds`, which is where Cluster API reads the deadline from, so the value is truncated to whole seconds. Unset means CAPI's default: drain with no deadline. Editing it applies to the Machines that already exist, including one that is draining right now. |
 | `metadata` | `ObjectMeta` | No | Labels and annotations to apply to the objects created for each control-plane replica: the `Machine`, and the infrastructure Machine cloned from `infrastructureRef`. Labels reach the Node through Cluster API, which syncs the `node-role.kubernetes.io/*`, `node-restriction.kubernetes.io/*` and `*.node.cluster.x-k8s.io/*` labels it finds on the `Machine`. Adding or changing an entry applies to the Machines that already exist; removing one leaves it in place on them, since the control plane does not own the whole metadata of a Machine. `cluster.x-k8s.io/cluster-name` and `cluster.x-k8s.io/control-plane` are set by the controller and cannot be overridden, because it selects its own Machines by them. |
 
@@ -335,7 +335,7 @@ Cross-field validation (enforced by the validating webhook, not expressible as k
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
 | `updatedReplicas` | `int32` | Number of Machines running the desired version. |
 | `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) below. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
@@ -401,6 +401,16 @@ Surfaced on `KairosControlPlane.status.conditions` for HA control planes only (`
 | `False` (Info) | `WaitingForEtcdMember` | The init node has not yet reported a healthy voting etcd member. |
 
 The condition is derived from a per-cluster, node-reported etcd-status Secret (see [Security Considerations](#security-considerations) for the trust model of this signal). The controller uses this condition, together with the desired replica count, to refuse control-plane Machine deletions that would drop etcd below the quorum minimum — this quorum-safety decision is made independently of, and before, any single node's self-reported signal.
+
+### MachinesUpToDate condition
+
+Reports whether every control-plane Machine runs `spec.version`.
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `True` | — | No control-plane Machine is outdated. |
+| `False` (Info) | `RollingOut` | Outdated Machines are being replaced, one at a time. A replacement is added and must register a Node before an outdated Machine is removed, and the rollout waits while any control-plane Machine is still being deleted. |
+| `False` (Warning) | `SingleNodeRolloutUnsupported` | A single-node control plane (`replicas: 1`) has a Machine whose version differs from `spec.version`. The Machine is left unchanged: it runs the whole cluster, so a replacement would start a separate, empty cluster. Set `spec.version` back to the version the Machine runs to clear the condition. |
 
 ---
 

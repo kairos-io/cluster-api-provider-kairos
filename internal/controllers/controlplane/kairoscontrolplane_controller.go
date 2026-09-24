@@ -210,6 +210,21 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// deferred Patch should flush observedGeneration/conditions on the
 	// non-terminal drain-requeue path.
 	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+		// A paused Cluster holds deletion too, as it does for upstream
+		// KubeadmControlPlane. Deleting the control plane marks every
+		// control-plane Machine for deletion and strips their etcd-leave hooks,
+		// neither of which can be undone, so an operator who paused the cluster
+		// (maintenance, a manual migration) must not have that happen under
+		// them. The finalizer stays, and deletion resumes on unpause.
+		paused, err := r.deletionPaused(ctx, kcp)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if paused {
+			log.Info("Deletion is paused for this KairosControlPlane")
+			patchOnExit = true
+			return ctrl.Result{}, nil
+		}
 		res, skipPatch, derr := r.reconcileDelete(ctx, log, kcp)
 		if !skipPatch {
 			patchOnExit = true
@@ -637,64 +652,25 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		maxSurge = *kcp.Spec.RolloutStrategy.RollingUpdate.MaxSurge
 	}
 
-	outdatedMachines := make([]*clusterv1.Machine, 0)
-	updatedReadyReplicas := int32(0)
+	plan := rolloutPlan{desiredReplicas: desiredReplicas, maxSurge: maxSurge}
 	for _, machine := range machines {
 		if r.machineMatchesVersion(machine, kcp.Spec.Version) {
+			plan.updated++
 			if machine.Status.NodeRef.IsDefined() {
-				updatedReadyReplicas++
+				plan.updatedJoined++
 			}
 			continue
 		}
-		outdatedMachines = append(outdatedMachines, machine)
+		plan.outdated = append(plan.outdated, machine)
 	}
 
-	// Rolling update behavior when machines are outdated
-	if len(outdatedMachines) > 0 {
-		if currentReplicas < desiredReplicas+maxSurge {
-			role := r.controlPlaneRoleForNewMachine(desiredReplicas, machines)
-			// The surge machine is a joiner like any other: it runs `etcd member
-			// add` on boot, so it needs the same quorum-safety gate as the plain
-			// scale-up path below. Without it a rollout can add a member while a
-			// previous joiner is still booting and break quorum (ADR 0005 §E.1).
-			if role == bootstrapv1beta2.ControlPlaneRoleJoin {
-				joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
-				}
-				if !joinable {
-					log.Info("Holding back rollout surge machine until it is safe to add a member", "reason", reason)
-					return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
-				}
-			}
-			if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
-			}
-			return ctrl.Result{}, nil
-		}
-
-		// If we are above desired replicas and have enough updated/ready replicas, delete one outdated machine
-		if currentReplicas > desiredReplicas && updatedReadyReplicas >= desiredReplicas {
-			target := outdatedMachines[0]
-			// ADR 0005 §E.2: refuse a quorum-breaking rollout delete. The guard
-			// fails closed and is bypassed only under whole-cluster teardown.
-			if ok, reason, err := r.canRemoveMember(ctx, kcp, cluster, target); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to evaluate etcd quorum safety: %w", err)
-			} else if !ok {
-				log.Info("Holding back outdated-machine rollout — etcd quorum would break", "machine", target.Name, "reason", reason)
-				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
-			}
-			// k3s embedded etcd has no supported member-remove (KD-5d); warn that
-			// the member will linger. For k0s the sweep above drives a clean
-			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
-			r.warnIfK3sEtcdLimitation(kcp, target)
-			log.Info("Deleting outdated control plane machine", "machine", target.Name)
-			if err := r.Delete(ctx, target); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
-			}
-			return ctrl.Result{}, nil
-		}
+	// While any machine is outdated the rollout owns every create and delete, and
+	// it always returns: the scale paths below do not wait for a replacement to
+	// join, so falling through to them would remove a member early.
+	if len(plan.outdated) > 0 {
+		return r.reconcileRollout(ctx, log, kcp, cluster, machines, plan)
 	}
+	conditions.MarkTrue(kcp, controlplanev1beta2.MachinesUpToDateCondition)
 
 	// Create machines if needed
 	if currentReplicas < desiredReplicas {
@@ -724,7 +700,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	// Delete machines if needed (scale down)
 	if currentReplicas > desiredReplicas {
-		target := r.selectMachineForDeletion(machines, outdatedMachines)
+		target := r.selectMachineForDeletion(machines, plan.outdated)
 		if target != nil {
 			// ADR 0005 §E.2: refuse a quorum-breaking scale-down. The guard fails
 			// closed and is bypassed only under whole-cluster teardown.
@@ -1003,6 +979,13 @@ func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.C
 	// infraRef is a value copy, so this does not mutate the KCP spec.
 	if infraRef.Namespace == "" {
 		infraRef.Namespace = kcp.Namespace
+	}
+	// A template in another namespace is refused here as well as at admission,
+	// in case the webhook was not in the path: cloning it would copy another
+	// namespace's machine template into this cluster.
+	if infraRef.Namespace != kcp.Namespace {
+		return nil, fmt.Errorf("machineTemplate.infrastructureRef names namespace %q: cross-namespace references are not allowed, the template must be in namespace %q",
+			infraRef.Namespace, kcp.Namespace)
 	}
 
 	// Same metadata the Machine gets, from the same two helpers, so the pair

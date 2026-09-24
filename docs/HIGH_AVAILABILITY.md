@@ -62,6 +62,10 @@ Two practical consequences:
   rollout is wedged.
 
 The same gate applies to the surge machine created during a rolling update.
+A rolling update replaces one member at a time: the surge machine has to
+register a Node before an outdated member is removed, and the rollout waits
+while any control-plane machine is still being deleted. Progress is reported on
+the `MachinesUpToDate` condition.
 
 ## Day-2: etcd health and quorum-safe replacement
 
