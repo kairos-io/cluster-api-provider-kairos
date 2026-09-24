@@ -66,7 +66,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 |-------|------|----------|---------|-------------|
 | `name` | `string` | Yes | — | Name of the Secret. |
 | `key` | `string` | No | `"password"` | Key within the Secret that contains the password. |
-| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. |
+| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. It must be the KairosConfig's own namespace: a different one is rejected by the validating webhook and refused by the controller, because the value it points at is copied into the bootstrap Secret beside the KairosConfig. |
 
 #### WorkerTokenSecretReference
 
@@ -74,7 +74,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 |-------|------|----------|---------|-------------|
 | `name` | `string` | Yes | — | Name of the Secret. |
 | `key` | `string` | No | `"token"` | Key within the Secret containing the token. |
-| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. |
+| `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. It must be the KairosConfig's own namespace: a different one is rejected by the validating webhook and refused by the controller, because the value it points at is copied into the bootstrap Secret beside the KairosConfig. |
 
 #### InstallConfig
 
@@ -261,7 +261,7 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. |
+| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. A different namespace is rejected: the template must live beside the `KairosControlPlane`. |
 | `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates and scale-down. Propagated to `Machine.spec.deletion.nodeDrainTimeoutSeconds`, which is where Cluster API reads the deadline from, so the value is truncated to whole seconds. Unset means CAPI's default: drain with no deadline. Editing it applies to the Machines that already exist, including one that is draining right now. |
 | `metadata` | `ObjectMeta` | No | Labels and annotations to apply to the objects created for each control-plane replica: the `Machine`, and the infrastructure Machine cloned from `infrastructureRef`. Labels reach the Node through Cluster API, which syncs the `node-role.kubernetes.io/*`, `node-restriction.kubernetes.io/*` and `*.node.cluster.x-k8s.io/*` labels it finds on the `Machine`. Adding or changing an entry applies to the Machines that already exist; removing one leaves it in place on them, since the control plane does not own the whole metadata of a Machine. `cluster.x-k8s.io/cluster-name` and `cluster.x-k8s.io/control-plane` are set by the controller and cannot be overridden, because it selects its own Machines by them. |
 
