@@ -17,6 +17,7 @@ permissions and limitations under the License.
 package kubeconfig_test
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -401,11 +402,32 @@ func TestSanitize_TableDriven(t *testing.T) {
 		{
 			name: "S4 a second, unreferenced context entry carrying extensions is still rejected",
 			mutate: func(t *testing.T, cfg *clientcmdapi.Config) {
-				cfg.Contexts["other"] = &clientcmdapi.Context{Cluster: "source", AuthInfo: "source-admin"}
+				cfg.Contexts["other"] = &clientcmdapi.Context{
+					Cluster:    "source",
+					AuthInfo:   "source-admin",
+					Extensions: map[string]runtime.Object{"foo": &runtime.Unknown{Raw: []byte("{}")}},
+				}
 			},
-			wantErr: true,
-			// A second context is also an S1 cardinality violation; either
-			// reason is acceptable here, asserted generically below.
+			wantErr:    true,
+			wantReason: kubeconfig.ReasonUnsafeIdentity,
+		},
+
+		// --- S4: top-level extensions ("extensions at any level"). ---
+		{
+			name: "S4 top-level Config extensions are rejected",
+			mutate: func(t *testing.T, cfg *clientcmdapi.Config) {
+				cfg.Extensions = map[string]runtime.Object{"foo": &runtime.Unknown{Raw: []byte("{}")}}
+			},
+			wantErr:    true,
+			wantReason: kubeconfig.ReasonUnsafeIdentity,
+		},
+		{
+			name: "S4 Preferences extensions are rejected",
+			mutate: func(t *testing.T, cfg *clientcmdapi.Config) {
+				cfg.Preferences.Extensions = map[string]runtime.Object{"foo": &runtime.Unknown{Raw: []byte("{}")}}
+			},
+			wantErr:    true,
+			wantReason: kubeconfig.ReasonUnsafeIdentity,
 		},
 	}
 
@@ -469,6 +491,26 @@ func TestSanitize_ClusterExtensionsRejected(t *testing.T) {
 	}
 	if got := rejectedReason(t, err); got != kubeconfig.ReasonUnsafeCluster {
 		t.Fatalf("reason = %q, want %q", got, kubeconfig.ReasonUnsafeCluster)
+	}
+}
+
+// TestSanitize_UserExtensionsRejected mirrors
+// TestSanitize_ClusterExtensionsRejected for S4's "extensions at any level"
+// on the referenced user entry itself (as opposed to the table's
+// second/unreferenced-entry case).
+func TestSanitize_UserExtensionsRejected(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.AuthInfos["source-admin"].Extensions = map[string]runtime.Object{
+		"foo": &runtime.Unknown{Raw: []byte("{}")},
+	}
+	raw := rawOf(t, cfg)
+
+	_, err := kubeconfig.Sanitize(raw, testClusterName, testExpectedServer)
+	if err == nil {
+		t.Fatal("expected an error for user extensions")
+	}
+	if got := rejectedReason(t, err); got != kubeconfig.ReasonUnsafeIdentity {
+		t.Fatalf("reason = %q, want %q", got, kubeconfig.ReasonUnsafeIdentity)
 	}
 }
 
@@ -564,6 +606,56 @@ func TestSanitize_S5_RebuildsCanonicalShape(t *testing.T) {
 	}
 	if _, ok := rebuilt.Clusters["source"]; ok {
 		t.Fatalf("input cluster name %q survived into the output", "source")
+	}
+}
+
+// TestSanitize_CABundleCanonicalized asserts that S2/S5 never propagate raw
+// certificate-authority-data bytes verbatim: the output CA bundle is a
+// canonical re-encoding of the DER of each parsed CERTIFICATE block, so
+// leading and inter-block bytes that pem.Decode skips over (which are never
+// validated, and are node-supplied) do not survive into the contract
+// kubeconfig, and the canonicalized output is itself a fixed point.
+func TestSanitize_CABundleCanonicalized(t *testing.T) {
+	cert1PEM, _, _ := generateCertPEM(t, true, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	cert2PEM, _, _ := generateCertPEM(t, true, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	var garbage bytes.Buffer
+	garbage.WriteString("LEADING GARBAGE THAT IS NOT PEM AT ALL\n")
+	garbage.Write(cert1PEM)
+	garbage.WriteString("INTER-BLOCK GARBAGE THAT IS ALSO NOT PEM\n")
+	garbage.Write(cert2PEM)
+
+	cfg := baseConfig(t)
+	cfg.Clusters["source"].CertificateAuthorityData = garbage.Bytes()
+	raw := rawOf(t, cfg)
+
+	out, err := kubeconfig.Sanitize(raw, testClusterName, testExpectedServer)
+	if err != nil {
+		t.Fatalf("Sanitize: %v", err)
+	}
+
+	rebuilt, err := clientcmd.Load(out)
+	if err != nil {
+		t.Fatalf("output does not parse as a kubeconfig: %v", err)
+	}
+	gotCA := rebuilt.Clusters[testClusterName].CertificateAuthorityData
+
+	var wantCA bytes.Buffer
+	wantCA.Write(cert1PEM)
+	wantCA.Write(cert2PEM)
+	if string(gotCA) != wantCA.String() {
+		t.Fatalf("CA bundle was not canonicalized:\n--- got ---\n%s\n--- want ---\n%s", gotCA, wantCA.String())
+	}
+	if strings.Contains(string(gotCA), "GARBAGE") {
+		t.Fatalf("garbage bytes leaked into the output CA bundle: %s", gotCA)
+	}
+
+	fixed, err := kubeconfig.IsFixedPoint(out, testClusterName, testExpectedServer)
+	if err != nil {
+		t.Fatalf("IsFixedPoint(canonicalized output): %v", err)
+	}
+	if !fixed {
+		t.Fatal("canonicalized output is not a fixed point of Sanitize")
 	}
 }
 

@@ -94,6 +94,17 @@ func Sanitize(raw []byte, clusterName, expectedServer string) ([]byte, error) {
 		return nil, reject(ReasonUnparseable, "input does not decode as a kubeconfig")
 	}
 
+	// S4's "extensions at any level" is not limited to cluster/user/context
+	// entries: the top-level Config and its (deprecated) Preferences also
+	// carry an Extensions map. Reject both explicitly, fail-closed, rather
+	// than relying on S5's rebuild to merely drop them silently.
+	if len(cfg.Extensions) != 0 {
+		return nil, reject(ReasonUnsafeIdentity, "top-level extensions are not permitted")
+	}
+	if len(cfg.Preferences.Extensions) != 0 {
+		return nil, reject(ReasonUnsafeIdentity, "preferences extensions are not permitted")
+	}
+
 	// S2 and S4 are applied to every entry the input carries, not only the
 	// ones the current context references — an unsafe field in a
 	// non-referenced entry is rejected just the same. This loop runs before
@@ -226,10 +237,10 @@ func validateStructure(cfg *clientcmdapi.Config) (clusterName, userName, context
 
 // validateClusterEntry implements S2 for a single cluster entry: rejects
 // every unsafe field, requires inline certificate-authority-data, and
-// returns it once every PEM block in it is confirmed to be a CERTIFICATE
-// that parses with x509, with at least one being a CA. The input "server"
-// field is deliberately never read here (S2: "the input server is
-// ignored").
+// returns a CANONICAL re-encoding of it (see validateCABundle) once every
+// PEM block in it is confirmed to be a CERTIFICATE that parses with x509,
+// with at least one being a CA. The input "server" field is deliberately
+// never read here (S2: "the input server is ignored").
 func validateClusterEntry(name string, c *clientcmdapi.Cluster) ([]byte, error) {
 	if c == nil {
 		return nil, reject(ReasonUnsafeCluster, "cluster %q: entry is empty", name)
@@ -252,10 +263,11 @@ func validateClusterEntry(name string, c *clientcmdapi.Cluster) ([]byte, error) 
 	if len(c.CertificateAuthorityData) == 0 {
 		return nil, reject(ReasonUnsafeCluster, "cluster %q: certificate-authority-data is required", name)
 	}
-	if err := validateCABundle(c.CertificateAuthorityData); err != nil {
+	canonicalCA, err := validateCABundle(c.CertificateAuthorityData)
+	if err != nil {
 		return nil, reject(ReasonUnsafeCluster, "cluster %q: %s", name, err)
 	}
-	return c.CertificateAuthorityData, nil
+	return canonicalCA, nil
 }
 
 // validateCABundle implements the PEM/x509 half of S2: every block must be a
@@ -263,8 +275,18 @@ func validateClusterEntry(name string, c *clientcmdapi.Cluster) ([]byte, error) 
 // must be a CA. The error strings here are our own, fixed, structural
 // descriptions — never the underlying x509/pem error text or any byte of
 // data, which could in principle echo attacker-controlled input.
-func validateCABundle(data []byte) error {
+//
+// It returns a CANONICAL re-encoding of the bundle: each parsed CERTIFICATE
+// block's DER (block.Bytes), pem.Encode-d back out in order, discarding
+// everything pem.Decode skipped to find those blocks (leading bytes, and
+// anything between blocks). The input is node-supplied, so the raw bytes
+// are never propagated into S5 output verbatim — only what this function
+// re-derives from a successfully parsed certificate. A comment cannot make
+// non-PEM bytes trailing the last block safe, so that case is still
+// rejected outright, below, rather than silently dropped.
+func validateCABundle(data []byte) ([]byte, error) {
 	rest := data
+	var canonical bytes.Buffer
 	blocks := 0
 	sawCA := false
 	for {
@@ -275,26 +297,27 @@ func validateCABundle(data []byte) error {
 		}
 		blocks++
 		if block.Type != "CERTIFICATE" {
-			return fmt.Errorf("certificate-authority-data contains a PEM block of type %q; only CERTIFICATE is permitted", block.Type)
+			return nil, fmt.Errorf("certificate-authority-data contains a PEM block of type %q; only CERTIFICATE is permitted", block.Type)
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return fmt.Errorf("certificate-authority-data contains a PEM block that does not parse as an X.509 certificate")
+			return nil, fmt.Errorf("certificate-authority-data contains a PEM block that does not parse as an X.509 certificate")
 		}
 		if cert.IsCA {
 			sawCA = true
 		}
+		canonical.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes}))
 	}
 	if blocks == 0 {
-		return fmt.Errorf("certificate-authority-data does not contain any PEM blocks")
+		return nil, fmt.Errorf("certificate-authority-data does not contain any PEM blocks")
 	}
 	if len(bytes.TrimSpace(rest)) != 0 {
-		return fmt.Errorf("certificate-authority-data contains trailing non-PEM data")
+		return nil, fmt.Errorf("certificate-authority-data contains trailing non-PEM data")
 	}
 	if !sawCA {
-		return fmt.Errorf("certificate-authority-data does not contain a CA certificate")
+		return nil, fmt.Errorf("certificate-authority-data does not contain a CA certificate")
 	}
-	return nil
+	return canonical.Bytes(), nil
 }
 
 // validateUserEntry implements S4 (unsafe fields) and S3 (credential shape)
