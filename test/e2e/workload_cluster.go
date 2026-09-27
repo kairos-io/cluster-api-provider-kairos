@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -246,6 +247,7 @@ func waitForClusterProvisioned(ctx context.Context, dc dynamic.Interface, namesp
 func waitForControlPlaneReady(ctx context.Context, env *kubevirtenv.Environment, dc dynamic.Interface, namespace, clusterName, name string, timeout time.Duration) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	started := time.Now()
 	var fatalReason string
 	err := wait.PollUntilContextCancel(waitCtx, 15*time.Second, true, func(ctx context.Context) (bool, error) {
 		obj, getErr := dc.Resource(kcpGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
@@ -261,6 +263,12 @@ func waitForControlPlaneReady(ctx context.Context, env *kubevirtenv.Environment,
 			fatalReason = reason
 			return false, fmt.Errorf("fatal virt-launcher state: %s", reason)
 		}
+		if time.Since(started) >= liveMediaStallGrace {
+			if reason := detectLiveMediaStall(ctx, env, dc, namespace); reason != "" {
+				fatalReason = reason
+				return false, fmt.Errorf("guest never started the install: %s", reason)
+			}
+		}
 		return false, nil
 	})
 	if err != nil {
@@ -269,8 +277,116 @@ func waitForControlPlaneReady(ctx context.Context, env *kubevirtenv.Environment,
 			_, _ = fmt.Fprintf(GinkgoWriter, "Fatal: %s\n", fatalReason)
 		}
 		dumpWorkloadDiagnostics(env, dc, namespace, clusterName, name)
-		Fail(fmt.Sprintf("KairosControlPlane %s/%s did not become ready within %s: %v", namespace, name, timeout, err))
+		// Report the time actually spent, not the budget. A fast-fail that still
+		// said "within 50m0s" would send the reader looking for a timeout that
+		// never happened.
+		Fail(fmt.Sprintf("KairosControlPlane %s/%s did not become ready (gave up after %s of a %s budget): %v",
+			namespace, name, time.Since(started).Round(time.Second), timeout, err))
 	}
+}
+
+// cpTimeout must cover the FULL Kairos install lifecycle on a
+// GH-Actions-sized KubeVirt VM (2 vCPU / 4 GiB):
+//   - live installer boot:          ~2 min
+//   - elemental install to /dev/vda: ~20-25 min (slow KVM I/O on the runner)
+//   - reboot into installed system:  ~1 min
+//   - systemd + k3s + post-bootstrap
+//     wait-loop + push:              ~3-5 min
+//
+// Empirically the previous 25-min budget timed out right as the installed-system
+// reboot was starting (serial-log capture caught the post-install GRUB menu
+// literally as ginkgo gave up). 50 min leaves 10-15 min margin; total ginkgo
+// timeout is 130m so we still have room for cleanup.
+//
+// It lives here rather than in the spec so liveMediaStallGrace can be checked
+// against it.
+const cpTimeout = 50 * time.Minute
+
+// liveMediaStallGrace is how long the control-plane wait tolerates a guest that has
+// not started its install before it reads the serial log and gives up on it.
+//
+// It has to sit above the slowest legitimate "install has not printed anything yet"
+// window and below the control-plane timeout to be worth anything. The live
+// installer boots in ~2 min (see cpTimeout's breakdown above) and the install
+// prints within seconds of starting, while a full healthy run has completed in as
+// little as 12 min. Ten minutes is several times the margin the first number needs
+// and still turns the 50-minute timeout into a 10-minute one.
+//
+// TestLiveMediaStallGraceLeavesRoomInsideTheControlPlaneTimeout keeps the two
+// constants in the right order.
+const liveMediaStallGrace = 10 * time.Minute
+
+// detectLiveMediaStall reads each VMI's guest serial log and returns a non-empty
+// reason if it shows a guest that booted the live installer media and never started
+// the unattended install. Any failure to read a log yields "", so a transient exec
+// error can never fail a healthy run: the caller simply waits out its timeout as
+// before.
+func detectLiveMediaStall(ctx context.Context, env *kubevirtenv.Environment, dc dynamic.Interface, namespace string) string {
+	logs, err := readGuestSerialLogs(ctx, env, dc, namespace)
+	if err != nil {
+		return ""
+	}
+	for vmiName, serial := range logs {
+		if reason := kubevirtenv.DetectLiveMediaStall(serial); reason != "" {
+			return fmt.Sprintf("vmi %s: %s", vmiName, reason)
+		}
+	}
+	return ""
+}
+
+// readGuestSerialLogs returns the tail of every VMI's guest serial log in the
+// namespace, keyed by VMI name.
+//
+// KubeVirt writes virtio-serial output to /var/run/kubevirt-private/<vmi-uid>/virt-serial0-log
+// inside the virt-launcher compute container. This is the only way to see what
+// cloud-init / systemd / the kairos-*-post-bootstrap unit actually did inside the
+// guest, and the only place an install that never started is visible at all.
+func readGuestSerialLogs(ctx context.Context, env *kubevirtenv.Environment, dc dynamic.Interface, namespace string) (map[string]string, error) {
+	cs, err := env.Clientset()
+	if err != nil {
+		return nil, err
+	}
+	list, err := dc.Resource(vmiGVR).Namespace(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, vmi := range list.Items {
+		vmiName := vmi.GetName()
+		pods, perr := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "kubevirt.io=virt-launcher,vm.kubevirt.io/name=" + vmiName,
+		})
+		if perr != nil || len(pods.Items) == 0 {
+			continue
+		}
+		body, runErr := guestSerialTailCmd(ctx, env, namespace, pods.Items[0].Name, guestSerialLogPath(vmi.GetUID())).Output()
+		if runErr != nil {
+			continue
+		}
+		out[vmiName] = string(body)
+	}
+	return out, nil
+}
+
+// guestSerialLogPath is where KubeVirt writes a VMI's virtio-serial output inside
+// the virt-launcher compute container.
+func guestSerialLogPath(vmiUID types.UID) string {
+	return fmt.Sprintf("/var/run/kubevirt-private/%s/virt-serial0-log", string(vmiUID))
+}
+
+// guestSerialTailCmd builds the kubectl exec that reads the tail of a guest serial
+// log. Both the quiet reader above and the verbose diagnostics dump below go
+// through it, so the path and the tail size cannot drift apart.
+//
+// ~2 MiB is the whole file for a hung early-boot VM, and enough to capture the last
+// few minutes of cloud-init / systemd / k0s|k3s / kairos-*-post-bootstrap output
+// for a long-running one.
+func guestSerialTailCmd(ctx context.Context, env *kubevirtenv.Environment, namespace, podName, serialPath string) *exec.Cmd {
+	return exec.CommandContext(ctx, "kubectl",
+		"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
+		"-n", namespace, "exec", podName, "-c", "compute", "--",
+		"tail", "-c", "2097152", serialPath,
+	)
 }
 
 // detectFatalVirtLauncherState returns a non-empty reason if any virt-launcher pod in the namespace is
@@ -419,7 +535,6 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 	_, _ = fmt.Fprintf(w, "\n--- VMI guest serial log (tail) ---\n")
 	if list, err := dc.Resource(vmiGVR).Namespace(namespace).List(ctx, metav1.ListOptions{}); err == nil {
 		for _, vmi := range list.Items {
-			uid := string(vmi.GetUID())
 			vmiName := vmi.GetName()
 			podName := ""
 			if pods, perr := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
@@ -431,7 +546,7 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 				_, _ = fmt.Fprintf(w, "  vmi=%s no virt-launcher pod found\n", vmiName)
 				continue
 			}
-			serialPath := fmt.Sprintf("/var/run/kubevirt-private/%s/virt-serial0-log", uid)
+			serialPath := guestSerialLogPath(vmi.GetUID())
 			// Capture file size first so we know whether we're hitting tail-truncation
 			// or whether the VM actually stopped writing serial output.
 			sizeCmd := exec.CommandContext(ctx, "kubectl",
@@ -442,15 +557,7 @@ func dumpWorkloadDiagnostics(env *kubevirtenv.Environment, dc dynamic.Interface,
 			sizeOut, _ := sizeCmd.CombinedOutput()
 			_, _ = fmt.Fprintf(w, "  vmi=%s pod=%s path=%s\n", vmiName, podName, serialPath)
 			_, _ = fmt.Fprintf(w, "  size: %s", string(sizeOut))
-			// Dump up to ~2 MiB tail. For a hung early-boot VM this is the whole file;
-			// for a long-running VM it's enough to capture the last few minutes of
-			// cloud-init / systemd / k0s|k3s / kairos-*-post-bootstrap output.
-			cmd := exec.CommandContext(ctx, "kubectl",
-				"--kubeconfig", env.KubeconfigPath(), "--context", env.KubectlContext(),
-				"-n", namespace, "exec", podName, "-c", "compute", "--",
-				"tail", "-c", "2097152", serialPath,
-			)
-			out, runErr := cmd.CombinedOutput()
+			out, runErr := guestSerialTailCmd(ctx, env, namespace, podName, serialPath).CombinedOutput()
 			if runErr != nil {
 				_, _ = fmt.Fprintf(w, "  exec error: %v\n  output:\n%s\n", runErr, string(out))
 			} else {
