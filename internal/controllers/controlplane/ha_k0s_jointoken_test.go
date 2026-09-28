@@ -926,7 +926,10 @@ func TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending(t *testing.T) {
 	enc, ws := issued(t, "aaaaaa", "https://10.0.0.20:9443", time.Now().Add(50*time.Minute))
 	jt := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: joinTokenSecretName(cluster.Name), Namespace: "default",
-			Annotations: map[string]string{k0sJoinTokenIDAnnotation: "aaaaaa"}},
+			Annotations: map[string]string{k0sJoinTokenIDAnnotation: "aaaaaa"},
+			// The KCP created this Secret, so it controls it: ensureJoinTokenSecret
+			// refuses a same-name Secret it does not control.
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane"))}},
 		Data: map[string][]byte{joinTokenSecretDataKey: []byte(enc)},
 	}
 	wc := fake.NewClientBuilder().WithScheme(workloadTestScheme(g)).

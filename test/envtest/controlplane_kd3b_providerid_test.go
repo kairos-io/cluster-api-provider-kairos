@@ -88,6 +88,9 @@ func TestProviderID_NotPatchedByController(t *testing.T) {
 				Kind:     "KairosControlPlane",
 				Name:     clusterName + "-kcp",
 			},
+			// ADR 0011: the publish path needs a known endpoint to canonicalize
+			// the kubeconfig before KubeconfigReady can go True.
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
 		},
 	}
 	g.Expect(c.Create(ctx, cluster)).To(Succeed())
@@ -236,10 +239,18 @@ func buildEnvtestKubeconfig(cfg *rest.Config) ([]byte, error) {
 		Server:                   cfg.Host,
 		CertificateAuthorityData: cfg.CAData,
 	}
-	api.AuthInfos[ctxName] = &clientcmdapi.AuthInfo{
-		ClientCertificateData: cfg.CertData,
-		ClientKeyData:         cfg.KeyData,
-		Token:                 cfg.BearerToken,
+	// The sanitizer (ADR 0011 S3) accepts exactly ONE credential type, never both
+	// an inline cert pair and a token. envtest authenticates with a client cert;
+	// fall back to the token only when no cert is present.
+	if len(cfg.CertData) != 0 && len(cfg.KeyData) != 0 {
+		api.AuthInfos[ctxName] = &clientcmdapi.AuthInfo{
+			ClientCertificateData: cfg.CertData,
+			ClientKeyData:         cfg.KeyData,
+		}
+	} else {
+		api.AuthInfos[ctxName] = &clientcmdapi.AuthInfo{
+			Token: cfg.BearerToken,
+		}
 	}
 	api.Contexts[ctxName] = &clientcmdapi.Context{
 		Cluster:  ctxName,

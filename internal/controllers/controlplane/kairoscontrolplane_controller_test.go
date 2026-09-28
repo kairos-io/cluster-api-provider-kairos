@@ -524,16 +524,20 @@ func TestSecretWatchPredicate_FiltersByTypeAndClusterNameLabel(t *testing.T) {
 	}
 }
 
-// TestObserveKubeconfigSecret_TransitionsCondition exercises the three
-// KubeconfigReadyCondition states observeKubeconfigSecret produces:
+// TestMarkWaitingForNodePush_TransitionsCondition exercises the two waiting
+// states markWaitingForNodePush produces for an absent/empty contract Secret
+// (the behavior formerly in observeKubeconfigSecret, now in
+// kubeconfig_publish.go; ADR 0011 step 10):
 //
-//   - Secret missing + first observation → False(WaitingForNodePush, Info);
-//     LastNodePushObserved set to now.
-//   - Secret missing + LastNodePushObserved older than kubeconfigReadyTimeout
-//     → severity escalates to Warning; LastNodePushObserved unchanged.
-//   - Secret present with kubeconfig data → True(KubeconfigReady);
-//     LastNodePushObserved cleared.
-func TestObserveKubeconfigSecret_TransitionsCondition(t *testing.T) {
+//   - first observation → False(WaitingForNodePush, Info); LastNodePushObserved
+//     set to now.
+//   - LastNodePushObserved older than kubeconfigReadyTimeout → severity
+//     escalates to Warning; LastNodePushObserved unchanged.
+//
+// The "Secret present → Ready" transition moved to the publish path (it now
+// requires S5-valid content, not merely a non-empty value); it is covered by the
+// reconcileKubeconfig tests in kubeconfig_publish_test.go.
+func TestMarkWaitingForNodePush_TransitionsCondition(t *testing.T) {
 	g := NewWithT(t)
 
 	scheme := runtime.NewScheme()
@@ -548,13 +552,11 @@ func TestObserveKubeconfigSecret_TransitionsCondition(t *testing.T) {
 	kcp := &controlplanev1beta2.KairosControlPlane{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-kcp", Namespace: "default"},
 	}
+	r := &KairosControlPlaneReconciler{Scheme: scheme}
 
-	// --- (1) Secret missing, first observation: False(Info), anchor timestamp.
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	// --- (1) First observation: False(Info), anchor timestamp.
 	beforeFirst := metav1.Now()
-	ready, err := r.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
-	g.Expect(err).NotTo(HaveOccurred())
+	ready := r.markWaitingForNodePush(kcp, cluster)
 	g.Expect(ready).To(BeFalse())
 	g.Expect(kcp.Status.LastNodePushObserved).NotTo(BeNil(), "first miss must anchor LastNodePushObserved")
 	g.Expect(kcp.Status.LastNodePushObserved.Time).To(BeTemporally(">=", beforeFirst.Add(-time.Second)))
@@ -564,88 +566,17 @@ func TestObserveKubeconfigSecret_TransitionsCondition(t *testing.T) {
 	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.WaitingForNodePushReason))
 	g.Expect(cond.Severity).To(Equal(clusterv1.ConditionSeverityInfo))
 
-	// --- (2) Secret still missing, but LastNodePushObserved is now in the past
-	// beyond kubeconfigReadyTimeout: severity escalates to Warning.
+	// --- (2) LastNodePushObserved in the past beyond kubeconfigReadyTimeout:
+	// severity escalates to Warning; timestamp not re-anchored.
 	stale := metav1.NewTime(time.Now().Add(-2 * kubeconfigReadyTimeout))
 	kcp.Status.LastNodePushObserved = &stale
 	originalStale := stale
-	ready, err = r.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
-	g.Expect(err).NotTo(HaveOccurred())
+	ready = r.markWaitingForNodePush(kcp, cluster)
 	g.Expect(ready).To(BeFalse())
-	// LastNodePushObserved must NOT be re-anchored — we measure elapsed
-	// since first observation, not since each reconcile.
 	g.Expect(kcp.Status.LastNodePushObserved.Time).To(Equal(originalStale.Time))
 	cond = conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
 	g.Expect(cond).NotTo(BeNil())
 	g.Expect(cond.Severity).To(Equal(clusterv1.ConditionSeverityWarning))
-
-	// --- (3) Secret present with non-empty value: True; LastNodePushObserved cleared.
-	pushedSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster-kubeconfig",
-			Namespace: "default",
-			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
-		},
-		Type: clusterv1.ClusterSecretType,
-		Data: map[string][]byte{"value": []byte("apiVersion: v1\nkind: Config")},
-	}
-	c2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pushedSecret).Build()
-	r2 := &KairosControlPlaneReconciler{Client: c2, Scheme: scheme}
-	ready, err = r2.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(ready).To(BeTrue())
-	g.Expect(kcp.Status.LastNodePushObserved).To(BeNil(), "Secret-present must clear LastNodePushObserved")
-	cond = conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
-	g.Expect(cond).NotTo(BeNil())
-	g.Expect(cond.Status).To(Equal(corev1.ConditionTrue))
-	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.KubeconfigReadyReason))
-}
-
-// TestObserveKubeconfigSecret_SSHFallbackAnnotation_SetsViaSSHReason
-// guards the one-line annotation check added in PR-9: when the
-// kubeconfig Secret was written by the SSH fallback worker (annotation
-// "controllers.cluster.x-k8s.io/kubeconfig-source: ssh-fallback"), the
-// condition Reason is KubeconfigReadyViaSSHFallback rather than the
-// default KubeconfigReady. This is the operator-visible audit signal
-// for "this cluster's kubeconfig was retrieved via SSH fallback."
-func TestObserveKubeconfigSecret_SSHFallbackAnnotation_SetsViaSSHReason(t *testing.T) {
-	g := NewWithT(t)
-
-	scheme := runtime.NewScheme()
-	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
-	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
-	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
-	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
-
-	cluster := &clusterv1.Cluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
-	}
-	kcp := &controlplanev1beta2.KairosControlPlane{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-kcp", Namespace: "default"},
-	}
-
-	sshFallbackSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster-kubeconfig",
-			Namespace: "default",
-			Labels:    map[string]string{clusterv1.ClusterNameLabel: "test-cluster"},
-			Annotations: map[string]string{
-				KubeconfigSourceAnnotation: KubeconfigSourceSSHFallback,
-			},
-		},
-		Type: clusterv1.ClusterSecretType,
-		Data: map[string][]byte{"value": []byte("apiVersion: v1\nkind: Config")},
-	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sshFallbackSecret).Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
-	ready, err := r.observeKubeconfigSecret(context.Background(), log.Log, kcp, cluster)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(ready).To(BeTrue())
-	cond := conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
-	g.Expect(cond).NotTo(BeNil())
-	g.Expect(cond.Status).To(Equal(corev1.ConditionTrue))
-	g.Expect(cond.Reason).To(Equal(controlplanev1beta2.KubeconfigReadyViaSSHFallbackReason),
-		"Secret annotated with ssh-fallback source must produce the via-SSH Reason")
 }
 
 // TestSecretToKairosControlPlane_UsesClusterNameLabel guards the KD-15 label

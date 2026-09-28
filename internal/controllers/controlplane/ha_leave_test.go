@@ -18,6 +18,13 @@ package controlplane
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"testing"
 	"time"
 
@@ -541,8 +548,33 @@ func TestEndpointRESTConfig_BoundsEveryRequest(t *testing.T) {
 	g.Expect(cfg.BearerToken).To(Equal("kcp-token"))
 }
 
-// testWorkloadCA is placeholder CA data: the config tests never dial.
-const testWorkloadCA = "test-ca-bundle"
+// testWorkloadCA is a real, canonical CA certificate PEM: the workload
+// kubeconfig is re-sanitized before use, and the sanitizer requires
+// certificate-authority-data to hold parseable CERTIFICATE blocks. The config
+// tests never dial.
+var testWorkloadCA = string(mustGenTestCAPEM())
+
+// mustGenTestCAPEM returns a fresh self-signed CA certificate as PEM.
+func mustGenTestCAPEM() []byte {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-workload-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
 
 // workloadKubeconfigSecret is the `<cluster>-kubeconfig` Secret for
 // testCluster(), with the given server.

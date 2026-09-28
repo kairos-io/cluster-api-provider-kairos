@@ -40,6 +40,7 @@ import (
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 // The etcd-leave handshake (ADR 0005 §E.3). These identifiers are a wire
@@ -161,6 +162,16 @@ const workloadRequestTimeout = 10 * time.Second
 // the k0s join-token path, and the etcd-leave handshake when no member answers
 // directly (connectForLeave). Every request is bounded by
 // workloadRequestTimeout.
+//
+// ADR 0011 (C5): the rest.Config is built from the S5-rebuilt output of the
+// contract bytes, NEVER the raw bytes (workloadRESTConfig). The contract Secret
+// is normally already S5 output (the publish path is its only sanctioned
+// writer), but re-sanitizing here closes the window where a node overwrote it
+// between reconciles: nothing client-go would honor as file-path credentials,
+// exec/auth-provider plugins, impersonation or insecure TLS survives Sanitize,
+// so a workload client can never be steered to leak this manager's
+// ServiceAccount token (A1/A2). A Sanitize failure returns an error, which the
+// callers treat as fail-safe (the etcd-leave hook stays set, quorum preserved).
 func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error) {
 	restCfg, err := r.endpointRESTConfig(ctx, cluster)
 	if err != nil {
@@ -197,7 +208,18 @@ func (r *KairosControlPlaneReconciler) workloadRESTConfig(ctx context.Context, c
 	if !ok || len(data) == 0 {
 		return nil, fmt.Errorf("workload kubeconfig secret %s has no non-empty 'value' key", key)
 	}
-	restCfg, err := clientcmd.RESTConfigFromKubeConfig(data)
+	// Re-sanitize in place: the contract is already S5 output with the correct
+	// forced server, so extracting that server and re-running Sanitize yields the
+	// same bytes for clean content and strips anything a node might have injected.
+	server, err := serverFromKubeconfig(data)
+	if err != nil {
+		return nil, fmt.Errorf("workload kubeconfig secret %s: %w", key, err)
+	}
+	sanitized, err := kubeconfig.Sanitize(data, cluster.Name, server)
+	if err != nil {
+		return nil, fmt.Errorf("workload kubeconfig secret %s failed sanitization: %w", key, err)
+	}
+	restCfg, err := clientcmd.RESTConfigFromKubeConfig(sanitized)
 	if err != nil {
 		return nil, fmt.Errorf("parse workload kubeconfig %s: %w", key, err)
 	}
