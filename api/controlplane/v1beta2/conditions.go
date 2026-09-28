@@ -147,6 +147,45 @@ const (
 	// cluster get its kubeconfig?" see this in `kubectl describe kcp`.
 	KubeconfigReadyViaSSHFallbackReason = "KubeconfigReadyViaSSHFallback"
 
+	// NodePushRejectedReason is the False reason for KubeconfigReadyCondition
+	// when a candidate kubeconfig (staged by a node, or already sitting in the
+	// contract Secret) is refused by the sanitizer for a reason that does NOT
+	// warrant emptying the contract Secret (ADR 0011 step 4/step 7): a
+	// structure-only (S1) or credential-shape (S3) violation on otherwise-clean
+	// content. The message names the offending rule, never a byte of the
+	// kubeconfig. Severity Warning. This reason is in the SSH-fallback
+	// eligibility set only via WaitingForNodePush; NodePushRejected itself is
+	// condition-only and leaves the contract content untouched.
+	NodePushRejectedReason = "NodePushRejected"
+
+	// NodePushCAMismatchReason is the False reason for KubeconfigReadyCondition
+	// when the certificate authority of a candidate or of the contract Secret
+	// does not match the CA fingerprint pinned on the KairosControlPlane
+	// annotation (ADR 0011 step 5, A8). A mismatch neutralizes the contract
+	// Secret (empty-in-place) and refuses to republish until an operator
+	// re-pins via the KCP annotation — a possible plant or a split-brain
+	// joiner, never a silent CA swap. Severity Warning. Deliberately NOT in the
+	// SSH-fallback eligibility set (G23): auto-recovery must not overwrite a CA
+	// the operator has not vetted.
+	NodePushCAMismatchReason = "NodePushCAMismatch"
+
+	// KubeconfigSecretNotOwnedReason is the False reason for
+	// KubeconfigReadyCondition when the contract Secret exists but is neither
+	// controlled by this KairosControlPlane nor adoptable under the ADR 0011
+	// adoption criteria (a leftover from a deleted same-name cluster, a
+	// pre-Cluster plant, or a mislabeled Secret). The controller does not touch
+	// its content; the message asks the operator to delete it. Severity
+	// Warning.
+	KubeconfigSecretNotOwnedReason = "KubeconfigSecretNotOwned"
+
+	// KubeconfigCertificateExpiredReason is the False reason for
+	// KubeconfigReadyCondition when the contract Secret is otherwise clean and
+	// canonical but its inline client certificate is outside its validity
+	// window (ADR 0011 step 7, KD-62). Expiry is inevitable in normal
+	// operation and MUST NOT empty a cluster's kubeconfig, so this is
+	// condition-only: the content is left in place. Severity Warning.
+	KubeconfigCertificateExpiredReason = "KubeconfigCertificateExpired"
+
 	// SSHFallbackDialingReason is the False reason for
 	// KubeconfigReadyCondition while the SSH fallback path is dialing
 	// the workload node. Severity Info. Transitions to True (one of
