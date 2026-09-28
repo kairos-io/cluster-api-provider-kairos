@@ -153,9 +153,10 @@ const (
 	// warrant emptying the contract Secret (ADR 0011 step 4/step 7): a
 	// structure-only (S1) or credential-shape (S3) violation on otherwise-clean
 	// content. The message names the offending rule, never a byte of the
-	// kubeconfig. Severity Warning. This reason is in the SSH-fallback
-	// eligibility set only via WaitingForNodePush; NodePushRejected itself is
-	// condition-only and leaves the contract content untouched.
+	// kubeconfig. Severity Warning. NodePushRejected on its own does not make
+	// SSH fallback eligible (ADR 0011 G23 restricts eligibility to
+	// WaitingForNodePush, SSHFallbackFailed and SSHFallbackMisconfigured); it
+	// is condition-only and leaves the contract content untouched.
 	NodePushRejectedReason = "NodePushRejected"
 
 	// NodePushCAMismatchReason is the False reason for KubeconfigReadyCondition

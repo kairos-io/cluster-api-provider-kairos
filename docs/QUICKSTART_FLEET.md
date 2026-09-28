@@ -296,7 +296,12 @@ kubectl --kubeconfig=fleet-demo-kubeconfig.yaml get nodes
 **Node-push behavior:** the control-plane node posts its kubeconfig to a
 Secret in the management cluster at bootstrap time, the same as CAPV/CAPM3.
 If the node has no route to the management cluster's API server, enable
-`SSHFallback` on the `KairosControlPlane` (see Prerequisites above).
+`SSHFallback` on the `KairosControlPlane` (see Prerequisites above). The
+controller validates and canonicalizes whatever it receives before
+publishing it — see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full set of `KubeconfigReady` reasons if the Secret does not appear
+or a kubeconfig you extract looks unexpected.
 
 ### providerID cross-provider contract — verify the match
 

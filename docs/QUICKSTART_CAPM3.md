@@ -672,6 +672,12 @@ The `KubeconfigReadyCondition` Reason tells you which path is active:
 | `SSHFallbackFailed` | SSH attempt failed. Check Events for the categorized error. |
 | `SSHFallbackMisconfigured` | A referenced Secret is missing, empty, or unparseable. Fix the Secret; the controller retries automatically. |
 
+`KubeconfigReadyCondition` can also go `False` for reasons unrelated to
+SSHFallback — a rejected or CA-mismatched kubeconfig, or a Secret the
+controller cannot take ownership of. See
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full reason list, including the `NodePushCAMismatch` re-pin runbook.
+
 ---
 
 ## Cleanup

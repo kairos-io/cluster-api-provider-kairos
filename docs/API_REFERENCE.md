@@ -486,6 +486,57 @@ The control plane makes the owning `Cluster` an owner of the templates it refere
 - It applies to templates whose kind ends in `Template`, in the Cluster's own namespace. A template that does not exist yet is skipped on that reconcile.
 - Kubernetes deletes an object once all of its owners are gone. Deleting the last Cluster that owns a template therefore deletes the template. A template shared by several Clusters stays until the last of them is deleted.
 
+### KubeconfigReady condition
+
+Reports whether the workload-cluster kubeconfig Secret (`<cluster>-kubeconfig`) is present, controlled by this `KairosControlPlane`, and holds canonical content that CAPI core and this provider's own controllers can safely build a client from.
+
+Before publishing, the controller stages the candidate kubeconfig in a per-cluster Secret it owns, `<cluster>-kubeconfig-push` (label `controlplane.cluster.x-k8s.io/secret-type: kubeconfig-push`), and rebuilds it into a single canonical form: one cluster, one user, one context, named `<cluster>-admin@<cluster>`, with the `server` the controller already knows for this cluster. A pre-existing `<cluster>-kubeconfig` Secret not yet controlled by this `KairosControlPlane` is adopted the first time it is observed, provided it was created no earlier than the `Cluster` object and carries the `cluster.x-k8s.io/cluster-name` label; adoption rewrites its content into the same canonical form.
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `True` | `KubeconfigReady` | The contract Secret is controlled by this control plane, canonical, and its client certificate is unexpired. |
+| `True` | `KubeconfigReadyViaSSHFallback` | Same as above, but the content arrived through the opt-in SSH fallback path rather than node-push. |
+| `False` (Info → Warning) | `WaitingForNodePush` | No usable kubeconfig has been published yet. Severity escalates from Info to Warning once the wait exceeds the node-push timeout (10 minutes). See [Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback) if the node cannot reach the management API server. |
+| `False` (Warning) | `NodePushRejected` | A candidate kubeconfig — the one staged by a node, or the one already in the contract Secret — failed a structural or credential-shape check. The message names the failing rule, never any kubeconfig content. Whatever the contract Secret already held is left unchanged. Correct the source of the candidate (redeploy the affected node, or inspect its staging Secret); it is re-evaluated on the next reconcile. |
+| `False` (Warning) | `NodePushCAMismatch` | A candidate kubeconfig presents a different certificate authority than the one already pinned for this cluster (see [Annotations](#annotations) below). The contract Secret's previous content, if any, is left in place; the controller refuses to publish the mismatched candidate until an operator re-pins. See the runbook below. |
+| `False` (Warning) | `KubeconfigSecretNotOwned` | A Secret named `<cluster>-kubeconfig` exists but is neither controlled by this `KairosControlPlane` nor eligible for adoption (it predates the `Cluster`, is missing the cluster-name label, or is controlled by something else). The controller does not touch its content. Delete the Secret so the controller can publish its own. |
+| `False` (Warning) | `KubeconfigCertificateExpired` | The published kubeconfig's inline client certificate is outside its validity window. Its content is left in place — expiry does not clear a working Secret — but a client built from it will fail authentication. A control-plane Machine replacement, or an SSH-fallback fetch, refreshes the certificate. |
+| `False` (Info) | `SSHFallbackDialing` | The SSH fallback path is dialing the workload node. |
+| `False` (Warning) | `SSHFallbackFailed` | An SSH fallback attempt failed. Check Events for the categorized error. |
+| `False` (Warning) | `SSHFallbackMisconfigured` | A Secret referenced by `spec.sshFallback` is missing, empty, or unparseable. |
+
+The controller also emits two Warning Events (not conditions) when the staging Secret's own metadata is unexpected — these indicate the staging Secret was modified by something other than the controller, and do not by themselves affect `KubeconfigReady`:
+
+| Event reason | Meaning |
+|---|---|
+| `StagingKubeconfigNotOwned` | The staging Secret `<cluster>-kubeconfig-push` exists but is not controlled by this `KairosControlPlane`. Delete it so the controller can recreate it. |
+| `StagingKubeconfigImmutable` | The staging Secret was marked `immutable: true`, which blocks the controller from repairing its metadata. Delete it so the controller can recreate it. |
+
+#### Annotations
+
+Two annotations on `KairosControlPlane` control the certificate-authority pin used by `NodePushCAMismatch`:
+
+| Annotation | Set by | Purpose |
+|---|---|---|
+| `controlplane.cluster.x-k8s.io/kubeconfig-ca-pin` | Controller only | The certificate-authority fingerprint of the first kubeconfig the controller accepted for this cluster. Every later candidate must present the same CA or it is refused with `NodePushCAMismatch`. Do not set this by hand; the controller manages it and overwrites it on the next accepted publish. |
+| `controlplane.cluster.x-k8s.io/kubeconfig-repin` | Operator | Set to `"true"` to clear the stored CA pin (both annotations are removed) and let the controller re-pin from the next candidate it accepts. This is the sanctioned way past a `NodePushCAMismatch`. The controller consumes the annotation once — you do not need to remove it yourself. |
+
+**Runbook: `NodePushCAMismatch`.**
+
+1. Inspect the kubeconfig currently offered on the staging Secret before doing anything else:
+   ```bash
+   kubectl get secret <cluster>-kubeconfig-push -n <cluster-namespace> \
+     -o jsonpath='{.data.value}' | base64 -d
+   ```
+   Confirm whether the change in certificate authority is expected — for example, a control-plane node that reset and regenerated its cluster CA — or unexpected, in which case investigate the node and its staging Secret before proceeding.
+2. If the change is expected, re-pin:
+   ```bash
+   kubectl annotate kairoscontrolplane <name> -n <cluster-namespace> \
+     controlplane.cluster.x-k8s.io/kubeconfig-repin=true
+   ```
+3. On the next reconcile the controller drops the stored pin and accepts the next candidate's CA as the new pin. `KubeconfigReady` returns to `True` (or to `False(WaitingForNodePush)` if no candidate is available yet).
+4. If the change is not expected, do not re-pin. Replace the affected control-plane node instead.
+
 ---
 
 ## KairosControlPlaneTemplate
@@ -664,4 +715,5 @@ Both controllers stop reconciling an object while its Cluster is paused (`Cluste
 - Worker tokens should use the `*SecretRef` variants. Inline tokens in specs are readable without Secret RBAC.
 - For kubeadm workers, the bootstrap token (valid 15 minutes) is never written to `spec` or `status`, but it is part of the rendered bootstrap data Secret. Restrict read access to bootstrap data Secrets as for any other distribution.
 - **HA etcd health/leave signals are node-self-reported and forgeable (KD-51).** Both day-2 HA signal channels — the per-cluster etcd-status Secret and the workload `kube-system/kairos-etcd-leave` ConfigMap leave acknowledgement — are written by control-plane nodes with vanilla RBAC on objects shared across the control plane, so a compromised control-plane node can forge them. This is not a privilege escalation (a compromised control-plane node already holds cluster-admin-equivalent access) and cannot force an unsafe deletion, because the quorum-safety decision is made independently of, and before, any node signal is consulted. A forged signal can only self-downgrade the clean-leave/health guarantee. Per-member-scoped signals are tracked as future hardening.
+- **The workload kubeconfig Secret is always controller-rebuilt, never stored verbatim.** The control-plane controller stages a candidate kubeconfig, validates it, and rebuilds it into a single canonical form before publishing `<cluster>-kubeconfig`; it pins the certificate authority the first time a cluster's kubeconfig is accepted and refuses a later candidate presenting a different one. See [KubeconfigReady condition](#kubeconfigready-condition) for the full set of reasons this surfaces and the operator re-pin procedure.
 - All Secrets referenced by `*SecretRef` fields must exist in the management cluster before the KairosConfig is reconciled. Missing Secrets cause a transient failure that clears automatically when the Secret is created.

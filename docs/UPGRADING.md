@@ -483,3 +483,41 @@ annotation on each `MutatingWebhookConfiguration` /
 There is no post-install CA-injection step on any install path (`clusterctl`
 or flat manifest). If you have automation that runs the old script, remove
 that step.
+
+---
+
+## Kubeconfig Secrets are adopted and canonicalized
+
+The control-plane controller now rebuilds the content of every
+`<cluster>-kubeconfig` Secret it manages into a single canonical form before
+publishing it, rather than keeping whatever was last written to it. See
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the reasons this surfaces on `KairosControlPlane.status.conditions` and
+the two annotations that control the certificate-authority pin.
+
+**Adoption.** A pre-existing `<cluster>-kubeconfig` Secret that is not yet
+controlled by the `KairosControlPlane` is adopted automatically the first
+time the controller observes it, provided it was created no earlier than the
+`Cluster` object and carries the `cluster.x-k8s.io/cluster-name` label.
+Adoption rewrites the Secret's content into the canonical form described
+below and sets the `KairosControlPlane` as its controller; a Secret that
+cannot be adopted is left untouched and reported as
+`KubeconfigSecretNotOwned`, naming the object to delete so the controller can
+publish its own.
+
+**Context and user names change.** The canonical form always names its
+`context` and `user` entries `<cluster>-admin@<cluster>` and
+`<cluster>-admin`, regardless of what a node originally wrote. This is
+visible in `clusterctl get kubeconfig <cluster>` and in any kubeconfig
+extracted with:
+
+```bash
+kubectl get secret <cluster>-kubeconfig -n <cluster-namespace> \
+  -o jsonpath='{.data.value}' | base64 -d
+```
+
+`kubectl --kubeconfig=<file> get nodes` and similar commands are unaffected —
+they select whichever context the file marks `current-context`, and the
+sanitizer sets that correctly. Automation that instead greps or hardcodes a
+specific context/user name from a previously-fetched kubeconfig should expect
+the new name after this Secret is next rewritten.
