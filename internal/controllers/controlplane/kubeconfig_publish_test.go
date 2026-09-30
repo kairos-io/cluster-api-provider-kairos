@@ -463,9 +463,13 @@ func TestReconcileKubeconfig_CAMismatchNeutralizes(t *testing.T) {
 	g.Expect(kcp.Annotations[KubeconfigCAPinAnnotation]).To(Equal(pinA), "the pin survives neutralization")
 }
 
-// TestReconcileKubeconfig_NotOwnedNotAdoptable: a same-name Secret older than the
-// Cluster (a leftover) is left untouched with KubeconfigSecretNotOwned. No delete.
-func TestReconcileKubeconfig_NotOwnedNotAdoptable(t *testing.T) {
+// TestReconcileKubeconfig_NotOwnedNotAdoptable_AuthoritativeEmptied is the SF1
+// (option b) flip of the former leave-untouched behaviour: a same-name Secret
+// older than the Cluster (a leftover, not adoptable) is now EMPTIED in place with
+// WaitingForNodePush because the Cluster controlPlaneRef points at this KCP (the
+// fixture's controlPlaneRef already does). No staging exists, so it stays empty
+// pending recovery. No delete, no owner change.
+func TestReconcileKubeconfig_NotOwnedNotAdoptable_AuthoritativeEmptied(t *testing.T) {
 	g := NewWithT(t)
 	kcp, cluster := publishKCPAndCluster()
 	cluster.CreationTimestamp = metav1.NewTime(time.Now())
@@ -484,10 +488,131 @@ func TestReconcileKubeconfig_NotOwnedNotAdoptable(t *testing.T) {
 	ready, err := r.reconcileKubeconfig(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(ready).To(BeFalse())
+	g.Expect(kubeconfigReason(kcp)).To(Equal(controlplanev1beta2.WaitingForNodePushReason))
+	got := getSecret(t, nd, "ns", "c-kubeconfig")
+	g.Expect(got.Data["value"]).To(BeEmpty(), "SF1: an authoritative not-owned/not-adoptable Secret is emptied in place")
+	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeFalse(), "neutralize does not take ownership")
+}
+
+// TestReconcileKubeconfig_NotOwnedNotAdoptable_MismatchUntouched is the SF1
+// sibling: with a controlPlaneRef that does NOT point at this KCP, the same
+// leftover Secret is left untouched with KubeconfigSecretNotOwned. No delete.
+func TestReconcileKubeconfig_NotOwnedNotAdoptable_MismatchUntouched(t *testing.T) {
+	g := NewWithT(t)
+	kcp, cluster := publishKCPAndCluster()
+	cluster.CreationTimestamp = metav1.NewTime(time.Now())
+	// Point the Cluster controlPlaneRef at a DIFFERENT control plane.
+	cluster.Spec.ControlPlaneRef.Name = "some-other-kcp"
+	valid := newValidKubeconfig(t, cluster.Name, testExpectedServer)
+	contract := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "c-kubeconfig", Namespace: "ns",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)), // older than Cluster
+			Labels:            map[string]string{clusterv1.ClusterNameLabel: "c"},
+		},
+		Type: clusterv1.ClusterSecretType,
+		Data: map[string][]byte{"value": valid},
+	}
+	r, nd := buildReconciler(t, kcp, cluster, contract)
+
+	ready, err := r.reconcileKubeconfig(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeFalse())
 	g.Expect(kubeconfigReason(kcp)).To(Equal(controlplanev1beta2.KubeconfigSecretNotOwnedReason))
 	got := getSecret(t, nd, "ns", "c-kubeconfig")
-	g.Expect(got.Data["value"]).To(Equal(valid), "a non-adoptable Secret is left untouched, never emptied or deleted")
+	g.Expect(got.Data["value"]).To(Equal(valid), "controlPlaneRef mismatch leaves the Secret untouched")
 	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeFalse())
+}
+
+// TestReconcileKubeconfig_SF1_ForgedOwnerPlantEmptiedAndRepublished: a tokenFile
+// plant carrying a FORGED controller ownerRef (so it is neither KCP-owned nor
+// adoptable) is emptied in place and then republished from clean staging when the
+// Cluster controlPlaneRef points at this KCP. The forged owner is dropped and the
+// KCP takes ownership. No delete.
+func TestReconcileKubeconfig_SF1_ForgedOwnerPlantEmptiedAndRepublished(t *testing.T) {
+	g := NewWithT(t)
+	kcp, cluster := publishKCPAndCluster()
+	// A plant with unsafe content (tokenFile — the A1 shape) AND a forged
+	// controller ownerRef that is not this KCP.
+	ctlTrue := true
+	plant := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "c-kubeconfig", Namespace: "ns",
+			Labels: map[string]string{clusterv1.ClusterNameLabel: "c"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       "kcp",
+				UID:        types.UID("FORGED-uid"), // not kcp.UID
+				Controller: &ctlTrue,
+			}},
+		},
+		Type: clusterv1.ClusterSecretType,
+		Data: map[string][]byte{"value": newTokenFileKubeconfig(t)},
+	}
+	// Clean staging so the SF1 branch republishes after emptying.
+	valid := newValidKubeconfig(t, cluster.Name, testExpectedServer)
+	staging := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "c-kubeconfig-push", Namespace: "ns",
+			Labels: map[string]string{clusterv1.ClusterNameLabel: "c"},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"value": valid},
+	}
+	g.Expect(controllerRefTo(kcp, staging, r0Scheme(t))).To(Succeed())
+	r, nd := buildReconciler(t, kcp, cluster, plant, staging)
+
+	ready, err := r.reconcileKubeconfig(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeTrue(), "SF1: after emptying the forged plant, clean staging republishes")
+	g.Expect(kubeconfigReason(kcp)).To(Equal(controlplanev1beta2.KubeconfigReadyReason))
+	got := getSecret(t, nd, "ns", "c-kubeconfig")
+	g.Expect(got.Data["value"]).To(Equal(valid), "the forged plant is replaced by clean staging content")
+	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeTrue(), "the KCP takes ownership, dropping the forged owner")
+	owner := metav1.GetControllerOfNoCopy(got)
+	g.Expect(owner).NotTo(BeNil())
+	g.Expect(owner.UID).To(Equal(kcp.UID))
+}
+
+// TestReconcileKubeconfig_SF1_PreClusterPlantEmptiedAndRepublished: a clean
+// Secret with a creationTimestamp before the Cluster (not adoptable by rule b) is
+// emptied and republished from clean staging when authoritative. No delete.
+func TestReconcileKubeconfig_SF1_PreClusterPlantEmptiedAndRepublished(t *testing.T) {
+	g := NewWithT(t)
+	kcp, cluster := publishKCPAndCluster()
+	cluster.CreationTimestamp = metav1.NewTime(time.Now())
+	// A clean (S5) contract but older than the Cluster: not adoptable (rule b),
+	// no controller owner.
+	preexisting := newValidKubeconfig(t, cluster.Name, testExpectedServer)
+	contract := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "c-kubeconfig", Namespace: "ns",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			Labels:            map[string]string{clusterv1.ClusterNameLabel: "c"},
+		},
+		Type: clusterv1.ClusterSecretType,
+		Data: map[string][]byte{"value": preexisting},
+	}
+	fresh := newValidKubeconfig(t, cluster.Name, testExpectedServer)
+	staging := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "c-kubeconfig-push", Namespace: "ns",
+			Labels: map[string]string{clusterv1.ClusterNameLabel: "c"},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"value": fresh},
+	}
+	g.Expect(controllerRefTo(kcp, staging, r0Scheme(t))).To(Succeed())
+	r, nd := buildReconciler(t, kcp, cluster, contract, staging)
+
+	ready, err := r.reconcileKubeconfig(context.Background(), log.Log, kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeTrue())
+	g.Expect(kubeconfigReason(kcp)).To(Equal(controlplanev1beta2.KubeconfigReadyReason))
+	got := getSecret(t, nd, "ns", "c-kubeconfig")
+	g.Expect(got.Data["value"]).To(Equal(fresh), "the pre-Cluster leftover is emptied then republished from staging")
+	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeTrue())
 }
 
 // TestReconcileKubeconfig_PublishesFromStaging: no contract yet; a KCP-owned

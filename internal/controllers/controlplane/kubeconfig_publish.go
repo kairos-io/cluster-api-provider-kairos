@@ -178,9 +178,38 @@ func (r *KairosControlPlaneReconciler) reconcileContractKubeconfig(ctx context.C
 	ownedByKCP := metav1.IsControlledBy(contract, kcp)
 	adoptable := !ownedByKCP && contractAdoptable(contract, cluster)
 	if !ownedByKCP && !adoptable {
-		// A leftover from a deleted same-name cluster, a pre-Cluster plant, or a
-		// mislabeled Secret. Do NOT touch its content (we have no authority over
-		// it); ask the operator to delete it (ADR 0011 migration rule a-c).
+		// Neither KCP-owned nor adoptable: a leftover from a deleted same-name
+		// cluster, a pre-Cluster plant, a plant carrying a forged controller
+		// ownerRef, or a mislabeled Secret.
+		//
+		// SF1 (ADR 0011 step 7 ownership-gate, option (b)): the authoritative
+		// direction is Cluster -> KCP (ownerRefs are forgeable; the
+		// controlPlaneRef is not, and `<cluster>-kubeconfig` is unique per
+		// cluster), so when Cluster.spec.controlPlaneRef points at this KCP the
+		// KCP is authoritative for that name. Neutralize the Secret in place
+		// (never delete) exactly as for an unsafe owned Secret, then recover from
+		// staging/SSH — this closes the A1/A2 window for a forged-ownerRef or
+		// pre-Cluster plant that would otherwise be left CAPI-core-readable.
+		// Reuse WaitingForNodePushReason (no new reason) so SSH-fallback
+		// eligibility (G23) stays intact. Mirrors handleContractRejection.
+		if clusterControlPlaneRefMatches(cluster, kcp) {
+			if err := r.neutralizeContract(ctx, log, kcp, cluster, contract,
+				controlplanev1beta2.WaitingForNodePushReason,
+				fmt.Sprintf("Contract kubeconfig for %s/%s is not KCP-owned and not adoptable, but the Cluster controlPlaneRef points at this KairosControlPlane; emptied in place to force recovery. The object is retained, not deleted.", cluster.Namespace, cluster.Name)); err != nil {
+				return false, err
+			}
+			published, ready, perr := r.publishFromStaging(ctx, log, kcp, cluster, contract, true, expectedServer)
+			if perr != nil {
+				return false, perr
+			}
+			if published {
+				return ready, nil
+			}
+			return false, nil
+		}
+		// controlPlaneRef does NOT point here: leave the content untouched (we
+		// have no authority over it); ask the operator to delete it (ADR 0011
+		// migration rule a-c).
 		r.markKubeconfigFalse(kcp, controlplanev1beta2.KubeconfigSecretNotOwnedReason,
 			fmt.Sprintf("Contract kubeconfig Secret %s/%s is not controlled by this KairosControlPlane and is not adoptable; delete it so the controller can republish.", cluster.Namespace, contract.Name))
 		return false, nil
@@ -349,6 +378,22 @@ func (r *KairosControlPlaneReconciler) writeContract(ctx context.Context, log lo
 		contract.Data = map[string][]byte{}
 	}
 	contract.Data[bootstrapv1beta2.KubeconfigPushSecretDataKey] = sanitized
+	// The KCP is authoritative for this unique name (guard above) and is the sole
+	// owner of the contract Secret. Drop a foreign/forged controller ownerRef a
+	// plant may carry (SF1) so SetControllerReference — which errors on a
+	// pre-existing DIFFERENT controller — can take ownership. Non-controller
+	// owners (e.g. the SSH-fallback Cluster owner preserved during adoption) are
+	// kept.
+	if existing := metav1.GetControllerOfNoCopy(contract); existing != nil && existing.UID != kcp.UID {
+		kept := make([]metav1.OwnerReference, 0, len(contract.OwnerReferences))
+		for _, o := range contract.OwnerReferences {
+			if o.Controller != nil && *o.Controller {
+				continue // drop the foreign controller owner
+			}
+			kept = append(kept, o)
+		}
+		contract.OwnerReferences = kept
+	}
 	if err := controllerutil.SetControllerReference(kcp, contract, r.Scheme); err != nil {
 		return fmt.Errorf("set controller reference on contract kubeconfig secret: %w", err)
 	}

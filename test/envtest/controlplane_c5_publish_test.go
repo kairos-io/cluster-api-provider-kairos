@@ -157,3 +157,146 @@ func TestC5_UnsafeContractNeutralizedEmptyInPlace(t *testing.T) {
 		"the contract Secret must still exist after neutralization (empty-in-place, no delete)")
 	g.Expect(apierrors.IsNotFound(c.Get(ctx, types.NamespacedName{Name: clusterName + "-kubeconfig", Namespace: ns.Name}, &corev1.Secret{}))).To(BeFalse())
 }
+
+// TestC5_SF1_ForgedOwnerPlantNeutralizedAndRepublished proves ADR 0011 SF1
+// (option b) at the apiserver layer: a contract Secret that is neither KCP-owned
+// nor adoptable — here a tokenFile plant carrying a FORGED controller ownerRef —
+// is neutralized in place (never deleted) and then republished from clean staging
+// because Cluster.spec.controlPlaneRef points at this KCP. The forged owner is
+// dropped; the KCP takes ownership; KubeconfigReady goes True. This is the A1/A2
+// window closure for a same-namespace Secret writer (T4).
+func TestC5_SF1_ForgedOwnerPlantNeutralizedAndRepublished(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping envtest in short mode")
+	}
+	g := NewWithT(t)
+	ctx, c, _, _, teardown := startKCPEnvtest(t)
+	defer teardown()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "c5-sf1-ns"}}
+	g.Expect(c.Create(ctx, ns)).To(Succeed())
+
+	clusterName := "c5-sf1-cluster"
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns.Name},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: controlplanev1beta2.GroupVersion.Group,
+				Kind:     "KairosControlPlane",
+				Name:     clusterName + "-kcp",
+			},
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
+		},
+	}
+	g.Expect(c.Create(ctx, cluster)).To(Succeed())
+
+	kcp := &controlplanev1beta2.KairosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName + "-kcp",
+			Namespace: ns.Name,
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+		},
+		Spec: controlplanev1beta2.KairosControlPlaneSpec{
+			Replicas: ptr.To(int32(1)),
+			Version:  "v1.30.0+k0s.0",
+			MachineTemplate: controlplanev1beta2.KairosControlPlaneMachineTemplate{
+				InfrastructureRef: corev1.ObjectReference{
+					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+					Kind:       "DockerMachineTemplate",
+					Name:       "missing-on-purpose",
+					Namespace:  ns.Name,
+				},
+			},
+			KairosConfigTemplate: controlplanev1beta2.KairosConfigTemplateReference{Name: "missing-on-purpose"},
+		},
+	}
+	g.Expect(c.Create(ctx, kcp)).To(Succeed())
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kcp.Name + "-0",
+			Namespace: ns.Name,
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:         clusterName,
+				clusterv1.MachineControlPlaneLabel: "",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       kcp.Name,
+				UID:        kcp.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: clusterv1.MachineSpec{
+			ClusterName:       clusterName,
+			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			InfrastructureRef: testMachineInfraRef("infra"),
+			Version:           "v1.30.0+k0s.0",
+		},
+	}
+	g.Expect(c.Create(ctx, machine)).To(Succeed())
+
+	// Clean staging Secret, KCP-owned, so the SF1 branch can republish.
+	staging := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName + "-kubeconfig-push",
+			Namespace: ns.Name,
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       kcp.Name,
+				UID:        kcp.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"value": validWorkloadKubeconfig(t)},
+	}
+	g.Expect(c.Create(ctx, staging)).To(Succeed())
+
+	// A plant: unsafe (tokenFile) content under a FORGED KairosControlPlane
+	// controller ownerRef (a UID that is not this KCP), so it is neither KCP-owned
+	// nor adoptable.
+	plant := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName + "-kubeconfig",
+			Namespace: ns.Name,
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       kcp.Name,
+				UID:        types.UID("00000000-0000-0000-0000-forgedforged"),
+				Controller: ptr.To(true),
+			}},
+		},
+		Type: clusterv1.ClusterSecretType,
+		Data: map[string][]byte{"value": unsafeWorkloadKubeconfig(t)},
+	}
+	g.Expect(c.Create(ctx, plant)).To(Succeed())
+
+	// The contract must end up republished (KubeconfigReady=True) with the KCP as
+	// controller owner, and the unsafe tokenFile content replaced.
+	g.Eventually(func() string {
+		got := &controlplanev1beta2.KairosControlPlane{}
+		if err := c.Get(ctx, types.NamespacedName{Name: kcp.Name, Namespace: kcp.Namespace}, got); err != nil {
+			return "ERR"
+		}
+		cond := conditions.Get(got, controlplanev1beta2.KubeconfigReadyCondition)
+		if cond == nil {
+			return ""
+		}
+		if cond.Status != corev1.ConditionTrue {
+			return "false:" + cond.Reason
+		}
+		return cond.Reason
+	}, 30*time.Second, time.Second).Should(Equal(controlplanev1beta2.KubeconfigReadyReason))
+
+	got := &corev1.Secret{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: clusterName + "-kubeconfig", Namespace: ns.Name}, got)).To(Succeed(),
+		"the contract Secret is retained (empty-in-place then republished, never deleted)")
+	g.Expect(got.Data["value"]).NotTo(BeEmpty(), "republished from clean staging")
+	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeTrue(), "the KCP takes ownership, dropping the forged owner")
+}
