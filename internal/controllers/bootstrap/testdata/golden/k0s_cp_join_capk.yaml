@@ -829,28 +829,21 @@ write_files:
         local ns='default'
         local name='ha-cluster-kubeconfig-push'
         local token='mgmt-token'
-        local cluster_name='ha-cluster'
-        local payload
-        # cluster.x-k8s.io/cluster-name label and node-push provenance
-        # annotation are required by the KCP controller's Secret-watch
-        # predicate (KD-15) and KD-3b observability respectively.
-        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        # PR-3 (ADR 0011): PATCH the `value` key of the controller-owned staging
+        # Secret <cluster>-kubeconfig-push. The node no longer creates or writes the
+        # contract Secret <cluster>-kubeconfig, and sends no metadata/labels/type —
+        # the KCP-created staging Secret already carries the cluster-name label and
+        # node-push provenance, and the control plane rebuilds the contract Secret.
+        local patch
+        patch="{\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
         local status
         status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
           -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/json" \
-          -X PUT \
-          --data "${payload}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH \
+          --data "${patch}" \
           "${url}" || true)
-        if [ "${status}" = "404" ]; then
-          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            --data "${payload}" \
-            "${api}/api/v1/namespaces/${ns}/secrets" || true)
-        fi
         if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
           echo "Pushed kubeconfig to management secret ${ns}/${name}"
           return 0

@@ -84,7 +84,7 @@ func goldenCases() []goldenCase {
 		d.ManagementEndpoint = &ManagementEndpoint{
 			APIServer:                 "https://mgmt.example.com:6443",
 			Token:                     "mgmt-token",
-			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretName:      "cluster-kubeconfig-push",
 			KubeconfigSecretNamespace: "default",
 			ClusterName:               "ha-cluster",
 			ControlPlaneEndpointHost:  host,
@@ -152,7 +152,7 @@ func capkHA(d TemplateData) TemplateData {
 	d.ManagementEndpoint = &ManagementEndpoint{
 		APIServer:                 "https://mgmt.example.com:6443",
 		Token:                     "mgmt-token",
-		KubeconfigSecretName:      "cluster-kubeconfig",
+		KubeconfigSecretName:      "cluster-kubeconfig-push",
 		KubeconfigSecretNamespace: "default",
 		ClusterName:               "ha-cluster",
 	}

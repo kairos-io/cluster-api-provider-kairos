@@ -777,12 +777,11 @@ func TestShquoteFieldsAreShellSafe(t *testing.T) {
 			applyToK0s: func(d *TemplateData) { d.ClusterNS = nameInjection },
 			applyToK3s: func(d *TemplateData) { d.ClusterNS = nameInjection },
 		},
-		{
-			name:       "ControlPlaneLBEndpoint",
-			payload:    urlInjection,
-			applyToK0s: func(d *TemplateData) { d.ControlPlaneLBEndpoint = urlInjection },
-			applyToK3s: func(d *TemplateData) { d.ControlPlaneLBEndpoint = urlInjection },
-		},
+		// ControlPlaneLBEndpoint is covered by TestControlPlaneLBEndpoint_InjectionContained:
+		// after PR-3 (ADR 0011) it renders shquote'd in some shell contexts (k0s CAPK)
+		// and quote'd in YAML contexts (k3s CAPK args), so the strict shquote-only
+		// assertion here no longer fits it. Its injection-containment across both
+		// safe encodings is asserted there.
 	}
 
 	baseK0s := func() TemplateData {
@@ -1455,39 +1454,89 @@ func TestRender_ManagementEndpoint_KD3bAdversarialFields(t *testing.T) {
 						t.Fatalf("rendered YAML did not parse: %v\n---OUTPUT---\n%s", err, out)
 					}
 
-					// (2) Payload appears inside shquote envelope.
-					envelope := shquote(tc.payload)
-					if !strings.Contains(out, envelope) {
-						t.Fatalf("payload not wrapped in shquote envelope:\nenvelope=%q\n---OUTPUT---\n%s", envelope, out)
+					// (2) After PR-3 (ADR 0011) these fields left the node push block:
+					// ClusterName is no longer rendered by it (the control plane owns
+					// the labels/provenance on the staging/contract Secrets), and
+					// ControlPlaneEndpointHost's server-rewrite sed is gone (the node
+					// pushes verbatim). They now appear only in shquote'd shell contexts
+					// (HA-gated) or quote'd YAML args, so assert injection containment
+					// across BOTH safe encodings rather than requiring a shquote
+					// envelope. YAML value args the templates compose with printf:
+					composed := []string{
+						"--tls-san=" + tc.payload,
+						"--server=https://" + tc.payload + ":6443",
+						"https://" + tc.payload + ":6443",
 					}
-
-					// (3) Dangerous fragments only inside the envelope.
-					for _, dangerous := range []string{dangerousSemi, dangerousSubsh} {
-						if !strings.Contains(tc.payload, dangerous) {
-							continue
-						}
-						idx := 0
-						for {
-							pos := strings.Index(out[idx:], dangerous)
-							if pos < 0 {
-								break
-							}
-							absPos := idx + pos
-							before := out[:absPos]
-							lastOpen := strings.LastIndex(before, "'")
-							if lastOpen < 0 {
-								t.Fatalf("dangerous fragment %q at offset %d has no preceding `'` — not inside shquote envelope\n---OUTPUT---\n%s", dangerous, absPos, out)
-							}
-							after := out[absPos+len(dangerous):]
-							nextClose := strings.Index(after, "'")
-							if nextClose < 0 {
-								t.Fatalf("dangerous fragment %q at offset %d has no closing `'` after it\n---OUTPUT---\n%s", dangerous, absPos, out)
-							}
-							idx = absPos + len(dangerous)
-						}
-					}
+					assertInjectionContained(t, out, tc.payload, composed...)
 				})
 			}
 		}
+	}
+}
+
+// assertInjectionContained verifies that no dangerous shell fragment in payload can
+// execute: the raw payload may appear ONLY inside a known-safe envelope — a POSIX
+// single-quoted shell literal (shquote) or a YAML double-quoted scalar (quote),
+// including the printf-composed YAML values the templates build. It strips every
+// safe encoding from the output and then asserts no dangerous fragment remains. A
+// field that does not appear at all is trivially safe.
+func assertInjectionContained(t *testing.T, out, payload string, composedYAMLValues ...string) {
+	t.Helper()
+	safe := []string{shquote(payload)}
+	if q, err := quote(payload); err == nil {
+		safe = append(safe, q)
+	}
+	for _, cv := range composedYAMLValues {
+		if q, err := quote(cv); err == nil {
+			safe = append(safe, q)
+		}
+	}
+	stripped := out
+	for _, s := range safe {
+		stripped = strings.ReplaceAll(stripped, s, "")
+	}
+	for _, dangerous := range []string{"; rm -rf /", "$(rm -rf /)"} {
+		if strings.Contains(payload, dangerous) && strings.Contains(stripped, dangerous) {
+			t.Fatalf("dangerous fragment %q appears outside a safe (shquote/quote) envelope\n---OUTPUT---\n%s", dangerous, out)
+		}
+	}
+}
+
+// TestControlPlaneLBEndpoint_InjectionContained covers ControlPlaneLBEndpoint after
+// PR-3: it is shquote'd in k0s CAPK shell contexts and quote'd in k3s CAPK YAML
+// args. Injection must be contained in both.
+func TestControlPlaneLBEndpoint_InjectionContained(t *testing.T) {
+	payload := `https://api:6443'; rm -rf /; echo '`
+	for _, dist := range []string{"k0s", "k3s"} {
+		t.Run(dist, func(t *testing.T) {
+			data := TemplateData{
+				Role:                   "control-plane",
+				SingleNode:             true,
+				UserName:               "kairos",
+				UserPassword:           "kairos",
+				UserGroups:             []string{"admin"},
+				IsKubeVirt:             true,
+				ControlPlaneLBEndpoint: payload,
+				ManagementEndpoint: &ManagementEndpoint{
+					Token:                     "test-token",
+					KubeconfigSecretName:      "cluster-kubeconfig-push",
+					KubeconfigSecretNamespace: "default",
+					APIServer:                 "https://1.2.3.4:6443",
+				},
+			}
+			out, err := renderForDist(dist, data)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			var doc map[string]any
+			if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+				t.Fatalf("rendered YAML did not parse: %v", err)
+			}
+			assertInjectionContained(t, out, payload,
+				"--server=https://"+payload+":6443",
+				"--tls-san="+payload,
+				"https://"+payload+":6443",
+			)
+		})
 	}
 }
