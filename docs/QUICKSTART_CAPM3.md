@@ -562,7 +562,7 @@ Reprovision with a fully-installed Hadron disk. See the "Hadron images: addition
 
 The node k3s/k0s is running but the kubeconfig has not reached the management cluster. Causes:
 
-1. **No network route from the node to the management cluster API server**: run `curl -k https://<mgmt-api-server-host>:6443/api` from the node. If it fails, either open the network path or enable [SSHFallback](#air-gapped-fallback-sshfallback).
+1. **No network route from the node to the management cluster API server**: run the TLS-verified reachability check from [INSTALL.md](INSTALL.md#management-api-tls-verification-and-the-ca-source) — `curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api` from the node (`curl -k` will not catch a certificate mismatch). If it fails, either open the network path or enable [SSHFallback](#air-gapped-fallback-sshfallback).
 2. **bootstrap-Secret naming**: if `BareMetalHost.spec.userData` references a Secret that does not exist, upgrade the provider to v0.1.0-alpha.2+. The deterministic bootstrap-Secret naming fix shipped in alpha.2 and is required for unattended Metal3 provisioning.
 
 ### Bootstrap issues

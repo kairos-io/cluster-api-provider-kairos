@@ -120,7 +120,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `dataSecretName` | `*string` | Name of the Secret containing the bootstrap cloud-config. |
 | `initialization.dataSecretCreated` | `bool` | v1beta2 contract field: `true` when the bootstrap Secret has been created. |
 | `bootstrapTokenID` | `string` | Non-secret ID (the six-character prefix) of the kubeadm bootstrap token most recently minted for this KairosConfig. The token Secret in the workload cluster is `kube-system/bootstrap-token-<id>`. The secret half of the token is never stored in `spec` or `status`. Empty for k0s and k3s, and for a kubeadm worker that has not yet minted a token. |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) and, for control-plane roles, [Waiting for the kubeconfig push target](#waiting-for-the-kubeconfig-push-target) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) and, for control-plane roles, [Waiting for the kubeconfig push target](#waiting-for-the-kubeconfig-push-target) and [Management API CA unavailable](#management-api-ca-unavailable) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable string indicating the last failure reason. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable description of the last failure. Cleared automatically on the next successful reconcile. If non-empty, check the owning Machine's events for context. |
@@ -206,6 +206,30 @@ cluster it manages, and the bootstrap controller re-reconciles once that
 happens. If a `KairosConfig` stays in this state, confirm a
 `KairosControlPlane` exists for the cluster and is reconciling — its own
 conditions and events show why, if not.
+
+Worker `KairosConfig`s never render a push block and are not affected.
+
+### Management API CA unavailable
+
+A control-plane `KairosConfig` also needs a certificate authority before it
+can render a push block: the node-push channel verifies TLS against this CA
+(`curl --cacert`) and has no insecure fallback. If none is available when a
+Machine needs bootstrap data, `BootstrapReady` is `False` with reason
+`ManagementCAUnavailable` at severity `Warning`, and the controller requeues
+every 10 seconds.
+
+In practice this state is rare to see on a running manager: the CA is
+resolved once at manager startup — from the `KAIROS_MANAGEMENT_API_CA_FILE`
+operator override, or otherwise from the manager's own in-cluster trust root
+— and the manager fails to start at all if push is enabled and neither source
+yields a CA. Seeing this condition means the resolver ran without either
+source available, which is a configuration or environment problem rather than
+a transient one.
+
+To resolve: set `KAIROS_MANAGEMENT_API_CA_FILE` on the controller Deployment
+to the management API server's CA (a filesystem path to a PEM bundle, or an
+inline PEM), then restart the manager. See
+[INSTALL.md — Management API TLS verification and the CA source](INSTALL.md#management-api-tls-verification-and-the-ca-source).
 
 Worker `KairosConfig`s never render a push block and are not affected.
 
