@@ -1322,7 +1322,7 @@ type stubResolver struct {
 	calls    int
 }
 
-func (s *stubResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
+func (s *stubResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Machine, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
 	s.calls++
 	return s.endpoint, s.err
 }

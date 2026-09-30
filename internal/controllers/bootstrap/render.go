@@ -207,7 +207,7 @@ func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log log
 	var mgmtEndpoint *ManagementEndpoint
 	if supportsManagementEndpoint(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
 		var err error
-		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
+		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, machine, cluster)
 		if err != nil {
 			return "", WorkerJoinMaterial{}, err
 		}

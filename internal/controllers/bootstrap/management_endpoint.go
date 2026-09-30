@@ -18,11 +18,21 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
+
+// ErrKubeconfigPushTargetNotReady is the resolver's "wait, not ready" signal
+// (ADR 0011, PR-3 resolver gate): the per-cluster staging kubeconfig Secret
+// <cluster>-kubeconfig-push does not yet exist, or is not controller-owned by the
+// same KairosControlPlane that controls this Machine. The caller maps it to a
+// timed requeue with WaitingForKubeconfigPushTargetReason rather than a hard
+// error, so no push token is handed out before the control plane has pre-created
+// and taken ownership of the staging Secret the node is allowed to PATCH.
+var ErrKubeconfigPushTargetNotReady = errors.New("kubeconfig push target (staging Secret) not ready")
 
 // ManagementEndpoint carries the values a node needs to push its kubeconfig
 // back to the management cluster without SSH. It is the controller-package
@@ -38,8 +48,14 @@ import (
 // ControlPlaneEndpointHost is the cluster's control-plane endpoint host that
 // CAPV templates use to rewrite the kubeconfig `server:` URL before pushing.
 type ManagementEndpoint struct {
-	APIServer                 string
-	Token                     string
+	APIServer string
+	Token     string
+	// KubeconfigSecretName is the STAGING kubeconfig Secret the node PATCHes:
+	// <cluster>-kubeconfig-push, pre-created and controller-owned by the
+	// KairosControlPlane (ADR 0011, PR-3). It is NOT the contract Secret
+	// <cluster>-kubeconfig — nodes no longer create or write the contract Secret;
+	// the control plane rebuilds and publishes it. The node only ever PATCHes the
+	// `value` key of this staging Secret.
 	KubeconfigSecretName      string
 	KubeconfigSecretNamespace string
 	ClusterName               string
@@ -63,5 +79,5 @@ type ManagementEndpoint struct {
 // The interface is the seam PR-6 introduces so PR-7 (KD-3b) can drop in
 // non-CAPK resolvers (CAPV, CAPM3) without touching the bootstrap controller.
 type ManagementEndpointResolver interface {
-	Resolve(ctx context.Context, kc *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster) (*ManagementEndpoint, error)
+	Resolve(ctx context.Context, kc *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (*ManagementEndpoint, error)
 }
