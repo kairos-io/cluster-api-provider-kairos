@@ -134,19 +134,27 @@ func TestManagementPushTLSHardening(t *testing.T) {
 			if strings.Contains(result, "Authorization: Bearer ${") {
 				t.Error("bearer token must not appear in a curl -H argv; use the --config header file")
 			}
-			if !strings.Contains(result, `--config "${KAIROS_MGMT_AUTH_CONF}"`) {
-				t.Error("push must read the auth header from the --config file (token off argv)")
+			if !strings.Contains(result, `--config "${_authf}"`) {
+				t.Error("push must read the auth header from the per-call --config file (token off argv)")
 			}
 			if !strings.Contains(result, `printf 'header = "Authorization: Bearer %s"\n'`) {
 				t.Error("the auth header file must be written from the token via printf, not passed on argv")
 			}
 
-			// The token file lives in a private (0700) run dir written 0600 via umask.
+			// The token file lives in a private (0700) run dir and is a per-call
+			// mktemp file (0600) removed immediately after the request (PR-4 A7).
 			if !strings.Contains(result, `chmod 0700 "${KAIROS_MGMT_RUNDIR}"`) {
 				t.Error("the run dir holding the token/body files must be 0700")
 			}
-			if !strings.Contains(result, "( umask 077; printf 'header") {
-				t.Error("the auth config file must be created under umask 077 (0600)")
+			if !strings.Contains(result, `mktemp "${KAIROS_MGMT_RUNDIR}/auth.XXXXXX"`) {
+				t.Error("the auth config file must be a per-call mktemp (0600) file")
+			}
+			if !strings.Contains(result, `rm -f "${_bodyf}" "${_authf}"`) {
+				t.Error("the token config file must be removed right after the request (must not linger on tmpfs)")
+			}
+			// The old shared, never-removed auth.conf must be gone.
+			if strings.Contains(result, "KAIROS_MGMT_AUTH_CONF") {
+				t.Error("the shared persistent auth.conf must be replaced by per-call mktemp files")
 			}
 
 			// Request bodies are staged in a file (off argv); responses are not
@@ -173,6 +181,9 @@ func TestManagementPushTLSHardening_K0sHasVMIGet(t *testing.T) {
 	}
 	if !strings.Contains(result, `json=$(mgmt_get "${url}")`) {
 		t.Error("k0s CAPK SAN detection must use the verified-TLS mgmt_get helper")
+	}
+	if !strings.Contains(result, `rm -f "${_respf}" "${_authf}"`) {
+		t.Error("mgmt_get must remove both the response and the token config file after the request")
 	}
 }
 

@@ -176,19 +176,33 @@ write_files:
       KAIROS_MGMT_RUNDIR="/run/kairos-capi"
       mkdir -p "${KAIROS_MGMT_RUNDIR}"
       chmod 0700 "${KAIROS_MGMT_RUNDIR}"
-      KAIROS_MGMT_AUTH_CONF="${KAIROS_MGMT_RUNDIR}/auth.conf"
-      ( umask 077; printf 'header = "Authorization: Bearer %s"\n' 'mgmt-token' > "${KAIROS_MGMT_AUTH_CONF}" )
+      # _mgmt_auth_conf writes a fresh 0600 curl --config file (mktemp) holding the
+      # bearer token as a `header` line, echoes its path, and each caller removes it
+      # immediately after the request — so the token file never lingers on tmpfs
+      # (PR-4 review A7). mktemp creates the file 0600 in the 0700 run dir.
+      # SECURITY: the printf'd value is safe ONLY because .Token is a
+      # controller-minted TokenRequest JWT (charset [A-Za-z0-9_.-]; no double quote,
+      # backslash, or newline). shquote guards the shell layer but does NOT escape
+      # curl config-file double-quote syntax, so .Token must NEVER be populated from
+      # user-controlled data.
+      _mgmt_auth_conf() {
+        local _f
+        _f="$(mktemp "${KAIROS_MGMT_RUNDIR}/auth.XXXXXX")"
+        printf 'header = "Authorization: Bearer %s"\n' 'mgmt-token' > "${_f}"
+        printf '%s' "${_f}"
+      }
       mgmt_patch() {
-        local _url="$1" _body="$2" _bodyf
+        local _url="$1" _body="$2" _bodyf _authf
         _bodyf="$(mktemp "${KAIROS_MGMT_RUNDIR}/body.XXXXXX")"
+        _authf="$(_mgmt_auth_conf)"
         printf '%s' "${_body}" > "${_bodyf}"
         curl --cacert "${KAIROS_MGMT_CA}" --proto '=https' \
-          --config "${KAIROS_MGMT_AUTH_CONF}" \
+          --config "${_authf}" \
           -sS -o /dev/null -w "%{http_code}" \
           -H "Content-Type: application/strategic-merge-patch+json" \
           -X PATCH --data-binary @"${_bodyf}" \
           "${_url}" || true
-        rm -f "${_bodyf}"
+        rm -f "${_bodyf}" "${_authf}"
       }
       # Push kubeconfig to management cluster without SSH (KD-3b).
       # CAPV has no LB Service: rewrite k3s.yaml's `server:` URL to use the
