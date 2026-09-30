@@ -209,4 +209,18 @@ func TestC5_NodePushRoleRBACProbe(t *testing.T) {
 	// (5) Patch another cluster's staging Secret → Forbidden.
 	otherErr := ic.Patch(ctx, secretRef("other-cluster-kubeconfig-push"), strategicValue())
 	g.Expect(apierrors.IsForbidden(otherErr)).To(BeTrue(), "node SA must NOT patch another cluster's staging Secret (got %v)", otherErr)
+
+	// (6) The Role is PATCH-ONLY: get and update on the staging Secret it CAN
+	// patch must still be Forbidden. Positive proof the removed verbs stay gone
+	// (guards against a future re-broadening of the node token).
+	getErr := ic.Get(ctx, types.NamespacedName{Name: stagingName, Namespace: nsName}, &corev1.Secret{})
+	g.Expect(apierrors.IsForbidden(getErr)).To(BeTrue(), "node SA must NOT get the staging Secret (patch-only; got %v)", getErr)
+
+	// update (PUT) needs a full object; fetch it as admin, then attempt the PUT as
+	// the node SA. The request is authorized before the object is read, so a
+	// Forbidden here is the RBAC denial, not a conflict.
+	stagingForUpdate := &corev1.Secret{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: stagingName, Namespace: nsName}, stagingForUpdate)).To(Succeed())
+	updateErr := ic.Update(ctx, stagingForUpdate)
+	g.Expect(apierrors.IsForbidden(updateErr)).To(BeTrue(), "node SA must NOT update (PUT) the staging Secret (patch-only; got %v)", updateErr)
 }
