@@ -62,4 +62,13 @@ const (
 	// controller-owned Secret. Clears on its own once the control plane has
 	// created and taken ownership of the staging Secret; see ADR 0011.
 	WaitingForKubeconfigPushTargetReason = "WaitingForKubeconfigPushTarget"
+
+	// ManagementCAUnavailableReason indicates that bootstrap rendering for a
+	// control-plane KairosConfig cannot proceed because no management API CA was
+	// resolved to verify the node-push channel against (ADR 0011 PR-4). The
+	// node-push TLS has no insecure fallback, so without a CA the push cannot be
+	// rendered. Resolve on its own once the operator supplies a CA
+	// (KAIROS_MANAGEMENT_API_CA_FILE) or the in-cluster trust root becomes
+	// available; the manager normally fails fast at startup instead.
+	ManagementCAUnavailableReason = "ManagementCAUnavailable"
 )

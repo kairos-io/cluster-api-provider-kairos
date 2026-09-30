@@ -172,9 +172,16 @@ func newResolverFixture(scheme *runtime.Scheme, sub *fakeSubResourceClient, mgmt
 		SubResource:         func(string) client.SubResourceClient { return sub },
 		Scheme:              scheme,
 		ManagementAPIServer: mgmtAPI,
+		ManagementCABundle:  testManagementCABundle,
 	}
 	return r, kc, machine, cluster
 }
+
+// testManagementCABundle is a non-empty stand-in for the management API CA
+// (ADR 0011 PR-4). The resolver only checks that a CA is present (len > 0); PEM
+// validation lives in bootstrap.SanitizeManagementCABundle, exercised in that
+// package's tests, so the exact bytes here do not matter to the resolver.
+var testManagementCABundle = []byte("-----BEGIN CERTIFICATE-----\ntest-management-ca\n-----END CERTIFICATE-----\n")
 
 // TestResolve_HappyPath_ReturnsFullEndpoint exercises the success path: the
 // SA/Role/RoleBinding upserts, the fake TokenRequest returns a token, and the
@@ -197,6 +204,9 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	// PR-3: the node's push target is the STAGING Secret, never the contract one.
 	g.Expect(got.KubeconfigSecretName).To(Equal("test-cluster-kubeconfig-push"))
 	g.Expect(got.KubeconfigSecretNamespace).To(Equal("default"))
+	// PR-4: the resolved endpoint carries the management API CA the node verifies
+	// the push channel against.
+	g.Expect(got.CABundle).To(Equal(testManagementCABundle))
 
 	// SA/Role/RoleBinding were created with the cluster-name label.
 	saName := kubeconfigWriterName("test-cluster")
@@ -394,6 +404,27 @@ func TestResolve_EmptyManagementAPIServer_ReturnsNilNil(t *testing.T) {
 	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 }
 
+// TestResolve_NoCA_ReturnsCAUnavailable covers the PR-4 fail-closed gate: when
+// push is enabled (a management URL is set) but no CA was resolved, the resolver
+// returns ErrManagementCAUnavailable BEFORE minting a token or touching the
+// staging Secret, so the node is never handed a push it cannot verify.
+func TestResolve_NoCA_ReturnsCAUnavailable(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r.ManagementCABundle = nil // push enabled, but no CA available
+
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
+	g.Expect(errors.Is(err, ErrManagementCAUnavailable)).To(BeTrue())
+	g.Expect(got).To(BeNil())
+	g.Expect(sub.createCalls).To(Equal(0), "no token minted when the CA is unavailable")
+	saName := kubeconfigWriterName("test-cluster")
+	sa := &corev1.ServiceAccount{}
+	g.Expect(apierrors.IsNotFound(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, sa))).To(BeTrue(),
+		"no SA created when the CA is unavailable")
+}
+
 // TestResolve_StagingMissing_ReturnsNotReady covers the PR-3 resolver gate: when
 // the staging Secret does not exist, Resolve returns ErrKubeconfigPushTargetNotReady
 // and mints NO token / creates NO SA (the gate runs before that work).
@@ -406,7 +437,7 @@ func TestResolve_StagingMissing_ReturnsNotReady(t *testing.T) {
 	machine := resolverMachine("test-cluster", "default")
 	// No staging Secret seeded.
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine).Build()
-	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443"}
+	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443", ManagementCABundle: testManagementCABundle}
 
 	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(errors.Is(err, ErrKubeconfigPushTargetNotReady)).To(BeTrue())
@@ -438,7 +469,7 @@ func TestResolve_StagingForeignOwner_ReturnsNotReady(t *testing.T) {
 		Controller: &ctlTrue,
 	}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine, foreign).Build()
-	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443"}
+	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443", ManagementCABundle: testManagementCABundle}
 
 	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(errors.Is(err, ErrKubeconfigPushTargetNotReady)).To(BeTrue())
@@ -477,7 +508,7 @@ func TestResolve_HappyPath_CAPVCluster(t *testing.T) {
 	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "capv-cluster", Namespace: "default"}}
 	machine := resolverMachine("capv-cluster", "default")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine, ownedStagingSecret("capv-cluster", "default")).Build()
-	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443"}
+	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443", ManagementCABundle: testManagementCABundle}
 
 	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())

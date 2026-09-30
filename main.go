@@ -342,10 +342,35 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 				"original", mgmtAPIServer, "override", override)
 			mgmtAPIServer = override
 		}
+
+		// ADR 0011 PR-4: the node-push channel is TLS-verified against the
+		// management API CA (curl --cacert) with NO insecure fallback. Resolve the
+		// CA once at startup, from the operator override
+		// (KAIROS_MANAGEMENT_API_CA_FILE) or the manager's own in-cluster trust
+		// root, and FAIL FAST if neither is available — better a loud startup
+		// error than silently rendering an unverifiable push. Only required when
+		// push is enabled (a non-empty management URL); the (nil,nil) disabled
+		// path (out-of-cluster `go run`, envtest without a REST config) needs no
+		// CA. We do not open a live TLS handshake here: the push URL is frequently
+		// the operator override (a LAN address reachable only from the workload
+		// VMs, not from this pod), so a startup dial would false-negative — the
+		// render-time CA validation plus the no-fallback curl are the guarantees.
+		var mgmtCABundle []byte
+		if mgmtAPIServer != "" {
+			ca, caErr := bootstrap.ResolveManagementCA(mgr.GetConfig())
+			if caErr != nil {
+				setupLog.Error(caErr, "management API CA unavailable; node-push TLS cannot be verified. "+
+					"Run in-cluster or set KAIROS_MANAGEMENT_API_CA_FILE to a CA PEM path or inline PEM")
+				return caErr
+			}
+			mgmtCABundle = ca
+		}
+
 		mgmtResolver := bootstrap.NewKubeVirtTokenResolver(
 			mgr.GetClient(),
 			mgr.GetScheme(),
 			mgmtAPIServer,
+			mgmtCABundle,
 		)
 
 		// kubeadm worker-join source (ADR 0010 P1). It needs dependencies only

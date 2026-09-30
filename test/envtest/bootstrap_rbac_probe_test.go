@@ -152,7 +152,9 @@ func TestC5_NodePushRoleRBACProbe(t *testing.T) {
 
 	// Run the production resolver to create the SA/Role/RoleBinding exactly as
 	// production emits them (k0s control-plane → includes the VMI grant).
-	resolver := bootstrap.NewKubeVirtTokenResolver(c, c.Scheme(), cfg.Host)
+	// PR-4 (ADR 0011): the resolver requires a management API CA. envtest's own
+	// rest.Config CAData is the realistic in-cluster trust root here.
+	resolver := bootstrap.NewKubeVirtTokenResolver(c, c.Scheme(), cfg.Host, cfg.CAData)
 	kcfg := &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: nsName},
 		Spec:       bootstrapv1beta2.KairosConfigSpec{Role: "control-plane", Distribution: "k0s"},

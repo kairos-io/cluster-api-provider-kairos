@@ -60,6 +60,12 @@ type ManagementEndpoint struct {
 	KubeconfigSecretNamespace string
 	ClusterName               string
 	ControlPlaneEndpointHost  string
+	// CABundle is the canonical PEM CA bundle nodes verify the management API
+	// server's TLS certificate against on the node-push channel (ADR 0011 PR-4).
+	// Resolved once at manager startup (ResolveManagementCA) and carried on the
+	// resolver; stamped here so the renderer's twin writes it to the CA file the
+	// push curls point --cacert at. Never the tenant workload cluster's CA.
+	CABundle []byte
 }
 
 // ManagementEndpointResolver materialises the management-cluster contact info

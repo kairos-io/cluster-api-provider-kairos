@@ -70,6 +70,16 @@ type kubeVirtTokenResolver struct {
 	// wiring pulls this from mgr.GetConfig().Host at SetupWithManager time.
 	// Empty string is the disabled-resolver signal.
 	ManagementAPIServer string
+
+	// ManagementCABundle is the canonical PEM CA bundle nodes verify the
+	// management API server's TLS certificate against (ADR 0011 PR-4). It is
+	// resolved once at manager startup (ResolveManagementCA) and stamped into
+	// every ManagementEndpoint the resolver returns. When ManagementAPIServer is
+	// set (push enabled) but this is empty, Resolve fails with
+	// ErrManagementCAUnavailable rather than emitting an unverifiable push — the
+	// manager's startup check normally prevents this, so a hit here is a wiring
+	// bug, not an operator error.
+	ManagementCABundle []byte
 }
 
 // Resolve performs the same idempotent SA/Role/RoleBinding upsert as the
@@ -91,6 +101,14 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 	if r.ManagementAPIServer == "" {
 		log.Info("Skipping kubeconfig push config; REST config not available")
 		return nil, nil
+	}
+
+	// PR-4 (ADR 0011): the node-push channel is TLS-verified against the
+	// management API CA (curl --cacert; no -k fallback). If push is enabled but
+	// no CA was resolved, fail closed rather than render a push the node cannot
+	// verify. The startup check in main.go normally catches this first.
+	if len(r.ManagementCABundle) == 0 {
+		return nil, ErrManagementCAUnavailable
 	}
 
 	// PR-3 resolver gate (ADR 0011): the node PATCHes ONLY the controller-owned
@@ -278,6 +296,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		APIServer:                 r.ManagementAPIServer,
 		KubeconfigSecretName:      secretName,
 		KubeconfigSecretNamespace: cluster.Namespace,
+		CABundle:                  r.ManagementCABundle,
 	}, nil
 }
 
@@ -320,11 +339,16 @@ var _ ManagementEndpointResolver = (*kubeVirtTokenResolver)(nil)
 // controller-runtime client's SubResource method directly. main.go calls this
 // at manager startup; tests in this package construct the struct literally
 // with a fake SubResource client.
-func NewKubeVirtTokenResolver(c client.Client, scheme *runtime.Scheme, mgmtAPIServer string) ManagementEndpointResolver {
+//
+// mgmtCABundle is the canonical PEM CA bundle nodes verify the management API
+// server against on the node-push channel (ADR 0011 PR-4), resolved by
+// ResolveManagementCA. It must be non-empty whenever mgmtAPIServer is set.
+func NewKubeVirtTokenResolver(c client.Client, scheme *runtime.Scheme, mgmtAPIServer string, mgmtCABundle []byte) ManagementEndpointResolver {
 	return &kubeVirtTokenResolver{
 		Client:              c,
 		SubResource:         c.SubResource,
 		Scheme:              scheme,
 		ManagementAPIServer: mgmtAPIServer,
+		ManagementCABundle:  mgmtCABundle,
 	}
 }

@@ -254,6 +254,7 @@ func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log log
 			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
 			ClusterName:               cluster.Name,
 			ControlPlaneEndpointHost:  cluster.Spec.ControlPlaneEndpoint.Host,
+			CABundle:                  string(mgmtEndpoint.CABundle),
 		}
 	}
 	if machine != nil {
