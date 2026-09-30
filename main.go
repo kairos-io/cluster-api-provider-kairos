@@ -401,6 +401,16 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 			setupLog.Error(err, "unable to create controller", "controller", "KairosConfig")
 			return err
 		}
+
+		// Startup Role migrator (ADR 0011, PR-3 / KD-60): narrow any pre-existing
+		// node-push Role to the reduced patch-only rule set the instant this manager
+		// takes leadership, so a booted node's stale token loses secrets:create and
+		// the contract-Secret write without waiting for a re-render. Leader-elected,
+		// run-once, uncached cluster-wide read; only ever removes permissions.
+		if err := mgr.Add(bootstrap.NewNodePushRoleMigrator(mgr.GetAPIReader(), mgr.GetClient())); err != nil {
+			setupLog.Error(err, "unable to add node-push Role migrator")
+			return err
+		}
 	}
 
 	if role.enablesControlPlane() {
