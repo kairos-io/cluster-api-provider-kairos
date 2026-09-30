@@ -127,6 +127,18 @@ func validateTemplateData(d *TemplateData) error {
 				errs = append(errs, err)
 			}
 		}
+		// CABundle is a multi-line PEM (newlines are legitimate), so it does NOT
+		// go through rejectControlChars. Instead it is validated as a
+		// CERTIFICATE-only PEM bundle: this is the render-time re-check behind the
+		// controller's SanitizeManagementCABundle call, and the load-bearing gate
+		// that a private key or YAML-breaking payload can never reach the
+		// write_files CA file. Only checked when set; empty renders no CA file
+		// (the push then fails closed — there is no insecure fallback).
+		if d.ManagementEndpoint.CABundle != "" {
+			if _, err := SanitizeManagementCABundle([]byte(d.ManagementEndpoint.CABundle)); err != nil {
+				errs = append(errs, fmt.Errorf("managementEndpoint.caBundle: %w", err))
+			}
+		}
 	}
 	for i, g := range d.UserGroups {
 		if err := rejectControlChars(fmt.Sprintf("userGroups[%d]", i), g); err != nil {
