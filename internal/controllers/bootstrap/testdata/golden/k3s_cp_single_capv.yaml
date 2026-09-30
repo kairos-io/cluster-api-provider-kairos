@@ -165,6 +165,31 @@ write_files:
           sleep 5
         done
       fi
+      # ADR 0011 PR-4: management-API request hardening, shared by every push
+      # below. TLS is verified against the management API CA at KAIROS_MGMT_CA
+      # (curl --cacert; there is no insecure fallback anywhere). The bearer
+      # token is kept out of curl's argv by writing it to a 0600 curl config file
+      # read via --config; request and response bodies are kept off argv and out
+      # of world-readable /tmp by staging them in mktemp 0600 files inside a 0700
+      # tmpfs dir (a PATCH response echoes the Secret, so it is discarded).
+      KAIROS_MGMT_CA="/etc/kairos-capi/management-ca.crt"
+      KAIROS_MGMT_RUNDIR="/run/kairos-capi"
+      mkdir -p "${KAIROS_MGMT_RUNDIR}"
+      chmod 0700 "${KAIROS_MGMT_RUNDIR}"
+      KAIROS_MGMT_AUTH_CONF="${KAIROS_MGMT_RUNDIR}/auth.conf"
+      ( umask 077; printf 'header = "Authorization: Bearer %s"\n' 'mgmt-token' > "${KAIROS_MGMT_AUTH_CONF}" )
+      mgmt_patch() {
+        local _url="$1" _body="$2" _bodyf
+        _bodyf="$(mktemp "${KAIROS_MGMT_RUNDIR}/body.XXXXXX")"
+        printf '%s' "${_body}" > "${_bodyf}"
+        curl --cacert "${KAIROS_MGMT_CA}" --proto '=https' \
+          --config "${KAIROS_MGMT_AUTH_CONF}" \
+          -sS -o /dev/null -w "%{http_code}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH --data-binary @"${_bodyf}" \
+          "${_url}" || true
+        rm -f "${_bodyf}"
+      }
       # Push kubeconfig to management cluster without SSH (KD-3b).
       # CAPV has no LB Service: rewrite k3s.yaml's `server:` URL to use the
       # cluster's controlPlaneEndpoint host (CAPV-controlled, set on the
@@ -199,7 +224,6 @@ write_files:
         local api='https://mgmt.example.com:6443'
         local ns='default'
         local name='ha-cluster-kubeconfig-push'
-        local token='mgmt-token'
         # PR-3 (ADR 0011): PATCH the `value` key of the controller-owned staging
         # Secret <cluster>-kubeconfig-push. The node no longer creates or writes the
         # contract Secret <cluster>-kubeconfig, sends no metadata/labels/type, and no
@@ -208,13 +232,10 @@ write_files:
         local patch
         patch="{\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        # PR-4 (ADR 0011): TLS-verified PATCH via mgmt_patch (curl --cacert; token
+        # and body off argv; no insecure fallback, no response body in /tmp).
         local status
-        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-          -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/strategic-merge-patch+json" \
-          -X PATCH \
-          --data "${patch}" \
-          "${url}" || true)
+        status=$(mgmt_patch "${url}" "${patch}")
         if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
           echo "Pushed kubeconfig to management secret ${ns}/${name}"
           return 0

@@ -88,6 +88,7 @@ func goldenCases() []goldenCase {
 			KubeconfigSecretNamespace: "default",
 			ClusterName:               "ha-cluster",
 			ControlPlaneEndpointHost:  host,
+			CABundle:                  goldenManagementCA,
 		}
 		return d
 	}
@@ -155,9 +156,27 @@ func capkHA(d TemplateData) TemplateData {
 		KubeconfigSecretName:      "cluster-kubeconfig-push",
 		KubeconfigSecretNamespace: "default",
 		ClusterName:               "ha-cluster",
+		CABundle:                  goldenManagementCA,
 	}
 	return d
 }
+
+// goldenManagementCA is a fixed, valid CA-certificate PEM used by the HA golden
+// fixtures so the ADR 0011 PR-4 management-CA write_files block renders
+// deterministically. It is a self-signed test CA (no private key ships in the
+// golden output — only the certificate).
+const goldenManagementCA = `-----BEGIN CERTIFICATE-----
+MIIBlzCCAT2gAwIBAgIUdeNhGQtfDB6MzsuCfT7yp/3ejvQwCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVa2Fpcm9zLWdvbGRlbi10ZXN0LWNhMCAXDTI2MDkzMDEwNTg1
+NFoYDzIxMjYwOTA2MTA1ODU0WjAgMR4wHAYDVQQDDBVrYWlyb3MtZ29sZGVuLXRl
+c3QtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQPBiI+dbJqCIS60D7lz31x
+BOC2BhG1YRKWXAjxR+QZHB8xXeD7sQWMRWQmeeHLBxMPy8iEwOXKQ6LFmOq6XtWI
+o1MwUTAdBgNVHQ4EFgQUt9qwjQz9hwGB5A4wl4fgHwoVDT4wHwYDVR0jBBgwFoAU
+t9qwjQz9hwGB5A4wl4fgHwoVDT4wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD
+AgNIADBFAiEAoZbZfZMI9EwRVOlFjYNl4RBCCLCa84UpLykKiU/wY1ECICm9LUxU
+grfraH74VERMr+gdq7NCdTm4KotBdpRo64GX
+-----END CERTIFICATE-----
+`
 
 func goldenPath(name string) string {
 	return filepath.Join("testdata", "golden", name+".yaml")

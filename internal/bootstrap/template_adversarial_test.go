@@ -1540,3 +1540,69 @@ func TestControlPlaneLBEndpoint_InjectionContained(t *testing.T) {
 		})
 	}
 }
+
+// TestRender_ManagementCABundle_Adversarial asserts the ADR 0011 PR-4 CA render
+// is safe: a valid CA renders into a write_files block that round-trips through
+// YAML to a certificate (never leaking a key), while a CA field carrying anything
+// other than clean CERTIFICATE blocks — a private key, YAML-breaking payload, or
+// injected extra document — is rejected at render time and never reaches userdata.
+func TestRender_ManagementCABundle_Adversarial(t *testing.T) {
+	baseEndpoint := func(ca string) *ManagementEndpoint {
+		return &ManagementEndpoint{
+			APIServer:                 "https://1.2.3.4:6443",
+			Token:                     "good-token",
+			KubeconfigSecretName:      "cluster-kubeconfig-push",
+			KubeconfigSecretNamespace: "default",
+			ClusterName:               "adv-cluster",
+			CABundle:                  ca,
+		}
+	}
+	baseData := func(ca string) TemplateData {
+		return TemplateData{
+			Role:               "control-plane",
+			SingleNode:         true,
+			UserName:           "kairos",
+			IsKubeVirt:         true,
+			ManagementEndpoint: baseEndpoint(ca),
+		}
+	}
+
+	t.Run("valid CA round-trips to a certificate, no key leaked", func(t *testing.T) {
+		for _, dist := range []string{"k0s", "k3s"} {
+			out, err := renderForDist(dist, baseData(goldenManagementCA))
+			if err != nil {
+				t.Fatalf("%s render: %v", dist, err)
+			}
+			var doc map[string]any
+			if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &doc); err != nil {
+				t.Fatalf("%s rendered YAML did not parse: %v", dist, err)
+			}
+			if !strings.Contains(out, "-----BEGIN CERTIFICATE-----") {
+				t.Errorf("%s: CA certificate missing from render", dist)
+			}
+			if strings.Contains(out, "PRIVATE KEY") {
+				t.Errorf("%s: a private key must never appear in the render", dist)
+			}
+		}
+	})
+
+	adversarial := []struct {
+		name string
+		ca   string
+	}{
+		{"private key appended", goldenManagementCA + "-----BEGIN PRIVATE KEY-----\nMIGdummy\n-----END PRIVATE KEY-----\n"},
+		{"yaml break inside block", "-----BEGIN CERTIFICATE-----\n\": injected\nextraKey: pwned\n-----END CERTIFICATE-----\n"},
+		{"injected yaml document", goldenManagementCA + "\n---\nkind: Secret\n"},
+		{"not a certificate", "$(rm -rf /)\n; malicious"},
+	}
+	for _, tc := range adversarial {
+		tc := tc
+		t.Run("rejected: "+tc.name, func(t *testing.T) {
+			for _, dist := range []string{"k0s", "k3s"} {
+				if _, err := renderForDist(dist, baseData(tc.ca)); err == nil {
+					t.Errorf("%s: render must reject an unsafe CA bundle (%s)", dist, tc.name)
+				}
+			}
+		})
+	}
+}
