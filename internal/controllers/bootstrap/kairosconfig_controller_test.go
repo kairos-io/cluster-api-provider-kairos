@@ -1343,7 +1343,7 @@ func TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock(t *testing.T) 
 	resolver := &stubResolver{endpoint: &ManagementEndpoint{
 		APIServer:                 "https://mgmt.example.com:6443",
 		Token:                     "test-token",
-		KubeconfigSecretName:      "test-cluster-kubeconfig",
+		KubeconfigSecretName:      "test-cluster-kubeconfig-push",
 		KubeconfigSecretNamespace: "default",
 	}}
 	reconciler := &KairosConfigReconciler{
@@ -1380,10 +1380,13 @@ func TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock(t *testing.T) 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(resolver.calls).To(Equal(1), "resolver must be invoked for CAPV control-plane")
 	g.Expect(out).To(ContainSubstring("push_kubeconfig()"), "CAPV control-plane render must include push block")
-	// Cluster-name and ControlPlaneEndpointHost must be stamped from the
-	// Cluster (not the resolver output), per the call-site convention.
-	g.Expect(out).To(ContainSubstring("local cluster_name='test-cluster'"))
-	g.Expect(out).To(ContainSubstring("local cp_endpoint_host='10.0.0.42'"))
+	// PR-3 (ADR 0011): the node PATCHes the staging Secret's value key; it no
+	// longer stamps a cluster-name/provenance payload or rewrites the server URL.
+	g.Expect(out).To(ContainSubstring("local name='test-cluster-kubeconfig-push'"), "push target is the staging Secret")
+	g.Expect(out).To(ContainSubstring(`patch="{\"data\":{\"value\":\"${kubeconfig_b64}\"}}"`), "push block must PATCH the value key")
+	g.Expect(out).To(ContainSubstring("-X PATCH"))
+	g.Expect(out).NotTo(ContainSubstring("-X PUT"))
+	g.Expect(out).NotTo(ContainSubstring("https://${cp_endpoint_host}:6443"), "node-side server-rewrite sed must be gone")
 }
 
 // TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock guards the role gate: a
@@ -1754,8 +1757,12 @@ func TestReconcile_WaitsForClusterInfrastructureThenRendersEndpoint(t *testing.T
 	// Tolerant of the YAML quoting style the `quote` template func picks.
 	g.Expect(cloudConfig).To(MatchRegexp(`sans:\s*\n\s*- "?172\.16\.56\.45"?`),
 		"the control-plane endpoint host must appear in k0s api.sans")
-	g.Expect(cloudConfig).To(ContainSubstring("local cp_endpoint_host='172.16.56.45'"),
-		"push_kubeconfig must rewrite the kubeconfig server: URL to the control-plane endpoint")
+	// PR-3 (ADR 0011): the node no longer rewrites the kubeconfig server: URL
+	// (the sed is gone — the control plane forces the endpoint). The push block
+	// PATCHes the staging Secret verbatim.
+	g.Expect(cloudConfig).To(ContainSubstring("-X PATCH"), "push_kubeconfig must PATCH the staging Secret")
+	g.Expect(cloudConfig).NotTo(ContainSubstring("local cp_endpoint_host="),
+		"node-side kubeconfig server-rewrite sed must be removed")
 }
 
 // TestReconcile_ControlPlaneWaitsForControlPlaneEndpoint covers the
