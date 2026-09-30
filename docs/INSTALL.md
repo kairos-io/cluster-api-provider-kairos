@@ -299,15 +299,18 @@ there.
 
 ## Network reachability requirement for non-CAPK infrastructure
 
-Starting with v0.1.0-alpha.2 (carried forward in v0.1.0-beta.1), the controller no longer SSHes into nodes to
-retrieve the workload kubeconfig. Instead, control-plane nodes POST their
-kubeconfig back to a Secret in the management cluster.
+Starting with v0.1.0-alpha.2, the controller no longer SSHes into nodes to
+retrieve the workload kubeconfig. Instead, control-plane nodes push their
+kubeconfig back to a staging Secret that the control plane creates and owns
+in the management cluster; see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the current mechanism.
 
 **Workload nodes running on non-CAPK infrastructure (CAPV / CAPM3 / Kairos
 fleet / Tinkerbell and any future provider) must have network reachability to
 the management cluster's API server URL.** This includes bare-metal nodes
 provisioned via Metal3 and nodes claimed via the Kairos fleet provider — they
-POST their kubeconfig to a Secret in the management cluster.
+push their kubeconfig to that staging Secret in the management cluster.
 
 ### Set the URL the nodes push to
 

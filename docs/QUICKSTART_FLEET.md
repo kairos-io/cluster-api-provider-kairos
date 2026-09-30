@@ -107,10 +107,11 @@ metal and pre-provisioned edge nodes that phone home to AuroraBoot.
    control-plane node once it comes up.
 
 5. **Network reachability from the claimed nodes to the management cluster's
-   API server.** Like CAPV/CAPM3, fleet nodes POST their kubeconfig back to a
-   Secret in the management cluster rather than being SSHed into. Set
-   `KAIROS_MANAGEMENT_API_OVERRIDE` on the bootstrap provider to a URL the
-   nodes can reach; without it they are given the in-cluster Service URL. See
+   API server.** Like CAPV/CAPM3, fleet nodes PATCH their kubeconfig into a
+   staging Secret the control plane owns in the management cluster, rather
+   than being SSHed into. Set `KAIROS_MANAGEMENT_API_OVERRIDE` on the bootstrap
+   provider to a URL the nodes can reach; without it they are given the
+   in-cluster Service URL. See
    [INSTALL.md — Set the URL the nodes push to](INSTALL.md#set-the-url-the-nodes-push-to)
    and [Network reachability requirement for non-CAPK infrastructure](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure).
    For air-gapped nodes, the opt-in `SSHFallback` mechanism on

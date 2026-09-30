@@ -54,12 +54,12 @@ const (
 	// network, CNI), then let the MHC or a manual delete replace the Machine.
 	BootstrapTokenRefreshCapExceededReason = "BootstrapTokenRefreshCapExceeded"
 
-	// WaitingForKubeconfigPushTargetReason indicates that bootstrap rendering is
-	// waiting for the control plane to pre-create the per-cluster staging
-	// kubeconfig Secret (<cluster>-kubeconfig-push) and take controller ownership
-	// of it before a control-plane node is handed a push token (ADR 0011, PR-3
-	// resolver gate). The node PATCHes only that controller-owned staging Secret;
-	// rendering the push block before it exists would hand out a token with no
-	// valid target.
+	// WaitingForKubeconfigPushTargetReason indicates that bootstrap rendering for
+	// a control-plane KairosConfig is waiting on the KairosControlPlane: the
+	// per-cluster staging kubeconfig Secret (<cluster>-kubeconfig-push) must
+	// exist and be owned by the control plane before a control-plane node can be
+	// handed a push token, because the rendered node only ever PATCHes that
+	// controller-owned Secret. Clears on its own once the control plane has
+	// created and taken ownership of the staging Secret; see ADR 0011.
 	WaitingForKubeconfigPushTargetReason = "WaitingForKubeconfigPushTarget"
 )

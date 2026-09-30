@@ -521,3 +521,41 @@ they select whichever context the file marks `current-context`, and the
 sanitizer sets that correctly. Automation that instead greps or hardcodes a
 specific context/user name from a previously-fetched kubeconfig should expect
 the new name after this Secret is next rewritten.
+
+---
+
+## Node-push RBAC narrows to patch-only, and the push target moves to a staging Secret
+
+Control-plane nodes now publish their kubeconfig by PATCHing only the `value`
+key of a controller-owned staging Secret, `<cluster>-kubeconfig-push`, instead
+of writing the contract Secret `<cluster>-kubeconfig` directly. The control
+plane is the contract Secret's sole writer; see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition).
+Operators do not create or edit the staging Secret.
+
+Matching this, the per-cluster node ServiceAccount's Role is narrowed to
+`patch` on two named Secrets (the staging kubeconfig and the HA etcd-status
+Secret) with no `create`, `get`, or `update` verb. The HA join-token Secret is
+written only by the control plane, so nodes have no access to it.
+
+**On upgrade, a startup migrator narrows any existing per-cluster node-push
+Role to this reduced rule set automatically**, the moment the new controller
+manager takes leadership. It only ever removes permissions from a Role it
+recognizes as its own (by owner and name) — it never widens a rule, and it
+never fails manager startup. No operator action is required.
+
+**A control-plane node whose bootstrap data was rendered before the upgrade**
+still runs its old push script, which targets the contract Secret directly
+with the old verbs. Once the migrator has run, that request is rejected with
+HTTP 403. This is expected, not an error: the push is a best-effort, one-shot
+step that logs a warning and does not block or retry bootstrap, and the
+contract Secret's correctness does not depend on that push succeeding. The
+warning clears the next time the affected control-plane Machine is replaced
+or rolled, which re-renders its bootstrap data with the current, patch-only
+push script.
+
+**A control-plane `KairosConfig`'s bootstrap rendering now also waits** for
+the `KairosControlPlane` to create and own the staging Secret before handing
+a node a push token, reported as `BootstrapReady=False(WaitingForKubeconfigPushTarget)`
+at severity `Info`. This clears on its own, typically within one reconcile;
+see [API_REFERENCE.md — Waiting for the kubeconfig push target](API_REFERENCE.md#waiting-for-the-kubeconfig-push-target).

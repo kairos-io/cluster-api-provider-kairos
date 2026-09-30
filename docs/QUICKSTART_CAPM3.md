@@ -611,7 +611,7 @@ If the node's IP changes after provisioning (DHCP lease reassignment), the `cont
 
 ## Air-gapped fallback (SSHFallback)
 
-**When to use:** the bare-metal node has no network route to the management cluster API server (`<mgmt-api-server-host>:6443`). The node-push path — where the node POSTs its kubeconfig to a management cluster Secret — is unreachable. Without this fallback, `KubeconfigReadyCondition` stays `False(WaitingForNodePush)` indefinitely.
+**When to use:** the bare-metal node has no network route to the management cluster API server (`<mgmt-api-server-host>:6443`). The node-push path — where the node PATCHes its kubeconfig into a staging Secret the control plane owns in the management cluster — is unreachable. Without this fallback, `KubeconfigReadyCondition` stays `False(WaitingForNodePush)` indefinitely.
 
 **When NOT to use:** the default node-push path works in most networks. Do not enable SSHFallback unless you have confirmed the node cannot reach the management API server. The fallback is an escape hatch, not a replacement for node-push.
 

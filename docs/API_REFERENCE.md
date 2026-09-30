@@ -120,7 +120,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `dataSecretName` | `*string` | Name of the Secret containing the bootstrap cloud-config. |
 | `initialization.dataSecretCreated` | `bool` | v1beta2 contract field: `true` when the bootstrap Secret has been created. |
 | `bootstrapTokenID` | `string` | Non-secret ID (the six-character prefix) of the kubeadm bootstrap token most recently minted for this KairosConfig. The token Secret in the workload cluster is `kube-system/bootstrap-token-<id>`. The secret half of the token is never stored in `spec` or `status`. Empty for k0s and k3s, and for a kubeadm worker that has not yet minted a token. |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) and, for control-plane roles, [Waiting for the kubeconfig push target](#waiting-for-the-kubeconfig-push-target) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable string indicating the last failure reason. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable description of the last failure. Cleared automatically on the next successful reconcile. If non-empty, check the owning Machine's events for context. |
@@ -184,6 +184,30 @@ Reasons a kubeadm worker reports:
 While the control plane is not yet initialized, or the kubeconfig Secret or
 workload cluster is not yet reachable, the controller requeues every 10 seconds
 and leaves conditions unchanged; the reason is in the bootstrap manager log.
+
+### Waiting for the kubeconfig push target
+
+A control-plane `KairosConfig` waits on one further precondition before
+rendering: the per-cluster staging kubeconfig Secret (`<cluster>-kubeconfig-push`)
+must exist and be owned by the same `KairosControlPlane` that owns this
+Machine. Until then, `BootstrapReady` is `False` with reason
+`WaitingForKubeconfigPushTarget` at severity `Info`, and the controller
+requeues every 10 seconds.
+
+This exists because a control-plane node's rendered cloud-config PATCHes only
+that staging Secret to publish its kubeconfig back to the management cluster
+(see [KubeconfigReady condition](#kubeconfigready-condition)); rendering the
+push block before the Secret exists, and is owned by the right control plane,
+would hand the node a token with no valid target.
+
+The wait clears on its own: the `KairosControlPlane` controller creates and
+takes ownership of the staging Secret as part of every reconcile for a
+cluster it manages, and the bootstrap controller re-reconciles once that
+happens. If a `KairosConfig` stays in this state, confirm a
+`KairosControlPlane` exists for the cluster and is reconciling — its own
+conditions and events show why, if not.
+
+Worker `KairosConfig`s never render a push block and are not affected.
 
 ### Example
 
@@ -492,6 +516,8 @@ Reports whether the workload-cluster kubeconfig Secret (`<cluster>-kubeconfig`) 
 
 Before publishing, the controller stages the candidate kubeconfig in a per-cluster Secret it owns, `<cluster>-kubeconfig-push` (label `controlplane.cluster.x-k8s.io/secret-type: kubeconfig-push`), and rebuilds it into a single canonical form: one cluster, one user, one context, named `<cluster>-admin@<cluster>`, with the `server` the controller already knows for this cluster. A pre-existing `<cluster>-kubeconfig` Secret not yet controlled by this `KairosControlPlane` is adopted the first time it is observed, provided it was created no earlier than the `Cluster` object and carries the `cluster.x-k8s.io/cluster-name` label; adoption rewrites its content into the same canonical form.
 
+The control-plane controller creates and owns the staging Secret; a control-plane node publishes its kubeconfig by PATCHing only the Secret's `value` key, and never creates it or writes the contract Secret `<cluster>-kubeconfig` directly — the control plane is the contract Secret's sole writer. Operators do not create or edit the staging Secret; treat it as controller-internal state. See [Waiting for the kubeconfig push target](#waiting-for-the-kubeconfig-push-target) for the bootstrap-rendering precondition on this Secret.
+
 | Status | Reason | Meaning |
 |--------|--------|---------|
 | `True` | `KubeconfigReady` | The contract Secret is controlled by this control plane, canonical, and its client certificate is unexpired. |
@@ -499,11 +525,21 @@ Before publishing, the controller stages the candidate kubeconfig in a per-clust
 | `False` (Info → Warning) | `WaitingForNodePush` | No usable kubeconfig has been published yet. Severity escalates from Info to Warning once the wait exceeds the node-push timeout (10 minutes). See [Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback) if the node cannot reach the management API server. |
 | `False` (Warning) | `NodePushRejected` | A candidate kubeconfig — the one staged by a node, or the one already in the contract Secret — failed a structural or credential-shape check. The message names the failing rule, never any kubeconfig content. Whatever the contract Secret already held is left unchanged. Correct the source of the candidate (redeploy the affected node, or inspect its staging Secret); it is re-evaluated on the next reconcile. |
 | `False` (Warning) | `NodePushCAMismatch` | A candidate kubeconfig presents a different certificate authority than the one already pinned for this cluster (see [Annotations](#annotations) below). The contract Secret's previous content, if any, is left in place; the controller refuses to publish the mismatched candidate until an operator re-pins. See the runbook below. |
-| `False` (Warning) | `KubeconfigSecretNotOwned` | A Secret named `<cluster>-kubeconfig` exists but is neither controlled by this `KairosControlPlane` nor eligible for adoption (it predates the `Cluster`, is missing the cluster-name label, or is controlled by something else). The controller does not touch its content. Delete the Secret so the controller can publish its own. |
+| `False` (Warning) | `KubeconfigSecretNotOwned` | A Secret named `<cluster>-kubeconfig` exists but is neither controlled by this `KairosControlPlane` nor eligible for adoption, and `Cluster.spec.controlPlaneRef` does not point at this `KairosControlPlane` either. The controller has no authority over a Secret belonging to a different cluster (or predating this one) and does not touch its content. Delete the Secret so the controller can publish its own. |
 | `False` (Warning) | `KubeconfigCertificateExpired` | The published kubeconfig's inline client certificate is outside its validity window. Its content is left in place — expiry does not clear a working Secret — but a client built from it will fail authentication. A control-plane Machine replacement, or an SSH-fallback fetch, refreshes the certificate. |
 | `False` (Info) | `SSHFallbackDialing` | The SSH fallback path is dialing the workload node. |
 | `False` (Warning) | `SSHFallbackFailed` | An SSH fallback attempt failed. Check Events for the categorized error. |
 | `False` (Warning) | `SSHFallbackMisconfigured` | A Secret referenced by `spec.sshFallback` is missing, empty, or unparseable. |
+
+When an unclaimed `<cluster>-kubeconfig` Secret's *cluster* still matches this
+control plane — `Cluster.spec.controlPlaneRef` points at this
+`KairosControlPlane`, even though the Secret itself is unowned or predates the
+`Cluster` — the controller recovers on its own instead of surfacing
+`KubeconfigSecretNotOwned`: it empties the Secret in place (never deletes it)
+and republishes from staging, reporting `WaitingForNodePush` meanwhile. No
+operator action is needed in that case. Manual deletion is only the right
+response when the Secret genuinely belongs to a different cluster, or
+predates this one entirely.
 
 The controller also emits two Warning Events (not conditions) when the staging Secret's own metadata is unexpected — these indicate the staging Secret was modified by something other than the controller, and do not by themselves affect `KubeconfigReady`:
 
