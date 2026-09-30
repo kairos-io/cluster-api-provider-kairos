@@ -353,10 +353,16 @@ If the management cluster is a kind cluster, its API server listens on
 `networking.apiServerPort`) in the kind configuration to a host address the
 nodes can reach, and use that address in the override.
 
-Verify reachability from a sample workload node before deploying:
+Verify reachability from a sample workload node before deploying (the node-push itself
+always verifies TLS against the management API CA — the provider uses no
+`curl -k` / `--insecure` anywhere, so verify the same way here):
 
 ```bash
-curl -k https://<mgmt-api-server-host>:6443/api
+# Point --cacert at the same CA the controller renders to the node at
+# /etc/kairos-capi/management-ca.crt (see "Management API TLS verification"
+# below). Do NOT use curl -k — an unverified reachability check hides exactly
+# the on-path interception the node-push is hardened against.
+curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api
 ```
 
 For air-gapped or strictly-segmented network environments, enable the opt-in
@@ -364,6 +370,27 @@ For air-gapped or strictly-segmented network environments, enable the opt-in
 host-key-verified SSH identity Secret and a `known_hosts` Secret. See
 [QUICKSTART_CAPV.md — Air-gapped fallback](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
 for the full configuration steps.
+
+### Management API TLS verification and the CA source
+
+The node-to-management push (kubeconfig staging, join-token, etcd-status) is
+TLS-verified: nodes run `curl --cacert` against the management API server's CA,
+which the controller renders into each node's cloud-config at
+`/etc/kairos-capi/management-ca.crt`. There is no insecure opt-out; a wrong or
+missing CA makes the push fail closed, and air-gapped environments use
+`SSHFallback` instead.
+
+Two environment variables on the controller Deployment tune this:
+
+| Env var | Purpose |
+| --- | --- |
+| `KAIROS_MANAGEMENT_API_OVERRIDE` | The URL nodes dial back to. Required for non-CAPK infrastructure where the in-cluster service IP is not routable from workload VMs — set it to a LAN-reachable URL such as `https://<mgmt-cp-node-ip>:6443`. |
+| `KAIROS_MANAGEMENT_API_CA_FILE` | Overrides the CA nodes verify that URL against. Accepts either a filesystem path to a PEM bundle or an inline PEM. When unset, the controller uses its own in-cluster trust root (the management API server CA). Set this when the override URL is served by a load balancer or proxy whose certificate is not issued by the cluster CA. |
+
+By default (no override), the controller resolves the CA from its own
+`rest.Config` (the management API server CA it already trusts). The controller
+**fails fast at startup** if push is enabled but no CA is available — it never
+falls back to an unverified push.
 
 ---
 
