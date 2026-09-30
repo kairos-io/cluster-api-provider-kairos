@@ -360,8 +360,8 @@ always verifies TLS against the management API CA — the provider uses no
 ```bash
 # Point --cacert at the same CA the controller renders to the node at
 # /etc/kairos-capi/management-ca.crt (see "Management API TLS verification"
-# below). Do NOT use curl -k — an unverified reachability check hides exactly
-# the on-path interception the node-push is hardened against.
+# below). Do NOT use curl -k here: an unverified check can pass even when the
+# CA is wrong, so it would not catch a CA mismatch the node-push itself rejects.
 curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api
 ```
 
