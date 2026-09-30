@@ -339,7 +339,7 @@ write_files:
       grfraH74VERMr+gdq7NCdTm4KotBdpRo64GX
       -----END CERTIFICATE-----
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |

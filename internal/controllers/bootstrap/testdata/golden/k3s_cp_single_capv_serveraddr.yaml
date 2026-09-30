@@ -117,7 +117,7 @@ write_files:
       [Service]
       ExecStartPre=/bin/sh -c 'mkdir -p /etc/rancher/k3s/config.yaml.d && printf "kubelet-arg:\n  - provider-id=vsphere://vm-uuid-1234\n" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml'
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |

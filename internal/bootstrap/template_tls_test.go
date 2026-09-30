@@ -215,6 +215,43 @@ func TestManagementCABundle_Rendered(t *testing.T) {
 	}
 }
 
+// TestPostBootstrapScriptIs0700 asserts the post-bootstrap script — which now
+// writes the bearer token into a curl config file and drives every push — is
+// mode 0700 (ADR 0011 PR-4), so a non-root local user cannot read the token out
+// of the script body.
+func TestPostBootstrapScriptIs0700(t *testing.T) {
+	for _, tc := range tlsHardeningCases() {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := tc.render(tlsHardeningData(tc.kubevirt))
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			var doc struct {
+				WriteFiles []struct {
+					Path        string `yaml:"path"`
+					Permissions string `yaml:"permissions"`
+				} `yaml:"write_files"`
+			}
+			if err := yaml.Unmarshal([]byte(result), &doc); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var found bool
+			for _, f := range doc.WriteFiles {
+				if strings.HasSuffix(f.Path, "post-bootstrap.sh") {
+					found = true
+					if f.Permissions != "0700" {
+						t.Errorf("%s permissions = %q, want 0700 (script handles the token)", f.Path, f.Permissions)
+					}
+				}
+			}
+			if !found {
+				t.Error("post-bootstrap script not found")
+			}
+		})
+	}
+}
+
 // TestManagementCABundle_RejectsPrivateKey is the adversarial case: a CA bundle
 // that carries a PRIVATE KEY block (or any non-certificate content) must fail the
 // render rather than writing a key into userdata.

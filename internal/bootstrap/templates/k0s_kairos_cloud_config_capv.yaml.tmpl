@@ -769,7 +769,7 @@ write_files:
     content: |{{ .ManagementEndpoint.CABundle | nindent 6 }}
   {{- end }}
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |
