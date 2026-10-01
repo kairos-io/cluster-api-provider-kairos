@@ -1,0 +1,191 @@
+#cloud-config
+
+hostname: kairos-node-0
+install:
+  auto: true
+  device: /dev/sda
+  reboot: true
+
+users:
+- name: kairos
+  passwd: test-password
+  groups:
+    - admin
+    - users
+  ssh_authorized_keys:
+    - github:octocat
+    - ssh-ed25519 AAAATESTKEYtestexample test@example
+- name: capk
+  groups: [users, admin]
+
+# Worker node configuration
+k3s-agent:
+  enabled: true
+  args:
+    - --server https://10.0.0.42:6443
+    - --token-file /etc/rancher/k3s/token
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # systemd drop-in: skip k3s.service on the Kairos live installer.
+  # See the same drop-in in k3s_kairos_cloud_config_capk.yaml.tmpl for
+  # rationale. KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
+  - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      ConditionKernelCommandLine=!cdroot
+  - path: /etc/rancher/k3s/token
+    permissions: "0644"
+    content: |
+      k3s-join-token
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-node-0
+  - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k3s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k3s
+      # node registration that never happens on the installer (overlayfs
+      # snapshotter cannot nest on the live tmpfs overlay), holding up
+      # cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      After=k3s-agent.service
+      Wants=k3s-agent.service
+      
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k3s-post-bootstrap.sh
+      
+      [Install]
+      WantedBy=multi-user.target
+  # Fleet (AuroraBoot): the node self-discovers its providerID before k3s starts.
+  # Runs for BOTH control-plane and worker roles — the providerID is not known at
+  # bootstrap render (the node is claimed from a group afterwards). z-provider-id.conf
+  # loads after override.conf.
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-fleet-discover-provider-id.sh || true'
+  # Fleet (AuroraBoot) providerID self-discovery (runs as the k3s ExecStartPre above,
+  # BEFORE k3s/kubelet starts, for both control-plane and worker roles).
+  #
+  # The KairosFleetMachine controller sets spec.providerID = kairos-fleet://<node-id>
+  # where <node-id> is the AuroraBoot managed-node UUID. That same UUID is persisted on
+  # the node by the phone-home agent at /usr/local/.kairos/phonehome-credentials.yaml
+  # (yaml key node_id; /usr/local is COS_PERSISTENT, so it survives reboots). This
+  # script derives the providerID from that file so the kubelet registers with the
+  # identical string on first registration (providerID is immutable).
+  #
+  # This block is STATIC shell — there is NO render-time interpolation, so no
+  # Go-template injection surface. The node-id is validated as a UUID before it
+  # reaches a file/shell context, and the script fails closed (writes nothing) on any
+  # missing/malformed value.
+  - path: /usr/local/bin/kairos-fleet-discover-provider-id.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -eu
+      CREDS="/usr/local/.kairos/phonehome-credentials.yaml"
+      DROPIN_DIR="/etc/rancher/k3s/config.yaml.d"
+      # Wait briefly for the phone-home agent to have written its credentials. On an
+      # enrolled fleet node these already exist (registration precedes the claim); the
+      # bounded wait just tolerates a slow first boot without racing k3s.
+      i=0
+      while [ ! -f "${CREDS}" ] && [ "${i}" -lt 30 ]; do
+        sleep 2
+        i=$((i + 1))
+      done
+      if [ ! -f "${CREDS}" ]; then
+        echo "fleet: no credentials at ${CREDS}; leaving providerID to k3s default"
+        exit 0
+      fi
+      # Extract node_id (a server-assigned UUID); strip the key, whitespace and quotes.
+      NODE_ID="$(sed -n 's/^[[:space:]]*node_id:[[:space:]]*//p' "${CREDS}" | head -n1 | tr -d '[:space:]"')"
+      # Defence in depth: only accept a well-formed UUID before it reaches the drop-in.
+      if ! printf '%s' "${NODE_ID}" | grep -qE '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'; then
+        echo "fleet: node_id in ${CREDS} is missing or not a UUID; leaving providerID to k3s default"
+        exit 0
+      fi
+      mkdir -p "${DROPIN_DIR}"
+      printf 'kubelet-arg:\n  - provider-id=kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/90-provider-id.yaml"
+      echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
+  - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # Enforce hostname from cloud-config on immutable rootfs
+      if [ -f /usr/local/etc/hostname ]; then
+        /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
+        if ! grep -qE "127\.0\.1\.1[[:space:]]+$(cat /usr/local/etc/hostname)" /etc/hosts; then
+          echo "127.0.1.1 $(cat /usr/local/etc/hostname)" >> /etc/hosts
+        fi
+      fi
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+
+      echo "k3s post-bootstrap tasks completed successfully"
+  
+  - path: /etc/motd
+    content: hello world
+    permissions: "0644"
+    owner: root:root
+stages:
+  boot:
+    - name: "Discover providerID for k3s (fleet self-discovery)"
+      commands:
+        - /usr/local/bin/kairos-fleet-discover-provider-id.sh || true
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    - name: "Ensure k3s directories exist"
+      commands:
+        - mkdir -p /etc/rancher/k3s
+        - mkdir -p /etc/rancher/k3s/config.yaml.d
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+        path: "/etc/resolv.conf"
+
+runcmd:
+  # `enable --now`: create the multi-user.target.wants/ symlink AND start
+  # the unit on this boot. Plain `enable` only creates the symlink; the
+  # service would only auto-start on the NEXT boot — too late for the
+  # KD-3b push pattern, which needs to fire on the first installed-system
+  # boot. Same fix the k0s templates use via the helper service.
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true
