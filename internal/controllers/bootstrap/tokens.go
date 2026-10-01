@@ -30,50 +30,6 @@ import (
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
-// tokenKind selects which precedence chain resolveToken walks. The two chains
-// are NOT identical: the k3s worker path prefers the k3s-specific ref/inline
-// fields before falling through to the generic worker/legacy fields, whereas
-// the k0s worker path starts at the generic worker fields.
-//
-// resolveToken is now a thin delegating wrapper, kept only so the existing
-// tokens_test.go precedence tables keep compiling; the live worker path resolves
-// through the per-distribution JoinMaterialSource (join.go). tokenKind and
-// resolveToken are removed once those tests move to the sources.
-type tokenKind int
-
-const (
-	// tokenKindK0sWorker resolves a k0s worker join token.
-	// Precedence: WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token.
-	tokenKindK0sWorker tokenKind = iota
-
-	// tokenKindK3sWorker resolves a k3s worker/server join token.
-	// Precedence: K3sTokenSecretRef > K3sToken > WorkerTokenSecretRef >
-	// WorkerToken > TokenSecretRef > Token.
-	tokenKindK3sWorker
-
-	// tokenKindControlPlaneJoin resolves the control-plane join token used by an
-	// HA join node (ADR 0005 Phase 3). It is ONLY sourced from a *SecretRef —
-	// never an inline spec field (TOKEN-INV / api CLAUDE.md § "No new
-	// inline-secret fields").
-	tokenKindControlPlaneJoin
-)
-
-// resolveToken is a delegating wrapper retained for the tokens_test.go precedence
-// tables. The worker arms resolve through the same package functions the
-// JoinMaterialSource built-ins use, so the test expectations are unchanged.
-func (r *KairosConfigReconciler) resolveToken(ctx context.Context, kind tokenKind, kc *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster) (string, error) {
-	switch kind {
-	case tokenKindControlPlaneJoin:
-		return r.resolveControlPlaneJoinToken(ctx, kc, cluster)
-	case tokenKindK3sWorker:
-		return resolveK3sWorkerToken(ctx, r.Client, kc, cluster)
-	case tokenKindK0sWorker:
-		return resolveWorkerToken(ctx, r.Client, kc, cluster)
-	default:
-		return "", fmt.Errorf("unknown token kind %d", kind)
-	}
-}
-
 // resolveWorkerToken walks the shared worker/legacy precedence tail:
 // WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token. It is the
 // common suffix of both the k0s and k3s worker chains. Reads through the given
@@ -95,7 +51,7 @@ func resolveWorkerToken(ctx context.Context, c client.Reader, kc *bootstrapv1bet
 
 // resolveK3sWorkerToken walks the k3s worker chain: K3sTokenSecretRef > K3sToken,
 // then the shared worker/legacy tail. It is the resolution the k3s join source
-// uses and the k3s arm of the resolveToken wrapper.
+// (join.go) uses.
 func resolveK3sWorkerToken(ctx context.Context, c client.Reader, kc *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster) (string, error) {
 	if kc.Spec.K3sTokenSecretRef != nil {
 		return tokenFromWorkerRef(ctx, c, kc.Namespace, kc.Spec.K3sTokenSecretRef, "k3s token")
@@ -133,14 +89,6 @@ func tokenFromWorkerRef(ctx context.Context, c client.Reader, ownerNamespace str
 		return "", fmt.Errorf("%s secret %s/%s does not contain key '%s'", label, secretKey.Namespace, secretKey.Name, key)
 	}
 	return string(tokenData), nil
-}
-
-// tokenFromWorkerRef (method) is a transitional reconciler-method shim over the
-// package function, kept only so secretref_namespace_test.go keeps compiling
-// until its call site moves to the package function. Removed in the final P0
-// cleanup commit.
-func (r *KairosConfigReconciler) tokenFromWorkerRef(ctx context.Context, ownerNamespace string, ref *bootstrapv1beta2.WorkerTokenSecretReference, label string) (string, error) {
-	return tokenFromWorkerRef(ctx, r.Client, ownerNamespace, ref, label)
 }
 
 // errCrossNamespaceSecretRef reports a Secret reference that names a namespace

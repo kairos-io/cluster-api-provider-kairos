@@ -1045,19 +1045,6 @@ func (r *KairosConfigReconciler) resolveUserPassword(ctx context.Context, kairos
 	return kairosConfig.Spec.UserPassword, nil
 }
 
-// generateK0sCloudConfig is a transitional wrapper over renderCloudConfig kept
-// so the existing controller tests keep compiling; their calls move to
-// renderCloudConfig in the final P0 cleanup commit.
-func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
-	return r.renderCloudConfig(ctx, log, bootstrapv1beta2.DistributionK0s, kairosConfig, machine, cluster, role, serverAddress)
-}
-
-// generateK3sCloudConfig is a transitional wrapper over renderCloudConfig; see
-// generateK0sCloudConfig.
-func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
-	return r.renderCloudConfig(ctx, log, bootstrapv1beta2.DistributionK3s, kairosConfig, machine, cluster, role, serverAddress)
-}
-
 func (r *KairosConfigReconciler) getControlPlaneLBEndpoint(ctx context.Context, namespace, name string) (string, error) {
 	if namespace == "" || name == "" {
 		return "", nil

@@ -76,8 +76,8 @@ type kubeVirtTokenResolver struct {
 //
 // Returns (nil, nil) when ManagementAPIServer is empty — the same "REST
 // config not available" disabled signal the legacy method used. Callers
-// (currently generateK0sCloudConfig / generateK3sCloudConfig) must treat that
-// as "render without the push block", not as an error.
+// (renderCloudConfig) must treat that as "render without the push block", not as
+// an error.
 //
 // TODO(KD-33b): cache tokens; refresh when <30m remaining. Each Reconcile
 // that renders today re-mints, which costs one TokenRequest API call per
