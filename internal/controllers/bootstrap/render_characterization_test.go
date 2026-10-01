@@ -329,11 +329,11 @@ func TestGenerateCloudConfig_TokenErrorBeatsPasswordError(t *testing.T) {
 	g.Expect(err).To(MatchError(errTokenNotReady), "the worker token resolves before the password; its error must win")
 }
 
-// TestGenerateCloudConfig_LBEndpointErrorAsymmetry pins the OQ-A asymmetry as it
-// stands TODAY: on a CAPK control plane, when the LB Service Get fails with a
-// non-NotFound error, k0s returns the bare error and k3s wraps it. The dedicated
-// `fix(bootstrap)` commit updates the k0s expectation to the wrapped form.
-func TestGenerateCloudConfig_LBEndpointErrorAsymmetry(t *testing.T) {
+// TestGenerateCloudConfig_LBEndpointErrorSymmetry pins the LB-endpoint error on
+// a CAPK control plane: when the LB Service Get fails with a non-NotFound error,
+// BOTH distributions now wrap it identically (OQ-A fix). Before the fix the k0s
+// arm returned the bare error.
+func TestGenerateCloudConfig_LBEndpointErrorSymmetry(t *testing.T) {
 	boom := errors.New("boom")
 	lbGetErr := interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -348,7 +348,7 @@ func TestGenerateCloudConfig_LBEndpointErrorAsymmetry(t *testing.T) {
 		dist    string
 		wantErr string
 	}{
-		{"k0s", "boom"},
+		{"k0s", "failed to get control plane LB endpoint: boom"},
 		{"k3s", "failed to get control plane LB endpoint: boom"},
 	}
 	for _, tc := range cases {

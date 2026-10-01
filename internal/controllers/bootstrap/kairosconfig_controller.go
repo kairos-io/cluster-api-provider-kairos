@@ -1243,7 +1243,7 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 	if cluster != nil && isKubevirtMachine(machine) && role == "control-plane" {
 		lbEndpoint, err := r.getControlPlaneLBEndpoint(ctx, cluster.Namespace, templateData.ControlPlaneLBServiceName)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to get control plane LB endpoint: %w", err)
 		}
 		if lbEndpoint == "" {
 			return "", errLBEndpointNotReady
