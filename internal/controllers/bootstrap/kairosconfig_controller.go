@@ -79,6 +79,12 @@ type KairosConfigReconciler struct {
 	client.Client
 	Scheme               *runtime.Scheme
 	MgmtEndpointResolver ManagementEndpointResolver
+	// JoinSources overrides the per-distribution worker JoinMaterialSource by
+	// distribution name. It is optional: a nil map or a missing key uses the
+	// built-in source over r.Client, so existing construction sites (main.go,
+	// envtest, unit tests) need no change. P1 wires a "kubeadm" source here, which
+	// needs dependencies only main.go has (cached/uncached readers, clustercache).
+	JoinSources map[string]JoinMaterialSource
 }
 
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -1016,14 +1022,16 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 			break
 		}
 		// k3s init carries the controller-generated shared server token (written
-		// to the token file for BOTH init and join per BLOCKER-1).
-		token, err := r.resolveToken(ctx, tokenKindControlPlaneJoin, kairosConfig, cluster)
+		// to the token file for BOTH init and join per BLOCKER-1). The
+		// control-plane join stays outside the worker JoinMaterialSource seam
+		// (M2): resolve it directly.
+		token, err := r.resolveControlPlaneJoinToken(ctx, kairosConfig, cluster)
 		if err != nil {
 			return err
 		}
 		td.JoinToken = token
 	case bootstrapv1beta2.ControlPlaneRoleJoin:
-		token, err := r.resolveToken(ctx, tokenKindControlPlaneJoin, kairosConfig, cluster)
+		token, err := r.resolveControlPlaneJoinToken(ctx, kairosConfig, cluster)
 		if err != nil {
 			return err
 		}
@@ -1083,24 +1091,17 @@ func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log
 		}
 	}
 
-	// Get worker token if needed (for worker nodes).
-	// Precedence (tokenKindK0sWorker): WorkerTokenSecretRef > WorkerToken >
-	// TokenSecretRef > Token. Resolution is centralized in resolveToken
-	// (tokens.go). NOTE: a missing referenced Secret now surfaces as
-	// errTokenNotReady (timed requeue) rather than a hard error, aligning the
-	// k0s worker path with the k3s worker path's pre-existing requeue behavior;
-	// a missing token Secret is transient, not terminal.
+	// Get worker join material (for worker nodes) through the per-distribution
+	// source (join.go). The built-in k0s source walks WorkerTokenSecretRef >
+	// WorkerToken > TokenSecretRef > Token and rejects an empty token; a missing
+	// referenced Secret surfaces as errTokenNotReady (timed requeue).
 	var workerToken string
 	if role == "worker" {
-		var err error
-		workerToken, err = r.resolveToken(ctx, tokenKindK0sWorker, kairosConfig, cluster)
+		mat, err := r.workerJoin(ctx, bootstrapv1beta2.DistributionK0s, kairosConfig, machine, cluster, serverAddress)
 		if err != nil {
 			return "", err
 		}
-		// Validate worker token is present
-		if workerToken == "" {
-			return "", fmt.Errorf("worker token is required for worker nodes: either WorkerTokenSecretRef, WorkerToken, TokenSecretRef, or Token must be set")
-		}
+		workerToken = mat.Token
 	}
 
 	// Set defaults for user configuration
@@ -1271,26 +1272,18 @@ func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log
 		}
 	}
 
-	// Resolve k3s token if needed (for worker nodes).
-	// Precedence (tokenKindK3sWorker): K3sTokenSecretRef > K3sToken >
-	// WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token. Resolution is
-	// centralized in resolveToken (tokens.go); a missing referenced Secret
-	// surfaces as errTokenNotReady (timed requeue), preserving the pre-refactor
-	// behavior of this path.
+	// Resolve k3s worker join material through the per-distribution source
+	// (join.go). The built-in k3s source walks K3sTokenSecretRef > K3sToken >
+	// WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token, then rejects an
+	// empty token and a missing server address; a missing referenced Secret
+	// surfaces as errTokenNotReady (timed requeue).
 	var k3sToken string
 	if role == "worker" {
-		var err error
-		k3sToken, err = r.resolveToken(ctx, tokenKindK3sWorker, kairosConfig, cluster)
+		mat, err := r.workerJoin(ctx, bootstrapv1beta2.DistributionK3s, kairosConfig, machine, cluster, serverAddress)
 		if err != nil {
 			return "", err
 		}
-
-		if k3sToken == "" {
-			return "", fmt.Errorf("k3s worker requires a join token: set k3sTokenSecretRef, k3sToken, workerTokenSecretRef, workerToken, tokenSecretRef, or token")
-		}
-		if serverAddress == "" {
-			return "", fmt.Errorf("k3s worker requires serverAddress or cluster controlPlaneEndpoint")
-		}
+		k3sToken = mat.Token
 	}
 
 	// Set defaults for user configuration
