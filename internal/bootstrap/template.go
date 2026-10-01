@@ -265,7 +265,74 @@ func (d TemplateData) RenderKubeVIP() bool {
 	return d.IsHAControlPlane() && d.VIP != nil && !d.IsKubeVirt
 }
 
-// RenderK0sCloudConfig renders the k0s Kairos cloud-config template.
+// templateSet is one row of distributionTemplates: the template.New name (which
+// appears verbatim in template parse/exec errors, so keep it stable), the generic
+// (CAPV/CAPM3/fleet) and KubeVirt (CAPK) template paths, and the providerIDMarker
+// — a substring present in every providerID-carrying render of the distribution,
+// which the controller's regeneration check looks for.
+type templateSet struct {
+	name             string
+	generic          string
+	kubeVirt         string
+	providerIDMarker string
+}
+
+// distributionTemplates is the renderer's single distribution table, keyed by the
+// api distribution constants so it cannot drift from the admission layer
+// (TestDistributionTablesAgree enforces this). Render is the only place a
+// distribution name selects templates.
+//
+// KD-9 DEBT: providerIDMarker (and the SSH-enable substrings the controller
+// checks) are substring heuristics that go away when the template-version
+// annotation lands.
+var distributionTemplates = map[string]templateSet{
+	bootstrapv1beta2.DistributionK0s: {
+		name:             "k0s_kairos_cloud_config",
+		generic:          "templates/k0s_kairos_cloud_config_capv.yaml.tmpl",
+		kubeVirt:         "templates/k0s_kairos_cloud_config_capk.yaml.tmpl",
+		providerIDMarker: "kairos-k0s-post-bootstrap.service",
+	},
+	bootstrapv1beta2.DistributionK3s: {
+		name:             "k3s_kairos_cloud_config",
+		generic:          "templates/k3s_kairos_cloud_config_capv.yaml.tmpl",
+		kubeVirt:         "templates/k3s_kairos_cloud_config_capk.yaml.tmpl",
+		providerIDMarker: "kairos-k3s-post-bootstrap.service",
+	},
+}
+
+// Render renders the Kairos cloud-config for distribution. It is the only place a
+// distribution name selects templates: data.IsKubeVirt picks the CAPK path,
+// otherwise the generic (CAPV/CAPM3/fleet) path. An unknown name returns
+// "unsupported distribution: <name>".
+func Render(distribution string, data TemplateData) (string, error) {
+	ts, ok := distributionTemplates[distribution]
+	if !ok {
+		return "", fmt.Errorf("unsupported distribution: %s", distribution)
+	}
+	templatePath := ts.generic
+	if data.IsKubeVirt {
+		templatePath = ts.kubeVirt
+	}
+	return renderTemplate(ts.name, templatePath, data)
+}
+
+// ProviderIDMarker returns a string present in every providerID-carrying render of
+// distribution (today, the post-bootstrap systemd unit); the controller's
+// regeneration check looks for it. ok is false for an unknown distribution.
+//
+// KD-9 DEBT: this and the SSH-enable substrings go when the template-version
+// annotation lands.
+func ProviderIDMarker(distribution string) (marker string, ok bool) {
+	ts, found := distributionTemplates[distribution]
+	if !found {
+		return "", false
+	}
+	return ts.providerIDMarker, true
+}
+
+// RenderK0sCloudConfig renders the k0s Kairos cloud-config template. It is a
+// permanent one-line wrapper over Render (OQ-E): it is the golden entry point and
+// is called from the renderer test suite.
 //
 // Kairos fleet (AuroraBoot) providerID self-discovery is implemented on the CAPV
 // template only: the control-plane derives kairos-fleet://<node-id> from the
@@ -275,20 +342,13 @@ func (d TemplateData) RenderKubeVIP() bool {
 // KubeVirt (isFleetMachine and isKubevirtMachine are mutually exclusive Kinds),
 // so the CAPK path needs no fleet branch.
 func RenderK0sCloudConfig(data TemplateData) (string, error) {
-	templatePath := "templates/k0s_kairos_cloud_config_capv.yaml.tmpl"
-	if data.IsKubeVirt {
-		templatePath = "templates/k0s_kairos_cloud_config_capk.yaml.tmpl"
-	}
-	return renderTemplate("k0s_kairos_cloud_config", templatePath, data)
+	return Render(bootstrapv1beta2.DistributionK0s, data)
 }
 
-// RenderK3sCloudConfig renders the k3s Kairos cloud-config template.
+// RenderK3sCloudConfig renders the k3s Kairos cloud-config template. Permanent
+// one-line wrapper over Render (OQ-E).
 func RenderK3sCloudConfig(data TemplateData) (string, error) {
-	templatePath := "templates/k3s_kairos_cloud_config_capv.yaml.tmpl"
-	if data.IsKubeVirt {
-		templatePath = "templates/k3s_kairos_cloud_config_capk.yaml.tmpl"
-	}
-	return renderTemplate("k3s_kairos_cloud_config", templatePath, data)
+	return Render(bootstrapv1beta2.DistributionK3s, data)
 }
 
 // renderTemplate is the shared entry point for both distribution renderers.
