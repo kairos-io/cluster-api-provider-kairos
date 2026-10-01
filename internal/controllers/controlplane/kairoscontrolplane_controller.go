@@ -70,6 +70,14 @@ type KairosControlPlaneReconciler struct {
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
+// kcpUnsupportedDistributionKubeadm is the distribution name a KairosControlPlane
+// cannot run in P1. ADR 0010 ships kubeadm as a bootstrap (worker-join)
+// distribution only; a kubeadm control plane is deferred to P2, so the KCP enum
+// stays [k0s, k3s]. Kept as a literal here (not the bootstrap api constant) to
+// decouple this refusal from the bootstrap enum flip that admits kubeadm on the
+// webhook-less KairosConfigTemplate.
+const kcpUnsupportedDistributionKubeadm = "kubeadm"
+
 // joinerGateRequeueAfter is the backstop requeue interval while waiting for the
 // HA init machine to become joinable (NodeRef + KubeconfigReady, plus the k0s
 // join-token Secret) before creating the next join machine (ADR 0005 Phase 3,
@@ -348,10 +356,30 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// (or one without a distribution) leaves the field empty for this reconcile
 	// (distributionOf falls back to k0s) and a later reconcile resolves it once
 	// the template exists, rather than persisting a guessed k0s.
+	// Defence in depth for an explicit kubeadm distribution. The validating
+	// webhook refuses spec.distribution=kubeadm on a KairosControlPlane (the KCP
+	// enum stays [k0s, k3s] until P2, ADR 0010), but a webhook is not always in the
+	// path (not yet installed, failurePolicy, direct etcd writes). Surface a clear
+	// condition and stop, rather than carrying kubeadm into the machine-create path.
+	if kcp.Spec.Distribution == kcpUnsupportedDistributionKubeadm {
+		return r.refuseKubeadmControlPlane(ctx, log, kcp,
+			"spec.distribution is kubeadm")
+	}
+
 	if kcp.Spec.Distribution == "" {
 		inherited, rerr := r.resolveEffectiveDistribution(ctx, kcp)
 		if rerr != nil {
 			return ctrl.Result{}, rerr
+		}
+		// A KairosConfigTemplate whose distribution is kubeadm cannot be adopted by
+		// a control plane in P1. Persisting kubeadm into spec.distribution would be
+		// rejected by the KCP webhook on every reconcile — an error loop — so refuse
+		// with a condition instead and leave spec.distribution empty. (ADR 0010 P1
+		// item 2: "a KCP referencing a kubeadm KairosConfigTemplate must be refused
+		// with a clear condition, not an error loop".)
+		if inherited == kcpUnsupportedDistributionKubeadm {
+			return r.refuseKubeadmControlPlane(ctx, log, kcp,
+				fmt.Sprintf("KairosConfigTemplate %q has distribution kubeadm", kcp.Spec.KairosConfigTemplate.Name))
 		}
 		if inherited != "" {
 			// Persist with a dedicated MergeFrom patch, separate from the status
@@ -533,6 +561,28 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// other paths above leave it zero-valued, so this is a no-op outside the HA
 	// gate case.
 	return machinesResult, nil
+}
+
+// refuseKubeadmControlPlane surfaces a clear, non-looping refusal when the
+// effective distribution of a KairosControlPlane is kubeadm (ADR 0010 P1 item 2).
+// It marks Available/Ready False(Warning) with UnsupportedDistributionReason,
+// latches the failure fields, flushes status, and returns without a requeue — it
+// never writes kubeadm into spec.distribution (which the webhook would reject on
+// every pass, an error loop). A later spec/template edit re-enqueues through the
+// normal watches. reason is a short human-readable cause for the condition message.
+func (r *KairosControlPlaneReconciler) refuseKubeadmControlPlane(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, reason string) (ctrl.Result, error) {
+	msg := fmt.Sprintf("kubeadm is not supported on a KairosControlPlane in this release (%s); "+
+		"kubeadm is a bootstrap worker-join distribution only (ADR 0010 P1). "+
+		"Use a k0s or k3s KairosConfigTemplate for the control plane.", reason)
+	log.Info("Refusing kubeadm KairosControlPlane", "reason", reason)
+	conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.UnsupportedDistributionReason, clusterv1.ConditionSeverityWarning, "%s", msg)
+	conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.UnsupportedDistributionReason, clusterv1.ConditionSeverityWarning, "%s", msg)
+	kcp.Status.FailureReason = controlplanev1beta2.UnsupportedDistributionReason
+	kcp.Status.FailureMessage = msg
+	if updateErr := r.Status().Update(ctx, kcp); updateErr != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update KCP status: %w", updateErr)
+	}
+	return ctrl.Result{}, nil
 }
 
 // findClusterForControlPlane searches for a Cluster that references this KairosControlPlane
