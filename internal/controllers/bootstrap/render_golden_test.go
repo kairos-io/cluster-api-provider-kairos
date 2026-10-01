@@ -68,7 +68,6 @@ var updateControllerGolden = flag.Bool("update", false, "regenerate controller g
 //	GitHubUser                        | every fixture
 //	SSHPublicKey                      | every fixture
 //	WorkerToken (k0s)                 | k0s_worker_*
-//	Manifests                         | every fixture
 //	Files                             | every fixture
 //	HostnamePrefix                    | every fixture
 //	DNSServers                        | every fixture
