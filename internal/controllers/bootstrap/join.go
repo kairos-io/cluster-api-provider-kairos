@@ -112,12 +112,12 @@ func (r *KairosConfigReconciler) joinSourceFor(distribution string) JoinMaterial
 			return src
 		}
 	}
-	switch distribution {
-	case bootstrapv1beta2.DistributionK3s:
-		return k3sJoinSource{c: r.Client}
-	default:
-		return k0sJoinSource{c: r.Client}
+	if row, ok := bootstrapDistributions[distribution]; ok && row.builtinJoin != nil {
+		return row.builtinJoin(r.Client)
 	}
+	// Defensive: renderCloudConfig rejects an unknown distribution before the
+	// worker path reaches here; fall back to the default distribution's built-in.
+	return bootstrapDistributions[bootstrapv1beta2.DefaultDistribution].builtinJoin(r.Client)
 }
 
 // workerJoin resolves the worker join material for distribution through the
