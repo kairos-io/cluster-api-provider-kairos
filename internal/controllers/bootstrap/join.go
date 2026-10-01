@@ -56,19 +56,47 @@ type JoinRequest struct {
 	ServerAddress string             // spec.serverAddress, else https://<controlPlaneEndpoint>, else ""
 }
 
-// WorkerJoinMaterial is what a worker needs to join. Token becomes the renderer's
-// WorkerToken (k0s) or K3sToken (k3s). Every field is redacted in String() and
-// GoString(), including fields P1 adds, so it never leaks through a %v/%+v/%#v
-// log (root rule 2).
+// WorkerJoinMaterial is what a worker needs to join. For k0s/k3s, Token becomes
+// the renderer's WorkerToken / K3sToken. For kubeadm, Kubeadm carries the minted
+// join material. Every secret-bearing field is redacted in String() and GoString()
+// so the material never leaks through a %v/%+v/%#v log (root rule 2).
 type WorkerJoinMaterial struct {
 	Token string
+	// Kubeadm, when non-nil, carries the kubeadm worker-join material minted by the
+	// kubeadm JoinMaterialSource after its owner-verified trust check (ADR 0010 P1).
+	Kubeadm *KubeadmJoinMaterial
 }
 
-// String redacts the material for %v/%s/%+v.
-func (WorkerJoinMaterial) String() string { return "WorkerJoinMaterial{Token:REDACTED}" }
+// KubeadmJoinMaterial is the kubeadm worker-join material: the marshalled
+// JoinConfiguration (which embeds the minted bootstrap token in its discovery
+// block — SECRET), the exact Kubernetes version the node must run, and the
+// NON-SECRET token ID for status/audit. The JoinConfiguration is redacted by
+// WorkerJoinMaterial's String/GoString; TokenID is safe to surface.
+type KubeadmJoinMaterial struct {
+	// JoinConfiguration is the version-marshalled kubeadm JoinConfiguration YAML.
+	// It embeds the minted bootstrap token in discovery.bootstrapToken.token, so it
+	// is secret material and is never logged.
+	JoinConfiguration string
+	// KubernetesVersion is the exact version the node must run (Machine.spec.version).
+	KubernetesVersion string
+	// TokenID is the non-secret ID half ("[a-z0-9]{6}") of the minted bootstrap
+	// token, written to KairosConfig.status.bootstrapTokenID for audit. Never the
+	// secret half.
+	TokenID string
+}
+
+// String redacts the material for %v/%s/%+v. Only the non-secret kubeadm token ID
+// is surfaced; the k0s/k3s token and the kubeadm JoinConfiguration (which embeds
+// the bootstrap token) are always REDACTED.
+func (m WorkerJoinMaterial) String() string {
+	if m.Kubeadm != nil {
+		return "WorkerJoinMaterial{Token:REDACTED, Kubeadm:{JoinConfiguration:REDACTED, TokenID:" + m.Kubeadm.TokenID + "}}"
+	}
+	return "WorkerJoinMaterial{Token:REDACTED}"
+}
 
 // GoString redacts the material for %#v.
-func (WorkerJoinMaterial) GoString() string { return "WorkerJoinMaterial{Token:REDACTED}" }
+func (m WorkerJoinMaterial) GoString() string { return m.String() }
 
 // k0sJoinSource is the built-in k0s worker join source over a client.Reader.
 type k0sJoinSource struct{ c client.Reader }
@@ -103,28 +131,36 @@ func (s k3sJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (WorkerJ
 }
 
 // joinSourceFor returns the JoinMaterialSource for distribution: the injected
-// source in r.JoinSources if present, otherwise the built-in over r.Client. A nil
-// map or missing key uses the built-in, so existing construction sites that set
-// no JoinSources are unchanged.
-func (r *KairosConfigReconciler) joinSourceFor(distribution string) JoinMaterialSource {
+// source in r.JoinSources if present, otherwise the row's built-in over r.Client.
+//
+// N2 (ADR 0010 P1): a distribution whose row has a nil builtinJoin (kubeadm) MUST
+// have an injected JoinSources entry — main.go wires it with the dependencies only
+// it has (clustercache, the uncached reader, the GroupKind allowlist). If both are
+// absent, this HARD-FAILS with a clear error rather than silently falling back to
+// the DefaultDistribution (k0s) built-in, which would resolve a k0s/k3s token and
+// render the wrong bootstrap data onto a kubeadm node. A nil map or a missing key
+// for a distribution that HAS a built-in (k0s/k3s) is still fine.
+func (r *KairosConfigReconciler) joinSourceFor(distribution string) (JoinMaterialSource, error) {
 	if r.JoinSources != nil {
 		if src, ok := r.JoinSources[distribution]; ok && src != nil {
-			return src
+			return src, nil
 		}
 	}
 	if row, ok := bootstrapDistributions[distribution]; ok && row.builtinJoin != nil {
-		return row.builtinJoin(r.Client)
+		return row.builtinJoin(r.Client), nil
 	}
-	// Defensive: renderCloudConfig rejects an unknown distribution before the
-	// worker path reaches here; fall back to the default distribution's built-in.
-	return bootstrapDistributions[bootstrapv1beta2.DefaultDistribution].builtinJoin(r.Client)
+	return nil, fmt.Errorf("no worker join source configured for distribution %q: it requires an injected JoinSources entry (check the manager wiring)", distribution)
 }
 
 // workerJoin resolves the worker join material for distribution through the
-// selected source. It is the single entry point both generators use for the
+// selected source. It is the single entry point renderCloudConfig uses for the
 // role == "worker" path.
 func (r *KairosConfigReconciler) workerJoin(ctx context.Context, distribution string, kc *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, serverAddress string) (WorkerJoinMaterial, error) {
-	return r.joinSourceFor(distribution).WorkerJoin(ctx, JoinRequest{
+	src, err := r.joinSourceFor(distribution)
+	if err != nil {
+		return WorkerJoinMaterial{}, err
+	}
+	return src.WorkerJoin(ctx, JoinRequest{
 		Config:        kc,
 		Machine:       machine,
 		Cluster:       cluster,

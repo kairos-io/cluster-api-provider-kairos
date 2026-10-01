@@ -19,6 +19,7 @@ package v1beta2
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
@@ -104,8 +105,16 @@ type KairosConfigSpec struct {
 	// +kubebuilder:default=worker
 	Role string `json:"role,omitempty"`
 
-	// Distribution specifies the Kubernetes distribution to install
-	// +kubebuilder:validation:Enum=k0s;k3s
+	// Distribution specifies the Kubernetes distribution to install.
+	//
+	// k0s and k3s render a Kairos-native cloud-config that installs and starts the
+	// distribution directly. kubeadm (ADR 0010 P1) joins a Kairos WORKER to an
+	// existing kubeadm control plane (Kamaji, upstream KubeadmControlPlane): the
+	// controller mints a short-lived bootstrap token against the workload cluster
+	// after an owner-verified trust check and renders a kubeadm JoinConfiguration.
+	// kubeadm is worker-only here; a kubeadm KairosControlPlane is deferred to P2,
+	// so KairosControlPlane.spec.distribution stays [k0s, k3s].
+	// +kubebuilder:validation:Enum=k0s;k3s;kubeadm
 	// +kubebuilder:default=k0s
 	Distribution string `json:"distribution,omitempty"`
 
@@ -356,6 +365,38 @@ type KairosConfigSpec struct {
 	// This controls how Kairos OS is installed to disk
 	// +optional
 	Install *InstallConfig `json:"install,omitempty"`
+
+	// Kubeadm carries the kubeadm-specific inputs for a worker join. It is honoured
+	// only when Distribution is kubeadm and Role is worker; it is ignored for k0s
+	// and k3s. All fields are optional — the controller defaults nodeRegistration,
+	// discovery (the minted bootstrap token and the cluster-CA pin), and the
+	// providerID patch. ADR 0010 OQ-5: this embeds the INDIVIDUAL CAPI kubeadm
+	// v1beta2 types (JoinConfiguration today; InitConfiguration with P2), NOT the
+	// whole KubeadmConfigSpec and NOT ClusterConfiguration.
+	//
+	// Secret material is refused at admission: no inline bootstrap token, no
+	// unsafeSkipCAVerification, no file-based discovery, and no "{{" placeholders
+	// (see the kubeadm webhook rule).
+	// +optional
+	Kubeadm *KubeadmConfig `json:"kubeadm,omitempty"`
+}
+
+// KubeadmConfig carries the kubeadm-specific inputs for a worker join (ADR 0010
+// P1). It embeds the individual CAPI kubeadm v1beta2 types rather than the whole
+// KubeadmConfigSpec (OQ-5), so only the fields a Kairos worker join needs are
+// exposed and the served CRD does not grow the entire CABPK surface.
+type KubeadmConfig struct {
+	// JoinConfiguration is the kubeadm JoinConfiguration for a worker join. The
+	// controller overlays the fields it owns — nodeRegistration.name (the Machine
+	// hostname), discovery (the minted bootstrap token, the control-plane endpoint,
+	// and the cluster-CA hash), the providerID kubelet patch, and the
+	// node.cluster.x-k8s.io/uninitialized taint — on top of whatever is set here.
+	// Fields that carry secret material or weaken the trust chain are refused at
+	// admission (see validateKubeadmConfig).
+	//
+	// controlPlane MUST be nil: a control-plane join is a P2 concern.
+	// +optional
+	JoinConfiguration *kubeadmv1.JoinConfiguration `json:"joinConfiguration,omitempty"`
 }
 
 // InstallConfig specifies the Kairos installation configuration
@@ -555,6 +596,16 @@ type KairosConfigStatus struct {
 	// If non-empty, check the owning Machine's events for context.
 	// +optional
 	FailureMessage string `json:"failureMessage,omitempty"`
+
+	// BootstrapTokenID is the NON-SECRET ID half (the "[a-z0-9]{6}" prefix) of the
+	// kubeadm bootstrap token this KairosConfig most recently minted in the workload
+	// cluster (ADR 0010 P1). It is written so operators can correlate the token
+	// Secret in the workload cluster's kube-system namespace with this KairosConfig
+	// and audit its refresh, without ever exposing the secret half, which lives only
+	// in the bootstrap-data Secret and is never placed in spec or status. Empty for
+	// k0s/k3s and for a kubeadm worker that has not yet minted a token.
+	// +optional
+	BootstrapTokenID string `json:"bootstrapTokenID,omitempty"`
 }
 
 // KairosConfigInitialization provides observations of the KairosConfig initialization process.

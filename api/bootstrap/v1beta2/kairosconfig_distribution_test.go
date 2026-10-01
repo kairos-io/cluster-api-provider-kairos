@@ -29,9 +29,10 @@ import (
 // exact strings and their aggregate order must not drift.
 
 const (
-	msgDistributionEnum = "spec.distribution must be one of [k0s, k3s]"
-	msgK0sWorkerToken   = "worker KairosConfig requires either spec.workerToken or spec.workerTokenSecretRef to be set"
-	msgK3sWorkerToken   = "k3s worker requires spec.k3sToken, spec.k3sTokenSecretRef, spec.workerToken, or spec.workerTokenSecretRef to be set"
+	msgDistributionEnum    = "spec.distribution must be one of [k0s, k3s, kubeadm]"
+	msgK0sWorkerToken      = "worker KairosConfig requires either spec.workerToken or spec.workerTokenSecretRef to be set"
+	msgK3sWorkerToken      = "k3s worker requires spec.k3sToken, spec.k3sTokenSecretRef, spec.workerToken, or spec.workerTokenSecretRef to be set"
+	msgKubeadmControlPlane = "kubeadm is supported only for worker nodes in this release"
 )
 
 // TestKairosConfig_Validate_DistributionMessages pins the exact distribution
@@ -45,7 +46,10 @@ func TestKairosConfig_Validate_DistributionMessages(t *testing.T) {
 		{"empty is valid (defaulter fills k0s)", "", false},
 		{"k0s is valid", "k0s", false},
 		{"k3s is valid", "k3s", false},
-		{"kubeadm is rejected in P0", "kubeadm", true},
+		// kubeadm is now an accepted enum value (ADR 0010 P1), but newValidKairosConfig
+		// is a control-plane config and kubeadm is worker-only, so it is still
+		// rejected here — by the kubeadm control-plane refusal, NOT the enum message.
+		{"kubeadm is accepted at the enum level", "kubeadm", false},
 		{"arbitrary is rejected", "rke2", true},
 	}
 	for _, tc := range cases {
@@ -53,6 +57,11 @@ func TestKairosConfig_Validate_DistributionMessages(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			kc := newValidKairosConfig() // control-plane: no worker-token rule
 			kc.Spec.Distribution = tc.dist
+			// For the kubeadm case, flip to worker so the enum check (not the
+			// control-plane refusal) is what we exercise.
+			if tc.dist == "kubeadm" {
+				kc.Spec.Role = "worker"
+			}
 			err := kc.validate()
 			if !tc.wantErr {
 				if err != nil {
@@ -67,6 +76,25 @@ func TestKairosConfig_Validate_DistributionMessages(t *testing.T) {
 				t.Errorf("validate() error %q does not contain %q", err.Error(), msgDistributionEnum)
 			}
 		})
+	}
+}
+
+// TestKairosConfig_Validate_KubeadmControlPlaneRefused pins that a kubeadm
+// control-plane KairosConfig is refused (worker-only in P1, ADR 0010), with the
+// control-plane refusal message rather than the enum message (kubeadm IS a valid
+// enum value now).
+func TestKairosConfig_Validate_KubeadmControlPlaneRefused(t *testing.T) {
+	kc := newValidKairosConfig() // role: control-plane
+	kc.Spec.Distribution = "kubeadm"
+	err := kc.validate()
+	if err == nil {
+		t.Fatalf("validate() returned nil; expected the kubeadm control-plane refusal")
+	}
+	if !strings.Contains(err.Error(), msgKubeadmControlPlane) {
+		t.Errorf("validate() error %q does not contain %q", err.Error(), msgKubeadmControlPlane)
+	}
+	if strings.Contains(err.Error(), msgDistributionEnum) {
+		t.Errorf("validate() error %q unexpectedly contains the enum message; kubeadm is a valid enum value", err.Error())
 	}
 }
 

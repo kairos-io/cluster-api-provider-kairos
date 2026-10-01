@@ -41,6 +41,41 @@ func dispatchCPData(kubevirt bool) TemplateData {
 	return d
 }
 
+// dispatchKubeadmWorkerData is the worker fixture for the kubeadm template, which
+// is worker-only (a kubeadm control-plane render is refused). The JoinConfiguration
+// and providerID patch are stand-in YAML; the controller produces the real values
+// via the version-aware marshaller.
+func dispatchKubeadmWorkerData(kubevirt bool) TemplateData {
+	d := TemplateData{
+		Role:       "worker",
+		Hostname:   "kairos-worker-0",
+		UserName:   "kairos",
+		UserGroups: []string{"admin"},
+		GitHubUser: "testuser",
+		ProviderID: "vsphere://vm-uuid",
+		IsKubeVirt: kubevirt,
+		Kubeadm: &KubeadmTemplateData{
+			JoinConfiguration: "apiVersion: kubeadm.k8s.io/v1beta4\nkind: JoinConfiguration\nnodeRegistration:\n  name: kairos-worker-0\n",
+			ProviderIDPatch:   "providerID: \"vsphere://vm-uuid\"\n",
+			KubernetesVersion: "v1.30.0",
+		},
+	}
+	if kubevirt {
+		d.ProviderID = "kubevirt://kairos-worker-0"
+		d.Kubeadm.ProviderIDPatch = "providerID: \"kubevirt://kairos-worker-0\"\n"
+	}
+	return d
+}
+
+// dispatchDataFor returns the render fixture appropriate to the distribution:
+// worker data for kubeadm (worker-only), control-plane data for k0s/k3s.
+func dispatchDataFor(dist string, kubevirt bool) TemplateData {
+	if dist == bootstrapv1beta2.DistributionKubeadm {
+		return dispatchKubeadmWorkerData(kubevirt)
+	}
+	return dispatchCPData(kubevirt)
+}
+
 // TestRender_UnknownDistribution pins the unsupported-distribution error.
 func TestRender_UnknownDistribution(t *testing.T) {
 	_, err := Render("foo", dispatchCPData(false))
@@ -49,6 +84,40 @@ func TestRender_UnknownDistribution(t *testing.T) {
 	}
 	if got, want := err.Error(), "unsupported distribution: foo"; got != want {
 		t.Errorf("Render(foo) error = %q; want %q", got, want)
+	}
+}
+
+// TestRender_KubeadmControlPlaneRefused pins the render-time refusal of a kubeadm
+// control-plane config (ADR 0010 P1 item 5): the P1 seam resolves worker join
+// material only and has no control-plane hook.
+func TestRender_KubeadmControlPlaneRefused(t *testing.T) {
+	data := dispatchCPData(false) // Role: control-plane
+	_, err := Render(bootstrapv1beta2.DistributionKubeadm, data)
+	if err == nil {
+		t.Fatal("Render(kubeadm, control-plane) returned nil error; expected a refusal")
+	}
+	if !strings.Contains(err.Error(), "not supported for control-plane") {
+		t.Errorf("Render(kubeadm, control-plane) error = %q; want a control-plane refusal", err.Error())
+	}
+}
+
+// TestRender_KubeadmWorker proves a kubeadm worker renders and carries the join
+// configuration, the providerID patch, the marker, and the SSH-enable stage.
+func TestRender_KubeadmWorker(t *testing.T) {
+	out, err := Render(bootstrapv1beta2.DistributionKubeadm, dispatchKubeadmWorkerData(false))
+	if err != nil {
+		t.Fatalf("Render(kubeadm, worker): %v", err)
+	}
+	for _, want := range []string{
+		"kind: JoinConfiguration",
+		"providerID: \"vsphere://vm-uuid\"",
+		"kairos-kubeadm-post-bootstrap.service",
+		"systemctl enable --now sshd",
+		"kubeadm join",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("kubeadm worker render missing %q", want)
+		}
 	}
 }
 
@@ -92,6 +161,7 @@ func TestProviderIDMarker(t *testing.T) {
 	}{
 		{bootstrapv1beta2.DistributionK0s, "kairos-k0s-post-bootstrap.service", true},
 		{bootstrapv1beta2.DistributionK3s, "kairos-k3s-post-bootstrap.service", true},
+		{bootstrapv1beta2.DistributionKubeadm, "kairos-kubeadm-post-bootstrap.service", true},
 		{"foo", "", false},
 	}
 	for _, tc := range cases {
@@ -115,7 +185,7 @@ func TestDistributionTemplatesTableAgrees(t *testing.T) {
 			t.Errorf("distributionTemplates missing a row for supported distribution %q", d)
 			continue
 		}
-		if _, err := Render(d, dispatchCPData(false)); err != nil {
+		if _, err := Render(d, dispatchDataFor(d, false)); err != nil {
 			t.Errorf("Render(%q) failed: %v", d, err)
 		}
 		if _, ok := ProviderIDMarker(d); !ok {
@@ -137,7 +207,7 @@ func TestRenderContract(t *testing.T) {
 		for _, kubevirt := range []bool{false, true} {
 			dist, kubevirt := dist, kubevirt
 			t.Run(dist, func(t *testing.T) {
-				data := dispatchCPData(kubevirt)
+				data := dispatchDataFor(dist, kubevirt)
 				out, err := Render(dist, data)
 				if err != nil {
 					t.Fatalf("Render(%s, kubevirt=%v): %v", dist, kubevirt, err)

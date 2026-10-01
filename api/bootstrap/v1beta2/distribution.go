@@ -17,9 +17,11 @@ permissions and limitations under the License.
 package v1beta2
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
@@ -35,12 +37,13 @@ import (
 const (
 	DistributionK0s     = "k0s"
 	DistributionK3s     = "k3s"
+	DistributionKubeadm = "kubeadm"
 	DefaultDistribution = DistributionK0s
 )
 
 // supportedDistributions is the accepted set, in admission-message order. It is
 // the order rendered into "spec.distribution must be one of [...]".
-var supportedDistributions = []string{DistributionK0s, DistributionK3s}
+var supportedDistributions = []string{DistributionK0s, DistributionK3s, DistributionKubeadm}
 
 // EffectiveDistribution returns d, or DefaultDistribution when d is empty. It
 // does not validate: an unknown non-empty name is returned unchanged.
@@ -83,8 +86,9 @@ type distributionRules struct {
 // distribution constants. The order is not significant for lookup; the
 // admission-message order is supportedDistributions.
 var bootstrapDistributions = []distributionRules{
-	{DistributionK0s, validateK0sConfig}, // the default and the pre-seam default: arm
-	{DistributionK3s, validateK3sConfig}, // the pre-seam case "k3s": arm
+	{DistributionK0s, validateK0sConfig},         // the default and the pre-seam default: arm
+	{DistributionK3s, validateK3sConfig},         // the pre-seam case "k3s": arm
+	{DistributionKubeadm, validateKubeadmConfig}, // ADR 0010 P1: hosted worker join
 }
 
 // rulesForDistribution returns the rules for the effective distribution, falling
@@ -158,4 +162,99 @@ func validateK3sConfig(kc *KairosConfig) field.ErrorList {
 		)}
 	}
 	return nil
+}
+
+// validateKubeadmConfig is the kubeadm admission rule (ADR 0010 P1). Unlike k0s
+// and k3s, a kubeadm worker needs no token in the spec: the controller mints a
+// short-lived bootstrap token against the workload cluster after an owner-verified
+// trust check, so this rule is purely a set of refusals. It runs for every role
+// (not gated on "worker") because the control-plane refusal is one of them.
+//
+// Refusals (ADR 0010 P1 API section):
+//   - role control-plane: a kubeadm KairosControlPlane is P2; P1 is worker-only.
+//   - an inline bootstrap token on the join discovery: tokens never appear in the
+//     spec (the controller mints and refreshes them).
+//   - unsafeSkipCAVerification: it disables the CA pin, defeating the trust chain.
+//   - discovery.file: the file-discovery path is out of P1 scope.
+//   - any "{{" anywhere in the kubeadm block: Jinja placeholders are not rendered
+//     on Kairos, and the JoinConfiguration is marshalled into a file on the node,
+//     so an unexpanded "{{ ... }}" would land verbatim in node-side config.
+//   - a nodeRegistration.name that is not a DNS-1123 subdomain (it becomes the
+//     Node object name and the kubelet client-cert CommonName).
+func validateKubeadmConfig(kc *KairosConfig) field.ErrorList {
+	var errs field.ErrorList
+
+	if kc.Spec.Role == "control-plane" {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "role"),
+			kc.Spec.Role,
+			"kubeadm is supported only for worker nodes in this release; a kubeadm "+
+				"KairosControlPlane is deferred to a later phase (ADR 0010 P2). Set "+
+				"spec.role to worker, or use the k0s/k3s distribution for a control plane.",
+		))
+	}
+
+	ka := kc.Spec.Kubeadm
+	if ka == nil {
+		return errs
+	}
+	kaPath := field.NewPath("spec", "kubeadm")
+
+	// No "{{" anywhere in the kubeadm block. Marshalling the whole block catches
+	// every user-settable string that is rendered into the on-node file, including
+	// fields not called out individually below.
+	if raw, err := json.Marshal(ka); err == nil {
+		if strings.Contains(string(raw), "{{") {
+			errs = append(errs, field.Invalid(
+				kaPath, "<redacted>",
+				"spec.kubeadm must not contain '{{': Jinja-style placeholders are not "+
+					"expanded on Kairos and would be written verbatim into the node's "+
+					"kubeadm configuration",
+			))
+		}
+	}
+
+	jc := ka.JoinConfiguration
+	if jc == nil {
+		return errs
+	}
+	jcPath := kaPath.Child("joinConfiguration")
+
+	// Inline bootstrap token on discovery — tokens never live in the spec.
+	if jc.Discovery.BootstrapToken.Token != "" {
+		errs = append(errs, field.Forbidden(
+			jcPath.Child("discovery", "bootstrapToken", "token"),
+			"an inline bootstrap token is not allowed: the controller mints and refreshes "+
+				"a short-lived token against the workload cluster",
+		))
+	}
+
+	// unsafeSkipCAVerification defeats the CA pin.
+	if jc.Discovery.BootstrapToken.UnsafeSkipCAVerification != nil && *jc.Discovery.BootstrapToken.UnsafeSkipCAVerification {
+		errs = append(errs, field.Forbidden(
+			jcPath.Child("discovery", "bootstrapToken", "unsafeSkipCAVerification"),
+			"unsafeSkipCAVerification is not allowed: it disables the cluster-CA pin that the join relies on",
+		))
+	}
+
+	// discovery.file is out of P1 scope.
+	if jc.Discovery.File.KubeConfigPath != "" {
+		errs = append(errs, field.Forbidden(
+			jcPath.Child("discovery", "file"),
+			"file-based discovery is not supported in this release; the controller "+
+				"configures bootstrap-token discovery",
+		))
+	}
+
+	// nodeRegistration.name, when set, must be a DNS-1123 subdomain.
+	if name := jc.NodeRegistration.Name; name != "" {
+		if msgs := validation.IsDNS1123Subdomain(name); len(msgs) > 0 {
+			errs = append(errs, field.Invalid(
+				jcPath.Child("nodeRegistration", "name"), name,
+				"nodeRegistration.name must be a valid DNS-1123 subdomain (it becomes the Node name)",
+			))
+		}
+	}
+
+	return errs
 }

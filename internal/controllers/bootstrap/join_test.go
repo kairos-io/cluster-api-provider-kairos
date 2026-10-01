@@ -58,6 +58,26 @@ func TestWorkerJoinMaterial_Redacts(t *testing.T) {
 	}
 }
 
+// TestWorkerJoinMaterial_RedactsKubeadm asserts the kubeadm JoinConfiguration
+// (which embeds the minted bootstrap token) never leaks through any fmt verb, while
+// the non-secret token ID IS surfaced for audit (ADR 0010 P1 item 8).
+func TestWorkerJoinMaterial_RedactsKubeadm(t *testing.T) {
+	g := NewWithT(t)
+	const secretJoinCfg = "discovery:\n  bootstrapToken:\n    token: abcdef.secrettokenvalue01"
+	mat := WorkerJoinMaterial{Kubeadm: &KubeadmJoinMaterial{
+		JoinConfiguration: secretJoinCfg,
+		KubernetesVersion: "v1.30.0",
+		TokenID:           "abcdef",
+	}}
+	for _, verb := range []string{"%v", "%s", "%+v", "%#v"} {
+		rendered := fmt.Sprintf(verb, mat)
+		g.Expect(rendered).NotTo(ContainSubstring("secrettokenvalue01"), "verb %s leaked the bootstrap token: %s", verb, rendered)
+		g.Expect(rendered).NotTo(ContainSubstring("bootstrapToken"), "verb %s leaked the JoinConfiguration body", verb)
+		g.Expect(rendered).To(ContainSubstring("REDACTED"))
+		g.Expect(rendered).To(ContainSubstring("abcdef"), "verb %s should surface the non-secret token ID", verb)
+	}
+}
+
 // TestJoinSourceFor pins source selection: an injected source is used; a nil map
 // or a missing key uses the built-in over r.Client.
 func TestJoinSourceFor(t *testing.T) {
@@ -69,14 +89,20 @@ func TestJoinSourceFor(t *testing.T) {
 	r := &KairosConfigReconciler{Client: c, Scheme: scheme, JoinSources: map[string]JoinMaterialSource{
 		bootstrapv1beta2.DistributionK0s: injected,
 	}}
-	g.Expect(r.joinSourceFor(bootstrapv1beta2.DistributionK0s)).To(BeIdenticalTo(injected), "injected source must be used")
+	gotInjected, err := r.joinSourceFor(bootstrapv1beta2.DistributionK0s)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(gotInjected).To(BeIdenticalTo(injected), "injected source must be used")
 	// Missing key -> built-in k3s.
-	_, isK3s := r.joinSourceFor(bootstrapv1beta2.DistributionK3s).(k3sJoinSource)
+	k3sSrc, err := r.joinSourceFor(bootstrapv1beta2.DistributionK3s)
+	g.Expect(err).NotTo(HaveOccurred())
+	_, isK3s := k3sSrc.(k3sJoinSource)
 	g.Expect(isK3s).To(BeTrue(), "missing key must fall back to the built-in k3s source")
 
 	// Nil map -> built-in for both.
 	rNil := &KairosConfigReconciler{Client: c, Scheme: scheme}
-	_, isK0s := rNil.joinSourceFor(bootstrapv1beta2.DistributionK0s).(k0sJoinSource)
+	k0sSrc, err := rNil.joinSourceFor(bootstrapv1beta2.DistributionK0s)
+	g.Expect(err).NotTo(HaveOccurred())
+	_, isK0s := k0sSrc.(k0sJoinSource)
 	g.Expect(isK0s).To(BeTrue(), "nil map must fall back to the built-in k0s source")
 }
 

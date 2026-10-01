@@ -220,11 +220,20 @@ spec:
                         type: object
                       distribution:
                         default: k0s
-                        description: Distribution specifies the Kubernetes distribution
-                          to install
+                        description: |-
+                          Distribution specifies the Kubernetes distribution to install.
+
+                          k0s and k3s render a Kairos-native cloud-config that installs and starts the
+                          distribution directly. kubeadm (ADR 0010 P1) joins a Kairos WORKER to an
+                          existing kubeadm control plane (Kamaji, upstream KubeadmControlPlane): the
+                          controller mints a short-lived bootstrap token against the workload cluster
+                          after an owner-verified trust check and renders a kubeadm JoinConfiguration.
+                          kubeadm is worker-only here; a kubeadm KairosControlPlane is deferred to P2,
+                          so KairosControlPlane.spec.distribution stays [k0s, k3s].
                         enum:
                         - k0s
                         - k3s
+                        - kubeadm
                         type: string
                       dnsServers:
                         description: |-
@@ -371,6 +380,519 @@ spec:
                             type: string
                         required:
                         - name
+                        type: object
+                      kubeadm:
+                        description: |-
+                          Kubeadm carries the kubeadm-specific inputs for a worker join. It is honoured
+                          only when Distribution is kubeadm and Role is worker; it is ignored for k0s
+                          and k3s. All fields are optional — the controller defaults nodeRegistration,
+                          discovery (the minted bootstrap token and the cluster-CA pin), and the
+                          providerID patch. ADR 0010 OQ-5: this embeds the INDIVIDUAL CAPI kubeadm
+                          v1beta2 types (JoinConfiguration today; InitConfiguration with P2), NOT the
+                          whole KubeadmConfigSpec and NOT ClusterConfiguration.
+
+                          Secret material is refused at admission: no inline bootstrap token, no
+                          unsafeSkipCAVerification, no file-based discovery, and no "{{" placeholders
+                          (see the kubeadm webhook rule).
+                        properties:
+                          joinConfiguration:
+                            description: |-
+                              JoinConfiguration is the kubeadm JoinConfiguration for a worker join. The
+                              controller overlays the fields it owns — nodeRegistration.name (the Machine
+                              hostname), discovery (the minted bootstrap token, the control-plane endpoint,
+                              and the cluster-CA hash), the providerID kubelet patch, and the
+                              node.cluster.x-k8s.io/uninitialized taint — on top of whatever is set here.
+                              Fields that carry secret material or weaken the trust chain are refused at
+                              admission (see validateKubeadmConfig).
+
+                              controlPlane MUST be nil: a control-plane join is a P2 concern.
+                            minProperties: 1
+                            properties:
+                              caCertPath:
+                                description: |-
+                                  caCertPath is the path to the SSL certificate authority used to
+                                  secure communications between node and control-plane.
+                                  Defaults to "/etc/kubernetes/pki/ca.crt".
+                                maxLength: 512
+                                minLength: 1
+                                type: string
+                              controlPlane:
+                                description: |-
+                                  controlPlane defines the additional control plane instance to be deployed on the joining node.
+                                  If nil, no additional control plane instance will be deployed.
+                                properties:
+                                  localAPIEndpoint:
+                                    description: localAPIEndpoint represents the endpoint
+                                      of the API server instance to be deployed on
+                                      this node.
+                                    minProperties: 1
+                                    properties:
+                                      advertiseAddress:
+                                        description: advertiseAddress sets the IP
+                                          address for the API server to advertise.
+                                        maxLength: 39
+                                        minLength: 1
+                                        type: string
+                                      bindPort:
+                                        description: |-
+                                          bindPort sets the secure port for the API Server to bind to.
+                                          Defaults to 6443.
+                                        format: int32
+                                        minimum: 1
+                                        type: integer
+                                    type: object
+                                type: object
+                              discovery:
+                                description: discovery specifies the options for the
+                                  kubelet to use during the TLS Bootstrap process
+                                minProperties: 1
+                                properties:
+                                  bootstrapToken:
+                                    description: |-
+                                      bootstrapToken is used to set the options for bootstrap token based discovery
+                                      BootstrapToken and File are mutually exclusive
+                                    minProperties: 1
+                                    properties:
+                                      apiServerEndpoint:
+                                        description: apiServerEndpoint is an IP or
+                                          domain name to the API server from which
+                                          info will be fetched.
+                                        maxLength: 512
+                                        minLength: 1
+                                        type: string
+                                      caCertHashes:
+                                        description: |-
+                                          caCertHashes specifies a set of public key pins to verify
+                                          when token-based discovery is used. The root CA found during discovery
+                                          must match one of these values. Specifying an empty set disables root CA
+                                          pinning, which can be unsafe. Each hash is specified as "<type>:<value>",
+                                          where the only currently supported type is "sha256". This is a hex-encoded
+                                          SHA-256 hash of the Subject Public Key Info (SPKI) object in DER-encoded
+                                          ASN.1. These hashes can be calculated using, for example, OpenSSL:
+                                          openssl x509 -pubkey -in ca.crt openssl rsa -pubin -outform der 2>&/dev/null | openssl dgst -sha256 -hex
+                                        items:
+                                          maxLength: 512
+                                          minLength: 1
+                                          type: string
+                                        maxItems: 100
+                                        minItems: 1
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                      token:
+                                        description: |-
+                                          token is a token used to validate cluster information
+                                          fetched from the control-plane.
+                                        maxLength: 512
+                                        minLength: 1
+                                        type: string
+                                      unsafeSkipCAVerification:
+                                        description: |-
+                                          unsafeSkipCAVerification allows token-based discovery
+                                          without CA verification via CACertHashes. This can weaken
+                                          the security of kubeadm since other nodes can impersonate the control-plane.
+                                        type: boolean
+                                    type: object
+                                  file:
+                                    description: |-
+                                      file is used to specify a file or URL to a kubeconfig file from which to load cluster information
+                                      BootstrapToken and File are mutually exclusive
+                                    properties:
+                                      kubeConfig:
+                                        description: |-
+                                          kubeConfig is used (optionally) to generate a KubeConfig based on the KubeadmConfig's information.
+                                          The file is generated at the path specified in KubeConfigPath.
+
+                                          Host address (server field) information is automatically populated based on the Cluster's ControlPlaneEndpoint.
+                                          Certificate Authority (certificate-authority-data field) is gathered from the cluster's CA secret.
+                                        properties:
+                                          cluster:
+                                            description: |-
+                                              cluster contains information about how to communicate with the kubernetes cluster.
+
+                                              By default the following fields are automatically populated:
+                                              - Server with the Cluster's ControlPlaneEndpoint.
+                                              - CertificateAuthorityData with the Cluster's CA certificate.
+                                            minProperties: 1
+                                            properties:
+                                              certificateAuthorityData:
+                                                description: |-
+                                                  certificateAuthorityData contains PEM-encoded certificate authority certificates.
+
+                                                  Defaults to the Cluster's CA certificate if empty.
+                                                format: byte
+                                                maxLength: 51200
+                                                minLength: 1
+                                                type: string
+                                              insecureSkipTLSVerify:
+                                                description: insecureSkipTLSVerify
+                                                  skips the validity check for the
+                                                  server's certificate. This will
+                                                  make your HTTPS connections insecure.
+                                                type: boolean
+                                              proxyURL:
+                                                description: |-
+                                                  proxyURL is the URL to the proxy to be used for all requests made by this
+                                                  client. URLs with "http", "https", and "socks5" schemes are supported.  If
+                                                  this configuration is not provided or the empty string, the client
+                                                  attempts to construct a proxy configuration from http_proxy and
+                                                  https_proxy environment variables. If these environment variables are not
+                                                  set, the client does not attempt to proxy requests.
+
+                                                  socks5 proxying does not currently support spdy streaming endpoints (exec,
+                                                  attach, port forward).
+                                                maxLength: 512
+                                                minLength: 1
+                                                type: string
+                                              server:
+                                                description: |-
+                                                  server is the address of the kubernetes cluster (https://hostname:port).
+
+                                                  Defaults to https:// + Cluster.Spec.ControlPlaneEndpoint.
+                                                maxLength: 512
+                                                minLength: 1
+                                                type: string
+                                              tlsServerName:
+                                                description: tlsServerName is used
+                                                  to check server certificate. If
+                                                  TLSServerName is empty, the hostname
+                                                  used to contact the server is used.
+                                                maxLength: 512
+                                                minLength: 1
+                                                type: string
+                                            type: object
+                                          user:
+                                            description: |-
+                                              user contains information that describes identity information.
+                                              This is used to tell the kubernetes cluster who you are.
+                                            minProperties: 1
+                                            properties:
+                                              authProvider:
+                                                description: authProvider specifies
+                                                  a custom authentication plugin for
+                                                  the kubernetes cluster.
+                                                properties:
+                                                  config:
+                                                    additionalProperties:
+                                                      type: string
+                                                    description: config holds the
+                                                      parameters for the authentication
+                                                      plugin.
+                                                    type: object
+                                                  name:
+                                                    description: name is the name
+                                                      of the authentication plugin.
+                                                    maxLength: 256
+                                                    minLength: 1
+                                                    type: string
+                                                required:
+                                                - name
+                                                type: object
+                                              exec:
+                                                description: exec specifies a custom
+                                                  exec-based authentication plugin
+                                                  for the kubernetes cluster.
+                                                properties:
+                                                  apiVersion:
+                                                    description: |-
+                                                      apiVersion is preferred input version of the ExecInfo. The returned ExecCredentials MUST use
+                                                      the same encoding version as the input.
+                                                      Defaults to client.authentication.k8s.io/v1 if not set.
+                                                    maxLength: 512
+                                                    minLength: 1
+                                                    type: string
+                                                  args:
+                                                    description: args is the arguments
+                                                      to pass to the command when
+                                                      executing it.
+                                                    items:
+                                                      maxLength: 512
+                                                      minLength: 1
+                                                      type: string
+                                                    maxItems: 100
+                                                    minItems: 1
+                                                    type: array
+                                                    x-kubernetes-list-type: atomic
+                                                  command:
+                                                    description: command to execute.
+                                                    maxLength: 1024
+                                                    minLength: 1
+                                                    type: string
+                                                  env:
+                                                    description: |-
+                                                      env defines additional environment variables to expose to the process. These
+                                                      are unioned with the host's environment, as well as variables client-go uses
+                                                      to pass argument to the plugin.
+                                                    items:
+                                                      description: |-
+                                                        KubeConfigAuthExecEnv is used for setting environment variables when executing an exec-based
+                                                        credential plugin.
+                                                      properties:
+                                                        name:
+                                                          description: name of the
+                                                            environment variable
+                                                          maxLength: 512
+                                                          minLength: 1
+                                                          type: string
+                                                        value:
+                                                          description: value of the
+                                                            environment variable
+                                                          maxLength: 512
+                                                          minLength: 1
+                                                          type: string
+                                                      required:
+                                                      - name
+                                                      - value
+                                                      type: object
+                                                    maxItems: 100
+                                                    minItems: 1
+                                                    type: array
+                                                    x-kubernetes-list-type: atomic
+                                                  provideClusterInfo:
+                                                    description: |-
+                                                      provideClusterInfo determines whether or not to provide cluster information,
+                                                      which could potentially contain very large CA data, to this exec plugin as a
+                                                      part of the KUBERNETES_EXEC_INFO environment variable. By default, it is set
+                                                      to false. Package k8s.io/client-go/tools/auth/exec provides helper methods for
+                                                      reading this environment variable.
+                                                    type: boolean
+                                                required:
+                                                - command
+                                                type: object
+                                            type: object
+                                        required:
+                                        - user
+                                        type: object
+                                      kubeConfigPath:
+                                        description: kubeConfigPath is used to specify
+                                          the actual file path or URL to the kubeconfig
+                                          file from which to load cluster information
+                                        maxLength: 512
+                                        minLength: 1
+                                        type: string
+                                    required:
+                                    - kubeConfigPath
+                                    type: object
+                                  tlsBootstrapToken:
+                                    description: |-
+                                      tlsBootstrapToken is a token used for TLS bootstrapping.
+                                      If .BootstrapToken is set, this field is defaulted to .BootstrapToken.Token, but can be overridden.
+                                      If .File is set, this field **must be set** in case the KubeConfigFile does not contain any other authentication information
+                                    maxLength: 512
+                                    minLength: 1
+                                    type: string
+                                type: object
+                              nodeRegistration:
+                                description: |-
+                                  nodeRegistration holds fields that relate to registering the new control-plane node to the cluster.
+                                  When used in the context of control plane nodes, NodeRegistration should remain consistent
+                                  across both InitConfiguration and JoinConfiguration
+                                minProperties: 1
+                                properties:
+                                  criSocket:
+                                    description: criSocket is used to retrieve container
+                                      runtime info. This information will be annotated
+                                      to the Node API object, for later re-use
+                                    maxLength: 512
+                                    minLength: 1
+                                    type: string
+                                  ignorePreflightErrors:
+                                    description: |-
+                                      ignorePreflightErrors provides a slice of pre-flight errors to be ignored when the current node is registered, e.g. 'IsPrivilegedUser,Swap'.
+                                      Value 'all' ignores errors from all checks.
+                                    items:
+                                      maxLength: 512
+                                      minLength: 1
+                                      type: string
+                                    maxItems: 50
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  imagePullPolicy:
+                                    description: |-
+                                      imagePullPolicy specifies the policy for image pulling
+                                      during kubeadm "init" and "join" operations. The value of
+                                      this field must be one of "Always", "IfNotPresent" or
+                                      "Never". Defaults to "IfNotPresent" if not set.
+                                    enum:
+                                    - Always
+                                    - IfNotPresent
+                                    - Never
+                                    type: string
+                                  imagePullSerial:
+                                    description: |-
+                                      imagePullSerial specifies if image pulling performed by kubeadm must be done serially or in parallel.
+                                      This option takes effect only on Kubernetes >=1.31.0.
+                                      Default: true (defaulted in kubeadm)
+                                    type: boolean
+                                  kubeletExtraArgs:
+                                    description: |-
+                                      kubeletExtraArgs is a list of args to pass to kubelet.
+                                      The arg name must match the command line flag name except without leading dash(es).
+                                      Extra arguments will override existing default arguments set by kubeadm.
+                                    items:
+                                      description: Arg represents an argument with
+                                        a name and a value.
+                                      properties:
+                                        name:
+                                          description: name is the Name of the extraArg.
+                                          maxLength: 256
+                                          minLength: 1
+                                          type: string
+                                        value:
+                                          description: value is the Value of the extraArg.
+                                          maxLength: 1024
+                                          minLength: 0
+                                          type: string
+                                      required:
+                                      - name
+                                      - value
+                                      type: object
+                                    maxItems: 100
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    - value
+                                    x-kubernetes-list-type: map
+                                    x-kubernetes-validations:
+                                    - message: kubeletExtraArgs name must be unique
+                                      rule: self.all(x, self.exists_one(y, x.name
+                                        == y.name))
+                                  name:
+                                    description: |-
+                                      name is the `.Metadata.Name` field of the Node API object that will be created in this `kubeadm init` or `kubeadm join` operation.
+                                      This field is also used in the CommonName field of the kubelet's client certificate to the API server.
+                                      Defaults to the hostname of the node if not provided.
+                                    maxLength: 253
+                                    minLength: 1
+                                    type: string
+                                  taints:
+                                    description: |-
+                                      taints specifies the taints the Node API object should be registered with. If this field is unset, i.e. nil, in the `kubeadm init` process
+                                      it will be defaulted to []v1.Taint{'node-role.kubernetes.io/master=""'}. If you don't want to taint your control-plane node, set this field to an
+                                      empty slice, i.e. `taints: []` in the YAML file. This field is solely used for Node registration.
+                                    items:
+                                      description: |-
+                                        The node this Taint is attached to has the "effect" on
+                                        any pod that does not tolerate the Taint.
+                                      properties:
+                                        effect:
+                                          description: |-
+                                            Required. The effect of the taint on pods
+                                            that do not tolerate the taint.
+                                            Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                                          type: string
+                                        key:
+                                          description: Required. The taint key to
+                                            be applied to a node.
+                                          type: string
+                                        timeAdded:
+                                          description: TimeAdded represents the time
+                                            at which the taint was added.
+                                          format: date-time
+                                          type: string
+                                        value:
+                                          description: The taint value corresponding
+                                            to the taint key.
+                                          type: string
+                                      required:
+                                      - effect
+                                      - key
+                                      type: object
+                                    maxItems: 100
+                                    minItems: 0
+                                    type: array
+                                type: object
+                              patches:
+                                description: |-
+                                  patches contains options related to applying patches to components deployed by kubeadm during
+                                  "kubeadm join". The minimum kubernetes version needed to support Patches is v1.22
+                                minProperties: 1
+                                properties:
+                                  directory:
+                                    description: |-
+                                      directory is a path to a directory that contains files named "target[suffix][+patchtype].extension".
+                                      For example, "kube-apiserver0+merge.yaml" or just "etcd.json". "target" can be one of
+                                      "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd". "patchtype" can be one
+                                      of "strategic" "merge" or "json" and they match the patch formats supported by kubectl.
+                                      The default "patchtype" is "strategic". "extension" must be either "json" or "yaml".
+                                      "suffix" is an optional string that can be used to determine which patches are applied
+                                      first alpha-numerically.
+                                      These files can be written into the target directory via KubeadmConfig.Files which
+                                      specifies additional files to be created on the machine, either with content inline or
+                                      by referencing a secret.
+                                    maxLength: 512
+                                    minLength: 1
+                                    type: string
+                                type: object
+                              skipPhases:
+                                description: |-
+                                  skipPhases is a list of phases to skip during command execution.
+                                  The list of phases can be obtained with the "kubeadm init --help" command.
+                                  This option takes effect only on Kubernetes >=1.22.0.
+                                items:
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                maxItems: 50
+                                minItems: 1
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              timeouts:
+                                description: timeouts holds various timeouts that
+                                  apply to kubeadm commands.
+                                minProperties: 1
+                                properties:
+                                  controlPlaneComponentHealthCheckSeconds:
+                                    description: |-
+                                      controlPlaneComponentHealthCheckSeconds is the amount of time to wait for a control plane
+                                      component, such as the API server, to be healthy during "kubeadm init" and "kubeadm join".
+                                      If not set, it defaults to 4m (240s).
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  discoverySeconds:
+                                    description: |-
+                                      discoverySeconds is the amount of time to wait for kubeadm to validate the API server identity
+                                      for a joining node.
+                                      If not set, it defaults to 5m (300s).
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  etcdAPICallSeconds:
+                                    description: |-
+                                      etcdAPICallSeconds is the amount of time to wait for the kubeadm etcd client to complete a request to
+                                      the etcd cluster.
+                                      If not set, it defaults to 2m (120s).
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  kubeletHealthCheckSeconds:
+                                    description: |-
+                                      kubeletHealthCheckSeconds is the amount of time to wait for the kubelet to be healthy
+                                      during "kubeadm init" and "kubeadm join".
+                                      If not set, it defaults to 4m (240s).
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  kubernetesAPICallSeconds:
+                                    description: |-
+                                      kubernetesAPICallSeconds is the amount of time to wait for the kubeadm client to complete a request to
+                                      the API server. This applies to all types of methods (GET, POST, etc).
+                                      If not set, it defaults to 1m (60s).
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  tlsBootstrapSeconds:
+                                    description: |-
+                                      tlsBootstrapSeconds is the amount of time to wait for the kubelet to complete TLS bootstrap
+                                      for a joining node.
+                                      If not set, it defaults to 5m (300s).
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                type: object
+                            type: object
                         type: object
                       kubernetesVersion:
                         description: KubernetesVersion specifies the Kubernetes version

@@ -143,7 +143,42 @@ type TemplateData struct {
 	// management-cluster contact is rendered. Resolved by the controller from a
 	// ManagementEndpointResolver; see internal/controllers/bootstrap/CLAUDE.md.
 	ManagementEndpoint *ManagementEndpoint
+	// Kubeadm, when non-nil, carries the pre-marshalled kubeadm worker-join inputs
+	// (ADR 0010 P1). It is set only for a kubeadm worker render; the kubeadm
+	// template writes JoinConfiguration and ProviderIDPatch verbatim as YAML block
+	// scalars and runs `kubeadm join` from a oneshot unit. Keeping it a plain string
+	// struct (not CAPI kubeadm types) preserves internal/bootstrap's
+	// CAPI-type-unaware contract: the controller marshals the CAPI JoinConfiguration
+	// with the version-aware marshaller and hands the rendered YAML in here.
+	Kubeadm *KubeadmTemplateData
 }
+
+// KubeadmTemplateData is the renderer-local, CAPI-type-free view of a kubeadm
+// worker join (ADR 0010 P1). Every field is already a rendered string: the
+// controller owns the CAPI types and the version-aware marshaller.
+//
+// Neither JoinConfiguration nor ProviderIDPatch is secret-free by construction —
+// JoinConfiguration carries the bootstrap-token discovery material — so, like the
+// rest of the rendered cloud-config, this struct must never be logged (root rule
+// 2). It is written to the node as a YAML block scalar, never through a shell
+// context, and validateTemplateData rejects a "{{" in either field as a
+// last-line defence behind the webhook.
+type KubeadmTemplateData struct {
+	// JoinConfiguration is the version-marshalled kubeadm JoinConfiguration YAML,
+	// written to /etc/kubernetes and passed to `kubeadm join --config`.
+	JoinConfiguration string
+	// ProviderIDPatch is the kubeadm kubeletconfiguration patch YAML that sets the
+	// Node providerID, written into the kubeadm patches directory. Empty when the
+	// infrastructure provider owns the providerID (e.g. Metal3) or it is discovered
+	// on-node.
+	ProviderIDPatch string
+	// KubernetesVersion is the exact Kubernetes version the node must run
+	// (Machine.spec.version). The join unit refuses on a `kubeadm version` mismatch.
+	KubernetesVersion string
+}
+
+// HasKubeadm reports whether this render carries kubeadm worker-join inputs.
+func (d TemplateData) HasKubeadm() bool { return d.Kubeadm != nil }
 
 // ManagementEndpoint bundles the values the rendered cloud-config needs
 // to push the workload kubeconfig back to the management cluster without SSH:
@@ -298,6 +333,17 @@ var distributionTemplates = map[string]templateSet{
 		kubeVirt:         "templates/k3s_kairos_cloud_config_capk.yaml.tmpl",
 		providerIDMarker: "kairos-k3s-post-bootstrap.service",
 	},
+	// kubeadm (ADR 0010 P1) is worker-only and the same cloud-config works on
+	// every infrastructure provider — the providerID is applied through a kubeadm
+	// patch, not a per-infra template branch — so generic and kubeVirt point at one
+	// template. Render refuses a kubeadm control-plane render (the P1 seam has no
+	// control-plane hook).
+	bootstrapv1beta2.DistributionKubeadm: {
+		name:             "kubeadm_kairos_cloud_config",
+		generic:          "templates/kubeadm_kairos_cloud_config.yaml.tmpl",
+		kubeVirt:         "templates/kubeadm_kairos_cloud_config.yaml.tmpl",
+		providerIDMarker: "kairos-kubeadm-post-bootstrap.service",
+	},
 }
 
 // Render renders the Kairos cloud-config for distribution. It is the only place a
@@ -308,6 +354,14 @@ func Render(distribution string, data TemplateData) (string, error) {
 	ts, ok := distributionTemplates[distribution]
 	if !ok {
 		return "", fmt.Errorf("unsupported distribution: %s", distribution)
+	}
+	// Render-time refusal of a kubeadm control-plane config (ADR 0010 P1 item 5).
+	// The P1 distribution seam resolves WORKER join material only; it has no
+	// control-plane hook, and a kubeadm KairosControlPlane is deferred to P2. The
+	// webhook already refuses role=control-plane for kubeadm, but a direct render
+	// call bypasses admission, so this is the renderer's last-line defence.
+	if distribution == bootstrapv1beta2.DistributionKubeadm && data.Role == "control-plane" {
+		return "", fmt.Errorf("kubeadm is not supported for control-plane nodes in this release (worker-only, ADR 0010 P1)")
 	}
 	templatePath := ts.generic
 	if data.IsKubeVirt {

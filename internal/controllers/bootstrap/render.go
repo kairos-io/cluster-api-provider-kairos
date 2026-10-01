@@ -65,6 +65,37 @@ var bootstrapDistributions = map[string]bootstrapDistribution{
 		},
 		builtinJoin: func(c client.Reader) JoinMaterialSource { return k3sJoinSource{c: c} },
 	},
+	// kubeadm (ADR 0010 P1): builtinJoin is nil — the worker JoinMaterialSource
+	// needs dependencies only main.go has (clustercache, an uncached reader, the
+	// control-plane GroupKind allowlist), so it is injected via JoinSources and
+	// joinSourceFor hard-fails if that wiring is missing (N2). fillTemplateData
+	// copies the minted join material from the source and builds the providerID
+	// kubeadm patch from the resolved td.ProviderID.
+	bootstrapv1beta2.DistributionKubeadm: {
+		fillTemplateData: func(td *bootstrap.TemplateData, _ *bootstrapv1beta2.KairosConfig, _ string, w WorkerJoinMaterial) {
+			if w.Kubeadm == nil {
+				return
+			}
+			td.Kubeadm = &bootstrap.KubeadmTemplateData{
+				JoinConfiguration: w.Kubeadm.JoinConfiguration,
+				KubernetesVersion: w.Kubeadm.KubernetesVersion,
+				ProviderIDPatch:   kubeadmProviderIDPatch(td.ProviderID),
+			}
+		},
+		builtinJoin: nil,
+	},
+}
+
+// kubeadmProviderIDPatch returns a kubeadm kubeletconfiguration merge-patch that
+// sets the Node providerID (ADR 0010 P1 item 4), or "" when no providerID is known
+// (the infra provider owns it, e.g. Metal3, or it is discovered on-node). providerID
+// is regex-validated (providerIDPattern) before render, so it contains no
+// YAML-special character that double-quoting cannot handle.
+func kubeadmProviderIDPatch(providerID string) string {
+	if providerID == "" {
+		return ""
+	}
+	return fmt.Sprintf("providerID: %q\n", providerID)
 }
 
 // renderCloudConfig is the merged generator for every distribution. It keeps

@@ -1,0 +1,152 @@
+#cloud-config
+
+{{- /*
+kubeadm WORKER join template (ADR 0010 P1). Worker-only: a kubeadm control-plane
+render is refused by Render() before this template is reached.
+
+Template inputs (from Go):
+
+  .Role              string   // always "worker" here
+  .Hostname          string   // explicit hostname (optional)
+  .HostnamePrefix    string   // e.g. "metal-"
+  .UserName          string   // e.g. "kairos"
+  .UserPassword      string   // optional
+  .UserGroups        []string
+  .GitHubUser        string   // optional
+  .SSHPublicKey      string   // optional
+  .DNSServers        []string // optional
+  .Install           *InstallConfig // optional
+  .ProviderID        string   // providerID for the Node (validated); "" suppresses the patch
+  .Kubeadm           *KubeadmTemplateData // join config + providerID patch + version
+
+The kubeadm JoinConfiguration and the providerID patch are controller-marshalled
+YAML written verbatim as block scalars — never through quote/shquote, never into a
+shell context. All user-controlled scalar fields go through quote.
+*/ -}}
+
+{{- if .Hostname }}
+hostname: {{ .Hostname | quote }}
+{{- else if .HostnamePrefix }}
+hostname: {{ printf "%s{{ trunc 4 .MachineID }}" .HostnamePrefix | quote }}
+{{- end }}
+
+{{- if .Install }}
+install:
+  auto: {{ .Install.Auto }}
+  device: {{ .Install.Device | quote }}
+  reboot: {{ .Install.Reboot }}
+{{- end }}
+
+users:
+- name: {{ .UserName | quote }}
+  {{- if .UserPassword }}
+  passwd: {{ .UserPassword | quote }}
+  {{- end }}
+  groups:
+  {{- range .UserGroups }}
+    - {{ . | quote }}
+  {{- end }}
+  {{- if or .GitHubUser .SSHPublicKey }}
+  ssh_authorized_keys:
+  {{- if .GitHubUser }}
+    - {{ printf "github:%s" .GitHubUser | quote }}
+  {{- end }}
+  {{- if .SSHPublicKey }}
+    - {{ .SSHPublicKey | quote }}
+  {{- end }}
+  {{- end }}
+
+{{- if .Files }}
+write_files:
+{{ toYaml .Files | indent 2 }}
+{{- end }}
+
+{{- if .Kubeadm }}
+{{- if not .Files }}
+write_files:
+{{- end }}
+  # kubeadm JoinConfiguration — controller-marshalled with the CAPI version-aware
+  # marshaller. Passed to `kubeadm join --config`. 0600: it carries the minted
+  # bootstrap token's discovery material.
+  - path: /etc/kubernetes/kairos-kubeadm-join.yaml
+    permissions: "0600"
+    owner: root:root
+    content: |
+{{ .Kubeadm.JoinConfiguration | indent 6 }}
+  {{- if .Kubeadm.ProviderIDPatch }}
+  # kubeadm patch: sets the kubelet providerID so the Node registers with the
+  # infrastructure provider's providerID (ADR 0010 P1 item 4). Applied via
+  # `kubeadm join --patches`, so no YAML tool is needed on the node.
+  - path: /etc/kubernetes/kairos-patches/kubeletconfiguration0+merge.yaml
+    permissions: "0600"
+    owner: root:root
+    content: |
+{{ .Kubeadm.ProviderIDPatch | indent 6 }}
+  {{- end }}
+  - path: /usr/local/bin/kairos-kubeadm-post-bootstrap.sh
+    permissions: "0700"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Idempotence: a joined node never re-runs kubeadm join on reboot. kubeadm's
+      # own preflight (the kubelet.conf FileAvailable check) is the second line.
+      if [ -f /etc/kubernetes/kubelet.conf ]; then
+        echo "kubelet.conf present; node already joined, skipping kubeadm join"
+        exit 0
+      fi
+
+      {{- if .Kubeadm.KubernetesVersion }}
+      # Exact-version image contract (ADR 0010): the image must ship kubeadm at the
+      # cluster's Kubernetes version down to the patch. Refuse on a mismatch rather
+      # than join a node running the wrong kubelet/kubeadm.
+      WANT_VERSION={{ .Kubeadm.KubernetesVersion | shquote }}
+      HAVE_VERSION="$(kubeadm version -o short 2>/dev/null || true)"
+      if [ -n "${WANT_VERSION}" ] && [ "${HAVE_VERSION}" != "${WANT_VERSION}" ]; then
+        echo "kubeadm version mismatch: image has '${HAVE_VERSION}', cluster needs '${WANT_VERSION}'" >&2
+        exit 1
+      fi
+      {{- end }}
+
+      JOIN_ARGS=(--config /etc/kubernetes/kairos-kubeadm-join.yaml)
+      {{- if .Kubeadm.ProviderIDPatch }}
+      JOIN_ARGS+=(--patches /etc/kubernetes/kairos-patches)
+      {{- end }}
+      kubeadm join "${JOIN_ARGS[@]}"
+      echo "kubeadm worker join completed successfully"
+  - path: /etc/systemd/system/kairos-kubeadm-post-bootstrap.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Kairos kubeadm worker post-bootstrap join
+      After=network-online.target containerd.service
+      Wants=network-online.target
+      ConditionPathExists=!/etc/kubernetes/kubelet.conf
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-kubeadm-post-bootstrap.sh
+      [Install]
+      WantedBy=multi-user.target
+{{- end }}
+
+stages:
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    {{- if .DNSServers }}
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+        {{- range .DNSServers }}
+          - {{ . | quote }}
+        {{- end }}
+        path: "/etc/resolv.conf"
+    {{- end }}
+
+runcmd:
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-kubeadm-post-bootstrap.service || true

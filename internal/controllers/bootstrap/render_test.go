@@ -26,7 +26,9 @@ import (
 
 // TestBootstrapDistributionsTableAgrees asserts the controller distribution table
 // has exactly the api-supported distributions, each with a non-nil
-// fillTemplateData and builtinJoin — no missing rows, no extra keys.
+// fillTemplateData — no missing rows, no extra keys. builtinJoin is non-nil for
+// every distribution EXCEPT kubeadm, whose worker JoinMaterialSource needs
+// dependencies only main.go has and is injected via JoinSources (ADR 0010 P1 N2).
 func TestBootstrapDistributionsTableAgrees(t *testing.T) {
 	g := NewWithT(t)
 	supported := bootstrapv1beta2.SupportedDistributions()
@@ -35,10 +37,33 @@ func TestBootstrapDistributionsTableAgrees(t *testing.T) {
 		row, ok := bootstrapDistributions[d]
 		g.Expect(ok).To(BeTrue(), "controller table missing a row for %q", d)
 		g.Expect(row.fillTemplateData).NotTo(BeNil(), "row %q has nil fillTemplateData", d)
-		g.Expect(row.builtinJoin).NotTo(BeNil(), "row %q has nil builtinJoin", d)
+		if d == bootstrapv1beta2.DistributionKubeadm {
+			g.Expect(row.builtinJoin).To(BeNil(), "kubeadm must have a nil builtinJoin (injected via JoinSources)")
+		} else {
+			g.Expect(row.builtinJoin).NotTo(BeNil(), "row %q has nil builtinJoin", d)
+		}
 	}
 	for k := range bootstrapDistributions {
 		g.Expect(bootstrapv1beta2.IsSupportedDistribution(k)).To(BeTrue(), "controller table has extra key %q", k)
+	}
+}
+
+// TestJoinSourceFor_KubeadmHardFails pins N2: a kubeadm worker with no injected
+// JoinSources entry hard-fails instead of silently falling back to the k0s
+// built-in join source.
+func TestJoinSourceFor_KubeadmHardFails(t *testing.T) {
+	g := NewWithT(t)
+	r := &KairosConfigReconciler{} // no JoinSources wired
+	src, err := r.joinSourceFor(bootstrapv1beta2.DistributionKubeadm)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(src).To(BeNil())
+	g.Expect(err.Error()).To(ContainSubstring("no worker join source configured for distribution \"kubeadm\""))
+
+	// k0s/k3s still resolve to their built-ins with no JoinSources.
+	for _, d := range []string{bootstrapv1beta2.DistributionK0s, bootstrapv1beta2.DistributionK3s} {
+		s, err := r.joinSourceFor(d)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(s).NotTo(BeNil())
 	}
 }
 
