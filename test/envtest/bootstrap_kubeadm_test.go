@@ -71,7 +71,12 @@ var kubeadmCPGVK = schema.GroupVersionKind{Group: kubeadmCPGroup, Version: "v1be
 func kubeadmControlPlaneCRD() *apiextensionsv1.CustomResourceDefinition {
 	preserve := true
 	return &apiextensionsv1.CustomResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: "testcontrolplanes." + kubeadmCPGroup},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "testcontrolplanes." + kubeadmCPGroup,
+			// CAPI contract label so external.GetObjectFromContractVersionedRef
+			// resolves this kind's served version (the production trust-check resolver).
+			Labels: map[string]string{"cluster.x-k8s.io/v1beta2": "v1beta2"},
+		},
 		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
 			Group: kubeadmCPGroup,
 			Names: apiextensionsv1.CustomResourceDefinitionNames{

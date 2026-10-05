@@ -209,6 +209,16 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 		extraKinds:     extraKinds,
 		tokenTTL:       defaultKubeadmTokenTTL,
 		now:            func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
+		// Stub the contract resolver: read the fixture CP (stored at v1beta2) from the
+		// fake mgmt client, so unit tests need no installed CRD / contract labels.
+		resolveControlPlane: func(ctx context.Context, ref clusterv1.ContractVersionedObjectReference, namespace string) (*unstructured.Unstructured, error) {
+			u := &unstructured.Unstructured{}
+			u.SetGroupVersionKind(schema.GroupVersionKind{Group: ref.APIGroup, Version: "v1beta2", Kind: ref.Kind})
+			if err := mgmt.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, u); err != nil {
+				return nil, err
+			}
+			return u, nil
+		},
 	}
 
 	machine := &clusterv1.Machine{

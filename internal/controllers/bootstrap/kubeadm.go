@@ -40,6 +40,7 @@ import (
 	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	kubeadmtypes "sigs.k8s.io/cluster-api/bootstrap/kubeadm/types"
+	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -133,6 +134,12 @@ type kubeadmJoinSource struct {
 	tokenTTL time.Duration
 	// now is the clock (injectable for tests).
 	now func() time.Time
+	// resolveControlPlane resolves a ContractVersionedObjectReference to the live
+	// control-plane object at its CONTRACT-advertised API version (so Kamaji's
+	// v1alpha1 KamajiControlPlane resolves correctly, not only v1beta2 kinds). Nil
+	// means the production resolver, external.GetObjectFromContractVersionedRef over
+	// s.mgmt; unit tests inject a stub so they need no CRD/contract labels.
+	resolveControlPlane func(ctx context.Context, ref clusterv1.ContractVersionedObjectReference, namespace string) (*unstructured.Unstructured, error)
 }
 
 var (
@@ -268,21 +275,13 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			cpRef.APIGroup, cpRef.Kind)
 	}
 
-	// Resolve the control-plane object to get its UID (the trust anchor).
-	cp := &unstructured.Unstructured{}
-	cp.SetGroupVersionKind(schema.GroupVersionKind{Group: cpRef.APIGroup, Kind: cpRef.Kind, Version: "v1beta2"})
-	cpKey := client.ObjectKey{Namespace: cluster.Namespace, Name: cpRef.Name}
-	if err := s.mgmt.Get(ctx, cpKey, cp); err != nil {
-		if apierrors.IsNotFound(err) {
-			return zero, newNotReady("WaitingForControlPlane", "waiting for control-plane object %s/%s", cpRef.Kind, cpRef.Name)
-		}
-		// Try without pinning the version in case the CRD serves a different one.
-		cp = &unstructured.Unstructured{}
-		cp.SetAPIVersion(cpRef.APIGroup + "/v1beta2")
-		cp.SetKind(cpRef.Kind)
-		if gerr := s.mgmt.Get(ctx, cpKey, cp); gerr != nil {
-			return zero, newNotReady("WaitingForControlPlane", "waiting to read control-plane object %s/%s: %v", cpRef.Kind, cpRef.Name, gerr)
-		}
+	// Resolve the control-plane object to get its UID (the trust anchor). The
+	// contract resolver reads the referenced kind's CRD contract label to pick the
+	// served API version, so this works for Kamaji's v1alpha1 KamajiControlPlane as
+	// well as v1beta2 kinds — matching how CAPI core resolves the same ref.
+	cp, err := s.resolveCP(ctx, cpRef, cluster.Namespace)
+	if err != nil {
+		return zero, newNotReady("WaitingForControlPlane", "waiting to resolve control-plane object %s/%s: %v", cpRef.Kind, cpRef.Name, err)
 	}
 	cpUID := cp.GetUID()
 	if cpUID == "" {
@@ -423,11 +422,25 @@ func (s *kubeadmJoinSource) clock() time.Time {
 	return s.now()
 }
 
-// TokenNeedsRefresh implements workerTokenRefresher (ADR 0010 P1 item 7). It reads
-// the token Secret the ID points at in the workload cluster and rotates when the
-// token is gone or past half its TTL — CABPK's shouldRotate, keyed by the stored
-// non-secret ID so we never need the secret half. Transient workload-cluster errors
-// are returned as bootstrapNotReadyError.
+// resolveCP resolves the control-plane object at its contract-advertised API
+// version. Production uses external.GetObjectFromContractVersionedRef; tests inject
+// s.resolveControlPlane so they need no installed CRD / contract labels.
+func (s *kubeadmJoinSource) resolveCP(ctx context.Context, ref clusterv1.ContractVersionedObjectReference, namespace string) (*unstructured.Unstructured, error) {
+	if s.resolveControlPlane != nil {
+		return s.resolveControlPlane(ctx, ref, namespace)
+	}
+	return external.GetObjectFromContractVersionedRef(ctx, s.mgmt, ref, namespace)
+}
+
+// TokenNeedsRefresh implements workerTokenRefresher (ADR 0010 P1 item 7). It is
+// READ-ONLY and is only ever reached AFTER a prior successful WorkerJoin: the
+// reconciler calls it with the non-secret tokenID persisted in status, which is set
+// only once the full trust check passed and a token was minted. It mints nothing and
+// re-verifies no trust itself; the coarse clustercache ClusterFilter still gates the
+// workload client it uses, and the next regeneration re-runs the full trust check. It
+// reads the token Secret the ID points at and rotates when the token is gone or past
+// half its TTL — CABPK's shouldRotate, keyed by the stored ID so we never need the
+// secret half. Transient workload-cluster errors are returned as bootstrapNotReadyError.
 func (s *kubeadmJoinSource) TokenNeedsRefresh(ctx context.Context, req JoinRequest, tokenID string) (bool, error) {
 	if tokenID == "" {
 		// No token on record (never minted, or lost the ID): (re)mint.
