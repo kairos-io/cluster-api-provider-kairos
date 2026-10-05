@@ -45,6 +45,11 @@ jobs:
     - name: Upload coverage
       uses: codecov/codecov-action@v4
       if: always()
+      # A Codecov outage must not decide whether the suite passed. The
+      # action throws out of its own process on a TLS failure, which exits
+      # non-zero whatever fail_ci_if_error says, and this job is the only
+      # unit-test gate the repository has.
+      continue-on-error: true
       with:
         file: ./coverage.out
         flags: unittests
