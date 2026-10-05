@@ -366,7 +366,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			return zero, fmt.Errorf("the %s Secret has an unparseable %q: %v", caKey.Name, clusterCASecretCrtKey, perr)
 		}
 		if !derCertSetsEqual(kubeconfigCADER, caDER) {
-			return zero, fmt.Errorf("the kubeconfig CA does not match the %s Secret's %q: refusing to mint a token (possible planted Secret)",
+			return zero, fmt.Errorf("the kubeconfig CA does not match the %s Secret's %q; inspect the Secret and re-pin if this change is expected",
 				caKey.Name, clusterCASecretCrtKey)
 		}
 	} else if !apierrors.IsNotFound(err) {
