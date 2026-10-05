@@ -130,6 +130,16 @@ type KairosConfigReconciler struct {
 // Service to discover the management endpoint. The control-plane manager owns
 // (creates/updates) that Service.
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// control-plane trust anchors (ADR 0010 P1): the kubeadm worker-join trust check
+// reads the Cluster's control-plane object to verify the <cluster>-kubeconfig's
+// controller-owner UID. Read-only, enumerated kinds — the P1 targets
+// KamajiControlPlane and KubeadmControlPlane plus our own KairosControlPlane. This
+// grant is REQUIRED even on a bootstrap-only (--controllers=bootstrap) Deployment,
+// where the control-plane manager's RBAC is absent; without it the trust-check Get
+// returns Forbidden and no kubeadm worker ever joins. An operator who widens the
+// allowlist via --kubeadm-extra-controlplane-kinds MUST supply RBAC for that group
+// themselves — we cannot grant kinds in groups we do not know at build time.
+//+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes;kubeadmcontrolplanes;kairoscontrolplanes,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 //
