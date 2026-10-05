@@ -372,8 +372,20 @@ func (e *Environment) createOSArtifactCR(ctx context.Context, dynamicClient dyna
 	if goarch != "amd64" && goarch != "arm64" {
 		return fmt.Errorf("OSArtifact: unsupported GOARCH %q (need amd64 or arm64)", goarch)
 	}
+	yaml := osArtifactManifest(goarch)
+	rc, err := e.RESTConfig()
+	if err != nil {
+		return err
+	}
+	return e.ApplyManifestContent(ctx, dynamicClient, rc, []byte(yaml))
+}
+
+// osArtifactManifest renders the OSArtifact the e2e builds its installer ISO
+// from. It is separate from createOSArtifactCR so a test can read the manifest
+// without a cluster.
+func osArtifactManifest(goarch string) string {
 	baseImg := kairosOSArtifactBaseImage(goarch)
-	yaml := fmt.Sprintf(`apiVersion: build.kairos.io/v1alpha2
+	return fmt.Sprintf(`apiVersion: build.kairos.io/v1alpha2
 kind: OSArtifact
 metadata:
   name: %s
@@ -394,7 +406,7 @@ spec:
         restartPolicy: Never
         containers:
         - name: upload-to-nginx
-          image: curlimages/curl:latest
+          image: %s
           command: ["sh", "-ec"]
           args:
             - |
@@ -407,12 +419,7 @@ spec:
           - name: artifacts
             mountPath: /artifacts
             readOnly: true
-`, kairosCloudImageName, baseImg, goarch, kairosOSArtifactDiskMiB, kairosCloudImageName)
-	rc, err := e.RESTConfig()
-	if err != nil {
-		return err
-	}
-	return e.ApplyManifestContent(ctx, dynamicClient, rc, []byte(yaml))
+`, kairosCloudImageName, baseImg, goarch, kairosOSArtifactDiskMiB, kairosCloudImageName, ExporterCurlImage)
 }
 
 func (e *Environment) waitForOSArtifactReady(ctx context.Context, dynamicClient dynamic.Interface) error {

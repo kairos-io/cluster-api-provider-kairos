@@ -47,6 +47,13 @@ const (
 
 	// KairosOperatorGitRef pins kairos-io/kairos-operator for kubectl apply -k (CRDs, controller, nginx).
 	KairosOperatorGitRef = "v0.1.0-beta4"
+
+	// ExporterCurlImage pins the image the OSArtifact exporter Pod runs to
+	// upload the built ISO to the in-cluster nginx. It was `curlimages/curl:latest`,
+	// the one image the e2e pulls from outside the project without a pin, so an
+	// upstream publish could change what CI runs between two identical commits.
+	// The digest is what `latest` resolved to when this was pinned.
+	ExporterCurlImage = "curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777"
 )
 
 // CDIOperatorManifestURL and CDICRManifestURL resolve the pinned CDI manifests.
