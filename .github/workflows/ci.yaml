@@ -49,6 +49,12 @@ jobs:
         file: ./coverage.out
         flags: unittests
         name: codecov-umbrella
+        # Codecov refuses tokenless uploads for a protected branch, so without
+        # this every push to main failed to upload, and each pull request's
+        # patch coverage was measured against the last main commit that had a
+        # report. Pull requests from forks do not receive the secret and keep
+        # uploading tokenless, which Codecov still accepts for them.
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   verify-generate:
     runs-on: ubuntu-latest
