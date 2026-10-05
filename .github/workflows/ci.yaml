@@ -24,7 +24,7 @@ jobs:
         go-version: '1.26.4'
 
     - name: Cache Go modules
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cache/go-build
@@ -67,7 +67,7 @@ jobs:
         go-version: '1.26.4'
 
     - name: Cache Go modules
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cache/go-build
@@ -104,7 +104,7 @@ jobs:
         go-version: '1.26.4'
 
     - name: Cache Go modules
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cache/go-build
@@ -149,7 +149,7 @@ jobs:
         setup-envtest use -p path 1.36.2
 
     - name: Cache Go modules
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cache/go-build
@@ -180,7 +180,7 @@ jobs:
         go-version: '1.26.4'
 
     - name: Cache Go modules
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cache/go-build
@@ -190,7 +190,7 @@ jobs:
           ${{ runner.os }}-go-1.26.0-
 
     - name: Cache pinned e2e CLIs (kubectl, kind, clusterctl, virtctl)
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: .e2e-bin
         key: ${{ runner.os }}-e2e-bin-${{ hashFiles('internal/kubevirtenv/binaries.go') }}
@@ -222,7 +222,7 @@ jobs:
         go-version: '1.26.4'
 
     - name: Cache Go modules
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cache/go-build
