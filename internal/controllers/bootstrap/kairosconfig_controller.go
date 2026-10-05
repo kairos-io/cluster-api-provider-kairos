@@ -85,6 +85,9 @@ type KairosConfigReconciler struct {
 	// envtest, unit tests) need no change. P1 wires a "kubeadm" source here, which
 	// needs dependencies only main.go has (cached/uncached readers, clustercache).
 	JoinSources map[string]JoinMaterialSource
+	// Now is an injectable clock used by the kubeadm token-refresh hard cap
+	// (ADR 0010 P1 item 7). Nil means time.Now; tests set it to drive the cap.
+	Now func() time.Time
 }
 
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -434,6 +437,30 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 				}
 			}
 
+			// kubeadm worker bootstrap-token refresh (ADR 0010 P1 item 7), outside the
+			// render-once short-circuit below: while the Machine has no nodeRef, keep
+			// the token fresh by regenerating the bootstrap data before it expires.
+			switch decision, derr := r.decideKubeadmTokenRefresh(ctx, log, kairosConfig, machine, cluster); {
+			case derr != nil:
+				var notReady *bootstrapNotReadyError
+				if errors.As(derr, &notReady) {
+					log.Info("Waiting to check the kubeadm bootstrap token", "reason", notReady.Reason())
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+				return ctrl.Result{}, fmt.Errorf("kubeadm bootstrap token refresh check: %w", derr)
+			case decision == kubeadmRefreshRegenerate:
+				log.Info("kubeadm bootstrap token is due for refresh; regenerating bootstrap data",
+					"secret", *kairosConfig.Status.DataSecretName)
+				needsRegeneration = true
+			case decision == kubeadmRefreshCapped:
+				const msg = "kubeadm bootstrap token refresh cap exceeded: the node has not registered in time; " +
+					"a MachineHealthCheck (nodeStartupTimeout) is expected to replace this Machine"
+				log.Info(msg, "secret", *kairosConfig.Status.DataSecretName)
+				conditions.MarkFalse(kairosConfig, bootstrapv1beta2.BootstrapReadyCondition,
+					bootstrapv1beta2.BootstrapTokenRefreshCapExceededReason, clusterv1.ConditionSeverityWarning, "%s", msg)
+				return ctrl.Result{RequeueAfter: kubeadmTokenRefreshCapRequeue}, nil
+			}
+
 			if needsRegeneration {
 				// Keep the existing secret name and regenerate its contents.
 				// The Machine's bootstrap dataSecretName is immutable, so we must not change it.
@@ -468,7 +495,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	}
 
 	// Generate Kairos cloud-config
-	cloudConfig, err := r.generateCloudConfig(ctx, log, kairosConfig, machine, cluster)
+	cloudConfig, joinMaterial, err := r.generateCloudConfigM(ctx, log, kairosConfig, machine, cluster)
 	if err != nil {
 		if errors.Is(err, errLBEndpointNotReady) {
 			log.Info("Waiting for control plane LoadBalancer endpoint before generating cloud-config")
@@ -476,6 +503,14 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		}
 		if errors.Is(err, errTokenNotReady) {
 			log.Info("Waiting for join token secret before generating cloud-config")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		// Typed not-ready signal from a JoinMaterialSource (ADR 0010 P1 item 6):
+		// transient workload-cluster/clustercache/API conditions on the kubeadm
+		// path. Requeue and leave conditions alone — do NOT park the KairosConfig.
+		var notReady *bootstrapNotReadyError
+		if errors.As(err, &notReady) {
+			log.Info("Waiting on join material before generating cloud-config", "reason", notReady.Reason())
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to generate cloud-config: %w", err)
@@ -581,6 +616,12 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 
 	// Update status with dataSecretName
 	kairosConfig.Status.DataSecretName = &secretName
+
+	// Persist the NON-SECRET kubeadm bootstrap token ID for audit (ADR 0010 P1
+	// item 8). The secret half lives only in the rendered data Secret, never here.
+	if joinMaterial.Kubeadm != nil {
+		kairosConfig.Status.BootstrapTokenID = joinMaterial.Kubeadm.TokenID
+	}
 
 	// Mark secret as Ready - providerID will be included if available, otherwise it will be regenerated later
 	// We allow the secret to be Ready even without providerID initially, so VM can be created
@@ -921,6 +962,83 @@ func resolveRole(kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1
 }
 
 func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (string, error) {
+	cc, _, err := r.generateCloudConfigM(ctx, log, kairosConfig, machine, cluster)
+	return cc, err
+}
+
+// kubeadmTokenRefreshCapRequeue is the slow requeue cadence after the kubeadm
+// token-refresh hard cap is exceeded (ADR 0010 P1 item 7): keep the condition
+// surfaced without re-minting or hammering the workqueue.
+const kubeadmTokenRefreshCapRequeue = 10 * time.Minute
+
+// kubeadmRefreshDecision is the outcome of decideKubeadmTokenRefresh.
+type kubeadmRefreshDecision int
+
+const (
+	// kubeadmRefreshNone: no refresh applies (not a kubeadm worker, the node has
+	// already registered, or the source cannot refresh).
+	kubeadmRefreshNone kubeadmRefreshDecision = iota
+	// kubeadmRefreshRegenerate: re-mint now by regenerating the bootstrap data.
+	kubeadmRefreshRegenerate
+	// kubeadmRefreshCapped: the hard cap elapsed; stop re-minting and surface a condition.
+	kubeadmRefreshCapped
+)
+
+// decideKubeadmTokenRefresh decides whether a kubeadm worker's bootstrap token
+// should be refreshed (ADR 0010 P1 item 7). It applies only to a kubeadm worker
+// whose Machine has not yet registered a Node, and only when the join source
+// implements workerTokenRefresher. A transient workload-cluster check returns a
+// bootstrapNotReadyError (the caller requeues). It never logs the token.
+func (r *KairosConfigReconciler) decideKubeadmTokenRefresh(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (kubeadmRefreshDecision, error) {
+	if bootstrapv1beta2.EffectiveDistribution(kairosConfig.Spec.Distribution) != bootstrapv1beta2.DistributionKubeadm {
+		return kubeadmRefreshNone, nil
+	}
+	if resolveRole(kairosConfig, machine) != "worker" {
+		return kubeadmRefreshNone, nil
+	}
+	// Stop refreshing once the node has registered (nodeRef set) — the token is no
+	// longer needed. Also skip if there is no Machine to anchor the cap on.
+	if machine == nil || machine.Status.NodeRef.Name != "" {
+		return kubeadmRefreshNone, nil
+	}
+	src, err := r.joinSourceFor(bootstrapv1beta2.DistributionKubeadm)
+	if err != nil {
+		return kubeadmRefreshNone, err // terminal wiring error (N2)
+	}
+	refresher, ok := src.(workerTokenRefresher)
+	if !ok {
+		return kubeadmRefreshNone, nil
+	}
+	// Hard cap: stop re-minting once the Machine has waited too long for a Node.
+	if !machine.CreationTimestamp.IsZero() && r.now().Sub(machine.CreationTimestamp.Time) > kubeadmTokenRefreshCap {
+		return kubeadmRefreshCapped, nil
+	}
+	need, err := refresher.TokenNeedsRefresh(ctx,
+		JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster},
+		kairosConfig.Status.BootstrapTokenID)
+	if err != nil {
+		return kubeadmRefreshNone, err // bootstrapNotReadyError (transient) or terminal
+	}
+	if need {
+		log.V(4).Info("kubeadm bootstrap token due for refresh")
+		return kubeadmRefreshRegenerate, nil
+	}
+	return kubeadmRefreshNone, nil
+}
+
+// now returns the current time, overridable in tests via r.Now.
+func (r *KairosConfigReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+// generateCloudConfigM is generateCloudConfig plus the resolved WorkerJoinMaterial,
+// so reconcileBootstrapData can persist the non-secret kubeadm token ID to status
+// (ADR 0010 P1 item 8). generateCloudConfig is the thin (string, error) wrapper the
+// render/characterization tests use.
+func (r *KairosConfigReconciler) generateCloudConfigM(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (string, WorkerJoinMaterial, error) {
 	// Determine role
 	role := resolveRole(kairosConfig, machine)
 
@@ -935,7 +1053,7 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 
 	// Render through the merged generator keyed by the distribution table
 	// (render.go). An unknown distribution returns "unsupported distribution: %s".
-	return r.renderCloudConfig(ctx, log, distribution, kairosConfig, machine, cluster, role, serverAddress)
+	return r.renderCloudConfigM(ctx, log, distribution, kairosConfig, machine, cluster, role, serverAddress)
 }
 
 // applyControlPlaneRenderData wires the HA control-plane fields onto td: the

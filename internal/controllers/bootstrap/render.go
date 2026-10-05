@@ -104,9 +104,18 @@ func kubeadmProviderIDPatch(providerID string) string {
 // distribution-only field assignment and template selection to the table, so the
 // rendered bytes are identical to the pre-seam per-distribution generators.
 func (r *KairosConfigReconciler) renderCloudConfig(ctx context.Context, log logr.Logger, dist string, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
+	cc, _, err := r.renderCloudConfigM(ctx, log, dist, kairosConfig, machine, cluster, role, serverAddress)
+	return cc, err
+}
+
+// renderCloudConfigM is renderCloudConfig plus the resolved WorkerJoinMaterial, so
+// the reconciler can persist the non-secret kubeadm token ID to status without
+// re-resolving (ADR 0010 P1 item 8). The material is the zero value for non-worker
+// renders. renderCloudConfig is the thin (string, error) wrapper the render tests use.
+func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log logr.Logger, dist string, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, WorkerJoinMaterial, error) {
 	row, ok := bootstrapDistributions[dist]
 	if !ok {
-		return "", fmt.Errorf("unsupported distribution: %s", dist)
+		return "", WorkerJoinMaterial{}, fmt.Errorf("unsupported distribution: %s", dist)
 	}
 
 	// Determine single-node mode. Single-node is determined by the explicit
@@ -129,7 +138,7 @@ func (r *KairosConfigReconciler) renderCloudConfig(ctx context.Context, log logr
 		var err error
 		workerMat, err = r.workerJoin(ctx, dist, kairosConfig, machine, cluster, serverAddress)
 		if err != nil {
-			return "", err
+			return "", WorkerJoinMaterial{}, err
 		}
 	}
 
@@ -140,7 +149,7 @@ func (r *KairosConfigReconciler) renderCloudConfig(ctx context.Context, log logr
 	}
 	userPassword, err := r.resolveUserPassword(ctx, kairosConfig)
 	if err != nil {
-		return "", err
+		return "", WorkerJoinMaterial{}, err
 	}
 	userGroups := kairosConfig.Spec.UserGroups
 	if len(userGroups) == 0 {
@@ -200,7 +209,7 @@ func (r *KairosConfigReconciler) renderCloudConfig(ctx context.Context, log logr
 		var err error
 		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
 		if err != nil {
-			return "", err
+			return "", WorkerJoinMaterial{}, err
 		}
 	}
 
@@ -258,20 +267,21 @@ func (r *KairosConfigReconciler) renderCloudConfig(ctx context.Context, log logr
 	if cluster != nil && isKubevirtMachine(machine) && role == "control-plane" {
 		lbEndpoint, err := r.getControlPlaneLBEndpoint(ctx, cluster.Namespace, templateData.ControlPlaneLBServiceName)
 		if err != nil {
-			return "", fmt.Errorf("failed to get control plane LB endpoint: %w", err)
+			return "", WorkerJoinMaterial{}, fmt.Errorf("failed to get control plane LB endpoint: %w", err)
 		}
 		if lbEndpoint == "" {
-			return "", errLBEndpointNotReady
+			return "", WorkerJoinMaterial{}, errLBEndpointNotReady
 		}
 		templateData.ControlPlaneLBEndpoint = lbEndpoint
 	}
 
 	// HA: role / join token / VIP (ADR 0005 Phase 3). No-op on workers (CPR-INV-1).
 	if err := r.applyControlPlaneRenderData(ctx, &templateData, kairosConfig, cluster, role); err != nil {
-		return "", err
+		return "", WorkerJoinMaterial{}, err
 	}
 
-	return bootstrap.Render(dist, templateData)
+	cloudConfig, err := bootstrap.Render(dist, templateData)
+	return cloudConfig, workerMat, err
 }
 
 // renderCarriesProviderID replaces the two inline regeneration checks: it reports

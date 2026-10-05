@@ -48,6 +48,21 @@ type JoinMaterialSource interface {
 	WorkerJoin(ctx context.Context, req JoinRequest) (WorkerJoinMaterial, error)
 }
 
+// workerTokenRefresher is an OPTIONAL capability a JoinMaterialSource may implement
+// (found by type assertion, never required). The reconciler consults it while the
+// owning Machine has no nodeRef to decide whether the previously-minted token needs
+// re-minting before it expires (ADR 0010 P1 item 7). kubeadm implements it; k0s/k3s
+// do not — their worker tokens are long-lived or externally managed, so the
+// reconciler simply skips the refresh for them.
+type workerTokenRefresher interface {
+	// TokenNeedsRefresh reports whether the token identified by tokenID (the
+	// non-secret ID persisted in status) should be re-minted — because it is
+	// missing from the workload cluster, or past half its TTL. A transient
+	// workload-cluster error MUST be returned as a bootstrapNotReadyError so the
+	// reconciler requeues instead of parking the KairosConfig.
+	TokenNeedsRefresh(ctx context.Context, req JoinRequest, tokenID string) (bool, error)
+}
+
 // JoinRequest is the read-only input to a JoinMaterialSource.
 type JoinRequest struct {
 	Config        *bootstrapv1beta2.KairosConfig
