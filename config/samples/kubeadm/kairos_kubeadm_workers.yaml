@@ -1,0 +1,139 @@
+# ============================================================================
+# kubeadm Sample: Kairos workers joining an existing kubeadm control plane
+# ============================================================================
+#
+# This provisions a MachineDeployment of Kairos worker nodes that join a
+# control plane managed by something else: a Kamaji KamajiControlPlane or a
+# Cluster API KubeadmControlPlane. It does NOT create the Cluster or the control
+# plane. For the full walkthrough, prerequisites, and troubleshooting, see
+# docs/KUBEADM_WORKERS.md.
+#
+# SCOPE (this release):
+#   - Workers only. distribution: kubeadm with role: control-plane is rejected
+#     at admission, and a KairosControlPlane cannot use kubeadm.
+#   - MachineDeployment only. A MachinePool owner is refused.
+#   - Validated by unit and envtest tests. Not yet validated against a live
+#     Kamaji or KubeadmControlPlane cluster.
+#
+# PREREQUISITES:
+#   1. The Kairos CAPI provider is installed (docs/INSTALL.md).
+#   2. A Cluster named "my-cluster" exists in this namespace and its
+#      spec.controlPlaneRef points at a KubeadmControlPlane or a
+#      KamajiControlPlane in the same namespace. Its control plane is
+#      initialized (status.initialization.controlPlaneInitialized: true) and
+#      spec.controlPlaneEndpoint is set. If you use another control-plane kind,
+#      the operator must allow it with --kubeadm-extra-controlplane-kinds
+#      (docs/INSTALL.md, "Optional manager flags").
+#   3. The Kairos image your infrastructure provider boots ships kubeadm,
+#      kubelet, and containerd at EXACTLY the version set in
+#      spec.template.spec.version below, down to the patch. The
+#      kairos-io/provider-kubernetes images are the reference image.
+#   4. A Secret holding the node user password. Create it before applying; the
+#      value never appears in this file:
+#        kubectl create secret generic kairos-user-password \
+#          --from-literal=password="$(openssl rand -base64 32)"
+#      Alternative: set sshPublicKey (or githubUser) on the template and drop
+#      userPasswordSecretRef.
+#   5. A MachineTemplate for your infrastructure provider. Replace the
+#      infrastructureRef placeholders below. The kubeadm bootstrap config is the
+#      same on every infrastructure provider; only this reference changes.
+#   6. A CNI plugin in the workload cluster. This provider installs none.
+#      Nodes join and stay NotReady until a CNI is running.
+#
+# APPLY:
+#   kubectl apply -f config/samples/kubeadm/kairos_kubeadm_workers.yaml
+#
+# VERIFY:
+#   kubectl get kairosconfig,machines -l cluster.x-k8s.io/cluster-name=my-cluster
+#   kubectl get kairosconfig -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.bootstrapTokenID}{"\n"}{end}'
+# ============================================================================
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-kubeadm-worker
+  namespace: default
+spec:
+  template:
+    spec:
+      # kubeadm is worker-only in this release; the webhook rejects
+      # role: control-plane for this distribution.
+      role: worker
+      distribution: kubeadm
+      # Required by the schema. For kubeadm the version that counts is
+      # Machine.spec.version (the MachineDeployment's spec.template.spec.version
+      # below); keep the two equal. Use the plain upstream form (vX.Y.Z), not a
+      # "+k0s.N" or "+k3sN" suffix.
+      kubernetesVersion: "v1.36.1"
+      userName: kairos
+      # Password comes from the Secret created in prerequisite 4.
+      userPasswordSecretRef:
+        name: kairos-user-password
+      userGroups:
+        - admin
+      # No token, CA hash, or discovery settings belong here. The controller
+      # mints a short-lived bootstrap token in the workload cluster and pins the
+      # cluster CA itself. The webhook rejects an inline bootstrap token,
+      # unsafeSkipCAVerification, and discovery.file.
+      #
+      # Optional: pass kubeadm JoinConfiguration fields. The controller
+      # overwrites nodeRegistration.name (unless you set it), discovery, and the
+      # providerID patch; every other field is passed through.
+      # kubeadm:
+      #   joinConfiguration:
+      #     nodeRegistration:
+      #       kubeletExtraArgs:
+      #         - name: node-labels
+      #           value: "workload=general"
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: kairos-kubeadm-workers
+  namespace: default
+spec:
+  clusterName: my-cluster
+  replicas: 2
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: my-cluster
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: my-cluster
+    spec:
+      clusterName: my-cluster
+      # Required for kubeadm. The controller refuses to render without it, and
+      # the node refuses to join if `kubeadm version` on the image differs.
+      # Set it to the exact version the image ships.
+      version: "v1.36.1"
+      bootstrap:
+        configRef:
+          apiGroup: bootstrap.cluster.x-k8s.io
+          kind: KairosConfigTemplate
+          name: kairos-kubeadm-worker
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        # REPLACE both values with the MachineTemplate for your infrastructure
+        # provider (for example VSphereMachineTemplate, KubevirtMachineTemplate,
+        # or Metal3MachineTemplate).
+        kind: REPLACE_WITH_MACHINE_TEMPLATE_KIND
+        name: REPLACE_WITH_MACHINE_TEMPLATE_NAME
+---
+# Replaces workers that never register a Node. The controller stops refreshing
+# a worker's bootstrap token 24 hours after the Machine was created and sets
+# BootstrapReady=False (BootstrapTokenRefreshCapExceeded), but it does not
+# delete the Machine. This MachineHealthCheck is the mechanism that does.
+# Set the timeout above your slowest expected provision-and-join time; CAPI
+# defaults it to 10 minutes when unset.
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineHealthCheck
+metadata:
+  name: kairos-kubeadm-workers
+  namespace: default
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: kairos-kubeadm-workers
+  checks:
+    nodeStartupTimeoutSeconds: 1800
