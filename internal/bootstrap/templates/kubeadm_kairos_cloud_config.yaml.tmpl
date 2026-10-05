@@ -90,17 +90,28 @@ write_files:
       #!/bin/bash
       set -euo pipefail
 
-      # Idempotence: a joined node never re-runs kubeadm join on reboot. kubeadm's
-      # own preflight (the kubelet.conf FileAvailable check) is the second line.
-      if [ -f /etc/kubernetes/kubelet.conf ]; then
-        echo "kubelet.conf present; node already joined, skipping kubeadm join"
+      # Persistent idempotence markers live on COS_PERSISTENT (/var/lib/kairos) so
+      # they survive a reboot (ADR 0010 "Node side"). A joined node NEVER rejoins; a
+      # half-finished join is NEVER retried on-node — the MachineHealthCheck replaces
+      # the Machine. kubeadm's own kubelet.conf preflight is the second line.
+      MARKER_DIR=/var/lib/kairos
+      ATTEMPTED="${MARKER_DIR}/kairos-kubeadm-join.attempted"
+      COMPLETED="${MARKER_DIR}/kairos-kubeadm-join.completed"
+
+      if [ -f "${COMPLETED}" ] || [ -f /etc/kubernetes/kubelet.conf ]; then
+        echo "kubeadm worker already joined; skipping"
         exit 0
+      fi
+      if [ -f "${ATTEMPTED}" ]; then
+        echo "a previous kubeadm join did not complete; refusing to retry on-node (remediation replaces the Machine)" >&2
+        exit 1
       fi
 
       {{- if .Kubeadm.KubernetesVersion }}
       # Exact-version image contract (ADR 0010): the image must ship kubeadm at the
       # cluster's Kubernetes version down to the patch. Refuse on a mismatch rather
-      # than join a node running the wrong kubelet/kubeadm.
+      # than join a node running the wrong kubelet/kubeadm. Checked BEFORE the
+      # attempted marker so a version mismatch does not burn the single attempt.
       WANT_VERSION={{ .Kubeadm.KubernetesVersion | shquote }}
       HAVE_VERSION="$(kubeadm version -o short 2>/dev/null || true)"
       if [ -n "${WANT_VERSION}" ] && [ "${HAVE_VERSION}" != "${WANT_VERSION}" ]; then
@@ -109,11 +120,26 @@ write_files:
       fi
       {{- end }}
 
+      # On any failure after this point, remove ONLY the token-bearing credential
+      # files. A worker has no etcd or PKI to reset (ADR 0010 "Node side" (b)).
+      cleanup_credentials() {
+        rm -f /etc/kubernetes/bootstrap-kubelet.conf
+      }
+      trap cleanup_credentials ERR
+
+      mkdir -p "${MARKER_DIR}"
+      # Record the attempt on persistent storage BEFORE kubeadm runs, so a crash
+      # mid-join is refused (not retried) on the next boot.
+      : > "${ATTEMPTED}"
+
       JOIN_ARGS=(--config /etc/kubernetes/kairos-kubeadm-join.yaml)
       {{- if .Kubeadm.ProviderIDPatch }}
       JOIN_ARGS+=(--patches /etc/kubernetes/kairos-patches)
       {{- end }}
       kubeadm join "${JOIN_ARGS[@]}"
+
+      # Verified success: mark complete on persistent storage.
+      : > "${COMPLETED}"
       echo "kubeadm worker join completed successfully"
   - path: /etc/systemd/system/kairos-kubeadm-post-bootstrap.service
     permissions: "0644"
@@ -123,6 +149,18 @@ write_files:
       Description=Kairos kubeadm worker post-bootstrap join
       After=network-online.target containerd.service
       Wants=network-online.target
+      # Boot-mode allowlist (ADR 0010 "Node side", KD-59): run ONLY on an installed
+      # active OR passive boot. The |-prefixed conditions form an OR group.
+      ConditionPathExists=|/run/cos/active_mode
+      ConditionPathExists=|/run/cos/passive_mode
+      # Never on an in-RAM boot (v4.2+ in-RAM boots also write active_mode).
+      ConditionPathExists=!/run/cos/in_ram_mode
+      # Never join onto ephemeral state: /etc/kubernetes and /var/lib/kubelet MUST be
+      # real persistent mounts. On v4.2+ in-RAM boots /etc is a tmpfs overlay, so the
+      # kubelet.conf check alone fails open (KD-59).
+      ConditionPathIsMountPoint=/etc/kubernetes
+      ConditionPathIsMountPoint=/var/lib/kubelet
+      # Fast path: a joined node does not re-run on a normal boot.
       ConditionPathExists=!/etc/kubernetes/kubelet.conf
       [Service]
       Type=oneshot

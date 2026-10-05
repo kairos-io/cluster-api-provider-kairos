@@ -114,6 +114,17 @@ func TestRender_KubeadmWorker(t *testing.T) {
 		"kairos-kubeadm-post-bootstrap.service",
 		"systemctl enable --now sshd",
 		"kubeadm join",
+		// Boot-mode / idempotence gate (ADR 0010 "Node side", KD-59).
+		"ConditionPathExists=|/run/cos/active_mode",
+		"ConditionPathExists=|/run/cos/passive_mode",
+		"ConditionPathExists=!/run/cos/in_ram_mode",
+		"ConditionPathIsMountPoint=/etc/kubernetes",
+		"ConditionPathIsMountPoint=/var/lib/kubelet",
+		// Persistent attempted/completion markers + credential-only cleanup.
+		"MARKER_DIR=/var/lib/kairos",
+		"kairos-kubeadm-join.attempted",
+		"kairos-kubeadm-join.completed",
+		"rm -f /etc/kubernetes/bootstrap-kubelet.conf",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("kubeadm worker render missing %q", want)
