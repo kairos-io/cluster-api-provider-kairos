@@ -16,7 +16,7 @@ jobs:
       matrix:
         go-version: ['1.26']  # go.mod requires go 1.26
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -59,7 +59,7 @@ jobs:
       matrix:
         go-version: ['1.26']  # go.mod requires go 1.26
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -96,7 +96,7 @@ jobs:
       matrix:
         go-version: ['1.26']  # go.mod requires go 1.26
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -135,7 +135,7 @@ jobs:
       matrix:
         go-version: ['1.26']  # go.mod requires go 1.26
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -172,7 +172,7 @@ jobs:
     env:
       GOTOOLCHAIN: local
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -214,7 +214,7 @@ jobs:
       matrix:
         go-version: ['1.26']  # go.mod requires go 1.26
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Go
       uses: actions/setup-go@v5
