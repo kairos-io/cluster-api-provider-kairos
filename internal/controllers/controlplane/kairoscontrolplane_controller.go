@@ -572,7 +572,7 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 // normal watches. reason is a short human-readable cause for the condition message.
 func (r *KairosControlPlaneReconciler) refuseKubeadmControlPlane(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, reason string) (ctrl.Result, error) {
 	msg := fmt.Sprintf("kubeadm is not supported on a KairosControlPlane in this release (%s); "+
-		"kubeadm is a bootstrap worker-join distribution only (ADR 0010 P1). "+
+		"kubeadm is a worker-join distribution only. "+
 		"Use a k0s or k3s KairosConfigTemplate for the control plane.", reason)
 	log.Info("Refusing kubeadm KairosControlPlane", "reason", reason)
 	conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.UnsupportedDistributionReason, clusterv1.ConditionSeverityWarning, "%s", msg)

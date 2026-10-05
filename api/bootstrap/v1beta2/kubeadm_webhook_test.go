@@ -69,6 +69,15 @@ func TestValidateKubeadmConfig_Refusals(t *testing.T) {
 			wantSub: "unsafeSkipCAVerification is not allowed",
 		},
 		{
+			name: "a control-plane join is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					ControlPlane: &kubeadmv1.JoinControlPlane{},
+				}}
+			},
+			wantSub: "control-plane join is not supported",
+		},
+		{
 			name: "discovery.file is refused",
 			mutate: func(kc *KairosConfig) {
 				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{

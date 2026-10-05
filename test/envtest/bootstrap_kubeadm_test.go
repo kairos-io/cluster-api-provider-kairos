@@ -340,7 +340,7 @@ func TestBootstrapIntegration_KubeadmWorker(t *testing.T) {
 	g.Expect(mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-bad", Namespace: nsName}, bad)).To(Succeed())
 	g.Expect(bad.Status.DataSecretName).To(BeNil(), "no bootstrap data Secret for a refused trust check")
 	g.Expect(bad.Status.BootstrapTokenID).To(BeEmpty(), "no token id for a refused trust check")
-	g.Expect(bad.Status.FailureMessage).To(ContainSubstring("not controller-owned"))
+	g.Expect(bad.Status.FailureMessage).To(ContainSubstring("must be owned by the cluster's control plane"))
 
 	cancel()
 	<-mgrErrCh

@@ -188,9 +188,8 @@ func validateKubeadmConfig(kc *KairosConfig) field.ErrorList {
 		errs = append(errs, field.Invalid(
 			field.NewPath("spec", "role"),
 			kc.Spec.Role,
-			"kubeadm is supported only for worker nodes in this release; a kubeadm "+
-				"KairosControlPlane is deferred to a later phase (ADR 0010 P2). Set "+
-				"spec.role to worker, or use the k0s/k3s distribution for a control plane.",
+			"kubeadm is supported only for worker nodes in this release; set spec.role "+
+				"to worker, or use the k0s or k3s distribution for a control plane.",
 		))
 	}
 
@@ -237,12 +236,21 @@ func validateKubeadmConfig(kc *KairosConfig) field.ErrorList {
 		))
 	}
 
-	// discovery.file is out of P1 scope.
+	// discovery.file is out of scope in this release.
 	if jc.Discovery.File.KubeConfigPath != "" {
 		errs = append(errs, field.Forbidden(
 			jcPath.Child("discovery", "file"),
 			"file-based discovery is not supported in this release; the controller "+
 				"configures bootstrap-token discovery",
+		))
+	}
+
+	// controlPlane marks a control-plane join; kubeadm is worker-only in this
+	// release, so a non-nil controlPlane section is refused.
+	if jc.ControlPlane != nil {
+		errs = append(errs, field.Forbidden(
+			jcPath.Child("controlPlane"),
+			"a control-plane join is not supported in this release; kubeadm is for worker joins only",
 		))
 	}
 

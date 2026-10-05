@@ -75,14 +75,26 @@ const (
 )
 
 // allowlistedControlPlaneKinds are the control-plane kinds a kubeadm worker may
-// trust WITHOUT an operator flag (ADR 0010 OQ-9), matched on group and kind.
-// KairosControlPlane is included but additionally requires spec.distribution ==
-// kubeadm (a kubeadm KairosControlPlane is P2, so in P1 this never matches — a
-// k0s/k3s KairosControlPlane is refused, per the ADR interop matrix).
+// trust WITHOUT an operator flag, matched on group and kind. KairosControlPlane is
+// included here for the FINE, per-request check only, where it additionally requires
+// spec.distribution == kubeadm (a kubeadm KairosControlPlane is a later phase, so in
+// this release that branch never matches — a k0s/k3s KairosControlPlane is refused).
 var allowlistedControlPlaneKinds = map[schema.GroupKind]bool{
 	{Group: controlPlaneGroup, Kind: "KubeadmControlPlane"}: true,
 	{Group: controlPlaneGroup, Kind: "KamajiControlPlane"}:  true,
 	{Group: controlPlaneGroup, Kind: "KairosControlPlane"}:  true,
+}
+
+// coarseTrustedControlPlaneKinds is the allowlist for the clustercache ClusterFilter
+// (the coarse, connect-level gate). It deliberately EXCLUDES KairosControlPlane:
+// kubeadm control planes are unsupported in this release, so the bootstrap manager's
+// workload-client cache must never dial a k0s/k3s KairosControlPlane cluster. The
+// fine per-request WorkerJoin check keeps the KairosControlPlane
+// (distribution==kubeadm) branch for forward-compatibility; it just never admits a
+// connection today.
+var coarseTrustedControlPlaneKinds = map[schema.GroupKind]bool{
+	{Group: controlPlaneGroup, Kind: "KubeadmControlPlane"}: true,
+	{Group: controlPlaneGroup, Kind: "KamajiControlPlane"}:  true,
 }
 
 // bootstrapNotReadyError is the typed not-ready signal for the kubeadm join path
@@ -136,7 +148,7 @@ type kubeadmJoinSource struct {
 	now func() time.Time
 	// resolveControlPlane resolves a ContractVersionedObjectReference to the live
 	// control-plane object at its CONTRACT-advertised API version (so Kamaji's
-	// v1alpha1 KamajiControlPlane resolves correctly, not only v1beta2 kinds). Nil
+	// non-v1beta2 KamajiControlPlane (e.g. v1alpha2) resolves correctly, not only v1beta2 kinds). Nil
 	// means the production resolver, external.GetObjectFromContractVersionedRef over
 	// s.mgmt; unit tests inject a stub so they need no CRD/contract labels.
 	resolveControlPlane func(ctx context.Context, ref clusterv1.ContractVersionedObjectReference, namespace string) (*unstructured.Unstructured, error)
@@ -181,7 +193,7 @@ func KubeadmTrustedClusterFilter(extraKinds map[schema.GroupKind]bool) func(*clu
 			return false
 		}
 		gk := schema.GroupKind{Group: cluster.Spec.ControlPlaneRef.APIGroup, Kind: cluster.Spec.ControlPlaneRef.Kind}
-		return allowlistedControlPlaneKinds[gk] || extraKinds[gk]
+		return coarseTrustedControlPlaneKinds[gk] || extraKinds[gk]
 	}
 }
 
@@ -277,7 +289,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 
 	// Resolve the control-plane object to get its UID (the trust anchor). The
 	// contract resolver reads the referenced kind's CRD contract label to pick the
-	// served API version, so this works for Kamaji's v1alpha1 KamajiControlPlane as
+	// served API version, so this works for Kamaji's non-v1beta2 KamajiControlPlane (e.g. v1alpha2) as
 	// well as v1beta2 kinds — matching how CAPI core resolves the same ref.
 	cp, err := s.resolveCP(ctx, cpRef, cluster.Namespace)
 	if err != nil {
@@ -293,7 +305,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 		dist, _, _ := unstructured.NestedString(cp.Object, "spec", "distribution")
 		if dist != bootstrapv1beta2.DistributionKubeadm {
 			return zero, fmt.Errorf("KairosControlPlane %s has distribution %q, not kubeadm: "+
-				"a kubeadm worker cannot join a k0s/k3s control plane (ADR 0010); a kubeadm KairosControlPlane is a later phase",
+				"a kubeadm worker cannot join a k0s or k3s control plane",
 				cpRef.Name, dist)
 		}
 	}
@@ -310,8 +322,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 	}
 	owner := metav1.GetControllerOf(kcSecret)
 	if owner == nil || owner.UID != cpUID {
-		return zero, fmt.Errorf("the %s Secret is not controller-owned by the cluster's control-plane object %s/%s: "+
-			"refusing to mint a token (a node-pushed or planted kubeconfig is not trusted on the kubeadm path)",
+		return zero, fmt.Errorf("the %s Secret must be owned by the cluster's control plane (%s/%s); refusing to mint a token",
 			kubeconfigKey.Name, cpRef.Kind, cpRef.Name)
 	}
 

@@ -234,6 +234,39 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 
 func ptrBool(b bool) *bool { return &b }
 
+// TestKubeadmTrustedClusterFilter pins the COARSE connect-level filter: it admits
+// only KubeadmControlPlane and KamajiControlPlane (plus operator-flag kinds) and
+// EXCLUDES KairosControlPlane, so clustercache never dials a k0s/k3s KairosControlPlane
+// cluster. The fine per-request WorkerJoin check still refuses non-kubeadm anyway.
+func TestKubeadmTrustedClusterFilter(t *testing.T) {
+	cp := func(group, kind string) *clusterv1.Cluster {
+		return &clusterv1.Cluster{Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{APIGroup: group, Kind: kind, Name: "cp"},
+		}}
+	}
+	cases := []struct {
+		name    string
+		cluster *clusterv1.Cluster
+		extra   map[schema.GroupKind]bool
+		want    bool
+	}{
+		{"KubeadmControlPlane admitted", cp(controlPlaneGroup, "KubeadmControlPlane"), nil, true},
+		{"KamajiControlPlane admitted", cp(controlPlaneGroup, "KamajiControlPlane"), nil, true},
+		{"KairosControlPlane excluded from coarse filter", cp(controlPlaneGroup, "KairosControlPlane"), nil, false},
+		{"unknown kind rejected", cp(controlPlaneGroup, "SomethingElse"), nil, false},
+		{"lookalike in another group rejected", cp("evil.example.com", "KubeadmControlPlane"), nil, false},
+		{"operator-flag kind admitted", cp("x.example.com", "FooControlPlane"), map[schema.GroupKind]bool{{Group: "x.example.com", Kind: "FooControlPlane"}: true}, true},
+		{"nil cluster rejected", nil, nil, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(KubeadmTrustedClusterFilter(tc.extra)(tc.cluster)).To(Equal(tc.want))
+		})
+	}
+}
+
 // TestKubeadmWorkerJoin_Accepts covers the three legitimate trust shapes and
 // asserts a token is minted and the JoinConfiguration is well-formed.
 func TestKubeadmWorkerJoin_Accepts(t *testing.T) {
@@ -300,7 +333,7 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 		extra   map[schema.GroupKind]bool
 		wantSub string
 	}{
-		{"owner UID mismatch", func(fx *kubeadmFixture) { fx.ownerUID = types.UID("not-the-cp") }, nil, "not controller-owned"},
+		{"owner UID mismatch", func(fx *kubeadmFixture) { fx.ownerUID = types.UID("not-the-cp") }, nil, "must be owned by the cluster's control plane"},
 		{"server mismatch", func(fx *kubeadmFixture) { fx.server = "https://evil.example.com:6443" }, nil, "does not equal the Cluster control-plane endpoint"},
 		{"CA cross-check mismatch", func(fx *kubeadmFixture) { fx.clusterCA = otherCA }, nil, "does not match"},
 		{"lookalike kind in another group", func(fx *kubeadmFixture) { fx.cpGroup = "evil.example.com" }, nil, "not on the kubeadm trust allowlist"},

@@ -361,7 +361,7 @@ func Render(distribution string, data TemplateData) (string, error) {
 	// webhook already refuses role=control-plane for kubeadm, but a direct render
 	// call bypasses admission, so this is the renderer's last-line defence.
 	if distribution == bootstrapv1beta2.DistributionKubeadm && data.Role == "control-plane" {
-		return "", fmt.Errorf("kubeadm is not supported for control-plane nodes in this release (worker-only, ADR 0010 P1)")
+		return "", fmt.Errorf("kubeadm is not supported for control-plane nodes in this release (worker-only)")
 	}
 	templatePath := ts.generic
 	if data.IsKubeVirt {
