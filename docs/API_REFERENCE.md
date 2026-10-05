@@ -422,6 +422,8 @@ Reports whether every control-plane Machine runs `spec.version`.
 
 `KairosControlPlaneTemplate` is a template for creating `KairosControlPlane` resources. Intended for use with ClusterClass (planned; not yet exercised in samples).
 
+Its validating webhook applies the same rules as the `KairosControlPlane` webhook, against the nested spec, so a template that would produce an invalid control plane is rejected when it is staged rather than when a cluster is created from it. Rules that compare against a namespace, `sshFallback` Secret references and `machineTemplate.infrastructureRef`, read the `KairosControlPlaneTemplate`'s own namespace, which is the namespace a stamped `KairosControlPlane` lives in.
+
 ### Spec Fields
 
 | Field | Type | Required | Description |
