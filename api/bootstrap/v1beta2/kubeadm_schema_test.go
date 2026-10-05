@@ -40,7 +40,7 @@ import (
 //  4. update this constant to the value the test prints.
 //
 // Do NOT update it blindly — that defeats the guard.
-const kubeadmSchemaDigest = "acca56acbdc1cf6d97b7eb8666af0706e115d6eecf9729dbec489c4405da4542"
+const kubeadmSchemaDigest = "11bf64a1dcaefa7b3f8e9542b6f46e3d38a578bf5415a5c3ed9001c2de225adf"
 
 // TestKubeadmSchemaDiff fails when the served spec.kubeadm schema drifts from the
 // recorded digest (ADR 0010 OQ-5).
