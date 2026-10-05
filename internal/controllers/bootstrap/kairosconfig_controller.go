@@ -594,12 +594,12 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		hasProviderIDInSecret := strings.Contains(cloudConfig, currentProviderID)
 		// Check for the systemd service that sets providerID (runs after k3s/k0s service starts)
 		var hasPostBootstrapService bool
-		switch kairosConfig.Spec.Distribution {
-		case "k3s":
+		switch kairosConfig.Spec.EffectiveDistribution() {
+		case bootstrapv1beta2.DistributionK3s:
 			hasPostBootstrapService = strings.Contains(cloudConfig, "kairos-k3s-post-bootstrap.service")
-		case "k0s":
+		case bootstrapv1beta2.DistributionK0s:
 			hasPostBootstrapService = strings.Contains(cloudConfig, "kairos-k0s-post-bootstrap.service")
-		case "kubeadm":
+		case bootstrapv1beta2.DistributionKubeadm:
 			hasPostBootstrapService = true
 		}
 		if hasProviderIDInSecret && hasPostBootstrapService {
@@ -935,11 +935,7 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 	// Determine role
 	role := resolveRole(kairosConfig, machine)
 
-	// Determine distribution
-	distribution := kairosConfig.Spec.Distribution
-	if distribution == "" {
-		distribution = "k0s"
-	}
+	distribution := kairosConfig.Spec.EffectiveDistribution()
 
 	// Get cluster information
 	serverAddress := kairosConfig.Spec.ServerAddress
@@ -949,11 +945,11 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 
 	// Generate cloud-config based on distribution
 	switch distribution {
-	case "kubeadm":
+	case bootstrapv1beta2.DistributionKubeadm:
 		return r.generateKubeadmCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
-	case "k0s":
+	case bootstrapv1beta2.DistributionK0s:
 		return r.generateK0sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
-	case "k3s":
+	case bootstrapv1beta2.DistributionK3s:
 		return r.generateK3sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
 	default:
 		return "", fmt.Errorf("unsupported distribution: %s", distribution)

@@ -182,6 +182,9 @@ func validateTemplateData(d *TemplateData) error {
 			errs = append(errs, err)
 		}
 	}
+	if err := validateKubeadmCluster(d.KubeadmCluster); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 

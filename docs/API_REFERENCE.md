@@ -21,14 +21,14 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 **API Version:** `v1beta2`
 **Kind:** `KairosConfig`
 
-`KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s.
+`KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s. With `distribution: kubeadm` it instead joins worker nodes to an existing kubeadm-compatible control plane; see [kubeadm workers](#kubeadm-workers).
 
 ### Spec Fields
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `role` | `string` | No | `"worker"` | Node role: `"control-plane"` or `"worker"`. |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"` or `"k3s"`. |
+| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"`, `"k3s"` or `"kubeadm"`. `kubeadm` supports only `role: worker`. See [kubeadm workers](#kubeadm-workers). |
 | `kubernetesVersion` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). The value is informational — the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. |
 | `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. What single-node mode renders is distribution- and infrastructure-specific: for k3s it enables cluster-init mode on every infrastructure provider; for k0s on CAPK it renders `--single`; for k0s on the generic / CAPV / CAPM3 / fleet render path it renders `--enable-worker` by default, or `--single` when `k0sSingleNode` is also `true` (see `k0sSingleNode` below). Tracked as a deprecation candidate in KD-39. |
 | `k0sSingleNode` | `*bool` | No | `false` | For a single-node k0s control plane (`singleNode: true`, `distribution: k0s`) on the generic / CAPV / CAPM3 / fleet render path, selects which k0s single-node flag is rendered. `false` (the default) renders `--enable-worker`: a joinable, schedulable controller that runs workloads itself and accepts worker joins, so a control-plane-plus-worker cluster works out of the box. `true` renders `--single`: a standalone all-in-one node that refuses all joins ("cannot join into a single node cluster") — use this only for a node that will never gain workers. Ignored by k3s and by worker/join nodes, and has no effect on CAPK, which always renders `--single` for single-node k0s. |
@@ -54,7 +54,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `serviceCIDR` | `string` | No | — | Service network CIDR for k0s. Uses k0s defaults when unset. |
 | `primaryIP` | `string` | No | — | Overrides the detected node IP used for TLS certificate SANs and endpoint configuration (sets `KAIROS_PRIMARY_IP`). Useful in KubeVirt environments where the detected IP is a pod network address rather than the VM's accessible address. |
 | `install` | `InstallConfig` | No | — | Controls Kairos OS installation to disk. Required when using the 2-disk installer pattern (see `config/samples/capk/`). |
-| `files` | `[]File` | No | — | Files to write on the node via the cloud-config `write_files:` list. Rendered on all distributions and all infrastructure providers. At most 32 entries; each file content is limited to 32 KiB. See [File](#file) for the sub-type and [Writing files to nodes](#writing-files-to-nodes) for usage guidance and the static-IP caveat. |
+| `files` | `[]File` | No | - | Files to write on the node via the cloud-config `write_files:` list. Rendered on k0s and k3s on all infrastructure providers; not rendered for `kubeadm`. At most 32 entries; each file content is limited to 32 KiB. See [File](#file) for the sub-type and [Writing files to nodes](#writing-files-to-nodes) for usage guidance and the static-IP caveat. |
 | `manifests` | `[]Manifest` | No | — | Kubernetes manifests placed in the distribution's auto-apply directory. k0s: `/var/lib/k0s/manifests/{name}/{file}`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/{file}`. Applied automatically by the distribution at cluster startup. |
 | `preCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
 | `postCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
@@ -138,6 +138,37 @@ has not reported `infrastructureProvisioned`, or (for a control plane) has
 reported it without publishing `spec.controlPlaneEndpoint`. Check the
 InfraCluster, not the `KairosConfig`.
 
+### kubeadm workers
+
+`distribution: kubeadm` renders a worker cloud-config for the Kairos
+[provider-kubernetes](https://github.com/kairos-io/provider-kubernetes) `cluster:`
+block, which runs `kubeadm join` against a control plane that this provider does
+not manage (for example a hosted control plane or a `KubeadmControlPlane`). The
+Kairos image must ship provider-kubernetes.
+
+Requirements:
+
+- `role` must be `worker`. Any other role fails reconciliation.
+- The owning `Machine` must set `spec.version`. It becomes
+  `clusterConfiguration.kubernetesVersion`; `spec.kubernetesVersion` is not used.
+- The `<cluster>-kubeconfig` Secret must exist in the Cluster's namespace and
+  carry `certificate-authority-data`. The controller uses it to reach the
+  workload cluster and pins the join to that CA.
+- The control-plane endpoint comes from `spec.serverAddress`, or from
+  `Cluster.spec.controlPlaneEndpoint` when unset.
+
+Join token: no `*Token` field is read. For each Machine the controller creates a
+bootstrap token Secret `<machine>-kubeadm-bootstrap-token` in the management
+cluster, owned by the Machine, and copies it into the workload cluster as
+`kube-system/bootstrap-token-<id>`. The token is valid for one hour and is not
+renewed, so a Machine that has not joined within that window must be recreated.
+
+Fields used: `hostname`, `hostnamePrefix`, the user and credential fields,
+`dnsServers` and `install`. When `hostname` is unset the node takes the Machine
+name. `files`, `manifests`, `podCIDR`, `serviceCIDR`, `primaryIP`, `singleNode`
+and the token fields are ignored, and the [persistence file](#persistence-behavior)
+is not injected.
+
 ### Example
 
 ```yaml
@@ -188,6 +219,21 @@ spec:
   k3sTokenSecretRef:
     name: k3s-worker-token
     key: token
+```
+
+For a kubeadm worker no token is set; the controller issues one per Machine:
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfig
+metadata:
+  name: kairos-config-kubeadm-worker
+  namespace: default
+spec:
+  role: worker
+  distribution: kubeadm
+  userPasswordSecretRef:
+    name: kairos-user-password
 ```
 
 ---
@@ -250,7 +296,7 @@ spec:
 |-------|------|----------|---------|-------------|
 | `replicas` | `*int32` | No | `1` | Number of control plane machines. One of `1`, `3`, or `5` — the validating webhook rejects even counts (they provide the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance). `1` configures a single-node control plane. `3` or `5` configure a highly-available control plane; set `ha.vip` for infrastructure providers that do not supply a load-balanced endpoint (CAPV, CAPM3, CAPD). |
 | `version` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. Changing it on an HA control plane replaces the control-plane Machines one at a time. On a single-node control plane it replaces nothing, because a replacement would start a separate, empty cluster; see [MachinesUpToDate condition](#machinesuptodate-condition). |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d — see [Multi-Node Control Planes](#multi-node-control-planes)). |
+| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. `kubeadm` is worker-only on `KairosConfig` and is not accepted here. k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d, see [Multi-Node Control Planes](#multi-node-control-planes)). |
 | `machineTemplate` | `KairosControlPlaneMachineTemplate` | Yes | — | Template for creating control plane Machines. |
 | `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | — | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
 | `rolloutStrategy` | `RolloutStrategy` | No | — | Strategy for rolling out updates. |
@@ -439,7 +485,7 @@ Reports whether every control-plane Machine runs `spec.version`.
 
 ## Persistence behavior
 
-The provider injects `/system/oem/12_kairos-capi-persistency.yaml` into every node's cloud-config via `write_files`. The file uses immucore's `extra-layout.env` mechanism (not `cos-layout.env`), so its `PERSISTENT_STATE_PATHS` value is **unioned** with the stock image's persistent paths — never overwriting them. A custom or stock Kairos image is unaffected; the provider's persistent paths are added on top of whatever the image already persists.
+The provider injects `/system/oem/12_kairos-capi-persistency.yaml` into every k0s and k3s node's cloud-config via `write_files` (not into `kubeadm` workers). The file uses immucore's `extra-layout.env` mechanism (not `cos-layout.env`), so its `PERSISTENT_STATE_PATHS` value is **unioned** with the stock image's persistent paths, never overwriting them. A custom or stock Kairos image is unaffected; the provider's persistent paths are added on top of whatever the image already persists.
 
 The provider declares the following paths as persistent across reboots and A/B upgrades:
 
@@ -466,7 +512,7 @@ Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence
 
 ## Writing files to nodes
 
-`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on all distributions (k0s, k3s) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3, and the Kairos fleet provider).
+`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on k0s and k3s (not on `kubeadm` workers) and on all infrastructure providers (CAPV, CAPK, CAPD, CAPM3, and the Kairos fleet provider).
 
 ### Limits
 
@@ -552,8 +598,9 @@ For `KairosConfig` with `role: worker`:
 
 - **k0s**: Set `workerToken` or `workerTokenSecretRef`. `workerTokenSecretRef` is preferred.
 - **k3s**: Set `k3sToken` or `k3sTokenSecretRef`. `k3sTokenSecretRef` is preferred.
+- **kubeadm**: Set nothing. The controller issues a one-hour bootstrap token per Machine; see [kubeadm workers](#kubeadm-workers).
 
-The controller fails reconciliation if no token is provided for a worker.
+For k0s and k3s, the controller fails reconciliation if no token is provided for a worker.
 
 ### Single-Node Mode
 

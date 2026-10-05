@@ -116,7 +116,19 @@ func goldenCases() []goldenCase {
 		{"k3s_capk_init", RenderK3sCloudConfig, withEtcdStatusSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-etcd-status")},
 		{"k0s_capk_join", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
 		{"k3s_capk_join", RenderK3sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
+
+		// --- kubeadm (provider-kubernetes) worker joining an external control plane ---
+		{"kubeadm_capk_worker", RenderKubeadmCloudConfig, kubeadmGoldenWorker()},
 	}
+}
+
+// kubeadmGoldenWorker builds the kubeadm worker fixture; the inputs are static, so a build error is a test bug.
+func kubeadmGoldenWorker() TemplateData {
+	c, err := NewKubeadmWorkerCluster(testKubeadmWorkerParams())
+	if err != nil {
+		panic(err)
+	}
+	return kubeadmWorkerTemplateData(c)
 }
 
 func withJoinToken(d TemplateData) TemplateData {

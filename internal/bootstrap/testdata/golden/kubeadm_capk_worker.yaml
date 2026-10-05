@@ -1,0 +1,55 @@
+#cloud-config
+hostname: md-0-abcde
+
+users:
+  - name: kairos
+    passwd: kairos
+    groups:
+      - admin
+
+stages:
+  initramfs:
+    - name: pre-kubeadm
+      sysctl:
+        net.ipv4.ip_forward: "1"
+        kernel.panic: "10"
+        kernel.panic_on_oops: "1"
+        vm.overcommit_memory: "1"
+  boot:
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+        path: "/etc/resolv.conf"
+
+cluster:
+  cluster_token: 0b6d2c9e-7a54-4f3c-9d1e-2f8a6b4c1d07
+  control_plane_host: 10.96.0.10:6443
+  role: worker
+  ca_certs:
+      - |
+        -----BEGIN CERTIFICATE-----
+        MIIBgDCCASegAwIBAgIUSy8sq9DIOjLcDRhMq3UAEF8tJdYwCgYIKoZIzj0EAwIw
+        FTETMBEGA1UEAwwKa3ViZXJuZXRlczAgFw0yNjA5MjkxMzU3NTNaGA8yMTI2MDkw
+        NTEzNTc1M1owFTETMBEGA1UEAwwKa3ViZXJuZXRlczBZMBMGByqGSM49AgEGCCqG
+        SM49AwEHA0IABKsijJ+JNqP85czWLfcZ5gFXxYImkvaurep8lv/NJYFfYeJ4Q+Qy
+        6sOuFnWbO3DPZ7i+zCLRNg9fnITFF8+EbwKjUzBRMB0GA1UdDgQWBBTbUwbMvDUI
+        9p00aNG97oA5yszqYjAfBgNVHSMEGDAWgBTbUwbMvDUI9p00aNG97oA5yszqYjAP
+        BgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIA1NQU+hNSCEl06duHlr
+        pjPfjR7uO1Gj9YDltfCy063cAiBzgFTnX6t9hjKfudIccxVJ0DUwxaL6IhvOUEQg
+        OJyseQ==
+        -----END CERTIFICATE-----
+  config: |
+      clusterConfiguration:
+          kubernetesVersion: v1.36.4
+      initConfiguration:
+          nodeRegistration:
+              kubeletExtraArgs:
+                  - name: provider-id
+                    value: kubevirt://md-0-abcde
+      joinConfiguration:
+          discovery:
+              bootstrapToken:
+                  token: abcdef.0123456789abcdef
+                  apiServerEndpoint: 10.96.0.10:6443

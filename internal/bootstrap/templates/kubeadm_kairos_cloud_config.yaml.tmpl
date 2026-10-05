@@ -1,84 +1,69 @@
 #cloud-config
-{{- /* 
-Template inputs (from Go):
+{{- /*
+Template inputs (from Go), for a provider-kubernetes worker:
 
-  .Role              string   // "control-plane" or "worker"
-  .SingleNode        bool     // true for single-node kubeadm (controller-only)
-  .Hostname          string   // explicit hostname (optional)
-  .UserName          string   // e.g. "kairos"
-  .UserPassword      string   // e.g. "kairos"
-  .UserGroups        []string // e.g. ["admin"]
-  .GitHubUser        string   // e.g. "YOUR_GITHUB_USER" (optional)
-  .SSHPublicKey      string   // alternative to GitHubUser (optional)
-  .WorkerToken       string   // used only for workers
-  .Manifests         []Manifest // optional manifests
-  .HostnamePrefix    string   // e.g. "metal-"
-  .DNSServers        []string // optional DNS resolvers
-  .Install           *InstallConfig // install configuration (optional)
-  .ProviderID        string   // providerID for Node (e.g., "vsphere://<vm-uuid>")
-  .ControlPlaneLBEndpoint string // LoadBalancer endpoint for control plane (used as server address for workers)
+  .Hostname          string          // explicit hostname (optional)
+  .HostnamePrefix    string          // e.g. "metal-", used when Hostname is empty
+  .UserName          string          // e.g. "kairos"
+  .UserPassword      string          // e.g. "kairos" (optional)
+  .UserGroups        []string        // e.g. ["admin"]
+  .GitHubUser        string          // optional
+  .SSHPublicKey      string          // alternative to GitHubUser (optional)
+  .DNSServers        []string        // optional DNS resolvers
+  .Install           *InstallConfig  // install configuration (optional)
+  .KubeadmCluster    *KubeadmCluster // provider-kubernetes cluster block (required)
 */ -}}
-{{/* Hostname: prefer explicit name, else use hostname prefix with Kairos templating for machine ID */}}
+
 {{/* The {{ trunc 4 .MachineID }} is Kairos templating syntax, output literally */}}
-hostname: {{ .Hostname }}
+{{- if .Hostname }}
+hostname: {{ .Hostname | quote }}
+{{- else if .HostnamePrefix }}
+hostname: {{ printf "%s{{ trunc 4 .MachineID }}" .HostnamePrefix | quote }}
+{{- end }}
 
 {{- if .Install }}
 install:
   auto: {{ .Install.Auto }}
-  device: "{{ .Install.Device }}"
+  device: {{ .Install.Device | quote }}
   reboot: {{ .Install.Reboot }}
 {{- end }}
 
 users:
-  - name: {{ .UserName }}
-    passwd: {{ .UserPassword }}
+  - name: {{ .UserName | quote }}
+    {{- if .UserPassword }}
+    passwd: {{ .UserPassword | quote }}
+    {{- end }}
     groups:
-{{- range .UserGroups }}
-      - {{ . }}
-{{- end }}
-{{- if or .GitHubUser .SSHPublicKey }}
+    {{- range .UserGroups }}
+      - {{ . | quote }}
+    {{- end }}
+    {{- if or .GitHubUser .SSHPublicKey }}
     ssh_authorized_keys:
-  {{- if .GitHubUser }}
-      - github:{{ .GitHubUser }}
-  {{- end }}
-  {{- if .SSHPublicKey }}
-      - {{ .SSHPublicKey }}
-  {{- end }}
-{{- end }}
-{{/*{{- /* DNS overrides and post-bootstrap service */}}
+    {{- if .GitHubUser }}
+      - {{ printf "github:%s" .GitHubUser | quote }}
+    {{- end }}
+    {{- if .SSHPublicKey }}
+      - {{ .SSHPublicKey | quote }}
+    {{- end }}
+    {{- end }}
+
 stages:
   initramfs:
-    - sysctl:
+    - name: pre-kubeadm
+      sysctl:
         net.ipv4.ip_forward: "1"
         kernel.panic: "10"
         kernel.panic_on_oops: "1"
         vm.overcommit_memory: "1"
-      name: pre-kubeadm
-  boot:
 {{- if .DNSServers }}
+  boot:
     - name: "Configure DNS resolvers for early boot"
       dns:
         nameservers:
         {{- range .DNSServers }}
-          - {{ . }}
+          - {{ . | quote }}
         {{- end }}
         path: "/etc/resolv.conf"
 {{- end }}
 
-cluster:
-  role: worker
-  config: |
-    joinConfiguration:
-      discovery:
-        bootstrapToken:
-          apiServerEndpoint: {{ .ControlPlaneLBEndpoint }}
-          unsafeSkipCAVerification: true
-          token: {{ .WorkerToken }}
-    initConfiguration:
-      nodeRegistration:
-        kubeletExtraArgs:
-{{- if .Hostname }}
-          provider-id: kubevirt://{{ .Hostname }}
-{{- else }}
-          provider-id: {{ .ProviderID }}
-{{- end }}
+cluster:{{ toYaml .KubeadmCluster | nindent 2 }}

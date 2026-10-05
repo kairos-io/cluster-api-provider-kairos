@@ -97,6 +97,13 @@ const (
 	ControlPlaneRoleJoin ControlPlaneRole = "join"
 )
 
+// Supported values for KairosConfigSpec.Distribution.
+const (
+	DistributionK0s     = "k0s"
+	DistributionK3s     = "k3s"
+	DistributionKubeadm = "kubeadm"
+)
+
 // KairosConfigSpec defines the desired state of KairosConfig
 type KairosConfigSpec struct {
 	// Role indicates whether this is a control-plane or worker node
@@ -511,6 +518,14 @@ type File struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$`
 	Owner string `json:"owner,omitempty"`
+}
+
+// EffectiveDistribution returns spec.distribution, defaulting to k0s when unset.
+func (s KairosConfigSpec) EffectiveDistribution() string {
+	if s.Distribution == "" {
+		return DistributionK0s
+	}
+	return s.Distribution
 }
 
 // KairosConfigStatus defines the observed state of KairosConfig

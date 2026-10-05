@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"text/template"
 
@@ -143,6 +144,9 @@ type TemplateData struct {
 	// management-cluster contact is rendered. Resolved by the controller from a
 	// ManagementEndpointResolver; see internal/controllers/bootstrap/CLAUDE.md.
 	ManagementEndpoint *ManagementEndpoint
+	// KubeadmCluster is the provider-kubernetes `cluster:` block, rendered whole via toYaml.
+	// Only the kubeadm distribution sets it.
+	KubeadmCluster *KubeadmCluster
 }
 
 // ManagementEndpoint bundles the values the rendered cloud-config needs
@@ -267,6 +271,9 @@ func (d TemplateData) RenderKubeVIP() bool {
 
 // RenderKubeadmCloudConfig renders the kubeadm Kairos cloud-config template.
 func RenderKubeadmCloudConfig(data TemplateData) (string, error) {
+	if data.KubeadmCluster == nil {
+		return "", errors.New("kubeadm cloud-config requires a KubeadmCluster")
+	}
 	return renderTemplate("kubeadm_kairos_cloud_config", "templates/kubeadm_kairos_cloud_config.yaml.tmpl", data)
 }
 

@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -56,6 +57,11 @@ const (
 	workloadKubeconfigSecretValueKey    = "value"
 	kubeadmTokenUsageEnabled            = "true"
 	kubeadmControlPlaneEndpointProtocol = "https://"
+	kubeadmRoleWorker                   = "worker"
+	kubeadmDefaultUserName              = "kairos"
+	kubeadmDefaultUserGroup             = "admin"
+	kubeadmDefaultHostnamePrefix        = "metal-"
+	kubeadmDefaultInstallDevice         = "auto"
 )
 
 // ensureKubeadmBootstrapToken returns the management-cluster Secret holding the bootstrap
@@ -104,33 +110,40 @@ func (r *KairosConfigReconciler) ensureKubeadmBootstrapToken(ctx context.Context
 	return secret, nil
 }
 
-// pushKubeadmBootstrapTokenToWorkloadCluster replicates the bootstrap token Secret into
-// kube-system of the workload cluster as bootstrap-token-<id>, using the kubeconfig stored
-// in the <cluster>-kubeconfig Secret on the management cluster. The token data (including
-// expiration) is copied verbatim so the two sides stay in sync.
-func (r *KairosConfigReconciler) pushKubeadmBootstrapTokenToWorkloadCluster(ctx context.Context, cluster *clusterv1.Cluster, mgmtSecret *corev1.Secret) error {
-	tokenID := string(mgmtSecret.Data[kubeadmTokenIDKey])
-	if tokenID == "" {
-		return fmt.Errorf("management bootstrap token Secret %s/%s is missing token-id", mgmtSecret.Namespace, mgmtSecret.Name)
-	}
-
+// workloadRESTConfig returns the workload cluster REST config from the <cluster>-kubeconfig Secret.
+func (r *KairosConfigReconciler) workloadRESTConfig(ctx context.Context, cluster *clusterv1.Cluster) (*rest.Config, error) {
 	kubeconfigSecret := &corev1.Secret{}
 	key := types.NamespacedName{
 		Name:      fmt.Sprintf("%s-%s", cluster.Name, workloadKubeconfigSecretSuffix),
 		Namespace: cluster.Namespace,
 	}
 	if err := r.Get(ctx, key, kubeconfigSecret); err != nil {
-		return fmt.Errorf("failed to get workload kubeconfig Secret %s: %w", key, err)
+		return nil, fmt.Errorf("failed to get workload kubeconfig Secret %s: %w", key, err)
 	}
 	kubeconfigBytes := kubeconfigSecret.Data[workloadKubeconfigSecretValueKey]
 	if len(kubeconfigBytes) == 0 {
-		return fmt.Errorf("workload kubeconfig Secret %s has empty 'value' field", key)
+		return nil, fmt.Errorf("workload kubeconfig Secret %s has empty 'value' field", key)
 	}
 
 	restCfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
 	if err != nil {
-		return fmt.Errorf("failed to parse workload kubeconfig: %w", err)
+		return nil, fmt.Errorf("failed to parse workload kubeconfig: %w", err)
 	}
+	if len(restCfg.CAData) == 0 {
+		return nil, fmt.Errorf("workload kubeconfig Secret %s has no certificate-authority-data", key)
+	}
+	return restCfg, nil
+}
+
+// pushKubeadmBootstrapTokenToWorkloadCluster replicates the bootstrap token Secret into
+// kube-system of the workload cluster as bootstrap-token-<id>. The token data (including
+// expiration) is copied verbatim so the two sides stay in sync.
+func (r *KairosConfigReconciler) pushKubeadmBootstrapTokenToWorkloadCluster(ctx context.Context, restCfg *rest.Config, mgmtSecret *corev1.Secret) error {
+	tokenID := string(mgmtSecret.Data[kubeadmTokenIDKey])
+	if tokenID == "" {
+		return fmt.Errorf("management bootstrap token Secret %s/%s is missing token-id", mgmtSecret.Namespace, mgmtSecret.Name)
+	}
+
 	remoteClient, err := client.New(restCfg, client.Options{Scheme: r.Scheme})
 	if err != nil {
 		return fmt.Errorf("failed to build workload cluster client: %w", err)
@@ -153,119 +166,101 @@ func (r *KairosConfigReconciler) pushKubeadmBootstrapTokenToWorkloadCluster(ctx 
 	return nil
 }
 
+// generateKubeadmCloudConfig renders a provider-kubernetes worker cloud-config that joins the workload
+// cluster with a per-Machine bootstrap token pinned to the workload cluster CA.
 func (r *KairosConfigReconciler) generateKubeadmCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
-	singleNode := kairosConfig.Spec.SingleNode
-
-	var workerToken string
-	if role == "worker" {
-		mgmtTokenSecret, err := r.ensureKubeadmBootstrapToken(ctx, kairosConfig, machine)
-		if err != nil {
-			return "", fmt.Errorf("failed to ensure kubeadm bootstrap token: %w", err)
-		}
-		if err := r.pushKubeadmBootstrapTokenToWorkloadCluster(ctx, cluster, mgmtTokenSecret); err != nil {
-			return "", fmt.Errorf("failed to push kubeadm bootstrap token to workload cluster: %w", err)
-		}
-		workerToken = fmt.Sprintf("%s.%s", mgmtTokenSecret.Data[kubeadmTokenIDKey], mgmtTokenSecret.Data[kubeadmTokenSecretKey])
+	if role != kubeadmRoleWorker {
+		return "", fmt.Errorf("kubeadm distribution only supports the %s role, got %q", kubeadmRoleWorker, role)
+	}
+	if machine == nil || cluster == nil {
+		return "", fmt.Errorf("kubeadm worker cloud-config requires both a Machine and a Cluster")
+	}
+	if machine.Spec.Version == "" {
+		return "", fmt.Errorf("machine %s/%s has no spec.version", machine.Namespace, machine.Name)
 	}
 
-	// Set defaults for user configuration
-	userName := kairosConfig.Spec.UserName
-	if userName == "" {
-		userName = "kairos"
+	restCfg, err := r.workloadRESTConfig(ctx, cluster)
+	if err != nil {
+		return "", err
 	}
+	mgmtTokenSecret, err := r.ensureKubeadmBootstrapToken(ctx, kairosConfig, machine)
+	if err != nil {
+		return "", fmt.Errorf("failed to ensure kubeadm bootstrap token: %w", err)
+	}
+	if err := r.pushKubeadmBootstrapTokenToWorkloadCluster(ctx, restCfg, mgmtTokenSecret); err != nil {
+		return "", fmt.Errorf("failed to push kubeadm bootstrap token to workload cluster: %w", err)
+	}
+
+	// Get providerID from Machine's infrastructure reference so the Node registers with it.
+	providerID := r.getProviderID(ctx, log, machine)
+	kubeadmCluster, err := bootstrap.NewKubeadmWorkerCluster(bootstrap.KubeadmWorkerParams{
+		ClusterToken:      string(cluster.UID),
+		ControlPlaneHost:  strings.TrimPrefix(serverAddress, kubeadmControlPlaneEndpointProtocol),
+		CACertPEM:         string(restCfg.CAData),
+		KubernetesVersion: machine.Spec.Version,
+		BootstrapToken:    fmt.Sprintf("%s.%s", mgmtTokenSecret.Data[kubeadmTokenIDKey], mgmtTokenSecret.Data[kubeadmTokenSecretKey]),
+		ProviderID:        providerID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to build kubeadm cluster block: %w", err)
+	}
+
 	userPassword, err := r.resolveUserPassword(ctx, kairosConfig)
 	if err != nil {
 		return "", err
 	}
-	userGroups := kairosConfig.Spec.UserGroups
-	if len(userGroups) == 0 {
-		userGroups = []string{"admin"}
-	}
 
-	// Set hostname prefix (default to "metal-" if not specified)
-	hostnamePrefix := kairosConfig.Spec.HostnamePrefix
-	if hostnamePrefix == "" {
-		hostnamePrefix = "metal-"
-	}
-
-	// Prefer explicit hostname, otherwise use Machine name
-	hostname := kairosConfig.Spec.Hostname
-	if hostname == "" && machine != nil {
-		hostname = machine.Name
-	}
-
-	// Set install configuration (with defaults)
-	var installConfig *bootstrap.InstallConfig
-	if kairosConfig.Spec.Install != nil {
-		installConfig = &bootstrap.InstallConfig{
-			Auto:   true,   // Default to true
-			Device: "auto", // Default to "auto"
-			Reboot: true,   // Default to true
-		}
-		if kairosConfig.Spec.Install.Auto != nil {
-			installConfig.Auto = *kairosConfig.Spec.Install.Auto
-		}
-		if kairosConfig.Spec.Install.Device != "" {
-			installConfig.Device = kairosConfig.Spec.Install.Device
-		}
-		if kairosConfig.Spec.Install.Reboot != nil {
-			installConfig.Reboot = *kairosConfig.Spec.Install.Reboot
-		}
-	}
-
-	if installConfig != nil {
-		log.Info("Using install configuration", "auto", installConfig.Auto, "device", installConfig.Device, "reboot", installConfig.Reboot)
-	} else {
-		log.Info("No install configuration provided; install block will be omitted")
-	}
-
-	// Get providerID from Machine's infrastructure reference
-	// This is needed to set the Node's providerID so the Machine controller can match Nodes to Machines
-	providerID := r.getProviderID(ctx, log, machine)
-	// Build template data
 	templateData := bootstrap.TemplateData{
 		Role:           role,
-		SingleNode:     singleNode,
-		Hostname:       hostname,
-		UserName:       userName,
+		Hostname:       kairosConfig.Spec.Hostname,
+		HostnamePrefix: kairosConfig.Spec.HostnamePrefix,
+		UserName:       kairosConfig.Spec.UserName,
 		UserPassword:   userPassword,
-		UserGroups:     userGroups,
+		UserGroups:     kairosConfig.Spec.UserGroups,
 		GitHubUser:     kairosConfig.Spec.GitHubUser,
 		SSHPublicKey:   kairosConfig.Spec.SSHPublicKey,
-		WorkerToken:    workerToken,
-		Manifests:      kairosConfig.Spec.Manifests,
-		HostnamePrefix: hostnamePrefix,
 		DNSServers:     kairosConfig.Spec.DNSServers,
-		PodCIDR:        kairosConfig.Spec.PodCIDR,
-		ServiceCIDR:    kairosConfig.Spec.ServiceCIDR,
-		PrimaryIP:      kairosConfig.Spec.PrimaryIP,
-		IsKubeVirt:     isKubevirtMachine(machine),
-		Install:        installConfig,
+		Install:        kubeadmInstallConfig(kairosConfig.Spec.Install),
 		ProviderID:     providerID,
-		// Workers join through the cluster control-plane endpoint.
-		ControlPlaneLBEndpoint: strings.ReplaceAll(serverAddress, kubeadmControlPlaneEndpointProtocol, ""),
+		KubeadmCluster: kubeadmCluster,
 	}
-	if machine != nil {
-		templateData.MachineName = machine.Name
-	}
-	if cluster != nil {
-		templateData.ClusterNS = cluster.Namespace
-		templateData.ControlPlaneLBServiceName = fmt.Sprintf("%s-%s", cluster.Name, controlPlaneLBServiceSuffix)
-		templateData.ControlPlaneLBServiceNamespace = cluster.Namespace
-	}
-	if cluster != nil && isKubevirtMachine(machine) && role == "control-plane" {
-		lbEndpoint, err := r.getControlPlaneLBEndpoint(ctx, cluster.Namespace, templateData.ControlPlaneLBServiceName)
-		if err != nil {
-			return "", err
-		}
-		if lbEndpoint == "" {
-			return "", errLBEndpointNotReady
-		}
-		templateData.ControlPlaneLBEndpoint = lbEndpoint
-	}
+	applyKubeadmTemplateDefaults(&templateData, machine)
 
-	// Render template
 	return bootstrap.RenderKubeadmCloudConfig(templateData)
+}
+
+// applyKubeadmTemplateDefaults fills the user and hostname defaults the other distributions also use.
+func applyKubeadmTemplateDefaults(data *bootstrap.TemplateData, machine *clusterv1.Machine) {
+	if data.UserName == "" {
+		data.UserName = kubeadmDefaultUserName
+	}
+	if len(data.UserGroups) == 0 {
+		data.UserGroups = []string{kubeadmDefaultUserGroup}
+	}
+	if data.HostnamePrefix == "" {
+		data.HostnamePrefix = kubeadmDefaultHostnamePrefix
+	}
+	if data.Hostname == "" {
+		data.Hostname = machine.Name
+	}
+}
+
+// kubeadmInstallConfig converts the KairosConfig install spec, defaulting to an automatic install with reboot.
+func kubeadmInstallConfig(spec *bootstrapv1beta2.InstallConfig) *bootstrap.InstallConfig {
+	if spec == nil {
+		return nil
+	}
+	cfg := &bootstrap.InstallConfig{Auto: true, Device: kubeadmDefaultInstallDevice, Reboot: true}
+	if spec.Auto != nil {
+		cfg.Auto = *spec.Auto
+	}
+	if spec.Device != "" {
+		cfg.Device = spec.Device
+	}
+	if spec.Reboot != nil {
+		cfg.Reboot = *spec.Reboot
+	}
+	return cfg
 }
 
 // randomBootstrapTokenString returns a random [a-z0-9] string of the given length.

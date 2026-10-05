@@ -71,7 +71,7 @@ func (*kairosConfigDefaulter) Default(_ context.Context, r *KairosConfig) error 
 
 	// Set default distribution
 	if r.Spec.Distribution == "" {
-		r.Spec.Distribution = "k0s"
+		r.Spec.Distribution = DistributionK0s
 	}
 
 	// Set default role
@@ -191,7 +191,7 @@ func (r *KairosConfig) validate() error {
 	}
 
 	// Validate distribution
-	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" && r.Spec.Distribution != "k3s" && r.Spec.Distribution != "kubeadm" {
+	if r.Spec.Distribution != "" && r.Spec.Distribution != DistributionK0s && r.Spec.Distribution != DistributionK3s && r.Spec.Distribution != DistributionKubeadm {
 		allErrs = append(allErrs, field.Invalid(
 			field.NewPath("spec", "distribution"),
 			r.Spec.Distribution,
