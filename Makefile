@@ -99,8 +99,10 @@ test-envtest: ## Run envtest-based integration tests.
 	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 	@echo "Downloading CAPI CRDs..."
 	@mkdir -p test/crd/capi
-	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.4/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
-		(echo "Warning: Failed to download CAPI CRDs. Tests may fail." && rm -f test/crd/capi/cluster-api-components.yaml)
+	@test -n "$(CAPI_VERSION)" || { echo "error: could not read sigs.k8s.io/cluster-api from go.mod"; exit 1; }
+	@curl -fsSL --retry 3 --retry-all-errors \
+		https://github.com/kubernetes-sigs/cluster-api/releases/download/$(CAPI_VERSION)/cluster-api-components.yaml \
+		-o test/crd/capi/cluster-api-components.yaml
 	@echo "Setting up kubebuilder tools..."
 	@export PATH=$$(go env GOPATH)/bin:$$PATH && \
 	eval $$(setup-envtest use -p env $(ENVTEST_K8S_VERSION)) && \
@@ -231,6 +233,13 @@ GOLANGCI_LINT_VERSION ?= v1.60.0
 # skew (one minor), NOT a mismatch to "fix" by bumping go.mod: MVS would revert it to CAPI's requirement.
 SETUP_ENVTEST_VERSION ?= v0.24.1
 ENVTEST_K8S_VERSION ?= 1.36.2
+# The CAPI CRDs the envtest suite installs have to come from the release the module
+# is built against, so the version is read from go.mod instead of written out a
+# second time. Renovate automerges a patch bump of sigs.k8s.io/cluster-api once the
+# checks pass (see the gomod rule in renovate.json), and a literal here would stay
+# behind it with nothing to report the gap: the download would still succeed and the
+# suite would install CRDs from the older release.
+CAPI_VERSION ?= $(shell go list -m -f '{{.Version}}' sigs.k8s.io/cluster-api)
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
