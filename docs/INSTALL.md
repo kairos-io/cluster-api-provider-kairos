@@ -236,6 +236,57 @@ make uninstall
 
 ---
 
+## Optional manager flags
+
+### `--kubeadm-extra-controlplane-kinds`
+
+Applies to the bootstrap manager only. It widens the set of control-plane kinds
+that a kubeadm worker (a `KairosConfig` with `distribution: kubeadm`) may join.
+See [Kubeadm workers](KUBEADM_WORKERS.md) for how the worker join uses it.
+
+- **Default.** The bootstrap manager trusts `KubeadmControlPlane` and
+  `KamajiControlPlane` in the `controlplane.cluster.x-k8s.io` group.
+  `KairosControlPlane` is also on the built-in list, but only when its
+  distribution is kubeadm, which is not supported in this release.
+- **Format.** Comma-separated `Kind.group` entries, for example
+  `FooControlPlane.controlplane.example.com,BarControlPlane.example.org`. The Kind
+  is the text before the first dot; the group is the remainder. Kind and group are
+  matched together. An entry that is not in `Kind.group` form makes the manager
+  exit at startup with `invalid --kubeadm-extra-controlplane-kinds`.
+- **Operator-level only.** No `Cluster` or `KairosConfig` field can add a kind.
+- **RBAC.** The bootstrap manager reads the control-plane object to verify it. The
+  shipped bootstrap RBAC grants read on `KubeadmControlPlane` and
+  `KamajiControlPlane` only, because it cannot name a kind it does not know about.
+  Grant the bootstrap Deployment's ServiceAccount `get` on the plural resource of
+  each kind you add. Find the ServiceAccount with
+  `kubectl -n <namespace> get deployment <name> -o jsonpath='{.spec.template.spec.serviceAccountName}'`,
+  using the Deployment names below.
+- **When to use it.** Add a kind only for a control-plane provider you operate. The
+  bootstrap manager reads the kubeconfig Secret that provider publishes and
+  connects, from the management cluster's network, to the server address in it.
+
+Set the flag on the bootstrap manager's Deployment. For the flat manifest and the
+developer install:
+
+```bash
+kubectl -n kairos-capi-system patch deployment kairos-capi-controller-manager \
+  --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubeadm-extra-controlplane-kinds=FooControlPlane.controlplane.example.com"}]'
+```
+
+For the `clusterctl` install, patch the bootstrap Deployment instead:
+
+```bash
+kubectl -n capi-kairos-bootstrap-system patch deployment capi-kairos-bootstrap-controller-manager \
+  --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubeadm-extra-controlplane-kinds=FooControlPlane.controlplane.example.com"}]'
+```
+
+The Deployment rolls out a new Pod. Re-applying the install manifest, or running
+`clusterctl upgrade`, resets the arguments, so re-apply the patch afterwards. Do
+not set the flag on the `clusterctl` control-plane Deployment; it has no effect
+there.
+
+---
+
 ## Network reachability requirement for non-CAPK infrastructure
 
 Starting with v0.1.0-alpha.2 (carried forward in v0.1.0-beta.1), the controller no longer SSHes into nodes to
@@ -268,5 +319,6 @@ for the full configuration steps.
 - [CAPK Quickstart](QUICKSTART_CAPK.md) — create a cluster with KubeVirt.
 - [CAPM3 Quickstart](QUICKSTART_CAPM3.md) — create a cluster on bare metal via Metal3.
 - [Fleet Quickstart](QUICKSTART_FLEET.md) — create a cluster from AuroraBoot-claimed nodes with the Kairos fleet infrastructure provider.
+- [Kubeadm workers](KUBEADM_WORKERS.md) — join Kairos workers to a Kamaji or `KubeadmControlPlane` control plane.
 
 For the current release status, breaking changes, and security caveats, read the [v0.1.0 release notes](release-notes/v0.1.0.md).

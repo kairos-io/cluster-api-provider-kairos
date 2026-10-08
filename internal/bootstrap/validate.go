@@ -182,6 +182,19 @@ func validateTemplateData(d *TemplateData) error {
 			errs = append(errs, err)
 		}
 	}
+	// Kubeadm block (ADR 0010 P1): JoinConfiguration and ProviderIDPatch are
+	// controller-marshalled YAML written as block scalars, so they legitimately
+	// contain newlines (no rejectControlChars). But a "{{" would be written
+	// verbatim into node-side config — Jinja is not expanded on Kairos — so reject
+	// it here as the renderer's last-line defence behind the webhook refusal.
+	if d.Kubeadm != nil {
+		if strings.Contains(d.Kubeadm.JoinConfiguration, "{{") {
+			errs = append(errs, fmt.Errorf("kubeadm.joinConfiguration must not contain '{{'"))
+		}
+		if strings.Contains(d.Kubeadm.ProviderIDPatch, "{{") {
+			errs = append(errs, fmt.Errorf("kubeadm.providerIDPatch must not contain '{{'"))
+		}
+	}
 	return errors.Join(errs...)
 }
 

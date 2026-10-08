@@ -16,7 +16,7 @@ Run unit tests (no envtest assets needed):
 go test ./...
 ```
 
-Coverage includes template rendering for k0s and k3s, bootstrap controller logic, and webhook validation.
+Coverage includes template rendering for k0s, k3s, and kubeadm, bootstrap controller logic, and webhook validation.
 
 ## Envtest (integration)
 
@@ -96,5 +96,7 @@ Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3,
 | CAPD | k0s | Supported (dev only) | Not exercised |
 | Fleet | k0s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 | Fleet | k3s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
+
+Kubeadm workers (`distribution: kubeadm`, see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. They are covered by unit and envtest tests only: the envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. No end-to-end run against a live Kamaji or `KubeadmControlPlane` cluster has been done.
 
 Hadron is the musl-libc-based next-generation Kairos OS; it is exercised alongside standard (glibc) Kairos images to confirm compatibility with both targets.

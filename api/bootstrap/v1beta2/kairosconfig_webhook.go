@@ -71,7 +71,7 @@ func (*kairosConfigDefaulter) Default(_ context.Context, r *KairosConfig) error 
 
 	// Set default distribution
 	if r.Spec.Distribution == "" {
-		r.Spec.Distribution = "k0s"
+		r.Spec.Distribution = DefaultDistribution
 	}
 
 	// Set default role
@@ -190,40 +190,11 @@ func (r *KairosConfig) validate() error {
 		))
 	}
 
-	// Validate distribution
-	if r.Spec.Distribution != "" && r.Spec.Distribution != "k0s" && r.Spec.Distribution != "k3s" {
-		allErrs = append(allErrs, field.Invalid(
-			field.NewPath("spec", "distribution"),
-			r.Spec.Distribution,
-			"spec.distribution must be one of [k0s, k3s]",
-		))
-	}
-
-	// Validate worker token requirement
-	if r.Spec.Role == "worker" {
-		switch r.Spec.Distribution {
-		case "k3s":
-			hasK3sToken := r.Spec.K3sToken != ""
-			hasK3sTokenRef := r.Spec.K3sTokenSecretRef != nil && r.Spec.K3sTokenSecretRef.Name != ""
-			hasWorkerToken := r.Spec.WorkerToken != ""
-			hasWorkerTokenRef := r.Spec.WorkerTokenSecretRef != nil && r.Spec.WorkerTokenSecretRef.Name != ""
-			if !hasK3sToken && !hasK3sTokenRef && !hasWorkerToken && !hasWorkerTokenRef {
-				allErrs = append(allErrs, field.Required(
-					field.NewPath("spec", "k3sToken"),
-					"k3s worker requires spec.k3sToken, spec.k3sTokenSecretRef, spec.workerToken, or spec.workerTokenSecretRef to be set",
-				))
-			}
-		default:
-			hasToken := r.Spec.WorkerToken != ""
-			hasTokenRef := r.Spec.WorkerTokenSecretRef != nil && r.Spec.WorkerTokenSecretRef.Name != ""
-			if !hasToken && !hasTokenRef {
-				allErrs = append(allErrs, field.Required(
-					field.NewPath("spec", "workerToken"),
-					"worker KairosConfig requires either spec.workerToken or spec.workerTokenSecretRef to be set",
-				))
-			}
-		}
-	}
+	// Validate distribution: the name check followed by the effective
+	// distribution's per-distribution rules (the worker-token requirement).
+	// The table and rules live in distribution.go; the aggregate order (name
+	// error, then token error) is preserved.
+	allErrs = append(allErrs, r.validateDistribution()...)
 
 	// KD-3a: require at least one explicit credential. Previously UserPassword
 	// silently defaulted to "kairos", which combined with PasswordAuthentication

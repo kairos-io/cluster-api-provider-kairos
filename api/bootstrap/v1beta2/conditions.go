@@ -44,4 +44,13 @@ const (
 
 	// BootstrapFailedReason indicates that bootstrap failed
 	BootstrapFailedReason = "BootstrapFailed"
+
+	// BootstrapTokenRefreshCapExceededReason is the False(Warning) reason on
+	// BootstrapReadyCondition for a kubeadm worker whose Machine has still not
+	// registered a Node after the token-refresh hard cap elapsed (ADR 0010 P1
+	// item 7). The controller stops re-minting bootstrap tokens past the cap; a
+	// MachineHealthCheck with a nodeStartupTimeout is expected to replace the stuck
+	// Machine. Resolution: check why the node never joined (image/version mismatch,
+	// network, CNI), then let the MHC or a manual delete replace the Machine.
+	BootstrapTokenRefreshCapExceededReason = "BootstrapTokenRefreshCapExceeded"
 )

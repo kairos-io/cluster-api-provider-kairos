@@ -19,6 +19,7 @@ package v1beta2
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
@@ -104,12 +105,25 @@ type KairosConfigSpec struct {
 	// +kubebuilder:default=worker
 	Role string `json:"role,omitempty"`
 
-	// Distribution specifies the Kubernetes distribution to install
-	// +kubebuilder:validation:Enum=k0s;k3s
+	// Distribution is the Kubernetes distribution this config provisions.
+	// One of: k0s, k3s, kubeadm. Defaults to k0s.
+	//
+	//   - k0s, k3s: render a Kairos-native cloud-config that installs and starts the
+	//     distribution directly (control-plane or worker).
+	//   - kubeadm: join a Kairos WORKER to an existing kubeadm control plane (for
+	//     example Kamaji or an upstream KubeadmControlPlane). The controller mints a
+	//     short-lived bootstrap token in the workload cluster after verifying the
+	//     cluster's kubeconfig is owned by its control plane, and renders a kubeadm
+	//     JoinConfiguration. kubeadm is for worker nodes only; it is not supported on
+	//     a KairosControlPlane, whose distribution remains one of k0s, k3s.
+	// +kubebuilder:validation:Enum=k0s;k3s;kubeadm
 	// +kubebuilder:default=k0s
 	Distribution string `json:"distribution,omitempty"`
 
-	// KubernetesVersion specifies the Kubernetes version to install
+	// KubernetesVersion records the intended Kubernetes version. It is informational:
+	// the running version is whatever the Kairos image ships. For kubeadm workers the
+	// authoritative version is the owning Machine's spec.version, which the rendered
+	// join checks against the image's kubeadm before joining.
 	// +kubebuilder:validation:Required
 	KubernetesVersion string `json:"kubernetesVersion"`
 
@@ -356,6 +370,34 @@ type KairosConfigSpec struct {
 	// This controls how Kairos OS is installed to disk
 	// +optional
 	Install *InstallConfig `json:"install,omitempty"`
+
+	// Kubeadm holds kubeadm-specific inputs for a worker join. It applies only when
+	// Distribution is kubeadm and Role is worker; it is ignored for k0s and k3s.
+	// Every field is optional: the controller fills nodeRegistration, discovery (the
+	// minted bootstrap token and the cluster-CA pin), and the providerID patch.
+	//
+	// Secret material and unsafe options are rejected at admission: no inline
+	// bootstrap token, no unsafeSkipCAVerification, no file-based discovery, no
+	// control-plane join, and no "{{" placeholders.
+	// +optional
+	Kubeadm *KubeadmConfig `json:"kubeadm,omitempty"`
+}
+
+// KubeadmConfig holds the kubeadm-specific inputs for a worker join. It embeds only
+// the individual CAPI kubeadm v1beta2 types a worker join needs, so the served CRD
+// does not carry the entire kubeadm bootstrap-config surface.
+type KubeadmConfig struct {
+	// JoinConfiguration is the kubeadm JoinConfiguration for a worker join. The
+	// controller overlays the fields it owns on top of anything set here:
+	// nodeRegistration.name (the Machine hostname), discovery (the minted bootstrap
+	// token, the control-plane endpoint, and the cluster-CA hash), the providerID
+	// kubelet patch, and the node.cluster.x-k8s.io/uninitialized taint.
+	//
+	// controlPlane must be nil: a control-plane join is not supported (worker only).
+	// Values that carry secret material or weaken the join's CA pin are rejected at
+	// admission.
+	// +optional
+	JoinConfiguration *kubeadmv1.JoinConfiguration `json:"joinConfiguration,omitempty"`
 }
 
 // InstallConfig specifies the Kairos installation configuration
@@ -555,6 +597,16 @@ type KairosConfigStatus struct {
 	// If non-empty, check the owning Machine's events for context.
 	// +optional
 	FailureMessage string `json:"failureMessage,omitempty"`
+
+	// BootstrapTokenID is the non-secret ID half (the "[a-z0-9]{6}" prefix) of the
+	// kubeadm bootstrap token this KairosConfig most recently minted in the workload
+	// cluster. It lets operators correlate the token Secret in the workload cluster's
+	// kube-system namespace with this KairosConfig and audit its refresh, without
+	// exposing the secret half, which lives only in the bootstrap-data Secret and is
+	// never placed in spec or status. Empty for k0s and k3s, and for a kubeadm worker
+	// that has not yet minted a token.
+	// +optional
+	BootstrapTokenID string `json:"bootstrapTokenID,omitempty"`
 }
 
 // KairosConfigInitialization provides observations of the KairosConfig initialization process.

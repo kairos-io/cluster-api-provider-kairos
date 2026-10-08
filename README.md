@@ -24,6 +24,8 @@ Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, 
 
 Read the [v0.1.3 release notes](docs/release-notes/v0.1.3.md) before installing, and the [v0.1.0 release notes](docs/release-notes/v0.1.0.md) if you are coming from before v0.1.0. If you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place.
 
+`KairosConfig` also accepts `distribution: kubeadm` to join Kairos **worker** nodes to a control plane that this provider does not run: a Kamaji `KamajiControlPlane` or a Cluster API `KubeadmControlPlane`. `KairosControlPlane` supports `k0s` and `k3s` only; this provider does not create kubeadm control planes. You supply the CNI and a node image that ships kubeadm, kubelet, and containerd at the exact workload Kubernetes version. This path is covered by unit and envtest tests and has not yet been validated against a live Kamaji or `KubeadmControlPlane` cluster. See [Kubeadm workers](docs/KUBEADM_WORKERS.md).
+
 The control plane provider is no longer limited to a fixed provider allowlist: any infrastructure provider that implements the standard CAPI `<Kind>MachineTemplate` contract works through a generic clone path, verified end-to-end against Beskar7 (a bare-metal provider outside the list above). CAPD, CAPV, CAPK, CAPM3, and the Kairos fleet provider remain the first-class path — HA support, worked samples, and a quickstart — because they carry behavior the generic path cannot infer (e.g. KubeVirt's cloud-init volume handling); other CAPI-conformant providers get the generic path with no dedicated sample or quickstart yet.
 
 ## Install (released version)
@@ -60,15 +62,17 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | kairos-fleet | v0.1.0+ (`cluster-api-provider-kairos-fleet`); v0.1.2+ recommended, since its shipped cluster template could not create workers before that. AuroraBoot — do not use fleet v0.1.0-beta.1, it crash-loops on a real management cluster |
 | k0s | ~v1.36.1+k0s |
 | k3s | ~v1.36.1+k3s1 |
+| kubeadm (workers only) | The kubeadm and kubelet version the node image ships; it must equal `Machine.spec.version` exactly. The control plane (Kamaji or `KubeadmControlPlane`) is run outside this provider |
 | Kairos | v4.1.2 (standard and Hadron images) |
 | cert-manager | v1.15+ |
 
-Management-cluster support is the full Cluster API v1.13 band (v1.30-v1.36); v1.36 is the version validated in CI/envtest and recommended for new installs, not a hard floor. Workload Kubernetes version is whatever k0s/k3s ships in the Kairos image you deploy: `KairosConfig.spec.kubernetesVersion` / `KairosControlPlane.spec.version` are informational only and do not select or override it (see [API Reference](docs/API_REFERENCE.md)).
+Management-cluster support is the full Cluster API v1.13 band (v1.30-v1.36); v1.36 is the version validated in CI/envtest and recommended for new installs, not a hard floor. Workload Kubernetes version is whatever k0s/k3s ships in the Kairos image you deploy: `KairosConfig.spec.kubernetesVersion` / `KairosControlPlane.spec.version` are informational only and do not select or override it (see [API Reference](docs/API_REFERENCE.md)). The exception is `distribution: kubeadm`, where the node image's kubeadm version must equal `Machine.spec.version` exactly or the node refuses to join (see [Kubeadm workers](docs/KUBEADM_WORKERS.md)).
 
 ## Documentation
 
 - [Install guide](docs/INSTALL.md) — installation paths (clusterctl, released flat artifact, and developer install from source).
 - [High-Availability control planes](docs/HIGH_AVAILABILITY.md) — VIP configuration, worked samples, and etcd day-2 behavior.
+- [Kubeadm workers](docs/KUBEADM_WORKERS.md) — join Kairos workers to a Kamaji or `KubeadmControlPlane` control plane.
 - [Upgrade guide](docs/UPGRADING.md) — upgrade procedures and breaking-change migration steps.
 - [API Reference](docs/API_REFERENCE.md) — CRD reference.
 - [Testing](docs/TESTING.md) — how to run tests.

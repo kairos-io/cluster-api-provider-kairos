@@ -1,0 +1,503 @@
+#cloud-config
+
+hostname: kairos-node-0
+install:
+  auto: true
+  device: /dev/sda
+  reboot: true
+
+users:
+- name: kairos
+  passwd: test-password
+  groups:
+    - admin
+    - users
+  ssh_authorized_keys:
+    - github:octocat
+    - ssh-ed25519 AAAATESTKEYtestexample test@example
+- name: capk
+  groups: [users, admin]
+
+# Control-plane node configuration
+# Pass providerID at k3s startup so node registers with correct providerID (avoids k3s:// vs kubevirt:// mismatch)
+# Use both k3s.args (Kairos) and config file drop-in (k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml on every start)
+# Add --tls-san for LB endpoint so management cluster can connect via LoadBalancer
+# ProviderID is regex-validated before render (see internal/bootstrap/validate.go).
+k3s:
+  enabled: true
+  args:
+    - --kubelet-arg=provider-id=kubevirt://kairos-node-0
+    # ADR 0005 (HA) init node on CAPK: bootstrap embedded etcd. NO kube-vip is
+    # rendered for CAPK (OQ-5) — CAPK's built-in LoadBalancer Service is the
+    # stable endpoint (ControlPlaneLBEndpoint), which --tls-san already covers.
+    #
+    # --token-file pins the shared K3S_TOKEN on the init node from the same token
+    # file the joiners read (written below for every HA role). Without it
+    # --cluster-init auto-generates a random token the joiners can never match.
+    # (ADR 0005 Phase 3, BLOCKER-1.)
+    #
+    # NOTE: these args arrive via a systemd override written ~3s AFTER
+    # k3s.service first starts — too late to choose the datastore.
+    # 93-ha-datastore.yaml (write_files, below) pins them in config.yaml.d.
+    - --cluster-init
+    - --token-file=/etc/rancher/k3s/server-token
+    - --tls-san=10.96.0.10
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # systemd drop-in: skip k3s.service on the Kairos live installer.
+  # The k3s.enabled: true cloud-config primitive (below) issues
+  # `systemctl start k3s.service`. On the live installer, k3s's bundled
+  # containerd cannot use the overlayfs snapshotter on the live tmpfs
+  # overlay (cannot nest overlayfs), so k3s.service stays in retry
+  # forever — blocking provider-kairos's k3s primitive from returning
+  # and hanging the userdata cloud-config stage indefinitely. The
+  # ConditionKernelCommandLine=!cdroot gate makes systemd treat the
+  # start as a no-op on the live installer; the install proceeds, then
+  # the installed-system boot has /var/lib/rancher on a real
+  # filesystem (no overlay nesting) and k3s starts normally.
+  # KD-3b lab finding on Hadron, harmless on Ubuntu-Kairos.
+  - path: /etc/systemd/system/k3s.service.d/00-skip-on-live-installer.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      ConditionKernelCommandLine=!cdroot
+  - path: /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      # ProviderID for CAPI/CAPK node matching (k3s loads this on every start)
+      kubelet-arg:
+        - provider-id=kubevirt://kairos-node-0
+  # tls-san for the apiserver serving cert. Provider-kairos's `k3s.args:`
+  # integration was observed during KD-3b lab validation to NOT write
+  # /etc/rancher/k3s/config.yaml on Hadron, so k3s generated its serving
+  # cert with default SANs only (127.0.0.1, ::1, kubernetes.default.svc,
+  # 10.43.0.1, 10.0.2.2) — missing the LB IP. CAPI's clustercache then
+  # fails to verify the cert when connecting via the LB Service IP from
+  # the management cluster, leaving the Machine in
+  # `NodeHealthy: ConnectionDown` forever. Writing tls-san directly to
+  # config.yaml.d (the same pattern we already use for kubelet-arg above)
+  # ensures k3s reads it on every start and regenerates the cert with
+  # the correct SANs included.
+  - path: /etc/rancher/k3s/config.yaml.d/91-tls-san.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      # tls-san for apiserver serving cert; LB IP must be reachable from
+      # the management cluster (KD-3b push pattern).
+      tls-san:
+        - 10.96.0.10
+  # Dual-interface bridge networking (CAPK HA). CAPK VMs use KubeVirt masquerade,
+  # so every VM's primary (eth0/pod) IP is the SLIRP self-address 10.0.2.2 —
+  # identical on every VM and unroutable between VMs. k3s embedded etcd peers over
+  # the node IP, which auto-detects to 10.0.2.2, so etcd members can never reach
+  # each other and HA never forms (the same masquerade constraint the k0s CAPK HA
+  # path solves via spec.storage.etcd.peerAddress + spec.api.address). The VM gets
+  # a SECOND NIC (eth1, Multus lan-bridge, routable DHCP address, e.g. 172.16.56.x);
+  # k3s must peer etcd over THAT. eth0/pod stays the LB/API path (OQ-5, no kube-vip);
+  # k3s joiners already join via the routable LB endpoint (--server=<LB>:6443), so
+  # unlike k0s no token-encoded address needs fixing — only node-ip.
+  #
+  # Fail-safe design: rather than ship a static config with a placeholder that k3s
+  # would reject if left unsubstituted (crash-loops the server), a k3s.service
+  # ExecStartPre detects the routable bridge IP on-node and WRITES
+  # /etc/rancher/k3s/config.yaml.d/92-node-ip.yaml with node-ip=<detected IP> BEFORE
+  # k3s starts. If no routable IP is found the file is NOT written and k3s falls back
+  # to its default node IP (no crash) — HA simply will not form until the lan-bridge
+  # NIC has a lease. No user/template value enters the script (the address is
+  # runtime-detected), so there is no shell-injection surface.
+  - path: /usr/local/bin/kairos-k3s-node-ip.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      CFG=/etc/rancher/k3s/config.yaml.d/92-node-ip.yaml
+
+      # Already written on a prior boot (node-ip is fixed once etcd has initialized).
+      if [ -f "${CFG}" ]; then
+        echo "k3s-node-ip: ${CFG} already present; nothing to do"
+        exit 0
+      fi
+
+      detect_bridge_ip() {
+        ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | \
+          while read -r addr; do
+            case "${addr}" in
+              10.0.2.*) continue ;;   # KubeVirt masquerade self (SLIRP)
+              127.*)    continue ;;   # loopback
+              "")       continue ;;
+              *)        echo "${addr}"; return 0 ;;
+            esac
+          done
+      }
+
+      # Bounded wait for the DHCP lease on the bridge NIC — etcd needs the address
+      # at first start, and the lease may lag the ExecStartPre by a few seconds.
+      NODE_IP=""
+      for i in $(seq 1 30); do
+        NODE_IP="$(detect_bridge_ip || true)"
+        if [ -n "${NODE_IP}" ]; then
+          break
+        fi
+        echo "k3s-node-ip: waiting for routable bridge IP (${i}/30)..."
+        sleep 2
+      done
+
+      if [ -z "${NODE_IP}" ]; then
+        echo "WARN: k3s-node-ip: no routable bridge IP found (only masquerade/loopback present); NOT writing ${CFG} — k3s uses its default node IP (HA etcd will not form until the lan-bridge NIC has a lease)"
+        exit 0
+      fi
+
+      # NODE_IP is a bare IPv4 from `ip`'s own output (never operator input) — only
+      # [0-9.], safe to interpolate into the config value.
+      mkdir -p "$(dirname "${CFG}")"
+      printf 'node-ip: %s\n' "${NODE_IP}" > "${CFG}"
+      echo "k3s-node-ip: wrote node-ip=${NODE_IP} to ${CFG}"
+  # k3s.service ExecStartPre drop-in: detect + write node-ip BEFORE k3s starts (etcd
+  # reads node-ip at first init/join). Mirrors the k0s CAPK ExecStartPre drop-in.
+  # HA-only.
+  - path: /etc/systemd/system/k3s.service.d/z-node-ip.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k3s-node-ip.sh || true'
+  # ADR 0005 (HA) on CAPK: shared k3s server token, written on BOTH init and join
+  # (IsHAControlPlane) so every HA member uses the same K3S_TOKEN — init via
+  # --token-file, joiners via --server+--token-file. Sourced from .JoinToken,
+  # which the Phase-3 controller generates once (crypto/rand) and resolves from a
+  # management-cluster Secret via *SecretRef (TOKEN-INV). Block-scalar guarded by
+  # rejectControlChars (not a shell context). 0600: cluster-join secret on disk.
+  # No kube-vip is rendered for CAPK (OQ-5).
+  - path: /etc/rancher/k3s/server-token
+    permissions: "0600"
+    owner: root
+    group: root
+    content: |
+      shared-server-token
+  # ADR 0005 (HA) datastore/join flags on CAPK — INIT-ORDERING (bare-metal
+  # lab, 2026-09-07).
+  # Same root cause as the CAPV template: k3s selects its datastore on its FIRST
+  # start and never migrates, but provider-kairos writes the `k3s.args:` systemd
+  # override ~3s AFTER k3s.service has already started. k3s therefore comes up as
+  # a plain `k3s server` on SQLite with a random server token, and --cluster-init
+  # / --server / --token-file are ignored for the life of the node: the init node
+  # reports "etcd disabled" and every joiner forms its own single-node cluster.
+  #
+  # config.yaml.d is read on EVERY start and write_files lands before the first
+  # one, so the datastore/join flags are pinned here too. Values match the
+  # k3s.args ones exactly, so the late override is a no-op when it arrives.
+  - path: /etc/rancher/k3s/config.yaml.d/93-ha-datastore.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      cluster-init: true
+      token-file: /etc/rancher/k3s/server-token
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-node-0
+  - path: /etc/systemd/system/kairos-k3s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k3s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k3s
+      # node registration that never happens on the installer (overlayfs
+      # snapshotter cannot nest on the live tmpfs overlay), holding up
+      # cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      After=k3s.service
+      Wants=k3s.service
+      
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k3s-post-bootstrap.sh
+      
+      [Install]
+      WantedBy=multi-user.target
+  # Systemd override: write providerID to k3s config before k3s starts.
+  # k3s loads /etc/rancher/k3s/config.yaml.d/*.yaml at startup - more reliable than wrapper.
+  # Use z-provider-id.conf so it loads after override.conf (Kairos/other configs).
+  - path: /etc/systemd/system/k3s.service.d/z-provider-id.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c 'mkdir -p /etc/rancher/k3s/config.yaml.d && printf "kubelet-arg:\n  - provider-id=kubevirt://kairos-node-0\n" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml'
+  - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # CAPK: always mark bootstrap success on script exit
+      mark_bootstrap_success() {
+        mkdir -p /run/cluster-api
+        echo "success" > /run/cluster-api/bootstrap-success.complete
+        chmod 0644 /run/cluster-api/bootstrap-success.complete
+      }
+      trap mark_bootstrap_success EXIT
+      # Enforce hostname from cloud-config on immutable rootfs
+      if [ -f /usr/local/etc/hostname ]; then
+        /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
+        if ! grep -qE "127\.0\.1\.1[[:space:]]+$(cat /usr/local/etc/hostname)" /etc/hosts; then
+          echo "127.0.1.1 $(cat /usr/local/etc/hostname)" >> /etc/hosts
+        fi
+      fi
+      # Fallback: post-bootstrap providerID patch (same approach as k0s CAPK single-node)
+      # If k3s registered with k3s://hostname, providerID is immutable and patch will fail - that's expected.
+      # If node has empty providerID, patch will succeed and unblock Machine-to-Node matching.
+      echo "Waiting for k3s node to be registered..."
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      MAX_WAIT=300
+      ELAPSED=0
+      while ! kubectl get node $(hostname) &>/dev/null; do
+        if [ $ELAPSED -ge $MAX_WAIT ]; then
+          echo "WARN: Timeout waiting for node to be registered (providerID patch skipped)"
+          break
+        fi
+        echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
+      done
+      
+      if kubectl get node $(hostname) &>/dev/null; then
+        echo "Attempting to set providerID=kubevirt://kairos-node-0 on node $(hostname)..."
+        for i in $(seq 1 30); do
+          if kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"kubevirt://kairos-node-0"}}' 2>/dev/null; then
+            echo "Successfully set providerID=kubevirt://kairos-node-0 on node $(hostname)"
+            break
+          fi
+          # If node already has providerID (immutable), patch fails - don't retry
+          CURRENT=$(kubectl get node $(hostname) -o jsonpath='{.spec.providerID}' 2>/dev/null || echo "")
+          if [ -n "$CURRENT" ]; then
+            echo "Node already has providerID=$CURRENT (immutable), skipping patch"
+            break
+          fi
+          echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+          sleep 5
+        done
+      fi
+      # Push kubeconfig to management cluster without SSH (KubeVirt/CAPK)
+      # Update server URL to LB endpoint so management cluster can connect
+      push_kubeconfig() {
+        local kubeconfig_file="/etc/rancher/k3s/k3s.yaml"
+        # Wait up to 5min for k3s to write k3s.yaml. After=k3s.service only
+        # orders against service activation, not bootstrap completion, so on
+        # slower hosts (Hadron+CAPV lab finding) the file is not yet present
+        # when this unit fires. Without this wait the unit silently abandons
+        # the push and KCP stays in WaitingForNodePush forever (KD-3b).
+        local _wait_budget=300
+        local _wait_elapsed=0
+        while [ ! -f "${kubeconfig_file}" ] && [ ${_wait_elapsed} -lt ${_wait_budget} ]; do
+          sleep 5
+          _wait_elapsed=$((_wait_elapsed + 5))
+        done
+        if [ ! -f "${kubeconfig_file}" ]; then
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file} after ${_wait_budget}s"
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push kubeconfig"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push kubeconfig"
+          return 1
+        fi
+        local kubeconfig_b64
+        local tmp_kubeconfig
+        tmp_kubeconfig=$(mktemp)
+        local lb_endpoint='10.96.0.10'
+        sed "s|https://[^[:space:]]*:6443|https://${lb_endpoint}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
+        kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
+        rm -f "${tmp_kubeconfig}"
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local name='ha-cluster-kubeconfig-push'
+        local token='mgmt-token'
+        local cluster_name='ha-cluster'
+        local payload
+        # cluster.x-k8s.io/cluster-name label + node-push annotation; see the
+        # k0s CAPK template for the controller-side rationale.
+        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" \
+          -X PUT \
+          --data "${payload}" \
+          "${url}" || true)
+        if [ "${status}" = "404" ]; then
+          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "${payload}" \
+            "${api}/api/v1/namespaces/${ns}/secrets" || true)
+        fi
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed kubeconfig to management secret ${ns}/${name}"
+          return 0
+        fi
+        echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
+        return 1
+      }
+      if ! push_kubeconfig; then
+        echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+      # ADR 0005 §E.1 (HA) etcd-health reporter — k3s HEALTH-ONLY variant (KD-5d).
+      # Every k3s server reports its own membership into the per-cluster
+      # etcd-status Secret over the node-push channel, feeding the joiner gate,
+      # EtcdHealthyCondition, and the quorum guard. k3s embedded etcd has no clean
+      # member-remove CLI, so member REMOVAL is unsupported (documented KD-5d);
+      # this reporter is read-only + best-effort. Member count is queried via
+      # etcdctl against the local embedded etcd IF etcdctl + the server certs are
+      # present; otherwise it reports healthy from server readiness (the
+      # post-bootstrap script only reaches here after k3s is up) with members=0.
+      #
+      # SECURITY: identical discipline to the k0s reporter — non-secret metadata,
+      # JSON built on-node, all management-endpoint values shquote'd, bearer token
+      # never logged, PATCHes only this node's own member key.
+      push_etcd_status() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot report etcd status"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot report etcd status"
+          return 1
+        fi
+        local member_key
+        member_key=$(hostname | tr -c 'a-zA-Z0-9._-' '-')
+        # Best-effort member count via etcdctl against the local embedded etcd.
+        local healthy=true voting=true members=0
+        local etcd_dir=/var/lib/rancher/k3s/server/tls/etcd
+        if command -v etcdctl >/dev/null 2>&1 && [ -f "${etcd_dir}/server-client.crt" ]; then
+          local ml
+          ml=$(ETCDCTL_API=3 etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert="${etcd_dir}/server-ca.crt" \
+            --cert="${etcd_dir}/server-client.crt" \
+            --key="${etcd_dir}/server-client.key" \
+            member list 2>/dev/null || true)
+          if [ -n "${ml}" ]; then
+            members=$(printf '%s\n' "${ml}" | grep -c 'started' | tr -d ' ')
+          fi
+        fi
+        local reported_at
+        reported_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        local status_json
+        status_json=$(printf '{"name":"%s","healthy":%s,"voting":%s,"members":%s,"reportedAt":"%s"}' \
+          "${member_key}" "${healthy}" "${voting}" "${members}" "${reported_at}")
+        local status_b64
+        status_b64=$(printf '%s' "${status_json}" | base64 -w 0 2>/dev/null || printf '%s' "${status_json}" | base64 | tr -d '\n')
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local es_name='ha-cluster-etcd-status'
+        local token='mgmt-token'
+        local patch
+        patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
+        # A dropped report blocks HA formation exactly like a dropped join token:
+        # initMachineJoinable treats "member not reported" as not-joinable on k0s,
+        # so the KCP holds every joiner until some node reports. This reporter runs
+        # ONCE, from a oneshot unit, with no timer behind it — "retry on next boot"
+        # described behaviour that does not exist, since nothing reboots the node.
+        # Retry here on the same cadence as the join-token push. The 2xx test is a
+        # glob, not an arithmetic comparison, so an empty status from a failed curl
+        # cannot abort the loop.
+        local status="" reported=""
+        for i in {1..30}; do
+          status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            -X PATCH \
+            --data "${patch}" \
+            "${url}" || true)
+          case "${status}" in
+            2[0-9][0-9]) reported=yes ;;
+          esac
+          if [ -n "${reported}" ]; then
+            break
+          fi
+          echo "Attempt $i/30: etcd-status report returned '${status}', retrying in 5 seconds..."
+          sleep 5
+        done
+        unset token
+        if [ -n "${reported}" ]; then
+          echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
+          return 0
+        fi
+        echo "WARN: failed to report etcd status after 30 attempts (last status '${status}')"
+        return 1
+      }
+      if ! push_etcd_status; then
+        echo "WARN: etcd-status report failed after retries; the joiner gate will hold until a member is reported"
+      fi
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+      
+      echo "k3s post-bootstrap tasks completed successfully"
+  
+  - path: /etc/motd
+    content: hello world
+    permissions: "0644"
+    owner: root:root
+stages:
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    - name: "Ensure k3s directories exist"
+      commands:
+        - mkdir -p /etc/rancher/k3s
+        - mkdir -p /etc/rancher/k3s/config.yaml.d
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+        path: "/etc/resolv.conf"
+
+runcmd:
+  # `enable --now`: create the multi-user.target.wants/ symlink AND start
+  # the unit on this boot. Plain `enable` only creates the symlink; the
+  # service would only auto-start on the NEXT boot — too late for the
+  # KD-3b push pattern, which needs to fire on the first installed-system
+  # boot. Same fix the k0s templates use via the helper service.
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true

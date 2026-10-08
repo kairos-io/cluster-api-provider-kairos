@@ -97,9 +97,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -178,9 +179,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneWithCIDRs(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -259,9 +261,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneKubeVirtBootstrapTrap(t *testing.T) 
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -317,9 +320,10 @@ func TestGenerateK0sCloudConfig_ControlPlaneMultiNode(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -379,9 +383,10 @@ func TestGenerateK0sCloudConfig_WorkerWithToken(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -571,9 +576,10 @@ func TestGenerateK0sCloudConfig_WorkerWithTokenSecretRef(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -633,9 +639,9 @@ func TestGenerateCloudConfig_WorkerIgnoresControlPlaneRole(t *testing.T) {
 				err error
 			)
 			if dist == "k0s" {
-				out, err = reconciler.generateK0sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "worker", "https://control-plane:6443")
+				out, err = reconciler.renderCloudConfig(context.Background(), log.Log, bootstrapv1beta2.DistributionK0s, kairosConfig, machine, cluster, "worker", "https://control-plane:6443")
 			} else {
-				out, err = reconciler.generateK3sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "worker", "https://control-plane:6443")
+				out, err = reconciler.renderCloudConfig(context.Background(), log.Log, bootstrapv1beta2.DistributionK3s, kairosConfig, machine, cluster, "worker", "https://control-plane:6443")
 			}
 			g.Expect(err).NotTo(HaveOccurred())
 
@@ -705,9 +711,10 @@ func TestGenerateK0sCloudConfig_WorkerTokenPrecedence(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -765,9 +772,10 @@ func TestGenerateK0sCloudConfig_WorkerMissingToken(t *testing.T) {
 		},
 	}
 
-	_, err := reconciler.generateK0sCloudConfig(
+	_, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -823,9 +831,10 @@ func TestGenerateK0sCloudConfig_HostnameTemplating(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK0sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK0s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -897,9 +906,10 @@ func TestGenerateK3sCloudConfig_WorkerTokenSecretRef(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK3sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK3s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -959,9 +969,10 @@ func TestGenerateK3sCloudConfig_WorkerTokenSecretMissing(t *testing.T) {
 		},
 	}
 
-	_, err := reconciler.generateK3sCloudConfig(
+	_, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK3s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -1040,9 +1051,10 @@ func TestGenerateK3sCloudConfig_ControlPlaneKubeVirtCapk(t *testing.T) {
 		},
 	}
 
-	cloudConfig, err := reconciler.generateK3sCloudConfig(
+	cloudConfig, err := reconciler.renderCloudConfig(
 		context.Background(),
 		log.Log,
+		bootstrapv1beta2.DistributionK3s,
 		kairosConfig,
 		machine,
 		cluster,
@@ -1364,7 +1376,7 @@ func TestGenerateK0sCloudConfig_CapvControlPlane_RendersPushBlock(t *testing.T) 
 		},
 	}
 
-	out, err := reconciler.generateK0sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "control-plane", "")
+	out, err := reconciler.renderCloudConfig(context.Background(), log.Log, bootstrapv1beta2.DistributionK0s, kairosConfig, machine, cluster, "control-plane", "")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(resolver.calls).To(Equal(1), "resolver must be invoked for CAPV control-plane")
 	g.Expect(out).To(ContainSubstring("push_kubeconfig()"), "CAPV control-plane render must include push block")
@@ -1417,7 +1429,7 @@ func TestGenerateK0sCloudConfig_CapkWorker_NoPushBlock(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
 	}
 
-	out, err := reconciler.generateK0sCloudConfig(context.Background(), log.Log, kairosConfig, machine, cluster, "worker", "")
+	out, err := reconciler.renderCloudConfig(context.Background(), log.Log, bootstrapv1beta2.DistributionK0s, kairosConfig, machine, cluster, "worker", "")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(resolver.calls).To(Equal(0), "resolver must NOT be invoked for worker role")
 	g.Expect(out).NotTo(ContainSubstring("push_kubeconfig"), "worker render must not include push block")
