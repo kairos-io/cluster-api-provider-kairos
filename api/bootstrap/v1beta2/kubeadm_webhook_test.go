@@ -120,6 +120,105 @@ func TestValidateKubeadmConfig_Refusals(t *testing.T) {
 			},
 			wantSub: "nodeRegistration.name must be a valid DNS-1123 subdomain",
 		},
+		{
+			name: "relative patches.directory is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "etc/kubernetes/patches"},
+				}}
+			},
+			wantSub: "patches.directory must be an absolute, clean path",
+		},
+		{
+			name: "patches.directory with a trailing slash is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/patches/"},
+				}}
+			},
+			wantSub: "patches.directory must be an absolute, clean path",
+		},
+		{
+			name: "patches.directory with a .. segment is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/../patches"},
+				}}
+			},
+			wantSub: "patches.directory must be an absolute, clean path",
+		},
+		{
+			name: "patches.directory / is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/"},
+				}}
+			},
+			wantSub: "patches.directory must be a directory under /etc/kubernetes/",
+		},
+		{
+			name: "patches.directory /etc/kubernetes itself is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes"},
+				}}
+			},
+			wantSub: "patches.directory must be a directory under /etc/kubernetes/",
+		},
+		{
+			name: "world-writable patches.directory is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/tmp/patches"},
+				}}
+			},
+			wantSub: "patches.directory must be a directory under /etc/kubernetes/",
+		},
+		{
+			name: "patches.directory in the kubelet static pod path is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/manifests/patches"},
+				}}
+			},
+			wantSub: "patches.directory must not be /etc/kubernetes/manifests or a directory under it",
+		},
+		{
+			name: "patches.directory set to the kubelet static pod path is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/manifests"},
+				}}
+			},
+			wantSub: "patches.directory must not be /etc/kubernetes/manifests or a directory under it",
+		},
+		{
+			name: "patches.directory with a newline is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/pat\nches"},
+				}}
+			},
+			wantSub: "patches.directory must not contain a newline, carriage return or NUL",
+		},
+		{
+			name: "patches.directory with a carriage return is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/pat\rches"},
+				}}
+			},
+			wantSub: "patches.directory must not contain a newline, carriage return or NUL",
+		},
+		{
+			name: "patches.directory with a NUL is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/pat\x00ches"},
+				}}
+			},
+			wantSub: "patches.directory must not contain a newline, carriage return or NUL",
+		},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -149,6 +248,16 @@ func TestValidateKubeadmConfig_Accepts(t *testing.T) {
 		{"valid nodeRegistration.name", func(kc *KairosConfig) {
 			kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
 				NodeRegistration: kubeadmv1.NodeRegistrationOptions{Name: "worker-0"},
+			}}
+		}},
+		{"absolute patches.directory", func(kc *KairosConfig) {
+			kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+				Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/patches"},
+			}}
+		}},
+		{"patches.directory that only shares a prefix with the static pod path", func(kc *KairosConfig) {
+			kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+				Patches: kubeadmv1.Patches{Directory: "/etc/kubernetes/manifests-extra"},
 			}}
 		}},
 		{"caCertHashes set without inline token is allowed", func(kc *KairosConfig) {
