@@ -24,8 +24,10 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,6 +76,10 @@ const (
 
 	// clusterCASecretCrtKey is the certificate key in a <cluster>-ca Secret.
 	clusterCASecretCrtKey = "tls.crt"
+
+	// serverAddressDefaultScheme is assumed for a spec.serverAddress given as host[:port].
+	serverAddressDefaultScheme = "https://"
+	schemeSeparator            = "://"
 )
 
 // allowlistedControlPlaneKinds are the control-plane kinds a kubeadm worker may
@@ -328,22 +334,15 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			kubeconfigKey.Name, cpRef.Kind, cpRef.Name)
 	}
 
-	// Parse the kubeconfig: the server must equal the Cluster endpoint, and the CA
-	// pin is taken from its certificate-authority-data.
+	// The CA pin comes from the kubeconfig; its server may be an internal address
+	// (e.g. Kamaji's admin.svc), so it is not compared to the Cluster endpoint.
 	kcData, ok := kcSecret.Data[workloadKubeconfigSecretKey]
 	if !ok || len(kcData) == 0 {
 		return zero, newNotReady("WaitingForKubeconfig", "the %s Secret has no %q payload yet", kubeconfigKey.Name, workloadKubeconfigSecretKey)
 	}
-	server, caData, err := serverAndCAFromKubeconfig(kcData)
+	caData, err := caFromKubeconfig(kcData)
 	if err != nil {
 		return zero, fmt.Errorf("the %s Secret is not a valid kubeconfig: %v", kubeconfigKey.Name, err)
-	}
-	// Build the expected server the way Cluster API writes it: APIEndpoint.String
-	// is net.JoinHostPort, so an IPv6 literal is bracketed on both sides.
-	wantServer := "https://" + cluster.Spec.ControlPlaneEndpoint.String()
-	if !sameServer(server, wantServer) {
-		return zero, fmt.Errorf("the %s Secret's server %q does not equal the Cluster control-plane endpoint %q: refusing to mint a token",
-			kubeconfigKey.Name, server, wantServer)
 	}
 
 	hashes, kubeconfigCADER, err := caCertHashesFromPEM(caData)
@@ -403,12 +402,19 @@ func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted tru
 	// Add the uninitialized taint CAPI core removes once the Machine is linked.
 	jc.NodeRegistration.Taints = appendUninitializedTaint(jc.NodeRegistration.Taints)
 
+	var serverAddress string
+	if req.Config != nil {
+		serverAddress = req.Config.Spec.ServerAddress
+	}
+	endpoint, err := kubeadmJoinEndpoint(serverAddress, trusted)
+	if err != nil {
+		return "", err
+	}
+
 	// Bootstrap-token discovery: the minted token, the endpoint, and the CA pin.
 	jc.Discovery.BootstrapToken = kubeadmv1.BootstrapTokenDiscovery{
 		Token:             token,
-		// APIEndpoint.String is net.JoinHostPort, so an IPv6 literal is bracketed
-		// as kubeadm requires. Do not hand-format this as host:port.
-		APIServerEndpoint: clusterv1.APIEndpoint{Host: trusted.endpointHost, Port: trusted.endpointPort}.String(),
+		APIServerEndpoint: endpoint,
 		CACertHashes:      trusted.caCertHashes,
 	}
 	// Belt-and-braces: never emit file-based discovery or unsafe skip.
@@ -571,29 +577,50 @@ func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration
 	return token, tokenID, nil
 }
 
-// serverAndCAFromKubeconfig parses a kubeconfig and returns the current-context
-// cluster's server URL and its certificate-authority-data.
-func serverAndCAFromKubeconfig(data []byte) (server string, caData []byte, err error) {
+// kubeadmJoinEndpoint returns spec.serverAddress as host:port when set (the CA pin
+// still authenticates it), otherwise the Cluster control-plane endpoint.
+func kubeadmJoinEndpoint(serverAddress string, trusted trustedControlPlane) (string, error) {
+	if serverAddress == "" {
+		return fmt.Sprintf("%s:%d", trusted.endpointHost, trusted.endpointPort), nil
+	}
+	raw := serverAddress
+	if !strings.Contains(raw, schemeSeparator) {
+		raw = serverAddressDefaultScheme + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("invalid spec.serverAddress %q: expected host[:port] or https://host[:port]", serverAddress)
+	}
+	port := u.Port()
+	if port == "" {
+		port = strconv.Itoa(int(trusted.endpointPort))
+	}
+	return net.JoinHostPort(u.Hostname(), port), nil
+}
+
+// caFromKubeconfig parses a kubeconfig and returns the current-context cluster's
+// certificate-authority-data.
+func caFromKubeconfig(data []byte) ([]byte, error) {
 	cfg, err := clientcmd.Load(data)
 	if err != nil {
-		return "", nil, fmt.Errorf("load kubeconfig: %w", err)
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
 	ctxName := cfg.CurrentContext
 	kubeCtx, ok := cfg.Contexts[ctxName]
 	if !ok || kubeCtx == nil {
 		// Fall back to the sole cluster when there is exactly one.
 		if len(cfg.Clusters) != 1 {
-			return "", nil, fmt.Errorf("kubeconfig has no usable current-context")
+			return nil, fmt.Errorf("kubeconfig has no usable current-context")
 		}
 		for _, cl := range cfg.Clusters {
-			return cl.Server, cl.CertificateAuthorityData, nil
+			return cl.CertificateAuthorityData, nil
 		}
 	}
 	cl, ok := cfg.Clusters[kubeCtx.Cluster]
 	if !ok || cl == nil {
-		return "", nil, fmt.Errorf("kubeconfig context %q references an unknown cluster", ctxName)
+		return nil, fmt.Errorf("kubeconfig context %q references an unknown cluster", ctxName)
 	}
-	return cl.Server, cl.CertificateAuthorityData, nil
+	return cl.CertificateAuthorityData, nil
 }
 
 // sameServer reports whether two API server URLs address the same endpoint.

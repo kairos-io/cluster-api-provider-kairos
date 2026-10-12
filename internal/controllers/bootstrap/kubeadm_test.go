@@ -295,6 +295,14 @@ func TestKubeadmWorkerJoin_Accepts(t *testing.T) {
 			fx.clusterCA = ca
 			return fx
 		}(), nil},
+		// Kamaji control-plane provider with advertiseAddress set publishes admin.svc.
+		{"Kamaji kubeconfig with the in-cluster Service server", func() kubeadmFixture {
+			fx := defaultFixture(ca)
+			fx.cpKind = "KamajiControlPlane"
+			fx.clusterCA = ca
+			fx.server = "https://my-cluster.default.svc:6443"
+			return fx
+		}(), nil},
 		{"operator-flag kind", func() kubeadmFixture {
 			fx := defaultFixture(ca)
 			fx.cpGroup = "evil.example.com"
@@ -353,6 +361,7 @@ func TestKubeadmWorkerJoin_Accepts(t *testing.T) {
 			}
 			// Must be the bracketed form for IPv6: kubeadm parses this as host:port.
 			g.Expect(jc).To(ContainSubstring(wantEP.String()))
+			g.Expect(jc).NotTo(ContainSubstring(".svc"), "the node must join the Cluster endpoint, not the kubeconfig server")
 			g.Expect(jc).To(ContainSubstring("node.cluster.x-k8s.io/uninitialized"))
 			g.Expect(jc).To(ContainSubstring("worker-0")) // nodeRegistration.name
 
@@ -410,7 +419,6 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 		wantSub string
 	}{
 		{"owner UID mismatch", func(fx *kubeadmFixture) { fx.ownerUID = types.UID("not-the-cp") }, nil, "must be owned by the cluster's control plane"},
-		{"server mismatch", func(fx *kubeadmFixture) { fx.server = "https://evil.example.com:6443" }, nil, "does not equal the Cluster control-plane endpoint"},
 		// An ownerRef that is not a controller ref: GetControllerOf returns nil, so
 		// the UID leg must refuse rather than fall through.
 		{"ownerRef present but not a controller ref", func(fx *kubeadmFixture) { fx.noController = true }, nil, "must be owned by the cluster's control plane"},
@@ -430,6 +438,49 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 			g.Expect(err.Error()).To(ContainSubstring(tc.wantSub))
 			var nr *bootstrapNotReadyError
 			g.Expect(errors.As(err, &nr)).To(BeFalse(), "refusal must be terminal, not not-ready")
+		})
+	}
+}
+
+// TestKubeadmWorkerJoin_ServerAddressOverridesEndpoint asserts spec.serverAddress
+// becomes the join endpoint while the CA pin is kept.
+func TestKubeadmWorkerJoin_ServerAddressOverridesEndpoint(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	src, req, _ := buildSource(t, defaultFixture(ca), nil)
+	req.Config.Spec.ServerAddress = "192.0.2.10:6443"
+
+	mat, err := src.WorkerJoin(context.Background(), req)
+	g.Expect(err).NotTo(HaveOccurred())
+	jc := mat.Kubeadm.JoinConfiguration
+	g.Expect(jc).To(ContainSubstring("apiServerEndpoint: 192.0.2.10:6443"))
+	g.Expect(jc).NotTo(ContainSubstring(testEndpointHost))
+	g.Expect(jc).To(ContainSubstring("sha256:"))
+}
+
+func TestKubeadmJoinEndpoint(t *testing.T) {
+	trusted := trustedControlPlane{endpointHost: testEndpointHost, endpointPort: testEndpointPort}
+	cases := []struct {
+		name, serverAddress, want string
+		wantErr                   bool
+	}{
+		{"unset uses the Cluster endpoint", "", "10.0.0.42:6443", false},
+		{"host and port", "192.0.2.10:6443", "192.0.2.10:6443", false},
+		{"https URL", "https://192.0.2.10:6443", "192.0.2.10:6443", false},
+		{"host only takes the Cluster port", "cp.example.com", "cp.example.com:6443", false},
+		{"IPv6", "[fd00::1]:6443", "[fd00::1]:6443", false},
+		{"no host", "https://", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := kubeadmJoinEndpoint(tc.serverAddress, trusted)
+			if tc.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(Equal(tc.want))
 		})
 	}
 }

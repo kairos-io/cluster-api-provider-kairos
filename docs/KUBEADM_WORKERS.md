@@ -41,9 +41,12 @@ bootstrap controller does the following for each Machine:
      (matched on API group and kind).
    - The `<cluster>-kubeconfig` Secret exists and is controller-owned by that
      control-plane object.
-   - The kubeconfig's `server` equals `https://<host>:<port>` of
-     `Cluster.spec.controlPlaneEndpoint`, and it carries
-     `certificate-authority-data`.
+   - The kubeconfig carries `certificate-authority-data`. Its `server` is not
+     compared to `Cluster.spec.controlPlaneEndpoint`: a control-plane provider
+     may publish an internal address there, as the Kamaji control-plane
+     provider does (`admin.svc`) when `spec.network.advertiseAddress` is set.
+     The node joins `spec.serverAddress` or the Cluster endpoint, never the
+     kubeconfig `server`.
    - If a `<cluster>-ca` Secret exists, its `tls.crt` equals the kubeconfig's
      CA. A missing `<cluster>-ca` is allowed.
 3. Mints a bootstrap token in the workload cluster: a Secret named
@@ -170,7 +173,12 @@ field is optional. The controller sets or overwrites these:
   which Cluster API removes once it links the Machine to the Node. Taints you set
   are kept.
 - `discovery.bootstrapToken`: the whole block (minted token, API server endpoint,
-  CA hash).
+  CA hash). The endpoint is `spec.serverAddress` when set, otherwise
+  `Cluster.spec.controlPlaneEndpoint`. Set it when workers must reach the API
+  server through a different address than the management cluster does, for
+  example the address a KamajiControlPlane advertises with
+  `spec.network.advertiseAddress`. The address must be covered by the API
+  server certificate's SANs. The CA hash pins discovery either way.
 - `discovery.file`: cleared.
 - A kubelet `providerID` patch, applied through `kubeadm join --patches`, when the
   infrastructure provider's providerID is known at render time.
@@ -180,7 +188,7 @@ Do not set `joinConfiguration.controlPlane`: control-plane joins are not
 supported in this release.
 
 These KairosConfig fields have no effect for kubeadm workers: `singleNode`,
-`k0sSingleNode`, `serverAddress`, `token`, `tokenSecretRef`, `workerToken`,
+`k0sSingleNode`, `token`, `tokenSecretRef`, `workerToken`,
 `workerTokenSecretRef`, `k3sToken`, `k3sTokenSecretRef`, `podCIDR`,
 `serviceCIDR`, `primaryIP`, and `manifests`. The user, hostname, `install`,
 `dnsServers`, and `files` fields are rendered as for other distributions.
@@ -280,7 +288,6 @@ kubectl get kairosconfig <name> -o jsonpath='{.status.failureMessage}'
 | --- | --- |
 | `is not controller-owned by the cluster's control-plane object` | The `<cluster>-kubeconfig` Secret is not owned by the control-plane object the Cluster references. Check `metadata.ownerReferences` on the Secret and `spec.controlPlaneRef` on the Cluster. |
 | `is not on the kubeadm trust allowlist` | The control-plane kind is not `KubeadmControlPlane` or `KamajiControlPlane`. Use a supported kind or have the operator set `--kubeadm-extra-controlplane-kinds`. |
-| `does not equal the Cluster control-plane endpoint` | The kubeconfig's `server` differs from `https://<host>:<port>` of `Cluster.spec.controlPlaneEndpoint`. Align the two. |
 | `kubeconfig CA does not match` | The CA in `<cluster>-kubeconfig` differs from `<cluster>-ca` `tls.crt`. Resolve which CA is correct before retrying. |
 | `carries no certificate-authority-data` | The kubeconfig has no CA to pin. Fix the control plane's kubeconfig Secret. |
 | `does not support MachinePool` | Use a `MachineDeployment`. |
