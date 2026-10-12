@@ -228,6 +228,19 @@ func validateKubeadmConfig(kc *KairosConfig) field.ErrorList {
 		))
 	}
 
+	// tlsBootstrapToken is the other half of the same rule. It defaults to the
+	// bootstrap token but may be overridden, so a value here becomes the kubelet's
+	// TLS-bootstrap credential in preference to the minted one: it would sit in
+	// plaintext in the spec, be copied into the rendered userdata, and escape the
+	// short TTL and refresh the controller's token relies on.
+	if jc.Discovery.TLSBootstrapToken != "" {
+		errs = append(errs, field.Forbidden(
+			jcPath.Child("discovery", "tlsBootstrapToken"),
+			"an inline TLS bootstrap token is not allowed: the controller mints and refreshes "+
+				"a short-lived token against the workload cluster",
+		))
+	}
+
 	// unsafeSkipCAVerification defeats the CA pin.
 	if jc.Discovery.BootstrapToken.UnsafeSkipCAVerification != nil && *jc.Discovery.BootstrapToken.UnsafeSkipCAVerification {
 		errs = append(errs, field.Forbidden(

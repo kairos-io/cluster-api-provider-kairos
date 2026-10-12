@@ -188,12 +188,22 @@ These KairosConfig fields have no effect for kubeadm workers: `singleNode`,
 ### Admission refusals
 
 The validating webhook rejects a `KairosConfig` with `distribution: kubeadm` that
-sets any of the following:
+sets any of the following.
+
+Note the object these apply to. The webhook is registered for `KairosConfig`, not
+for `KairosConfigTemplate`, so a field set on a template is refused one object
+later, when Cluster API core creates the `KairosConfig` from it: the
+`MachineDeployment` stops producing usable Machines rather than the template
+being rejected on `kubectl apply`. The three refusals that would otherwise reach
+the node (`role: control-plane`, `discovery.tlsBootstrapToken` and
+`joinConfiguration.controlPlane`) are additionally enforced when the
+cloud-config is rendered, so a template cannot smuggle them past admission.
 
 | Field | Why it is refused |
 | --- | --- |
 | `spec.role: control-plane` | Kubeadm is worker-only in this release. |
 | `spec.kubeadm.joinConfiguration.discovery.bootstrapToken.token` | Tokens never appear in the spec; the controller mints and refreshes them. |
+| `spec.kubeadm.joinConfiguration.discovery.tlsBootstrapToken` | It defaults to the bootstrap token but may be overridden, so a value here would become the kubelet's TLS-bootstrap credential and escape the minted token's lifetime. |
 | `spec.kubeadm.joinConfiguration.discovery.bootstrapToken.unsafeSkipCAVerification: true` | It disables the CA pin the join relies on. |
 | `spec.kubeadm.joinConfiguration.discovery.file` | File-based discovery is not supported; the controller configures token discovery. |
 | Any `{{` inside `spec.kubeadm` | Jinja-style placeholders are not expanded on Kairos and would land verbatim in node configuration. |

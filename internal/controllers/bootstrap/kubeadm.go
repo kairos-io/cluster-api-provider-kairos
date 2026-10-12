@@ -24,7 +24,9 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -336,8 +338,10 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 	if err != nil {
 		return zero, fmt.Errorf("the %s Secret is not a valid kubeconfig: %v", kubeconfigKey.Name, err)
 	}
-	wantServer := fmt.Sprintf("https://%s:%d", cluster.Spec.ControlPlaneEndpoint.Host, cluster.Spec.ControlPlaneEndpoint.Port)
-	if server != wantServer {
+	// Build the expected server the way Cluster API writes it: APIEndpoint.String
+	// is net.JoinHostPort, so an IPv6 literal is bracketed on both sides.
+	wantServer := "https://" + cluster.Spec.ControlPlaneEndpoint.String()
+	if !sameServer(server, wantServer) {
 		return zero, fmt.Errorf("the %s Secret's server %q does not equal the Cluster control-plane endpoint %q: refusing to mint a token",
 			kubeconfigKey.Name, server, wantServer)
 	}
@@ -402,11 +406,22 @@ func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted tru
 	// Bootstrap-token discovery: the minted token, the endpoint, and the CA pin.
 	jc.Discovery.BootstrapToken = kubeadmv1.BootstrapTokenDiscovery{
 		Token:             token,
-		APIServerEndpoint: fmt.Sprintf("%s:%d", trusted.endpointHost, trusted.endpointPort),
+		// APIEndpoint.String is net.JoinHostPort, so an IPv6 literal is bracketed
+		// as kubeadm requires. Do not hand-format this as host:port.
+		APIServerEndpoint: clusterv1.APIEndpoint{Host: trusted.endpointHost, Port: trusted.endpointPort}.String(),
 		CACertHashes:      trusted.caCertHashes,
 	}
 	// Belt-and-braces: never emit file-based discovery or unsafe skip.
 	jc.Discovery.File = kubeadmv1.FileDiscovery{}
+	// tlsBootstrapToken defaults to the bootstrap token but may be overridden, so
+	// a spec value would become the kubelet's TLS-bootstrap credential in
+	// preference to the one minted here, escaping its TTL and rotation entirely.
+	// The webhook forbids it; this is the render-time half of the same rule.
+	jc.Discovery.TLSBootstrapToken = ""
+	// A worker never carries control-plane join material. The webhook forbids this
+	// too, but KairosConfigTemplate has no webhook registered, so without this the
+	// only gate would be admission on the KairosConfig CAPI core derives from it.
+	jc.ControlPlane = nil
 
 	version, err := semver.ParseTolerant(req.Machine.Spec.Version)
 	if err != nil {
@@ -579,6 +594,38 @@ func serverAndCAFromKubeconfig(data []byte) (server string, caData []byte, err e
 		return "", nil, fmt.Errorf("kubeconfig context %q references an unknown cluster", ctxName)
 	}
 	return cl.Server, cl.CertificateAuthorityData, nil
+}
+
+// sameServer reports whether two API server URLs address the same endpoint.
+//
+// A byte comparison is wrong here. Cluster API writes the kubeconfig's server
+// from APIEndpoint.String, which is net.JoinHostPort and therefore brackets an
+// IPv6 literal, so "https://[fd00::1]:6443" and "https://fd00::1:6443" denote
+// the same endpoint while differing as strings. Host comparison is also
+// case-insensitive (DNS), a trailing slash is not part of the authority, and an
+// absent port means the scheme's default. Getting any of these wrong refuses a
+// legitimate join with a message that reads like a planted-kubeconfig incident.
+func sameServer(got, want string) bool {
+	g, err := url.Parse(got)
+	if err != nil {
+		return false
+	}
+	w, err := url.Parse(want)
+	if err != nil {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			return "443"
+		}
+		return ""
+	}
+	return strings.EqualFold(g.Scheme, w.Scheme) &&
+		strings.EqualFold(g.Hostname(), w.Hostname()) &&
+		port(g) == port(w)
 }
 
 // caCertHashesFromPEM parses a PEM CA bundle and returns the kubeadm-style

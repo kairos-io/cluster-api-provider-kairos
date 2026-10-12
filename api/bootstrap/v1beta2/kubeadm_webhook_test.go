@@ -58,6 +58,18 @@ func TestValidateKubeadmConfig_Refusals(t *testing.T) {
 			wantSub: "inline bootstrap token is not allowed",
 		},
 		{
+			// The sibling of the inline bootstrap token: it defaults to that token but
+			// may be overridden, so a value here becomes the kubelet's TLS-bootstrap
+			// credential and escapes the controller's TTL and refresh entirely.
+			name: "inline tlsBootstrapToken is refused",
+			mutate: func(kc *KairosConfig) {
+				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{
+					Discovery: kubeadmv1.Discovery{TLSBootstrapToken: "abcdef.0123456789abcdef"},
+				}}
+			},
+			wantSub: "inline TLS bootstrap token is not allowed",
+		},
+		{
 			name: "unsafeSkipCAVerification is refused",
 			mutate: func(kc *KairosConfig) {
 				kc.Spec.Kubeadm = &KubeadmConfig{JoinConfiguration: &kubeadmv1.JoinConfiguration{

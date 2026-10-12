@@ -9,8 +9,10 @@
 # docs/KUBEADM_WORKERS.md.
 #
 # SCOPE (this release):
-#   - Workers only. distribution: kubeadm with role: control-plane is rejected
-#     at admission, and a KairosControlPlane cannot use kubeadm.
+#   - Workers only. distribution: kubeadm with role: control-plane is rejected on
+#     a KairosConfig at admission and again when the cloud-config is rendered
+#     (KairosConfigTemplate has no webhook, so a template is caught at render
+#     time), and a KairosControlPlane cannot use kubeadm at all.
 #   - MachineDeployment only. A MachinePool owner is refused.
 #   - Validated by unit and envtest tests. Not yet validated against a live
 #     Kamaji or KubeadmControlPlane cluster.

@@ -46,6 +46,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
+
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
@@ -125,6 +127,9 @@ type kubeadmFixture struct {
 	initialized  bool
 	endpoint     bool // set a valid controlPlaneEndpoint
 	noKubeconfig bool
+	endpointHost string // overrides testEndpointHost when set
+	endpointPort int32  // overrides testEndpointPort when non-zero
+	noController bool   // the kubeconfig ownerRef exists but is not a controller ref
 }
 
 // defaultFixture is a passing KubeadmControlPlane fixture.
@@ -155,8 +160,15 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 			},
 		},
 	}
+	epHost, epPort := testEndpointHost, testEndpointPort
+	if fx.endpointHost != "" {
+		epHost = fx.endpointHost
+	}
+	if fx.endpointPort != 0 {
+		epPort = fx.endpointPort
+	}
 	if fx.endpoint {
-		cluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: testEndpointHost, Port: testEndpointPort}
+		cluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: epHost, Port: epPort}
 	}
 	if fx.initialized {
 		cluster.Status.Initialization.ControlPlaneInitialized = ptrBool(true)
@@ -182,7 +194,7 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 					Kind:       fx.cpKind,
 					Name:       "cp",
 					UID:        fx.ownerUID,
-					Controller: ptrBool(true),
+					Controller: ptrBool(!fx.noController),
 				}},
 			},
 			Data: map[string][]byte{workloadKubeconfigSecretKey: makeKubeconfig(t, fx.server, fx.kubeconfigCA)},
@@ -289,6 +301,32 @@ func TestKubeadmWorkerJoin_Accepts(t *testing.T) {
 			fx.cpKind = "KubeadmControlPlane"
 			return fx
 		}(), map[schema.GroupKind]bool{{Group: "evil.example.com", Kind: "KubeadmControlPlane"}: true}},
+		// Cluster API writes the kubeconfig server with net.JoinHostPort, so an
+		// IPv6 endpoint arrives bracketed. Comparing the raw strings refused every
+		// IPv6 cluster, with a message that reads like a planted kubeconfig.
+		{"IPv6 endpoint, bracketed by CAPI", func() kubeadmFixture {
+			fx := defaultFixture(ca)
+			fx.endpointHost = "fd00::1"
+			fx.server = "https://[fd00::1]:6443"
+			return fx
+		}(), nil},
+		{"kubeconfig server has a trailing slash", func() kubeadmFixture {
+			fx := defaultFixture(ca)
+			fx.server = fmt.Sprintf("https://%s:%d/", testEndpointHost, testEndpointPort)
+			return fx
+		}(), nil},
+		{"host differs only in case", func() kubeadmFixture {
+			fx := defaultFixture(ca)
+			fx.endpointHost = "CP.Example.com"
+			fx.server = "https://cp.example.com:6443"
+			return fx
+		}(), nil},
+		{"default https port omitted in the kubeconfig", func() kubeadmFixture {
+			fx := defaultFixture(ca)
+			fx.endpointPort = 443
+			fx.server = fmt.Sprintf("https://%s", testEndpointHost)
+			return fx
+		}(), nil},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -306,7 +344,15 @@ func TestKubeadmWorkerJoin_Accepts(t *testing.T) {
 			g.Expect(jc).To(ContainSubstring("bootstrapToken"))
 			g.Expect(jc).To(ContainSubstring("caCertHashes"))
 			g.Expect(jc).To(ContainSubstring("sha256:"))
-			g.Expect(jc).To(ContainSubstring(fmt.Sprintf("%s:%d", testEndpointHost, testEndpointPort)))
+			wantEP := clusterv1.APIEndpoint{Host: testEndpointHost, Port: testEndpointPort}
+			if tc.fx.endpointHost != "" {
+				wantEP.Host = tc.fx.endpointHost
+			}
+			if tc.fx.endpointPort != 0 {
+				wantEP.Port = tc.fx.endpointPort
+			}
+			// Must be the bracketed form for IPv6: kubeadm parses this as host:port.
+			g.Expect(jc).To(ContainSubstring(wantEP.String()))
 			g.Expect(jc).To(ContainSubstring("node.cluster.x-k8s.io/uninitialized"))
 			g.Expect(jc).To(ContainSubstring("worker-0")) // nodeRegistration.name
 
@@ -322,6 +368,36 @@ func TestKubeadmWorkerJoin_Accepts(t *testing.T) {
 	}
 }
 
+// TestKubeadmWorkerJoin_StripsSpecSuppliedJoinCredentials is the render-time half
+// of two webhook rules. KairosConfigTemplate has no webhook registered, so for a
+// config CAPI core derives from a template these fields are only refused one
+// object later. The renderer must not emit them even if they reach it.
+func TestKubeadmWorkerJoin_StripsSpecSuppliedJoinCredentials(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	src, req, _ := buildSource(t, defaultFixture(ca), nil)
+
+	req.Config.Spec.Kubeadm = &bootstrapv1beta2.KubeadmConfig{
+		JoinConfiguration: &kubeadmv1.JoinConfiguration{
+			Discovery:    kubeadmv1.Discovery{TLSBootstrapToken: "abcdef.0123456789abcdef"},
+			ControlPlane: &kubeadmv1.JoinControlPlane{},
+		},
+	}
+
+	mat, err := src.WorkerJoin(context.Background(), req)
+	g.Expect(err).NotTo(HaveOccurred())
+	jc := mat.Kubeadm.JoinConfiguration
+
+	g.Expect(jc).NotTo(ContainSubstring("abcdef.0123456789abcdef"),
+		"a spec-supplied tlsBootstrapToken must never reach the rendered userdata")
+	g.Expect(jc).NotTo(ContainSubstring("tlsBootstrapToken"))
+	g.Expect(jc).NotTo(ContainSubstring("controlPlane"),
+		"a worker join must carry no control-plane join material")
+	// The minted token is still there: stripping must not break the join.
+	g.Expect(jc).To(ContainSubstring("bootstrapToken"))
+	g.Expect(mat.Kubeadm.TokenID).To(MatchRegexp(`^[a-z0-9]{6}$`))
+}
+
 // TestKubeadmWorkerJoin_TerminalRefusals covers every TERMINAL trust-check failure:
 // no token minted, the error is NOT a bootstrapNotReadyError.
 func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
@@ -335,6 +411,9 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 	}{
 		{"owner UID mismatch", func(fx *kubeadmFixture) { fx.ownerUID = types.UID("not-the-cp") }, nil, "must be owned by the cluster's control plane"},
 		{"server mismatch", func(fx *kubeadmFixture) { fx.server = "https://evil.example.com:6443" }, nil, "does not equal the Cluster control-plane endpoint"},
+		// An ownerRef that is not a controller ref: GetControllerOf returns nil, so
+		// the UID leg must refuse rather than fall through.
+		{"ownerRef present but not a controller ref", func(fx *kubeadmFixture) { fx.noController = true }, nil, "must be owned by the cluster's control plane"},
 		{"CA cross-check mismatch", func(fx *kubeadmFixture) { fx.clusterCA = otherCA }, nil, "does not match"},
 		{"lookalike kind in another group", func(fx *kubeadmFixture) { fx.cpGroup = "evil.example.com" }, nil, "not on the kubeadm trust allowlist"},
 		{"k0s KairosControlPlane", func(fx *kubeadmFixture) { fx.cpKind = "KairosControlPlane"; fx.cpDist = "k0s" }, nil, "not kubeadm"},
