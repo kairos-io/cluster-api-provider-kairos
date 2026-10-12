@@ -57,6 +57,13 @@ bootstrap controller does the following for each Machine:
      kubeconfig `server`.
    - If a `<cluster>-ca` Secret exists, its `tls.crt` equals the kubeconfig's
      CA. A missing `<cluster>-ca` is allowed.
+   - Under Kamaji, do not expect to control `<cluster>-ca` yourself. Kamaji
+     honours a bring-your-own CA only as a pre-created `<tcp>-ca` holding a
+     valid `ca.crt`/`ca.key` pair; a CAPI-style `<cluster>-ca` carrying only
+     `tls.crt`/`tls.key` is overwritten with Kamaji's own generated CA, and the
+     join then pins that CA rather than the one you supplied. Reported by
+     @patrostkowski from a live Kamaji cluster. It does not weaken the anchor
+     above, because `<cluster>-ca` still carries the tenant CA either way.
 3. Mints a bootstrap token in the workload cluster: a Secret named
    `bootstrap-token-<id>` in `kube-system`, valid for 15 minutes. The
    non-secret `<id>` is recorded in `KairosConfig.status.bootstrapTokenID`. The
