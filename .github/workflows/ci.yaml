@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -49,6 +52,26 @@ jobs:
         file: ./coverage.out
         flags: unittests
         name: codecov-umbrella
+
+  kubeadm-join:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      fail-fast: false
+      matrix:
+        # v1.30 renders JoinConfiguration v1beta3, v1.31 and later v1beta4.
+        kubeadm-version: ['v1.30.14', 'v1.36.2']
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26.4'
+
+    - name: Run the kubeadm worker join against a real kubeadm
+      run: make test-kubeadm KUBEADM_VERSION=${{ matrix.kubeadm-version }}
 
   verify-generate:
     runs-on: ubuntu-latest

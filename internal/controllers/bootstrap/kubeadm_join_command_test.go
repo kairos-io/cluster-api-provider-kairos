@@ -140,12 +140,14 @@ func renderKubeadmWorker(t *testing.T, version, providerID, userPatches string) 
 	t.Helper()
 	src, req, _ := buildSource(t, defaultFixture(genTestCA(t, "cluster-ca")), nil)
 	req.Machine.Spec.Version = version
-	if userPatches != "" {
-		req.Config.Spec.Kubeadm = &bootstrapv1beta2.KubeadmConfig{
-			JoinConfiguration: &kubeadmv1.JoinConfiguration{
-				Patches: kubeadmv1.Patches{Directory: userPatches},
-			},
-		}
+	req.Config.Spec.Kubeadm = &bootstrapv1beta2.KubeadmConfig{
+		JoinConfiguration: &kubeadmv1.JoinConfiguration{
+			// A fixed socket, so a real kubeadm does not probe the host's CRIs and
+			// fail with "found multiple CRI endpoints" on a machine that has more
+			// than one.
+			NodeRegistration: kubeadmv1.NodeRegistrationOptions{CRISocket: "unix:///run/containerd/containerd.sock"},
+			Patches:          kubeadmv1.Patches{Directory: userPatches},
+		},
 	}
 	mat, err := src.WorkerJoin(context.Background(), req)
 	if err != nil {
@@ -212,7 +214,7 @@ set -euo pipefail
 if [ "$1" = version ]; then echo "$WANT_KUBEADM_VERSION"; exit 0; fi
 printf '%s\n' "$@" > "$KUBEADM_ARGS_FILE"
 if [ -n "${KUBEADM_BIN:-}" ]; then
-  exec "$KUBEADM_BIN" "$@" --skip-phases="$KUBEADM_JOIN_PHASES"
+  exec "$KUBEADM_BIN" "$@" --skip-phases="$KUBEADM_JOIN_PHASES" --dry-run
 fi
 `
 	if err := os.WriteFile(filepath.Join(stubDir, "kubeadm"), []byte(stub), 0o700); err != nil {
