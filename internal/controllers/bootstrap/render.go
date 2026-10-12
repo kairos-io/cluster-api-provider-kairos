@@ -79,12 +79,17 @@ var bootstrapDistributions = map[string]bootstrapDistribution{
 			td.Kubeadm = &bootstrap.KubeadmTemplateData{
 				JoinConfiguration: w.Kubeadm.JoinConfiguration,
 				KubernetesVersion: w.Kubeadm.KubernetesVersion,
+				PatchesDirectory:  w.Kubeadm.PatchesDirectory,
 				ProviderIDPatch:   kubeadmProviderIDPatch(td.ProviderID),
 			}
 		},
 		builtinJoin: nil,
 	},
 }
+
+// defaultKubeadmPatchesDir is the kubeadm patches directory used when the spec
+// does not name one.
+const defaultKubeadmPatchesDir = "/etc/kubernetes/kairos-patches"
 
 // kubeadmProviderIDPatch returns a kubeadm kubeletconfiguration merge-patch that
 // sets the Node providerID (ADR 0010 P1 item 4), or "" when no providerID is known
