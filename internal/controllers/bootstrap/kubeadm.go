@@ -334,13 +334,15 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			kubeconfigKey.Name, cpRef.Kind, cpRef.Name)
 	}
 
-	// The CA pin comes from the kubeconfig; its server may be an internal address
-	// (e.g. Kamaji's admin.svc), so it is not compared to the Cluster endpoint.
+	// The CA pin comes from the kubeconfig. Its server may legitimately be an
+	// internal address (Kamaji publishes admin.svc when advertiseAddress is set),
+	// so it is not required to equal the Cluster endpoint -- but see the anchor
+	// check below: one of the two must hold.
 	kcData, ok := kcSecret.Data[workloadKubeconfigSecretKey]
 	if !ok || len(kcData) == 0 {
 		return zero, newNotReady("WaitingForKubeconfig", "the %s Secret has no %q payload yet", kubeconfigKey.Name, workloadKubeconfigSecretKey)
 	}
-	caData, err := caFromKubeconfig(kcData)
+	server, caData, err := serverAndCAFromKubeconfig(kcData)
 	if err != nil {
 		return zero, fmt.Errorf("the %s Secret is not a valid kubeconfig: %v", kubeconfigKey.Name, err)
 	}
@@ -359,6 +361,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 	// (ADR 0010 P1 step 1).
 	caKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + "-ca"}
 	caSecret := &corev1.Secret{}
+	caCrossChecked := false
 	if err := s.caReader.Get(ctx, caKey, caSecret); err == nil {
 		crt, ok := caSecret.Data[clusterCASecretCrtKey]
 		if !ok || len(crt) == 0 {
@@ -372,8 +375,24 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			return zero, fmt.Errorf("the kubeconfig CA does not match the %s Secret's %q; inspect the Secret and re-pin if this change is expected",
 				caKey.Name, clusterCASecretCrtKey)
 		}
+		caCrossChecked = true
 	} else if !apierrors.IsNotFound(err) {
 		return zero, newNotReady("WaitingForClusterCA", "waiting to cross-check the %s Secret: %v", caKey.Name, err)
+	}
+
+	// Exactly one of the two independent anchors must hold, because the owner
+	// reference is not one: ownerReferences are user-settable and a UID is
+	// readable, so anyone who can create Secrets in this namespace can forge the
+	// owner leg. That leaves the server equalling the Cluster endpoint, and the CA
+	// matching a <cluster>-ca this controller read separately. Requiring neither
+	// would let a planted kubeconfig steer this controller's own client, which
+	// holds workload-cluster admin credentials, at any address reachable from the
+	// management network. Kamaji satisfies the second anchor: it publishes
+	// <cluster>-ca alongside the kubeconfig (ADR 0010 P1 step 1, F4).
+	wantServer := "https://" + cluster.Spec.ControlPlaneEndpoint.String()
+	if !sameServer(server, wantServer) && !caCrossChecked {
+		return zero, fmt.Errorf("the %s Secret's server %q does not equal the Cluster control-plane endpoint %q, and there is no %s Secret to cross-check its CA against: refusing to mint a token",
+			kubeconfigKey.Name, server, wantServer, caKey.Name)
 	}
 
 	return trustedControlPlane{
@@ -581,7 +600,9 @@ func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration
 // still authenticates it), otherwise the Cluster control-plane endpoint.
 func kubeadmJoinEndpoint(serverAddress string, trusted trustedControlPlane) (string, error) {
 	if serverAddress == "" {
-		return fmt.Sprintf("%s:%d", trusted.endpointHost, trusted.endpointPort), nil
+		// APIEndpoint.String is net.JoinHostPort, so an IPv6 literal is bracketed
+		// as kubeadm requires. Do not hand-format this as host:port.
+		return clusterv1.APIEndpoint{Host: trusted.endpointHost, Port: trusted.endpointPort}.String(), nil
 	}
 	raw := serverAddress
 	if !strings.Contains(raw, schemeSeparator) {
@@ -598,29 +619,30 @@ func kubeadmJoinEndpoint(serverAddress string, trusted trustedControlPlane) (str
 	return net.JoinHostPort(u.Hostname(), port), nil
 }
 
-// caFromKubeconfig parses a kubeconfig and returns the current-context cluster's
-// certificate-authority-data.
-func caFromKubeconfig(data []byte) ([]byte, error) {
+// serverAndCAFromKubeconfig parses a kubeconfig and returns the current-context
+// cluster's server URL and its certificate-authority-data. Both are needed: the
+// CA is the pin handed to the node, the server is one of the two trust anchors.
+func serverAndCAFromKubeconfig(data []byte) (server string, caData []byte, err error) {
 	cfg, err := clientcmd.Load(data)
 	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig: %w", err)
+		return "", nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
 	ctxName := cfg.CurrentContext
 	kubeCtx, ok := cfg.Contexts[ctxName]
 	if !ok || kubeCtx == nil {
 		// Fall back to the sole cluster when there is exactly one.
 		if len(cfg.Clusters) != 1 {
-			return nil, fmt.Errorf("kubeconfig has no usable current-context")
+			return "", nil, fmt.Errorf("kubeconfig has no usable current-context")
 		}
 		for _, cl := range cfg.Clusters {
-			return cl.CertificateAuthorityData, nil
+			return cl.Server, cl.CertificateAuthorityData, nil
 		}
 	}
 	cl, ok := cfg.Clusters[kubeCtx.Cluster]
 	if !ok || cl == nil {
-		return nil, fmt.Errorf("kubeconfig context %q references an unknown cluster", ctxName)
+		return "", nil, fmt.Errorf("kubeconfig context %q references an unknown cluster", ctxName)
 	}
-	return cl.CertificateAuthorityData, nil
+	return cl.Server, cl.CertificateAuthorityData, nil
 }
 
 // sameServer reports whether two API server URLs address the same endpoint.

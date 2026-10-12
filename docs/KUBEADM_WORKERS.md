@@ -41,10 +41,18 @@ bootstrap controller does the following for each Machine:
      (matched on API group and kind).
    - The `<cluster>-kubeconfig` Secret exists and is controller-owned by that
      control-plane object.
-   - The kubeconfig carries `certificate-authority-data`. Its `server` is not
-     compared to `Cluster.spec.controlPlaneEndpoint`: a control-plane provider
-     may publish an internal address there, as the Kamaji control-plane
-     provider does (`admin.svc`) when `spec.network.advertiseAddress` is set.
+   - The kubeconfig carries `certificate-authority-data`, and at least one of
+     two independent anchors holds: either its `server` equals
+     `https://<host>:<port>` of `Cluster.spec.controlPlaneEndpoint`, or a
+     `<cluster>-ca` Secret exists and its `tls.crt` matches the kubeconfig's CA.
+     The `server` is allowed to differ because a control-plane provider may
+     publish an internal address there, as the Kamaji control-plane provider
+     does (`admin.svc`) when `spec.network.advertiseAddress` is set -- and
+     Kamaji publishes `<cluster>-ca` too, so the second anchor holds. Requiring
+     one of the two matters because the controller reaches the workload cluster
+     through this kubeconfig with admin credentials, and the Secret's owner
+     reference is not an anchor on its own: ownerReferences are user-settable,
+     so anyone who can create Secrets in the namespace can forge that leg.
      The node joins `spec.serverAddress` or the Cluster endpoint, never the
      kubeconfig `server`.
    - If a `<cluster>-ca` Secret exists, its `tls.crt` equals the kubeconfig's
@@ -192,6 +200,8 @@ These KairosConfig fields have no effect for kubeadm workers: `singleNode`,
 `workerTokenSecretRef`, `k3sToken`, `k3sTokenSecretRef`, `podCIDR`,
 `serviceCIDR`, `primaryIP`, and `manifests`. The user, hostname, `install`,
 `dnsServers`, and `files` fields are rendered as for other distributions.
+
+| `does not equal the Cluster control-plane endpoint, and there is no <cluster>-ca Secret to cross-check` | The kubeconfig's `server` differs from `Cluster.spec.controlPlaneEndpoint` and there is no `<cluster>-ca` to anchor its CA. Either align the two addresses, or publish `<cluster>-ca` with the cluster's CA certificate. |
 
 ### Admission refusals
 

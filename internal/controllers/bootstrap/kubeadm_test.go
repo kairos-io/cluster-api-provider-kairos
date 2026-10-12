@@ -422,6 +422,14 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 		// An ownerRef that is not a controller ref: GetControllerOf returns nil, so
 		// the UID leg must refuse rather than fall through.
 		{"ownerRef present but not a controller ref", func(fx *kubeadmFixture) { fx.noController = true }, nil, "must be owned by the cluster's control plane"},
+		// The other half of the Kamaji accept case above. A server that differs from
+		// the Cluster endpoint is allowed only when <cluster>-ca anchors the CA; with
+		// neither anchor the owner reference is all that is left, and that is
+		// forgeable by anyone who can create Secrets in the namespace.
+		{"server differs and there is no <cluster>-ca to anchor it", func(fx *kubeadmFixture) {
+			fx.server = "https://evil.example.com:6443"
+			fx.clusterCA = nil
+		}, nil, "Secret to cross-check its CA against"},
 		{"CA cross-check mismatch", func(fx *kubeadmFixture) { fx.clusterCA = otherCA }, nil, "does not match"},
 		{"lookalike kind in another group", func(fx *kubeadmFixture) { fx.cpGroup = "evil.example.com" }, nil, "not on the kubeadm trust allowlist"},
 		{"k0s KairosControlPlane", func(fx *kubeadmFixture) { fx.cpKind = "KairosControlPlane"; fx.cpDist = "k0s" }, nil, "not kubeadm"},
