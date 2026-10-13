@@ -1,9 +1,19 @@
 # Kubeadm Workers
 
-Last verified against: CAPI v1.13.4 (v1beta2 contract). Verification so far is
-unit and envtest tests; this path has not been validated against a live Kamaji
-or KubeadmControlPlane cluster or a specific Kairos image. Provider version: not
+Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: not
 yet released (follows v0.1.3).
+
+Verification status, by control plane:
+
+- **Kamaji** (`KamajiControlPlane`): validated end to end on a live management
+  cluster with KubeVirt workers and real Kairos images, in three
+  configurations -- vanilla, `spec.network.advertiseAddress` with
+  `spec.serverAddress`, and a bring-your-own CA with `advertiseAddress` and no
+  `serverAddress`. Workers joined and became Ready in all three. Contributed by
+  @patrostkowski.
+- **Upstream `KubeadmControlPlane`**: unit and envtest tests only. Not yet
+  validated against a live cluster. See also the namespace requirement below,
+  which applies specifically to this case.
 
 Setting `spec.distribution: kubeadm` on a `KairosConfig` or
 `KairosConfigTemplate` bootstraps a Kairos **worker** node that joins a control
@@ -21,12 +31,40 @@ background discussion is in
 | Capability | Status |
 | --- | --- |
 | Kairos workers created by a `MachineDeployment` | Supported. |
-| Control planes of kind `KubeadmControlPlane` or `KamajiControlPlane` | Designed for; not yet validated against a live cluster (see the verification status at the top). Other kinds need an operator flag; see [Allowing other control-plane kinds](#allowing-other-control-plane-kinds). |
+| Control planes of kind `KamajiControlPlane` | Supported. Validated on a live cluster; see the verification status above. |
+| Control planes of kind `KubeadmControlPlane` | Designed for, not yet validated live, and it **must** have its own namespace; see [the namespace requirement](#required-keep-upstream-kubeadmcontrolplane-clusters-in-their-own-namespace). |
+| Control planes of any other kind | Need an operator flag; see [Allowing other control-plane kinds](#allowing-other-control-plane-kinds). |
 | A kubeadm control plane run by this provider (`KairosControlPlane` with `distribution: kubeadm`) | Not supported. Refused; see [KairosControlPlane refuses kubeadm](#kairoscontrolplane-refuses-kubeadm). |
 | `MachinePool` workers | Not supported. Refused. |
 | Joining a k0s or k3s `KairosControlPlane` | Not supported. Use `distribution: k0s` or `k3s` workers for those clusters. |
 | CNI installation | Not provided. You install and operate the CNI. |
 | Building the node image | Not provided. See [Prerequisites](#prerequisites). |
+
+## Required: keep upstream KubeadmControlPlane clusters in their own namespace
+
+**Do not put a cluster whose control plane is an upstream `KubeadmControlPlane`
+in the same namespace as a k0s or k3s Kairos cluster.** Give it a namespace of
+its own. This is a condition of using the kubeadm worker path at all while it is
+a preview, not a recommendation.
+
+The reason is how upstream `KubeadmControlPlane` obtains its PKI: it **adopts**
+a pre-existing `<cluster>-ca` or `<cluster>-kubeconfig` Secret rather than
+insisting on creating one. A Secret planted before the control plane reconciles
+is therefore adopted and given a legitimate controller owner reference, which
+the trust check described below cannot distinguish from the real thing. The
+check catches a planted Secret; it cannot catch an adopted one.
+
+What makes that reachable today is a separate, known weakness in the k0s and k3s
+control-plane paths: a control-plane node pushes its kubeconfig using a
+ServiceAccount whose Role carries an unscoped `secrets` `create`. A node
+compromised in a namespace that also holds an upstream-KCP cluster can use it to
+plant a Secret for that neighbouring cluster. Keeping the two in separate
+namespaces removes the adjacency, which is the only mitigation available until
+that push path is fixed.
+
+Kamaji is not affected in the same way: it overwrites planted data and sets
+itself as the controller owner, so the trust check holds. The prohibition is
+specifically about upstream `KubeadmControlPlane`.
 
 ## How it works
 
