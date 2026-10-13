@@ -1782,44 +1782,6 @@ func (r *KairosControlPlaneReconciler) getControlPlaneLBEndpoint(ctx context.Con
 	return host, port, nil
 }
 
-// updateKubeconfigServerToNodeIP replaces 127.0.0.1/localhost in kubeconfig server with the node IP.
-// k3s default kubeconfig uses https://127.0.0.1:6443 which is not reachable from the management cluster.
-func updateKubeconfigServerToNodeIP(kubeconfig []byte, nodeIP string, port int32) ([]byte, error) {
-	if nodeIP == "" || port == 0 {
-		return kubeconfig, nil
-	}
-	config, err := clientcmd.Load(kubeconfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
-	}
-	desired := fmt.Sprintf("https://%s:%d", nodeIP, port)
-	changed := false
-	for _, cluster := range config.Clusters {
-		if cluster == nil {
-			continue
-		}
-		parsed, err := url.Parse(cluster.Server)
-		if err != nil {
-			cluster.Server = desired
-			changed = true
-			continue
-		}
-		// Replace 127.0.0.1 or localhost with node IP
-		if parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "localhost" {
-			cluster.Server = desired
-			changed = true
-		}
-	}
-	if !changed {
-		return kubeconfig, nil
-	}
-	out, err := clientcmd.Write(*config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize kubeconfig: %w", err)
-	}
-	return out, nil
-}
-
 // ensureKubeconfigServer updates the kubeconfig secret server to match the given endpoint.
 func (r *KairosControlPlaneReconciler) ensureKubeconfigServer(ctx context.Context, log logr.Logger, secret *corev1.Secret, host string, port int32) (bool, error) {
 	if host == "" || port == 0 {
