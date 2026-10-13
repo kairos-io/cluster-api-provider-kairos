@@ -173,11 +173,11 @@ type KairosConfigSpec struct {
 	// +kubebuilder:validation:MaxItems=32
 	Files []File `json:"files,omitempty"`
 
-	// PreCommands are commands to run before k0s/k3s installation
+	// PreCommands is reserved and not yet rendered into the cloud-config.
 	// +optional
 	PreCommands []string `json:"preCommands,omitempty"`
 
-	// PostCommands are commands to run after k0s/k3s installation
+	// PostCommands is reserved and not yet rendered into the cloud-config.
 	// +optional
 	PostCommands []string `json:"postCommands,omitempty"`
 
