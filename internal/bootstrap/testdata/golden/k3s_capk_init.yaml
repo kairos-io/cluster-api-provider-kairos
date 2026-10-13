@@ -265,7 +265,8 @@ write_files:
       fi
       if [ -n "$PROVIDER_ID" ]; then
         mkdir -p /etc/rancher/k3s/config.yaml.d
-        printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+        printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$
+        mv -f /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$ /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
       fi
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
     permissions: "0755"

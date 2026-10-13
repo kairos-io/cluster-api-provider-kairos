@@ -419,7 +419,8 @@ write_files:
       # stray leading whitespace on its top-level keys — k3s rejects a
       # config.yaml.d file whose keys are indented. ${uuid} is validated above.
       mkdir -p /etc/rancher/k3s/config.yaml.d
-      printf 'kubelet-arg:\n  - provider-id=metal3://%s\nnode-label:\n  - metal3.io/uuid=%s\n' "${uuid}" "${uuid}" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+      printf 'kubelet-arg:\n  - provider-id=metal3://%s\nnode-label:\n  - metal3.io/uuid=%s\n' "${uuid}" "${uuid}" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$
+      mv -f /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$ /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
       echo "metal3-providerid: wrote provider-id=metal3://${uuid} and metal3.io/uuid=${uuid} for kubelet registration"
   {{- end }}
   {{- if and .IsFleet (not .ProviderID) }}
@@ -466,7 +467,8 @@ write_files:
         exit 0
       fi
       mkdir -p "${DROPIN_DIR}"
-      printf 'kubelet-arg:\n  - provider-id=kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/90-provider-id.yaml"
+      printf 'kubelet-arg:\n  - provider-id=kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/90-provider-id.yaml.tmp.$$"
+      mv -f "${DROPIN_DIR}/90-provider-id.yaml.tmp.$$" "${DROPIN_DIR}/90-provider-id.yaml"
       echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
   {{- else if and (eq .Role "control-plane") (not .ProviderID) (not .Metal3) }}
   # VM self-discovery of providerID when not available at bootstrap (runs before k3s via ExecStartPre).
@@ -509,7 +511,8 @@ write_files:
           FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
           PROVIDER_ID="vsphere://${FORMATTED}"
           mkdir -p /etc/rancher/k3s/config.yaml.d
-          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$
+          mv -f /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$ /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
           echo "Discovered providerID: $PROVIDER_ID"
         fi
       fi

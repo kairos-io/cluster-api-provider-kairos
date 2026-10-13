@@ -327,7 +327,8 @@ write_files:
           FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
           PROVIDER_ID="vsphere://${FORMATTED}"
           mkdir -p /etc/rancher/k3s/config.yaml.d
-          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$
+          mv -f /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$ /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
           echo "Discovered providerID: $PROVIDER_ID"
         fi
       fi
