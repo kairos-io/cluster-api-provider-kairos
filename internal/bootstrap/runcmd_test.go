@@ -41,6 +41,10 @@ var systemctlStart = regexp.MustCompile(`\bsystemctl\b.*(\s--now\b|\s(re)?start\
 // cloud-config stage for that long, so users and SSH keys are not applied
 // until it ends.
 func TestRender_PostBootstrapStartDoesNotBlock(t *testing.T) {
+	worker := func(d TemplateData) TemplateData {
+		d.Role = "worker"
+		return d
+	}
 	cases := []struct {
 		name string
 		dist string
@@ -48,6 +52,10 @@ func TestRender_PostBootstrapStartDoesNotBlock(t *testing.T) {
 	}{
 		{"kubeadm capv", bootstrapv1beta2.DistributionKubeadm, dispatchKubeadmWorkerData(false)},
 		{"kubeadm capk", bootstrapv1beta2.DistributionKubeadm, dispatchKubeadmWorkerData(true)},
+		{"k3s capv control-plane", bootstrapv1beta2.DistributionK3s, dispatchCPData(false)},
+		{"k3s capk control-plane", bootstrapv1beta2.DistributionK3s, dispatchCPData(true)},
+		{"k3s capv worker", bootstrapv1beta2.DistributionK3s, worker(dispatchCPData(false))},
+		{"k3s capk worker", bootstrapv1beta2.DistributionK3s, worker(dispatchCPData(true))},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
