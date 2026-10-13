@@ -557,7 +557,7 @@ func TestObserveKubeconfigSecret_TransitionsCondition(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(ready).To(BeFalse())
 	g.Expect(kcp.Status.LastNodePushObserved).NotTo(BeNil(), "first miss must anchor LastNodePushObserved")
-	g.Expect(kcp.Status.LastNodePushObserved.Time).To(BeTemporally(">=", beforeFirst.Time.Add(-time.Second)))
+	g.Expect(kcp.Status.LastNodePushObserved.Time).To(BeTemporally(">=", beforeFirst.Add(-time.Second)))
 	cond := conditions.Get(kcp, controlplanev1beta2.KubeconfigReadyCondition)
 	g.Expect(cond).NotTo(BeNil())
 	g.Expect(cond.Status).To(Equal(corev1.ConditionFalse))

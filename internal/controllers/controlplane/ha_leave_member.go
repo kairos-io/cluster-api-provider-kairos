@@ -101,8 +101,8 @@ func memberRESTConfig(base *rest.Config, ip string) (*rest.Config, error) {
 	cfg := rest.CopyConfig(base)
 	cfg.Host = "https://" + net.JoinHostPort(parsed.String(), k0sAPIServerPort)
 	cfg.Timeout = memberRequestTimeout
-	cfg.TLSClientConfig.ServerName = ""
-	cfg.TLSClientConfig.Insecure = false
+	cfg.ServerName = ""
+	cfg.Insecure = false
 	return cfg, nil
 }
 

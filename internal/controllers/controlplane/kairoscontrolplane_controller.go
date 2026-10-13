@@ -225,7 +225,7 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// has already finalized the object via a bare r.Update; otherwise the
 	// deferred Patch should flush observedGeneration/conditions on the
 	// non-terminal drain-requeue path.
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kcp.DeletionTimestamp.IsZero() {
 		// A paused Cluster holds deletion too, as it does for upstream
 		// KubeadmControlPlane. Deleting the control plane marks every
 		// control-plane Machine for deletion and strips their etcd-leave hooks,
