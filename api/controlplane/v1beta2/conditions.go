@@ -202,4 +202,20 @@ const (
 	// `spec.controlPlaneEndpoint.host`/`port` directly — CAPI core
 	// does not overwrite a populated value.
 	WaitingForInfrastructureControlPlaneEndpointReason = "WaitingForInfrastructureControlPlaneEndpoint"
+
+	// UnsupportedDistributionReason is the False(Warning) reason on the
+	// KairosControlPlane AvailableCondition and ReadyCondition when the effective
+	// distribution is one the control-plane provider does not support. The only
+	// case today is `kubeadm`: ADR 0010 ships kubeadm as a bootstrap (worker-join)
+	// distribution in P1, while a kubeadm KairosControlPlane is deferred to P2, so
+	// the KCP enum stays [k0s, k3s]. The validating webhook already refuses an
+	// explicit `spec.distribution: kubeadm`; this reason covers the inherit path,
+	// where a KairosControlPlane references a KairosConfigTemplate whose
+	// distribution is kubeadm. The controller MUST surface this as a condition
+	// rather than persist kubeadm into spec.distribution — the webhook would reject
+	// that write on every reconcile, producing an error loop.
+	//
+	// Resolution: point the KairosControlPlane at a k0s or k3s KairosConfigTemplate,
+	// or wait for P2's kubeadm control-plane support.
+	UnsupportedDistributionReason = "UnsupportedDistribution"
 )

@@ -1,0 +1,874 @@
+#cloud-config
+
+hostname: kairos-node-0
+install:
+  auto: true
+  device: /dev/sda
+  reboot: true
+
+users:
+- name: kairos
+  passwd: test-password
+  groups:
+    - admin
+    - users
+  ssh_authorized_keys:
+    - github:octocat
+    - ssh-ed25519 AAAATESTKEYtestexample test@example
+- name: capk
+  groups: [users, admin]
+
+# Control-plane node configuration
+# ADR 0005 (HA) join node: k0s controller-join via --token-file. The token is
+# produced on the init controller (k0s token create --role=controller) and
+# delivered by the Phase-3 controller through .JoinToken (TOKEN-INV). The join
+# target is k0s's own gossip/etcd peer discovery seeded by the token, NOT the
+# VIP block.
+k0s:
+  enabled: true
+  args:
+    - --config /etc/k0s/k0s.yaml
+    # Controller-join: --token-file carries the controller-role join token.
+    - --token-file=/etc/k0s/controller-token
+    # ADR 0005 § D.3 (HA): run the k0s controller as a schedulable worker too, so
+    # the kube-vip DaemonSet — which selects control-plane Nodes — has a Node to
+    # land on. A controller-only k0s node registers no kubelet/Node, so the
+    # DaemonSet would stay Pending and the VIP would never float (Phase-4 lab
+    # finding). k0s auto-applies the node-role.kubernetes.io/control-plane:NoSchedule
+    # taint with --enable-worker; the DaemonSet tolerates it and general workloads
+    # stay off. HA + CAPV/CAPM3 only — single-node (RenderKubeVIP=false) and CAPK
+    # (OQ-5) never reach this, so their rendering is byte-for-byte unchanged.
+    - --enable-worker
+    # KD-3c: tell kubelet the providerID BEFORE the Node is registered so it
+    # appears in spec.providerID from first registration. The PR-8 audit
+    # surfaced that k0s would otherwise register the Node and the
+    # post-bootstrap kubectl patch would race the immutable-once-set
+    # ProviderID. Mirrors the k3s ExecStartPre pattern. Validator at
+    # internal/bootstrap/validate.go pins ProviderID to a strict regex,
+    # so direct interpolation here is safe (no shell injection surface).
+    # Not emitted for Metal3: CAPM3 owns Node.spec.providerID (ADR 0004).
+    - --kubelet-extra-args=--provider-id=vsphere://vm-uuid-1234
+
+write_files:
+  - path: /system/oem/12_kairos-capi-persistency.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      name: "Kairos CAPI persistent state paths"
+      stages:
+        rootfs:
+          - environment_file: /run/cos/extra-layout.env
+            environment:
+              PERSISTENT_STATE_PATHS: "/etc/cni /etc/k0s /etc/kubernetes /etc/rancher /etc/ssh /etc/systemd /var/lib/cni /var/lib/containerd /var/lib/k0s /var/lib/kubelet /var/lib/rancher /var/log"
+  # INIT-ORDERING (bare-metal lab, 2026-09-08). provider-kairos turns `k0s.args:`
+  # into /etc/systemd/system/k0scontroller.service.d/override.conf, and it writes
+  # that file AFTER enabling the unit. It usually wins by a fraction of a second,
+  # but not always — measured across four k0s boots on identical images:
+  #
+  #   07:12:16.064 override / 07:12:16 start   args applied
+  #   07:19:25.756 override / 07:19:25 start   args applied
+  #   08:08:12.016 override / 08:08:12 start   args applied
+  #   08:35:04.287 override / 08:35:01 start   args LOST  (3.3s late)
+  #
+  # On the boot that lost, /proc/<pid>/cmdline was a bare `k0s controller` with
+  # every flag missing: no worker role, so no kubelet, so the Node never
+  # registered and the whole control plane stalled. On a JOIN node the casualty
+  # is the join-token flag, which is the k3s split-brain failure in k0s clothing.
+  #
+  # write_files lands in the boot stage, before the unit is enabled, so a drop-in
+  # written here is always present at the first start. It sorts after
+  # override.conf, so it wins whenever both exist and is harmless when the plugin
+  # never gets there. Same belt-and-braces as the k3s 93-ha-datastore.yaml pin —
+  # k0s has no config.yaml.d equivalent for CLI-only flags, so the drop-in is the
+  # available mechanism. Keep this list identical to `k0s.args:` above;
+  # TestHA_K0sArgsDropInMatchesK0sArgs fails the build if they drift.
+  - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-args.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      # Never start with these arguments inside a recovery/install boot: on
+      # a join node that is a real controller-join, registered as a voter,
+      # that the installer then reboots out from under the cluster (measured
+      # on the beskar7 lab, 2026-09-08). The bare first start cannot join —
+      # it has no token and this drop-in is not loaded yet — and every start
+      # that carries the token follows a reload that also loads this file.
+      ConditionPathExists=!/run/cos/recovery_mode
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/k0s controller --config /etc/k0s/k0s.yaml --token-file=/etc/k0s/controller-token --enable-worker --kubelet-extra-args=--provider-id=vsphere://vm-uuid-1234
+  - path: /etc/k0s/k0s.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: k0s.k0sproject.io/v1beta1
+      kind: ClusterConfig
+      metadata:
+        name: k0s
+      spec:
+        api:
+          # Per-node API advertise address, same requirement the CAPK template
+          # already meets for KubeVirt masquerade. A bare-metal node is dual-homed
+          # too — an isolated provisioning NIC plus a routable LAN NIC — and with
+          # no api.address k0s picks one itself. Observed on the beskar7 lab
+          # (2026-09-08): it chose the provisioning address, `k0s token create`
+          # baked that into the controller-join token, and every joiner then failed
+          # with "failed to join existing cluster via https://192.168.190.61:9443:
+          # context deadline exceeded" while the join API answered perfectly well
+          # on the node itself.
+          #
+          # The placeholder below is replaced with this node's routable address by
+          # the k0scontroller ExecStartPre. It is deliberately the ONLY occurrence
+          # in this file: the resolver anchors on the address line, and its
+          # "already done" check keys on the same thing, so a stray copy in prose
+          # would make it re-run on every boot. Leaving a placeholder in place
+          # would make k0s reject the config, so when no address can be found the
+          # resolver deletes this line instead (KD-55 fail-open).
+          address: __API_ADDR__
+        network:
+      
+          podCIDR: 10.244.0.0/16
+      
+      
+          serviceCIDR: 10.96.0.0/12
+      
+        storage:
+          etcd:
+            # Per-node etcd peer address. The API advertise address alone is not
+            # enough: members also have to reach each OTHER, and on a dual-homed
+            # node k0s will otherwise peer over whichever interface it picks. Set
+            # from the same routable address, resolved by the same ExecStartPre
+            # before k0s starts, because etcd reads peerAddress at init/join and
+            # cannot be corrected afterwards. CAPK sets both for the same reason.
+            peerAddress: __ETCD_PEER_ADDR__
+  - path: /usr/local/bin/kairos-k0s-api-addr.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+
+      CFG=/etc/k0s/k0s.yaml
+      SENTINEL=__API_ADDR__
+      PEER_SENTINEL=__ETCD_PEER_ADDR__
+      ENDPOINT='10.0.0.42'
+
+      [ -f "${CFG}" ] || exit 0
+      # Idempotent: both addresses are fixed once the API and etcd have
+      # initialised, and this runs on every k0s start. Anchored to the value
+      # lines so nothing else in the file can keep this alive.
+      if ! grep -qE "^[[:space:]]*(address|peerAddress): (${SENTINEL}|${PEER_SENTINEL})\$" "${CFG}"; then
+        exit 0
+      fi
+
+      detect_addr() {
+        local src dev
+        # The address the kernel would use to reach the control-plane endpoint.
+        # That is by definition the one joiners can reach, which is what has to
+        # end up in the join token. Selected by routing, never by interface name.
+        src="$(ip -4 route get "${ENDPOINT}" 2>/dev/null |
+               sed -n 's/.*[[:space:]]src[[:space:]]\{1,\}\([0-9.]\{1,\}\).*/\1/p' | head -1)"
+        # If the endpoint is already local — kube-vip claimed the VIP on an earlier
+        # boot — the kernel answers with the VIP itself, which is not a per-node
+        # address and must not be advertised as one.
+        if [ -n "${src}" ] && [ "${src}" != "${ENDPOINT}" ]; then
+          echo "${src}"
+          return 0
+        fi
+        # Fall back to whichever interface carries the default route. An isolated
+        # provisioning network advertises no gateway, so this lands on the routable
+        # one.
+        dev="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+        if [ -n "${dev}" ]; then
+          src="$(ip -4 -o addr show dev "${dev}" scope global 2>/dev/null |
+                 awk '{print $4}' | cut -d/ -f1 | head -1)"
+          if [ -n "${src}" ]; then
+            echo "${src}"
+            return 0
+          fi
+        fi
+        return 1
+      }
+
+      # Bounded wait: the DHCP lease can lag the ExecStartPre by a few seconds, and
+      # k0s reads this address at first init/join so it must be right by then.
+      ADDR=""
+      for i in $(seq 1 30); do
+        ADDR="$(detect_addr || true)"
+        if [ -n "${ADDR}" ]; then
+          break
+        fi
+        echo "k0s-api-addr: waiting for a routable address (${i}/30)..."
+        sleep 2
+      done
+
+      if [ -n "${ADDR}" ]; then
+        sed -i "s|^\([[:space:]]*address: \)${SENTINEL}\$|\1${ADDR}|" "${CFG}"
+        sed -i "s|^\([[:space:]]*peerAddress: \)${PEER_SENTINEL}\$|\1${ADDR}|" "${CFG}"
+        echo "k0s-api-addr: api.address and etcd peerAddress set to ${ADDR}"
+      else
+        # Fail open. An unsubstituted sentinel makes k0s reject the config and
+        # crash-loop, so the settings are removed instead. The two halves need
+        # different surgery: an empty `api:` is re-defaulted by k0s, but an
+        # empty `etcd:` is not — its storage defaulting only repairs kine, so
+        # spec.storage.etcd stays nil and the etcd component dereferences it
+        # at start, after `k0s config validate` has passed. The storage section
+        # exists only to carry peerAddress, so drop the whole section and let
+        # k0s fall back to its default etcd config. The range delete runs only
+        # when its closing line is present, so it can never run to end of file.
+        sed -i "/^[[:space:]]*address: ${SENTINEL}\$/d" "${CFG}"
+        if grep -qE "^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$" "${CFG}"; then
+          sed -i "/^[[:space:]]*storage:\$/,/^[[:space:]]*peerAddress: ${PEER_SENTINEL}\$/d" "${CFG}"
+        fi
+        echo "k0s-api-addr: no routable address found; removed api.address and the etcd storage section, k0s will auto-detect"
+      fi
+  - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-api-addr.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k0s-api-addr.sh || true'
+  # ADR 0005 (HA) join node: k0s controller-role join token. Sourced from
+  # .JoinToken, which the Phase-3 controller produces on the init controller
+  # (k0s token create --role=controller) and delivers over the node-push channel
+  # (TOKEN-INV). Phase 2 renders it given the input; empty until Phase 3.
+  # 0600: this is a controller-join secret on disk.
+  - path: /etc/k0s/controller-token
+    permissions: "0600"
+    owner: root
+    group: root
+    content: |
+      k0s-controller-join-token
+  # ADR 0005 § D.1 (HA) kube-vip DaemonSet + RBAC (CAPV/CAPM3 only; CAPK uses its
+  # built-in LoadBalancer Service per OQ-5 and never reaches this block).
+  # k0s applies manifests under /var/lib/k0s/manifests/<dir>/ via its
+  # manifest-deployer (stack applier). The manifest is a multi-document set
+  # (ServiceAccount + ClusterRole + ClusterRoleBinding + DaemonSet) produced by
+  # kubeVIPManifest (marshaled YAML, VIP-INV-2) — no operator string is
+  # concatenated into the YAML. The DaemonSet runs one kube-vip per control-plane
+  # Node; the instances leader-elect on the plndr-cp-lock Lease (hence the RBAC)
+  # and the leader ARPs the floating control-plane VIP, so VIP ownership fails
+  # over when the leader's Node dies.
+  - path: /var/lib/k0s/manifests/kube-vip/kube-vip.yaml
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+          name: kube-vip
+          namespace: kube-system
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+          name: system:kube-vip-role
+      rules:
+          - apiGroups:
+              - ""
+            resources:
+              - services
+              - services/status
+              - nodes
+              - endpoints
+            verbs:
+              - get
+              - list
+              - watch
+              - update
+          - apiGroups:
+              - coordination.k8s.io
+            resources:
+              - leases
+            verbs:
+              - get
+              - list
+              - watch
+              - update
+              - create
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+          name: system:kube-vip-binding
+      roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: system:kube-vip-role
+      subjects:
+          - kind: ServiceAccount
+            name: kube-vip
+            namespace: kube-system
+      ---
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+          name: kube-vip
+          namespace: kube-system
+          labels:
+              app.kubernetes.io/name: kube-vip
+      spec:
+          selector:
+              matchLabels:
+                  app.kubernetes.io/name: kube-vip
+          template:
+              metadata:
+                  labels:
+                      app.kubernetes.io/name: kube-vip
+              spec:
+                  serviceAccountName: kube-vip
+                  hostNetwork: true
+                  nodeSelector:
+                      node-role.kubernetes.io/control-plane: "true"
+                  tolerations:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: Exists
+                        effect: NoSchedule
+                      - key: node-role.kubernetes.io/master
+                        operator: Exists
+                        effect: NoSchedule
+                  containers:
+                      - name: kube-vip
+                        image: ghcr.io/kube-vip/kube-vip:v0.8.7
+                        imagePullPolicy: IfNotPresent
+                        args:
+                          - manager
+                        env:
+                          - name: vip_arp
+                            value: "true"
+                          - name: vip_interface
+                            value: eth0
+                          - name: address
+                            value: 192.168.1.240
+                          - name: port
+                            value: "6443"
+                          - name: cp_enable
+                            value: "true"
+                          - name: svc_enable
+                            value: "false"
+                          - name: vip_leaderelection
+                            value: "true"
+                          - name: vip_leaseduration
+                            value: "5"
+                          - name: vip_renewdeadline
+                            value: "3"
+                          - name: vip_retryperiod
+                            value: "1"
+                          - name: bgp_enable
+                            value: "false"
+                        securityContext:
+                          capabilities:
+                              add:
+                                  - NET_ADMIN
+                                  - NET_RAW
+                        volumeMounts:
+                          - mountPath: /etc/kubernetes/admin.conf
+                            name: kubeconfig
+                  volumes:
+                      - name: kubeconfig
+                        hostPath:
+                          path: /etc/kubernetes/admin.conf
+          updateStrategy:
+              type: RollingUpdate
+  - path: /usr/local/etc/hostname
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      kairos-node-0
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k0s post-bootstrap tasks
+      # Skip on Kairos live installer (cdroot present in cmdline) — the
+      # post-bootstrap script would block for 7+ minutes waiting for k0s
+      # node registration that never happens on the installer, holding
+      # up cloud-init's runcmd and preventing kairos-agent from rebooting
+      # into the installed system. (KD-3b lab finding on Hadron.)
+      ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
+      After=k0scontroller.service
+      Wants=k0scontroller.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/kairos-k0s-post-bootstrap.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/kairos-k0s-post-bootstrap-enable.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Enable kairos-k0s-post-bootstrap service
+      # Skip on live installer; pairs with the same gate on the main
+      # post-bootstrap service. (KD-3b.)
+      ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
+      After=systemd-udev-settle.service
+      Before=multi-user.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/systemctl daemon-reload
+      # `enable --now`: create the multi-user.target.wants/ symlink AND
+      # start the unit on this boot. After the KD-3b write_files move,
+      # the main service file lands on disk during cloud-init early boot;
+      # this helper runs once multi-user.target is set up and triggers
+      # both enablement and immediate start of the post-bootstrap service.
+      ExecStart=/bin/systemctl enable --now kairos-k0s-post-bootstrap.service
+      # ADR 0005 §E.3: on HA control-plane nodes, also enable the etcd-leave
+      # responder timer so the node can cleanly `k0s etcd leave` when the
+      # controller requests it during a quorum-safe replacement/scale-down.
+      ExecStart=/bin/systemctl enable --now kairos-etcd-leave.timer
+
+      [Install]
+      WantedBy=multi-user.target
+  # ADR 0005 §E.3 (HA) k0s etcd-leave responder. During a quorum-safe
+  # replacement/scale-down the controller (a) sets a CAPI pre-terminate hook on
+  # this Machine and (b) writes a `leave-requested` sentinel for this member into
+  # the workload-cluster kube-system/kairos-etcd-leave ConfigMap. This node-local
+  # timer polls that ConfigMap via the LOCAL admin.conf (no mgmt token — the
+  # node's mgmt bearer token is only valid ~24h, but replacement happens much
+  # later; the local kubeconfig never expires), and on the exact sentinel runs
+  # `k0s etcd leave` (which leaves THIS node — no operator/ConfigMap value is
+  # ever passed as a command argument), then acks `left`. The controller then
+  # clears the pre-terminate hook and CAPI terminates the VM.
+  - path: /usr/local/bin/kairos-etcd-leave.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      # This member's key == the sanitized hostname, identical to the reporter's
+      # key so it matches what the controller writes (the node's Kubernetes Node
+      # name == NodeRef.Name). Strip hostname's trailing newline BEFORE the
+      # complement-translate, or it becomes a spurious trailing '-' that no
+      # longer matches NodeRef.Name.
+      member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
+      # Target the control-plane VIP, NOT this node's local apiserver: `k0s etcd
+      # leave` (below) drops THIS node's local apiserver (it loses its etcd
+      # backend), so a localhost read/ack would fail post-leave and never retry.
+      # The VIP is always fronted by a surviving node, so both the sentinel read
+      # and the `left` ack keep working across the timer's poll cycles until the
+      # ack lands. VIP.Address is render-validated (VIP-INV-3) + shquoted
+      # (VIP-INV-1); it is a --server flag value, never eval'd.
+      vip_addr='192.168.1.240'
+      srv=(--server="https://${vip_addr}:6443")
+      # Read our own leave signal from the workload ConfigMap via the VIP.
+      # Absent ConfigMap/key => empty => no-op exit.
+      val=$(k0s kubectl "${srv[@]}" -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
+      # Fixed sentinel, string-equality only — never eval'd, never a command arg.
+      [ "${val}" = "leave-requested" ] || exit 0
+      echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
+      # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
+      # configured peer address — no ConfigMap/operator-derived value reaches the
+      # command (security constraint: peer-address is never externally supplied).
+      if k0s etcd leave 2>/dev/null; then
+        echo "etcd-leave: left etcd cluster"
+      else
+        echo "etcd-leave: k0s etcd leave returned non-zero (already left?); acking anyway"
+      fi
+      # Ack by patching our own key to `left` via the VIP (the local apiserver is
+      # gone now). Only member_key (locally sanitized) is interpolated; the
+      # read-back value is never reused.
+      k0s kubectl "${srv[@]}" -n kube-system patch configmap kairos-etcd-leave --type merge \
+        -p "{\"data\":{\"${member_key}\":\"left\"}}" 2>/dev/null || true
+  - path: /etc/systemd/system/kairos-etcd-leave.service
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Kairos k0s etcd-leave responder (ADR 0005 §E.3)
+      ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
+      After=k0scontroller.service
+      Wants=k0scontroller.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/kairos-etcd-leave.sh
+  - path: /etc/systemd/system/kairos-etcd-leave.timer
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Poll for Kairos k0s etcd-leave requests (ADR 0005 §E.3)
+      ConditionKernelCommandLine=!cdroot
+      ConditionPathExists=!/run/cos/recovery_mode
+
+      [Timer]
+      OnBootSec=60
+      OnUnitActiveSec=30
+
+      [Install]
+      WantedBy=timers.target
+  # INIT-ORDERING (bare-metal lab, 2026-09-08). k0scontroller is enabled and
+  # started before the arguments meant for it exist on disk. BOTH delivery paths
+  # land afterwards: provider-kairos writes override.conf 3-4s late, and the
+  # write_files drop-in lands within the same second as the start, i.e. after
+  # systemd has loaded the unit. systemd picks the files up — the EFFECTIVE
+  # ExecStart is correct — but the running process keeps its original argv:
+  #
+  #   systemctl show -p ExecStart  ->  the full, correct command line
+  #   /proc/<pid>/cmdline          ->  k0s controller          (bare)
+  #
+  # Consequence: no worker role, so no kubelet, so the Node never registers, so
+  # the providerID patch times out and the control plane stalls at 0/3 joined.
+  # On a join node the missing flag is the token, and the controller initialises
+  # a cluster of its own instead of joining.
+  #
+  # NOT the mechanism ADR 0004 removed. That one was a oneshot ordered ahead of
+  # the k0s unit, which is an ordering cycle by construction and deadlocked the
+  # node with the apiserver down. This runs from the post-bootstrap unit, which is
+  # After=/Wants= only, and detaches the restart through systemd-run --no-block
+  # so the restart job is never part of the caller's transaction. It is also a
+  # no-op whenever the argv already matches, so a boot that won the race and
+  # every subsequent boot are untouched.
+  - path: /usr/local/bin/kairos-k0s-apply-args.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+      UNIT=k0scontroller.service
+
+      pid="$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)"
+      if [ -z "${pid}" ] || [ "${pid}" = "0" ] || [ ! -r "/proc/${pid}/cmdline" ]; then
+        exit 0
+      fi
+      running="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+      wanted="$(systemctl show -p ExecStart --value "${UNIT}" 2>/dev/null |
+                sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' || true)"
+      [ -n "${running}" ] && [ -n "${wanted}" ] || exit 0
+
+      # Collapse whitespace so a formatting difference is not read as a drift.
+      r="$(echo ${running})"
+      w="$(echo ${wanted})"
+      if [ "${r}" = "${w}" ]; then
+        exit 0
+      fi
+
+      echo "k0s started before its arguments existed; applying them"
+      echo "  running: ${r}"
+      echo "  wanted:  ${w}"
+      # A join controller that came up without its token did not join anything:
+      # it initialised a cluster of its own, with its own CA and etcd. Restarting
+      # with the token does not merge that away, so the state it created has to
+      # go. Guarded twice over — this branch is rendered only for a JOIN node,
+      # and only fires when the LIVE process is missing the token flag, i.e. one
+      # that is provably not a member of the real cluster.
+      #
+      # bin/ holds the extracted k0s binaries and manifests/ holds the kube-vip
+      # manifest that write_files put there; neither identifies a cluster, and
+      # removing them would be destructive for no reason.
+      case "${r}" in
+        *--token-file*) ;;
+        *)
+          echo "  join controller self-initialised without its token; discarding that state"
+          systemctl stop "${UNIT}" || true
+          find /var/lib/k0s -mindepth 1 -maxdepth 1 \
+            ! -name bin ! -name manifests -exec rm -rf {} + 2>/dev/null || true
+          ;;
+      esac
+      systemctl restart "${UNIT}" || true
+  - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -e
+      # Apply the k0s arguments if systemd started the controller before they
+      # existed (see /usr/local/bin/kairos-k0s-apply-args.sh). This has to happen
+      # before anything below: without the worker role there is no kubelet, so
+      # the Node never registers and every step that waits for it times out.
+      #
+      # Detached through systemd-run so the restart is its own transaction and
+      # can never block this unit; then wait for k0s to answer again.
+      if [ -x /usr/local/bin/kairos-k0s-apply-args.sh ]; then
+        if command -v systemd-run >/dev/null 2>&1; then
+          systemd-run --no-block --unit=kairos-k0s-apply-args --collect \
+            /usr/local/bin/kairos-k0s-apply-args.sh || true
+        else
+          setsid /usr/local/bin/kairos-k0s-apply-args.sh >/dev/null 2>&1 &
+        fi
+        for i in {1..60}; do
+          if k0s status >/dev/null 2>&1; then
+            break
+          fi
+          sleep 5
+        done
+      fi
+      # Enforce hostname from cloud-config on immutable rootfs
+      if [ -f /usr/local/etc/hostname ]; then
+        /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
+        if ! grep -qE "127\.0\.1\.1[[:space:]]+$(cat /usr/local/etc/hostname)" /etc/hosts; then
+          echo "127.0.1.1 $(cat /usr/local/etc/hostname)" >> /etc/hosts
+        fi
+      fi
+      # Wait for k0s to be ready and the Node to be registered, then set providerID.
+      # KD-55: fail-OPEN. A providerID hiccup (API blip, slow registration) must NOT
+      # abort the rest of post-bootstrap — the kubeconfig push below MUST still run,
+      # or a transient failure strands the cluster in WaitingForNodePush forever.
+      # Warn and continue instead of `exit 1`; the Machine may briefly stay
+      # NodeNotFound until providerID is set, but the kubeconfig still reaches the
+      # management cluster (and the controller re-renders to retry providerID).
+      echo "Waiting for k0s node to be registered..."
+      # Use `k0s kubectl` (resolves the local admin kubeconfig). The Hadron k0s
+      # image ships no standalone `kubectl` binary, so bare `kubectl` would fail
+      # `command not found` (swallowed by &>/dev/null) and silently never set the
+      # providerID — lab-confirmed. Mirrors the Metal3 path below.
+      node_registered=false
+      MAX_WAIT=300
+      ELAPSED=0
+      while [ $ELAPSED -lt $MAX_WAIT ]; do
+        if k0s kubectl get node $(hostname) &>/dev/null; then
+          node_registered=true
+          break
+        fi
+        echo "Waiting for node to be registered... (${ELAPSED}s/${MAX_WAIT}s)"
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
+      done
+      if [ "$node_registered" != "true" ]; then
+        echo "WARN: timed out waiting for Node registration; skipping providerID (continuing post-bootstrap)"
+      else
+        # Set providerID on the Node. Retry for transient API-server unavailability.
+        echo "Setting providerID=vsphere://vm-uuid-1234 on node $(hostname)..."
+        PROVIDER_ID_SET=false
+        for i in {1..30}; do
+          if k0s kubectl patch node $(hostname) --type=merge -p '{"spec":{"providerID":"vsphere://vm-uuid-1234"}}' &>/dev/null; then
+            echo "Successfully set providerID=vsphere://vm-uuid-1234 on node $(hostname)"
+            PROVIDER_ID_SET=true
+            break
+          fi
+          echo "Attempt $i/30: Failed to set providerID, retrying in 5 seconds..."
+          sleep 5
+        done
+        if [ "$PROVIDER_ID_SET" != "true" ]; then
+          echo "WARN: failed to set providerID after 30 attempts; continuing post-bootstrap (Machine may stay NodeNotFound until providerID is set)"
+        fi
+      fi
+      # Push kubeconfig to management cluster without SSH (KD-3b).
+      # Mirrors the CAPK push block; CAPV has no LB Service so the
+      # `server:` URL is rewritten to the cluster's controlPlaneEndpoint
+      # host (set by the infrastructure provider) instead of an LB IP.
+      push_kubeconfig() {
+        local kubeconfig_file="/var/lib/k0s/pki/admin.conf"
+        # Wait up to 5min for k0s to write admin.conf. After=k0scontroller.service only
+        # orders against service activation, not bootstrap completion, so on
+        # slower hosts (Hadron+CAPV lab finding) the file is not yet present
+        # when this unit fires. Without this wait the unit silently abandons
+        # the push and KCP stays in WaitingForNodePush forever (KD-3b).
+        local _wait_budget=300
+        local _wait_elapsed=0
+        while [ ! -f "${kubeconfig_file}" ] && [ ${_wait_elapsed} -lt ${_wait_budget} ]; do
+          sleep 5
+          _wait_elapsed=$((_wait_elapsed + 5))
+        done
+        if [ ! -f "${kubeconfig_file}" ]; then
+          echo "WARN: kubeconfig file not found at ${kubeconfig_file} after ${_wait_budget}s"
+          return 1
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot push kubeconfig"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot push kubeconfig"
+          return 1
+        fi
+        local kubeconfig_b64
+        local tmp_kubeconfig
+        tmp_kubeconfig=$(mktemp)
+        local cp_endpoint_host='10.0.0.42'
+        sed "s|https://[^[:space:]]*:6443|https://${cp_endpoint_host}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
+        kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
+        rm -f "${tmp_kubeconfig}"
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local name='ha-cluster-kubeconfig-push'
+        local token='mgmt-token'
+        local cluster_name='ha-cluster'
+        local payload
+        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        local status
+        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+          -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" \
+          -X PUT \
+          --data "${payload}" \
+          "${url}" || true)
+        if [ "${status}" = "404" ]; then
+          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "${payload}" \
+            "${api}/api/v1/namespaces/${ns}/secrets" || true)
+        fi
+        if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+          echo "Pushed kubeconfig to management secret ${ns}/${name}"
+          return 0
+        fi
+        echo "WARN: failed to push kubeconfig to management cluster (status ${status})"
+        return 1
+      }
+      if ! push_kubeconfig; then
+        echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
+      fi
+      # ADR 0005 §E.1 (HA) etcd-health reporter: every control-plane node (init
+      # AND join) reports its own etcd member health into the per-cluster
+      # etcd-status Secret over the SAME node-push channel as the kubeconfig/join
+      # token (NOT SSH, NOT a controller etcd dial — KD-10). The controller reads
+      # it for the joiner gate (init must be a healthy voting member),
+      # EtcdHealthyCondition, and the quorum-safe-replacement guard.
+      #
+      # SECURITY: etcd membership (name/count) is non-sensitive cluster metadata —
+      # NO secret material is written into this Secret. The status JSON is built
+      # ON-NODE (never interpolated through text/template); every
+      # management-endpoint value is shquote'd; the bearer token is never logged.
+      # The node PATCHes ONLY its own member key (keyed by hostname).
+      push_etcd_status() {
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "WARN: curl not available; cannot report etcd status"
+          return 1
+        fi
+        if ! command -v base64 >/dev/null 2>&1; then
+          echo "WARN: base64 not available; cannot report etcd status"
+          return 1
+        fi
+        # This member's Secret data key = the node hostname, sanitized to the
+        # allowed Secret-key charset [a-zA-Z0-9._-] so it is safe both as a
+        # Secret key and inside the strategic-merge patch JSON.
+        local member_key
+        # Strip hostname's trailing newline BEFORE the complement-translate, or
+        # it becomes a spurious trailing '-'; the key must equal the node's
+        # Kubernetes Node name (NodeRef.Name) that the controller looks up.
+        member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
+        # Query k0s etcd membership. k0s controllers join as full voting members
+        # (no learners), so "present in member-list" == "healthy voting member".
+        local ml healthy=false voting=false members=0
+        ml=$(k0s etcd member-list 2>/dev/null || true)
+        if [ -n "${ml}" ]; then
+          healthy=true
+          voting=true
+          members=$(printf '%s' "${ml}" | grep -oE 'https?://' | wc -l | tr -d ' ')
+        fi
+        local reported_at
+        reported_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        # Compact, non-secret status JSON for THIS member, built on-node.
+        local status_json
+        status_json=$(printf '{"name":"%s","healthy":%s,"voting":%s,"members":%s,"reportedAt":"%s"}' \
+          "${member_key}" "${healthy}" "${voting}" "${members}" "${reported_at}")
+        local status_b64
+        status_b64=$(printf '%s' "${status_json}" | base64 -w 0 2>/dev/null || printf '%s' "${status_json}" | base64 | tr -d '\n')
+        local api='https://mgmt.example.com:6443'
+        local ns='default'
+        local es_name='ha-cluster-etcd-status'
+        local token='mgmt-token'
+        # Strategic-merge PATCH only this member's own data key in the pre-created,
+        # Cluster-owned etcd-status Secret. update/patch on the named Secret is
+        # exactly the node SA's RBAC (no create).
+        local patch
+        patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
+        local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
+        # A dropped report blocks HA formation exactly like a dropped join token:
+        # initMachineJoinable treats "member not reported" as not-joinable on k0s,
+        # so the KCP holds every joiner until some node reports. This reporter runs
+        # ONCE, from a oneshot unit, with no timer behind it — "retry on next boot"
+        # described behaviour that does not exist, since nothing reboots the node.
+        # Retry here on the same cadence as the join-token push. The 2xx test is a
+        # glob, not an arithmetic comparison, so an empty status from a failed curl
+        # cannot abort the loop.
+        local status="" reported=""
+        for i in {1..30}; do
+          status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/strategic-merge-patch+json" \
+            -X PATCH \
+            --data "${patch}" \
+            "${url}" || true)
+          case "${status}" in
+            2[0-9][0-9]) reported=yes ;;
+          esac
+          if [ -n "${reported}" ]; then
+            break
+          fi
+          echo "Attempt $i/30: etcd-status report returned '${status}', retrying in 5 seconds..."
+          sleep 5
+        done
+        unset token
+        if [ -n "${reported}" ]; then
+          echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
+          return 0
+        fi
+        echo "WARN: failed to report etcd status after 30 attempts (last status '${status}')"
+        return 1
+      }
+      if ! push_etcd_status; then
+        echo "WARN: etcd-status report failed after retries; the joiner gate will hold until a member is reported"
+      fi
+
+      # Mark bootstrap success for CAPI/CAPK consumers
+      # This file is used by Cluster API to determine bootstrap completion
+      mkdir -p /run/cluster-api
+      echo "success" > /run/cluster-api/bootstrap-success.complete
+      chmod 0644 /run/cluster-api/bootstrap-success.complete
+
+      echo "k0s post-bootstrap tasks completed successfully"
+  
+  - path: /etc/motd
+    content: hello world
+    permissions: "0644"
+    owner: root:root
+  # Written LAST, deliberately. Everything k0s needs at start — the argument
+  # drop-ins, k0s.yaml, the join/worker token, the address resolver — is above
+  # this point, and yip writes files in order. An image can gate its k0s units on
+  # this path (ConditionPathExists=/etc/k0s/.capi-args-ready) so the unit can
+  # never start before this config has fully landed; the beskar7 image does
+  # exactly that at its initramfs stage. Without such a gate this file is inert.
+  # Rendered for every role: a worker needs it for k0sworker.service.
+  - path: /etc/k0s/.capi-args-ready
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      written by cluster-api-provider-kairos as the last of its write_files;
+      k0s may start once this exists
+stages:
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+        path: "/etc/resolv.conf"
+runcmd:
+  # Enable + start the helper service explicitly. `enable --now` both
+  # creates the multi-user.target.wants/ symlink for next boot AND starts
+  # the unit on this boot. Required after KD-3b moved unit writes from
+  # stages.initramfs.files to top-level write_files (runcmd is now too
+  # late in boot for ln-only symlink creation to be honored by systemd).
+  - /bin/systemctl daemon-reload || true
+  - /bin/systemctl enable --now kairos-k0s-post-bootstrap-enable.service || true

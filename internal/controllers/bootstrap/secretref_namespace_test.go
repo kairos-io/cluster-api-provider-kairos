@@ -73,7 +73,7 @@ func TestTokenFromWorkerRef_RefusesAnotherNamespacesSecret(t *testing.T) {
 	g := NewWithT(t)
 	r, foreignReads := foreignReadCounter(g)
 
-	tok, err := r.tokenFromWorkerRef(context.Background(), "default",
+	tok, err := tokenFromWorkerRef(context.Background(), r.Client, "default",
 		&bootstrapv1beta2.WorkerTokenSecretReference{Name: "stolen", Namespace: "other-tenant", Key: "password"}, "worker token")
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(errors.Is(err, errCrossNamespaceSecretRef)).To(BeTrue(), "got: %v", err)
