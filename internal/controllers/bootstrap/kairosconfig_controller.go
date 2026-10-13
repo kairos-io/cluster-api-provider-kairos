@@ -118,7 +118,7 @@ type KairosConfigReconciler struct {
 // blast-radius wart — no controller code issues an explicit client.Delete on a
 // Secret (owned Secrets cascade via owner references). Dropping it needs a
 // watch/cache redesign and is tracked as a follow-up, not this PR.
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;create;update;patch;delete
 // serviceaccounts/token + roles/rolebindings: the KubeVirt/CAPK management-
 // endpoint resolver (management_endpoint_resolver.go, KD-33) mints a per-cluster
 // ServiceAccount + namespaced Role/RoleBinding + TokenRequest so the workload

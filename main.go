@@ -135,6 +135,66 @@ func (r controllerRole) leaderElectionID() string {
 	}
 }
 
+// uncachedTypes are the types the manager's client reads straight from the API
+// server instead of from the shared cache. Every entry is a credential.
+//
+// The manager reads Secrets on two paths: the bootstrap-data Secrets the
+// KairosConfig, KairosControlPlane and SSH-fallback controllers write and read
+// back, and, through the clustercache SecretClient, the <cluster>-kubeconfig of
+// every workload cluster it connects to. controller-runtime starts an informer
+// on the first cached read of a type, and that informer lists and watches the
+// whole scope the manager is configured for, not the one object asked for. On a
+// management cluster watching all namespaces that means the process holds, for
+// its whole lifetime, admin credentials for every workload cluster present,
+// Kairos or not, plus Kamaji's CA key material.
+//
+// A label selector does not narrow this: CAPI labels the kubeconfig Secrets
+// with cluster.x-k8s.io/cluster-name, which is the same label the watch
+// predicates select on, so a selector-scoped cache would still hold them.
+// Not caching them at all is what removes the resident copy.
+//
+// This costs a GET per read on paths that run per reconcile, and it starts no
+// informer, which is why the generated role no longer needs watch on secrets.
+var uncachedTypes = []client.Object{&corev1.Secret{}}
+
+// managerOptions builds the options ctrl.NewManager is called with. It is the
+// one place the manager is configured, so a guard test can assert on the value
+// the running provider actually gets instead of on a copy that can drift.
+//
+// watchSingle restricts the cache to watchNamespace: --namespace (clusterctl's
+// single-namespace install) or the legacy WATCH_NAMESPACE. When it is false the
+// manager watches all namespaces, which is the flat-manifest default.
+func managerOptions(role controllerRole, metricsAddr, probeAddr string, enableLeaderElection bool, watchNamespace string, watchSingle bool) ctrl.Options {
+	opts := ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
+		WebhookServer: webhook.NewServer(webhook.Options{
+			Port: 9443,
+		}),
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		// Role-specific so the bootstrap and control-plane Deployments (ADR
+		// 0007) never contend for a shared lease; roleAll keeps the historical
+		// ID so flat-manifest installs retain their lease across upgrades.
+		LeaderElectionID: role.leaderElectionID(),
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: uncachedTypes,
+			},
+		},
+	}
+	if watchSingle {
+		opts.Cache = cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				watchNamespace: {},
+			},
+		}
+	}
+	return opts
+}
+
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
@@ -200,23 +260,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Configure manager options
-	mgrOptions := ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
-		},
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Port: 9443,
-		}),
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		// Role-specific so the bootstrap and control-plane Deployments (ADR
-		// 0007) never contend for a shared lease; roleAll keeps the historical
-		// ID so flat-manifest installs retain their lease across upgrades.
-		LeaderElectionID: role.leaderElectionID(),
-	}
-
 	// --namespace (clusterctl single-namespace watch) takes precedence over the
 	// legacy WATCH_NAMESPACE env path. When --namespace is empty the prior
 	// WATCH_NAMESPACE behavior is preserved byte-for-byte (roleAll + empty
@@ -229,15 +272,12 @@ func main() {
 		watchNamespace, watchSingle = cfg.GetWatchNamespace(), true
 	}
 	if watchSingle {
-		mgrOptions.Cache = cache.Options{
-			DefaultNamespaces: map[string]cache.Config{
-				watchNamespace: {},
-			},
-		}
 		setupLog.Info("Watching single namespace", "namespace", watchNamespace)
 	} else {
 		setupLog.Info("Watching all namespaces")
 	}
+
+	mgrOptions := managerOptions(role, metricsAddr, probeAddr, enableLeaderElection, watchNamespace, watchSingle)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
