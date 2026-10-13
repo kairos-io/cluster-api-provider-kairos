@@ -180,7 +180,7 @@ func TestBootstrapIntegration_KubeadmWorker(t *testing.T) {
 	workload := fake.NewClientBuilder().WithScheme(scheme).Build()
 	extraKinds := map[schema.GroupKind]bool{{Group: kubeadmCPGroup, Kind: testControlPlaneKind}: true}
 	kubeadmSource := bootstrap.NewKubeadmJoinSource(direct, direct,
-		func(context.Context, client.ObjectKey) (client.Client, error) { return workload, nil }, extraKinds)
+		func(context.Context, client.ObjectKey, []byte) (client.Client, error) { return workload, nil }, extraKinds)
 
 	reconciler := &bootstrap.KairosConfigReconciler{
 		Client:      mgr.GetClient(),

@@ -23,7 +23,6 @@ import (
 	"os"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -31,7 +30,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -39,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	"sigs.k8s.io/cluster-api/controllers/clustercache"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -349,30 +346,20 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		)
 
 		// kubeadm worker-join source (ADR 0010 P1). It needs dependencies only
-		// main.go has: a workload-cluster client cache (for minting/refreshing the
+		// main.go has: a workload-cluster client factory (for minting/refreshing the
 		// bootstrap token), an UNCACHED management reader (for the <cluster>-ca
-		// cross-check), and the operator-level trust allowlist. The ClusterCache's
-		// ClusterFilter is the COARSE gate — it only ever connects to clusters whose
-		// control-plane kind is on the kubeadm trust allowlist, so the bootstrap
-		// manager never dials a k0s/k3s cluster's node-pushed kubeconfig; the FINE,
-		// owner-verified trust check runs per-request in the source.
+		// cross-check), and the operator-level trust allowlist.
+		//
+		// The connection is made ON DEMAND, by the join itself, from the kubeconfig
+		// the FINE owner-verified trust check just validated. Installing this
+		// provider therefore opens no workload-cluster connection at all until one
+		// of our own kubeadm workers joins. It used to be wired through a
+		// clustercache whose ClusterFilter was the coarse gate, but clustercache is
+		// not lazy: its Cluster reconciler connected to, and then health-probed,
+		// every KubeadmControlPlane and KamajiControlPlane cluster in the management
+		// cluster, Kairos or not, because spec.controlPlaneRef is all a filter can
+		// see (kairos-io/kairos#5466).
 		joinSources := map[string]bootstrap.JoinMaterialSource{}
-		clusterCache, err := clustercache.SetupWithManager(ctx, mgr, clustercache.Options{
-			SecretClient: mgr.GetClient(),
-			Client: clustercache.ClientOptions{
-				UserAgent: "cluster-api-provider-kairos-bootstrap",
-				Cache: clustercache.ClientCacheOptions{
-					// Never cache workload Secrets: we mint and read bootstrap-token
-					// Secrets and must see them live.
-					DisableFor: []client.Object{&corev1.Secret{}},
-				},
-			},
-			ClusterFilter: bootstrap.KubeadmTrustedClusterFilter(kubeadmExtraKinds),
-		}, controller.Options{MaxConcurrentReconciles: 10})
-		if err != nil {
-			setupLog.Error(err, "unable to set up workload cluster cache for kubeadm")
-			return err
-		}
 		// Uncached management reader for the <cluster>-ca cross-check (a planted or
 		// stale cached value must not be trusted).
 		uncachedReader, err := client.New(mgr.GetConfig(), client.Options{
@@ -386,9 +373,7 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		joinSources[bootstrapv1beta2.DistributionKubeadm] = bootstrap.NewKubeadmJoinSource(
 			mgr.GetClient(),
 			uncachedReader,
-			func(ctx context.Context, key client.ObjectKey) (client.Client, error) {
-				return clusterCache.GetClient(ctx, key)
-			},
+			bootstrap.NewOnDemandWorkloadClient(),
 			kubeadmExtraKinds,
 		)
 
