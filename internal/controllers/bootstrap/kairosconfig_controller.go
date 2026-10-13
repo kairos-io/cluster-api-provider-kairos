@@ -79,6 +79,15 @@ type KairosConfigReconciler struct {
 	client.Client
 	Scheme               *runtime.Scheme
 	MgmtEndpointResolver ManagementEndpointResolver
+	// JoinSources overrides the per-distribution worker JoinMaterialSource by
+	// distribution name. It is optional: a nil map or a missing key uses the
+	// built-in source over r.Client, so existing construction sites (main.go,
+	// envtest, unit tests) need no change. P1 wires a "kubeadm" source here, which
+	// needs dependencies only main.go has (cached/uncached readers, clustercache).
+	JoinSources map[string]JoinMaterialSource
+	// Now is an injectable clock used by the kubeadm token-refresh hard cap
+	// (ADR 0010 P1 item 7). Nil means time.Now; tests set it to drive the cap.
+	Now func() time.Time
 }
 
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kairosconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -121,6 +130,16 @@ type KairosConfigReconciler struct {
 // Service to discover the management endpoint. The control-plane manager owns
 // (creates/updates) that Service.
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// control-plane trust anchors (ADR 0010 P1): the kubeadm worker-join trust check
+// reads the Cluster's control-plane object to verify the <cluster>-kubeconfig's
+// controller-owner UID. Read-only, enumerated kinds — the P1 targets
+// KamajiControlPlane and KubeadmControlPlane plus our own KairosControlPlane. This
+// grant is REQUIRED even on a bootstrap-only (--controllers=bootstrap) Deployment,
+// where the control-plane manager's RBAC is absent; without it the trust-check Get
+// returns Forbidden and no kubeadm worker ever joins. An operator who widens the
+// allowlist via --kubeadm-extra-controlplane-kinds MUST supply RBAC for that group
+// themselves — we cannot grant kinds in groups we do not know at build time.
+//+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes;kubeadmcontrolplanes;kairoscontrolplanes,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 //
@@ -395,19 +414,10 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 					// Kubernetes Secrets are stored base64-encoded in etcd, but client-go
 					// already decodes them into Secret.Data. Treat it as plain text.
 					cloudConfigStr := string(secretData)
-					// Check if providerID is present in the script
-					hasProviderIDInSecret := strings.Contains(cloudConfigStr, currentProviderID)
-
-					distribution := kairosConfig.Spec.Distribution
-					if distribution == "" {
-						distribution = "k0s"
-					}
-					// Check if there's a post-bootstrap service (indicating providerID was included)
-					// If Machine has providerID but secret has no service, we need to regenerate
-					hasPostBootstrapService := strings.Contains(cloudConfigStr, "kairos-k0s-post-bootstrap.service")
-					if distribution == "k3s" {
-						hasPostBootstrapService = strings.Contains(cloudConfigStr, "kairos-k3s-post-bootstrap.service")
-					}
+					// Check whether the stored render embeds the providerID and the
+					// distribution's post-bootstrap marker (render.go). If the Machine
+					// has a providerID but the secret lacks either, regenerate.
+					hasProviderIDInSecret, hasPostBootstrapService := renderCarriesProviderID(kairosConfig.Spec.Distribution, cloudConfigStr, currentProviderID)
 					// Ensure SSH enable stage exists (regression guard for CAPV access).
 					//
 					// KD-3a: the `hasSSHPassAuth` check that previously looked for
@@ -435,6 +445,30 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 						needsRegeneration = true
 					}
 				}
+			}
+
+			// kubeadm worker bootstrap-token refresh (ADR 0010 P1 item 7), outside the
+			// render-once short-circuit below: while the Machine has no nodeRef, keep
+			// the token fresh by regenerating the bootstrap data before it expires.
+			switch decision, derr := r.decideKubeadmTokenRefresh(ctx, log, kairosConfig, machine, cluster); {
+			case derr != nil:
+				var notReady *bootstrapNotReadyError
+				if errors.As(derr, &notReady) {
+					log.Info("Waiting to check the kubeadm bootstrap token", "reason", notReady.Reason())
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+				return ctrl.Result{}, fmt.Errorf("kubeadm bootstrap token refresh check: %w", derr)
+			case decision == kubeadmRefreshRegenerate:
+				log.Info("kubeadm bootstrap token is due for refresh; regenerating bootstrap data",
+					"secret", *kairosConfig.Status.DataSecretName)
+				needsRegeneration = true
+			case decision == kubeadmRefreshCapped:
+				const msg = "kubeadm bootstrap token refresh cap exceeded: the node has not registered in time; " +
+					"a MachineHealthCheck (nodeStartupTimeout) is expected to replace this Machine"
+				log.Info(msg, "secret", *kairosConfig.Status.DataSecretName)
+				conditions.MarkFalse(kairosConfig, bootstrapv1beta2.BootstrapReadyCondition,
+					bootstrapv1beta2.BootstrapTokenRefreshCapExceededReason, clusterv1.ConditionSeverityWarning, "%s", msg)
+				return ctrl.Result{RequeueAfter: kubeadmTokenRefreshCapRequeue}, nil
 			}
 
 			if needsRegeneration {
@@ -471,7 +505,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	}
 
 	// Generate Kairos cloud-config
-	cloudConfig, err := r.generateCloudConfig(ctx, log, kairosConfig, machine, cluster)
+	cloudConfig, joinMaterial, err := r.generateCloudConfigM(ctx, log, kairosConfig, machine, cluster)
 	if err != nil {
 		if errors.Is(err, errLBEndpointNotReady) {
 			log.Info("Waiting for control plane LoadBalancer endpoint before generating cloud-config")
@@ -479,6 +513,14 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		}
 		if errors.Is(err, errTokenNotReady) {
 			log.Info("Waiting for join token secret before generating cloud-config")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		// Typed not-ready signal from a JoinMaterialSource (ADR 0010 P1 item 6):
+		// transient workload-cluster/clustercache/API conditions on the kubeadm
+		// path. Requeue and leave conditions alone — do NOT park the KairosConfig.
+		var notReady *bootstrapNotReadyError
+		if errors.As(err, &notReady) {
+			log.Info("Waiting on join material before generating cloud-config", "reason", notReady.Reason())
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to generate cloud-config: %w", err)
@@ -585,22 +627,20 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// Update status with dataSecretName
 	kairosConfig.Status.DataSecretName = &secretName
 
+	// Persist the NON-SECRET kubeadm bootstrap token ID for audit (ADR 0010 P1
+	// item 8). The secret half lives only in the rendered data Secret, never here.
+	if joinMaterial.Kubeadm != nil {
+		kairosConfig.Status.BootstrapTokenID = joinMaterial.Kubeadm.TokenID
+	}
+
 	// Mark secret as Ready - providerID will be included if available, otherwise it will be regenerated later
 	// We allow the secret to be Ready even without providerID initially, so VM can be created
 	// When providerID becomes available (via VSphereMachine watch), the secret will be regenerated
 	if currentProviderID != "" {
-		// Verify providerID is included in the cloud-config
-		// cloudConfig is plain text, no need to decode
-		hasProviderIDInSecret := strings.Contains(cloudConfig, currentProviderID)
-		distribution := kairosConfig.Spec.Distribution
-		if distribution == "" {
-			distribution = "k0s"
-		}
-		// Check for the systemd service that sets providerID (runs after k3s/k0s service starts)
-		hasPostBootstrapService := strings.Contains(cloudConfig, "kairos-k0s-post-bootstrap.service")
-		if distribution == "k3s" {
-			hasPostBootstrapService = strings.Contains(cloudConfig, "kairos-k3s-post-bootstrap.service")
-		}
+		// Verify the freshly-rendered cloud-config embeds the providerID and the
+		// distribution's post-bootstrap marker (render.go). cloudConfig is plain
+		// text, no need to decode.
+		hasProviderIDInSecret, hasPostBootstrapService := renderCarriesProviderID(kairosConfig.Spec.Distribution, cloudConfig, currentProviderID)
 
 		if hasProviderIDInSecret && hasPostBootstrapService {
 			kairosConfig.Status.Ready = true
@@ -932,30 +972,98 @@ func resolveRole(kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1
 }
 
 func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (string, error) {
+	cc, _, err := r.generateCloudConfigM(ctx, log, kairosConfig, machine, cluster)
+	return cc, err
+}
+
+// kubeadmTokenRefreshCapRequeue is the slow requeue cadence after the kubeadm
+// token-refresh hard cap is exceeded (ADR 0010 P1 item 7): keep the condition
+// surfaced without re-minting or hammering the workqueue.
+const kubeadmTokenRefreshCapRequeue = 10 * time.Minute
+
+// kubeadmRefreshDecision is the outcome of decideKubeadmTokenRefresh.
+type kubeadmRefreshDecision int
+
+const (
+	// kubeadmRefreshNone: no refresh applies (not a kubeadm worker, the node has
+	// already registered, or the source cannot refresh).
+	kubeadmRefreshNone kubeadmRefreshDecision = iota
+	// kubeadmRefreshRegenerate: re-mint now by regenerating the bootstrap data.
+	kubeadmRefreshRegenerate
+	// kubeadmRefreshCapped: the hard cap elapsed; stop re-minting and surface a condition.
+	kubeadmRefreshCapped
+)
+
+// decideKubeadmTokenRefresh decides whether a kubeadm worker's bootstrap token
+// should be refreshed (ADR 0010 P1 item 7). It applies only to a kubeadm worker
+// whose Machine has not yet registered a Node, and only when the join source
+// implements workerTokenRefresher. A transient workload-cluster check returns a
+// bootstrapNotReadyError (the caller requeues). It never logs the token.
+func (r *KairosConfigReconciler) decideKubeadmTokenRefresh(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (kubeadmRefreshDecision, error) {
+	if bootstrapv1beta2.EffectiveDistribution(kairosConfig.Spec.Distribution) != bootstrapv1beta2.DistributionKubeadm {
+		return kubeadmRefreshNone, nil
+	}
+	if resolveRole(kairosConfig, machine) != "worker" {
+		return kubeadmRefreshNone, nil
+	}
+	// Stop refreshing once the node has registered (nodeRef set) — the token is no
+	// longer needed. Also skip if there is no Machine to anchor the cap on.
+	if machine == nil || machine.Status.NodeRef.Name != "" {
+		return kubeadmRefreshNone, nil
+	}
+	src, err := r.joinSourceFor(bootstrapv1beta2.DistributionKubeadm)
+	if err != nil {
+		return kubeadmRefreshNone, err // terminal wiring error (N2)
+	}
+	refresher, ok := src.(workerTokenRefresher)
+	if !ok {
+		return kubeadmRefreshNone, nil
+	}
+	// Hard cap: stop re-minting once the Machine has waited too long for a Node.
+	if !machine.CreationTimestamp.IsZero() && r.now().Sub(machine.CreationTimestamp.Time) > kubeadmTokenRefreshCap {
+		return kubeadmRefreshCapped, nil
+	}
+	need, err := refresher.TokenNeedsRefresh(ctx,
+		JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster},
+		kairosConfig.Status.BootstrapTokenID)
+	if err != nil {
+		return kubeadmRefreshNone, err // bootstrapNotReadyError (transient) or terminal
+	}
+	if need {
+		log.V(4).Info("kubeadm bootstrap token due for refresh")
+		return kubeadmRefreshRegenerate, nil
+	}
+	return kubeadmRefreshNone, nil
+}
+
+// now returns the current time, overridable in tests via r.Now.
+func (r *KairosConfigReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+// generateCloudConfigM is generateCloudConfig plus the resolved WorkerJoinMaterial,
+// so reconcileBootstrapData can persist the non-secret kubeadm token ID to status
+// (ADR 0010 P1 item 8). generateCloudConfig is the thin (string, error) wrapper the
+// render/characterization tests use.
+func (r *KairosConfigReconciler) generateCloudConfigM(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (string, WorkerJoinMaterial, error) {
 	// Determine role
 	role := resolveRole(kairosConfig, machine)
 
-	// Determine distribution
-	distribution := kairosConfig.Spec.Distribution
-	if distribution == "" {
-		distribution = "k0s"
-	}
+	// Determine distribution ("" means the default).
+	distribution := bootstrapv1beta2.EffectiveDistribution(kairosConfig.Spec.Distribution)
 
-	// Get cluster information
+	// Get cluster information.
 	serverAddress := kairosConfig.Spec.ServerAddress
 	if serverAddress == "" && cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		serverAddress = fmt.Sprintf("https://%s:%d", cluster.Spec.ControlPlaneEndpoint.Host, cluster.Spec.ControlPlaneEndpoint.Port)
 	}
 
-	// Generate cloud-config based on distribution
-	switch distribution {
-	case "k0s":
-		return r.generateK0sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
-	case "k3s":
-		return r.generateK3sCloudConfig(ctx, log, kairosConfig, machine, cluster, role, serverAddress)
-	default:
-		return "", fmt.Errorf("unsupported distribution: %s", distribution)
-	}
+	// Render through the merged generator keyed by the distribution table
+	// (render.go). An unknown distribution returns "unsupported distribution: %s".
+	return r.renderCloudConfigM(ctx, log, distribution, kairosConfig, machine, cluster, role, serverAddress)
 }
 
 // applyControlPlaneRenderData wires the HA control-plane fields onto td: the
@@ -986,10 +1094,7 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 		}
 	}
 
-	distribution := kairosConfig.Spec.Distribution
-	if distribution == "" {
-		distribution = "k0s"
-	}
+	distribution := bootstrapv1beta2.EffectiveDistribution(kairosConfig.Spec.Distribution)
 
 	// ADR 0005 §E.1: every HA control-plane node (init AND join) reports its own
 	// etcd member health into the per-cluster etcd-status Secret over the
@@ -1016,14 +1121,16 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 			break
 		}
 		// k3s init carries the controller-generated shared server token (written
-		// to the token file for BOTH init and join per BLOCKER-1).
-		token, err := r.resolveToken(ctx, tokenKindControlPlaneJoin, kairosConfig, cluster)
+		// to the token file for BOTH init and join per BLOCKER-1). The
+		// control-plane join stays outside the worker JoinMaterialSource seam
+		// (M2): resolve it directly.
+		token, err := r.resolveControlPlaneJoinToken(ctx, kairosConfig, cluster)
 		if err != nil {
 			return err
 		}
 		td.JoinToken = token
 	case bootstrapv1beta2.ControlPlaneRoleJoin:
-		token, err := r.resolveToken(ctx, tokenKindControlPlaneJoin, kairosConfig, cluster)
+		token, err := r.resolveControlPlaneJoinToken(ctx, kairosConfig, cluster)
 		if err != nil {
 			return err
 		}
@@ -1064,374 +1171,6 @@ func (r *KairosConfigReconciler) resolveUserPassword(ctx context.Context, kairos
 		return string(data), nil
 	}
 	return kairosConfig.Spec.UserPassword, nil
-}
-
-func (r *KairosConfigReconciler) generateK0sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
-	// Determine single-node mode
-	// Single-node is determined by:
-	// 1. Explicit flag in KairosConfig.spec.singleNode
-	// 2. Or if this is a control-plane and we can check the owning KairosControlPlane
-	singleNode := kairosConfig.Spec.SingleNode
-	k0sSingleNode := kairosConfig.Spec.K0sSingleNode != nil && *kairosConfig.Spec.K0sSingleNode
-	if !singleNode && role == "control-plane" && machine != nil {
-		// Try to find the owning KairosControlPlane to check replicas
-		ownerRef := metav1.GetControllerOf(machine)
-		if ownerRef != nil && ownerRef.Kind == "KairosControlPlane" {
-			// For now, we rely on the SingleNode flag in spec
-			// In the future, we could fetch the KCP and check spec.replicas == 1
-			log.V(4).Info("Control plane node, single-node mode determined from spec", "singleNode", singleNode)
-		}
-	}
-
-	// Get worker token if needed (for worker nodes).
-	// Precedence (tokenKindK0sWorker): WorkerTokenSecretRef > WorkerToken >
-	// TokenSecretRef > Token. Resolution is centralized in resolveToken
-	// (tokens.go). NOTE: a missing referenced Secret now surfaces as
-	// errTokenNotReady (timed requeue) rather than a hard error, aligning the
-	// k0s worker path with the k3s worker path's pre-existing requeue behavior;
-	// a missing token Secret is transient, not terminal.
-	var workerToken string
-	if role == "worker" {
-		var err error
-		workerToken, err = r.resolveToken(ctx, tokenKindK0sWorker, kairosConfig, cluster)
-		if err != nil {
-			return "", err
-		}
-		// Validate worker token is present
-		if workerToken == "" {
-			return "", fmt.Errorf("worker token is required for worker nodes: either WorkerTokenSecretRef, WorkerToken, TokenSecretRef, or Token must be set")
-		}
-	}
-
-	// Set defaults for user configuration
-	userName := kairosConfig.Spec.UserName
-	if userName == "" {
-		userName = "kairos"
-	}
-	userPassword, err := r.resolveUserPassword(ctx, kairosConfig)
-	if err != nil {
-		return "", err
-	}
-	userGroups := kairosConfig.Spec.UserGroups
-	if len(userGroups) == 0 {
-		userGroups = []string{"admin"}
-	}
-
-	// Set hostname prefix (default to "metal-" if not specified)
-	hostnamePrefix := kairosConfig.Spec.HostnamePrefix
-	if hostnamePrefix == "" {
-		hostnamePrefix = "metal-"
-	}
-
-	// Prefer explicit hostname, otherwise use Machine name
-	hostname := kairosConfig.Spec.Hostname
-	if hostname == "" && machine != nil {
-		hostname = machine.Name
-	}
-
-	// Set install configuration (with defaults)
-	var installConfig *bootstrap.InstallConfig
-	if kairosConfig.Spec.Install != nil {
-		installConfig = &bootstrap.InstallConfig{
-			Auto:   true,   // Default to true
-			Device: "auto", // Default to "auto"
-			Reboot: true,   // Default to true
-		}
-		if kairosConfig.Spec.Install.Auto != nil {
-			installConfig.Auto = *kairosConfig.Spec.Install.Auto
-		}
-		if kairosConfig.Spec.Install.Device != "" {
-			installConfig.Device = kairosConfig.Spec.Install.Device
-		}
-		if kairosConfig.Spec.Install.Reboot != nil {
-			installConfig.Reboot = *kairosConfig.Spec.Install.Reboot
-		}
-	}
-
-	if installConfig != nil {
-		log.Info("Using install configuration", "auto", installConfig.Auto, "device", installConfig.Device, "reboot", installConfig.Reboot)
-	} else {
-		log.Info("No install configuration provided; install block will be omitted")
-	}
-
-	// Get providerID from Machine's infrastructure reference.
-	// CAPM3 owns Node.spec.providerID for Metal3 machines — suppress it here so
-	// the template does not emit --provider-id args or the kubectl patch block.
-	// (ADR 0004, OQ-1 RESOLVED.)
-	var providerID string
-	if !isMetal3Machine(machine) && !isFleetMachine(machine) {
-		// Fleet, like Metal3, does not embed a render-time providerID: the node is
-		// claimed after render and self-discovers kairos-fleet://<node-id>.
-		providerID = r.getProviderID(ctx, log, machine)
-	}
-
-	// Control-plane: ask the resolver for the management-endpoint bundle
-	// the node needs to push its kubeconfig back without SSH. KD-3b broadened
-	// the gate from CAPK-only to any infrastructure kind whose templates
-	// support the push block (see supportsManagementEndpoint). The resolver
-	// itself is allowed to return (nil, nil) as a "disabled" signal (e.g.
-	// envtest without a management REST config); we treat that the same as
-	// "no push block", per the contract in management_endpoint.go.
-	var mgmtEndpoint *ManagementEndpoint
-	if supportsManagementEndpoint(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
-		var err error
-		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	// Build template data
-	templateData := bootstrap.TemplateData{
-		Role:                           role,
-		SingleNode:                     singleNode,
-		K0sSingleNode:                  k0sSingleNode,
-		Hostname:                       hostname,
-		UserName:                       userName,
-		UserPassword:                   userPassword,
-		UserGroups:                     userGroups,
-		GitHubUser:                     kairosConfig.Spec.GitHubUser,
-		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
-		WorkerToken:                    workerToken,
-		Manifests:                      kairosConfig.Spec.Manifests,
-		Files:                          kairosConfig.Spec.Files,
-		HostnamePrefix:                 hostnamePrefix,
-		DNSServers:                     kairosConfig.Spec.DNSServers,
-		PodCIDR:                        kairosConfig.Spec.PodCIDR,
-		ServiceCIDR:                    kairosConfig.Spec.ServiceCIDR,
-		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
-		MachineName:                    "",
-		ClusterNS:                      "",
-		IsKubeVirt:                     isKubevirtMachine(machine),
-		Metal3:                         isMetal3Machine(machine),
-		IsFleet:                        isFleetMachine(machine),
-		Install:                        installConfig,
-		ProviderID:                     providerID,
-		ControlPlaneLBServiceName:      "",
-		ControlPlaneLBServiceNamespace: "",
-		ControlPlaneLBEndpoint:         "",
-	}
-	if mgmtEndpoint != nil {
-		// One-line conversion preserves the rule that internal/bootstrap is
-		// API-server-unaware: the renderer's ManagementEndpoint is a flat
-		// data struct, identical in shape but distinct in type.
-		//
-		// ClusterName and ControlPlaneEndpointHost are stamped from the live
-		// Cluster object rather than the resolver output because they're pure
-		// CAPI metadata (not resolver-specific): the cluster-name label keeps
-		// the controlplane controller's Secret-watch predicate sharp, and the
-		// CP endpoint host is what CAPV's `server:` URL rewrite uses. Keeping
-		// these in the call site means the resolver doesn't need to be aware
-		// of the rewrite semantics.
-		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
-			APIServer:                 mgmtEndpoint.APIServer,
-			Token:                     mgmtEndpoint.Token,
-			KubeconfigSecretName:      mgmtEndpoint.KubeconfigSecretName,
-			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
-			ClusterName:               cluster.Name,
-			ControlPlaneEndpointHost:  cluster.Spec.ControlPlaneEndpoint.Host,
-		}
-	}
-	if machine != nil {
-		templateData.MachineName = machine.Name
-	}
-	if cluster != nil {
-		templateData.ClusterNS = cluster.Namespace
-		templateData.ControlPlaneLBServiceName = fmt.Sprintf("%s-%s", cluster.Name, controlPlaneLBServiceSuffix)
-		templateData.ControlPlaneLBServiceNamespace = cluster.Namespace
-	}
-	if cluster != nil && isKubevirtMachine(machine) && role == "control-plane" {
-		lbEndpoint, err := r.getControlPlaneLBEndpoint(ctx, cluster.Namespace, templateData.ControlPlaneLBServiceName)
-		if err != nil {
-			return "", err
-		}
-		if lbEndpoint == "" {
-			return "", errLBEndpointNotReady
-		}
-		templateData.ControlPlaneLBEndpoint = lbEndpoint
-	}
-
-	// HA: role / join token / VIP (ADR 0005 Phase 3). No-op on workers (CPR-INV-1).
-	if err := r.applyControlPlaneRenderData(ctx, &templateData, kairosConfig, cluster, role); err != nil {
-		return "", err
-	}
-
-	// Render template
-	return bootstrap.RenderK0sCloudConfig(templateData)
-}
-
-func (r *KairosConfigReconciler) generateK3sCloudConfig(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, role, serverAddress string) (string, error) {
-	// Determine single-node mode
-	singleNode := kairosConfig.Spec.SingleNode
-	k0sSingleNode := kairosConfig.Spec.K0sSingleNode != nil && *kairosConfig.Spec.K0sSingleNode
-	if !singleNode && role == "control-plane" && machine != nil {
-		ownerRef := metav1.GetControllerOf(machine)
-		if ownerRef != nil && ownerRef.Kind == "KairosControlPlane" {
-			log.V(4).Info("Control plane node, single-node mode determined from spec", "singleNode", singleNode)
-		}
-	}
-
-	// Resolve k3s token if needed (for worker nodes).
-	// Precedence (tokenKindK3sWorker): K3sTokenSecretRef > K3sToken >
-	// WorkerTokenSecretRef > WorkerToken > TokenSecretRef > Token. Resolution is
-	// centralized in resolveToken (tokens.go); a missing referenced Secret
-	// surfaces as errTokenNotReady (timed requeue), preserving the pre-refactor
-	// behavior of this path.
-	var k3sToken string
-	if role == "worker" {
-		var err error
-		k3sToken, err = r.resolveToken(ctx, tokenKindK3sWorker, kairosConfig, cluster)
-		if err != nil {
-			return "", err
-		}
-
-		if k3sToken == "" {
-			return "", fmt.Errorf("k3s worker requires a join token: set k3sTokenSecretRef, k3sToken, workerTokenSecretRef, workerToken, tokenSecretRef, or token")
-		}
-		if serverAddress == "" {
-			return "", fmt.Errorf("k3s worker requires serverAddress or cluster controlPlaneEndpoint")
-		}
-	}
-
-	// Set defaults for user configuration
-	userName := kairosConfig.Spec.UserName
-	if userName == "" {
-		userName = "kairos"
-	}
-	userPassword, err := r.resolveUserPassword(ctx, kairosConfig)
-	if err != nil {
-		return "", err
-	}
-	userGroups := kairosConfig.Spec.UserGroups
-	if len(userGroups) == 0 {
-		userGroups = []string{"admin"}
-	}
-
-	// Set hostname prefix (default to "metal-" if not specified)
-	hostnamePrefix := kairosConfig.Spec.HostnamePrefix
-	if hostnamePrefix == "" {
-		hostnamePrefix = "metal-"
-	}
-
-	// Prefer explicit hostname, otherwise use Machine name
-	hostname := kairosConfig.Spec.Hostname
-	if hostname == "" && machine != nil {
-		hostname = machine.Name
-	}
-
-	// Set install configuration (with defaults)
-	var installConfig *bootstrap.InstallConfig
-	if kairosConfig.Spec.Install != nil {
-		installConfig = &bootstrap.InstallConfig{
-			Auto:   true,
-			Device: "auto",
-			Reboot: true,
-		}
-		if kairosConfig.Spec.Install.Auto != nil {
-			installConfig.Auto = *kairosConfig.Spec.Install.Auto
-		}
-		if kairosConfig.Spec.Install.Device != "" {
-			installConfig.Device = kairosConfig.Spec.Install.Device
-		}
-		if kairosConfig.Spec.Install.Reboot != nil {
-			installConfig.Reboot = *kairosConfig.Spec.Install.Reboot
-		}
-	}
-
-	if installConfig != nil {
-		log.Info("Using install configuration", "auto", installConfig.Auto, "device", installConfig.Device, "reboot", installConfig.Reboot)
-	} else {
-		log.Info("No install configuration provided; install block will be omitted")
-	}
-
-	// Get providerID from Machine's infrastructure reference.
-	// CAPM3 owns Node.spec.providerID for Metal3 machines — suppress it here so
-	// the template does not emit --provider-id args or the kubectl patch block.
-	// (ADR 0004, OQ-1 RESOLVED.)
-	var providerID string
-	if !isMetal3Machine(machine) && !isFleetMachine(machine) {
-		// Fleet, like Metal3, does not embed a render-time providerID: the node is
-		// claimed after render and self-discovers kairos-fleet://<node-id>.
-		providerID = r.getProviderID(ctx, log, machine)
-	}
-
-	// Control-plane: same routing as the k0s path above. KD-3b broadened
-	// the gate from CAPK-only to any supported infrastructure kind.
-	var mgmtEndpoint *ManagementEndpoint
-	if supportsManagementEndpoint(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
-		var err error
-		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	// Build template data
-	templateData := bootstrap.TemplateData{
-		Role:                           role,
-		SingleNode:                     singleNode,
-		K0sSingleNode:                  k0sSingleNode,
-		Hostname:                       hostname,
-		UserName:                       userName,
-		UserPassword:                   userPassword,
-		UserGroups:                     userGroups,
-		GitHubUser:                     kairosConfig.Spec.GitHubUser,
-		SSHPublicKey:                   kairosConfig.Spec.SSHPublicKey,
-		Manifests:                      kairosConfig.Spec.Manifests,
-		Files:                          kairosConfig.Spec.Files,
-		HostnamePrefix:                 hostnamePrefix,
-		DNSServers:                     kairosConfig.Spec.DNSServers,
-		PrimaryIP:                      kairosConfig.Spec.PrimaryIP,
-		MachineName:                    "",
-		ClusterNS:                      "",
-		IsKubeVirt:                     isKubevirtMachine(machine),
-		Metal3:                         isMetal3Machine(machine),
-		IsFleet:                        isFleetMachine(machine),
-		Install:                        installConfig,
-		ProviderID:                     providerID,
-		K3sServerURL:                   serverAddress,
-		K3sToken:                       k3sToken,
-		ControlPlaneLBServiceName:      "",
-		ControlPlaneLBServiceNamespace: "",
-		ControlPlaneLBEndpoint:         "",
-	}
-	if mgmtEndpoint != nil {
-		// See k0s twin above for the rationale behind stamping ClusterName /
-		// ControlPlaneEndpointHost from the live Cluster (not the resolver).
-		templateData.ManagementEndpoint = &bootstrap.ManagementEndpoint{
-			APIServer:                 mgmtEndpoint.APIServer,
-			Token:                     mgmtEndpoint.Token,
-			KubeconfigSecretName:      mgmtEndpoint.KubeconfigSecretName,
-			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
-			ClusterName:               cluster.Name,
-			ControlPlaneEndpointHost:  cluster.Spec.ControlPlaneEndpoint.Host,
-		}
-	}
-	if machine != nil {
-		templateData.MachineName = machine.Name
-	}
-	if cluster != nil {
-		templateData.ClusterNS = cluster.Namespace
-		templateData.ControlPlaneLBServiceName = fmt.Sprintf("%s-%s", cluster.Name, controlPlaneLBServiceSuffix)
-		templateData.ControlPlaneLBServiceNamespace = cluster.Namespace
-	}
-	if cluster != nil && isKubevirtMachine(machine) && role == "control-plane" {
-		lbEndpoint, err := r.getControlPlaneLBEndpoint(ctx, cluster.Namespace, templateData.ControlPlaneLBServiceName)
-		if err != nil {
-			return "", fmt.Errorf("failed to get control plane LB endpoint: %w", err)
-		}
-		if lbEndpoint == "" {
-			return "", errLBEndpointNotReady
-		}
-		templateData.ControlPlaneLBEndpoint = lbEndpoint
-	}
-
-	// HA: role / join token / VIP (ADR 0005 Phase 3). No-op on workers (CPR-INV-1).
-	if err := r.applyControlPlaneRenderData(ctx, &templateData, kairosConfig, cluster, role); err != nil {
-		return "", err
-	}
-
-	return bootstrap.RenderK3sCloudConfig(templateData)
 }
 
 func (r *KairosConfigReconciler) getControlPlaneLBEndpoint(ctx context.Context, namespace, name string) (string, error) {

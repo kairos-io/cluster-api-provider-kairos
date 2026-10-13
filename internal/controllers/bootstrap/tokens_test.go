@@ -110,13 +110,13 @@ func TestResolveToken_K0sWorkerPrecedence(t *testing.T) {
 				Spec:       tc.spec,
 			}
 			r := tokenReconciler(g, tc.objs...)
-			got, err := r.resolveToken(context.Background(), tokenKindK0sWorker, kc, cluster)
+			mat, err := k0sJoinSource{c: r.Client}.WorkerJoin(context.Background(), JoinRequest{Config: kc, Cluster: cluster})
 			if tc.errIs != nil {
 				g.Expect(err).To(MatchError(tc.errIs))
 				return
 			}
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(got).To(Equal(tc.want))
+			g.Expect(mat.Token).To(Equal(tc.want))
 		})
 	}
 }
@@ -171,13 +171,13 @@ func TestResolveToken_K3sWorkerPrecedence(t *testing.T) {
 				Spec:       tc.spec,
 			}
 			r := tokenReconciler(g, tc.objs...)
-			got, err := r.resolveToken(context.Background(), tokenKindK3sWorker, kc, cluster)
+			mat, err := k3sJoinSource{c: r.Client}.WorkerJoin(context.Background(), JoinRequest{Config: kc, Cluster: cluster, ServerAddress: "https://cp:6443"})
 			if tc.errIs != nil {
 				g.Expect(err).To(MatchError(tc.errIs))
 				return
 			}
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(got).To(Equal(tc.want))
+			g.Expect(mat.Token).To(Equal(tc.want))
 		})
 	}
 }
@@ -234,7 +234,7 @@ func TestResolveToken_ControlPlaneJoin(t *testing.T) {
 				Spec:       tc.spec,
 			}
 			r := tokenReconciler(g, tc.objs...)
-			got, err := r.resolveToken(context.Background(), tokenKindControlPlaneJoin, kc, cluster)
+			got, err := r.resolveControlPlaneJoinToken(context.Background(), kc, cluster)
 			if tc.errIs != nil {
 				g.Expect(err).To(MatchError(tc.errIs))
 				return
@@ -258,7 +258,7 @@ func TestResolveToken_KeylessSecretIsHardError(t *testing.T) {
 		},
 	}
 	r := tokenReconciler(g, tokenSecret("wt", "default", "wrong-key", "x"))
-	_, err := r.resolveToken(context.Background(), tokenKindK0sWorker, kc, cluster)
+	_, err := k0sJoinSource{c: r.Client}.WorkerJoin(context.Background(), JoinRequest{Config: kc, Cluster: cluster})
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err).ToNot(MatchError(errTokenNotReady))
 }

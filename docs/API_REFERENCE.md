@@ -2,7 +2,7 @@
 
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.3.
 
-This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md).
+This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md). Joining Kairos workers to a Kamaji or `KubeadmControlPlane` control plane: [Kubeadm workers](KUBEADM_WORKERS.md).
 
 ## Table of Contents
 
@@ -21,15 +21,15 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 **API Version:** `v1beta2`
 **Kind:** `KairosConfig`
 
-`KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s.
+`KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s. With `distribution: kubeadm` it bootstraps worker nodes only, joining them to a kubeadm control plane that this provider does not run (see [Kubeadm workers](KUBEADM_WORKERS.md)).
 
 ### Spec Fields
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `role` | `string` | No | `"worker"` | Node role: `"control-plane"` or `"worker"`. |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"` or `"k3s"`. |
-| `kubernetesVersion` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). The value is informational — the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. |
+| `role` | `string` | No | `"worker"` | Node role: `"control-plane"` or `"worker"`. `distribution: kubeadm` accepts `"worker"` only; the validating webhook rejects `"control-plane"`. |
+| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"`, `"k3s"`, or `"kubeadm"`. `kubeadm` joins a Kairos worker to an existing kubeadm control plane (Kamaji `KamajiControlPlane` or `KubeadmControlPlane`) and is worker-only. `KairosControlPlane.spec.distribution` does not accept `kubeadm`. See [kubeadm workers](#kubeadm-workers). |
+| `kubernetesVersion` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). For k0s and k3s the value is informational — the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. For `distribution: kubeadm` the version that must match the image is `Machine.spec.version`, not this field; keep the two equal and use the plain upstream form (for example `"v1.36.1"`). |
 | `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. What single-node mode renders is distribution- and infrastructure-specific: for k3s it enables cluster-init mode on every infrastructure provider; for k0s on CAPK it renders `--single`; for k0s on the generic / CAPV / CAPM3 / fleet render path it renders `--enable-worker` by default, or `--single` when `k0sSingleNode` is also `true` (see `k0sSingleNode` below). Tracked as a deprecation candidate in KD-39. |
 | `k0sSingleNode` | `*bool` | No | `false` | For a single-node k0s control plane (`singleNode: true`, `distribution: k0s`) on the generic / CAPV / CAPM3 / fleet render path, selects which k0s single-node flag is rendered. `false` (the default) renders `--enable-worker`: a joinable, schedulable controller that runs workloads itself and accepts worker joins, so a control-plane-plus-worker cluster works out of the box. `true` renders `--single`: a standalone all-in-one node that refuses all joins ("cannot join into a single node cluster") — use this only for a node that will never gain workers. Ignored by k3s and by worker/join nodes, and has no effect on CAPK, which always renders `--single` for single-node k0s. |
 | `userName` | `string` | No | `"kairos"` | Username for the default OS user. |
@@ -59,6 +59,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `preCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
 | `postCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
 | `pause` | `bool` | No | `false` | When `true`, pauses reconciliation of this KairosConfig. |
+| `kubeadm` | `KubeadmConfig` | No | — | kubeadm-specific inputs for a worker join. Honoured only when `distribution` is `kubeadm` and `role` is `worker`; ignored for k0s and k3s. All fields are optional. See [KubeadmConfig](#kubeadmconfig). |
 
 #### UserPasswordSecretReference
 
@@ -101,6 +102,14 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `file` | `string` | Yes | Filename within the directory. |
 | `content` | `string` | Yes | YAML content of the manifest. |
 
+#### KubeadmConfig
+
+`spec.kubeadm`. Honoured only for `distribution: kubeadm` with `role: worker`.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `joinConfiguration` | `JoinConfiguration` | No | — | The kubeadm `JoinConfiguration` for the worker join. The schema is the `JoinConfiguration` of Cluster API's kubeadm bootstrap provider (`bootstrap.cluster.x-k8s.io/v1beta2`); every field is optional. The controller sets or overwrites `nodeRegistration.name` (the Machine name, unless you set it), `discovery.bootstrapToken` (the minted token, the control-plane endpoint, and the cluster CA hash), and `discovery.file` (cleared); it adds the `node.cluster.x-k8s.io/uninitialized:NoSchedule` taint to `nodeRegistration.taints` and keeps any taints you set. All other fields pass through. Do not set `controlPlane`: control-plane joins are not supported in this release. Secret-bearing and trust-weakening fields are rejected at admission; see [Admission refusals](KUBEADM_WORKERS.md#admission-refusals). |
+
 ### Status Fields
 
 | Field | Type | Description |
@@ -108,7 +117,8 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `ready` | `bool` | `true` when bootstrap data has been generated and the bootstrap Secret is available for the CAPI Machine controller. |
 | `dataSecretName` | `*string` | Name of the Secret containing the bootstrap cloud-config. |
 | `initialization.dataSecretCreated` | `bool` | v1beta2 contract field: `true` when the bootstrap Secret has been created. |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) for the reasons these carry before the bootstrap Secret is written. |
+| `bootstrapTokenID` | `string` | Non-secret ID (the six-character prefix) of the kubeadm bootstrap token most recently minted for this KairosConfig. The token Secret in the workload cluster is `kube-system/bootstrap-token-<id>`. The secret half of the token is never stored in `spec` or `status`. Empty for k0s and k3s, and for a kubeadm worker that has not yet minted a token. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable string indicating the last failure reason. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable description of the last failure. Cleared automatically on the next successful reconcile. If non-empty, check the owning Machine's events for context. |
@@ -137,6 +147,41 @@ If a `KairosConfig` stays in this state, the cluster's infrastructure provider
 has not reported `infrastructureProvisioned`, or (for a control plane) has
 reported it without publishing `spec.controlPlaneEndpoint`. Check the
 InfraCluster, not the `KairosConfig`.
+
+### kubeadm workers
+
+A `KairosConfig` with `distribution: kubeadm` and `role: worker` joins a control
+plane that this provider does not run. The controller verifies the control plane,
+mints a short-lived bootstrap token in the workload cluster, and renders a kubeadm
+`JoinConfiguration`. The full procedure, prerequisites, and troubleshooting are in
+[Kubeadm workers](KUBEADM_WORKERS.md). A worked manifest is in
+`config/samples/kubeadm/kairos_kubeadm_workers.yaml`.
+
+Requirements that surface as API behavior:
+
+- `Machine.spec.version` must be set, in plain upstream form (`v1.36.1`), and must
+  equal the kubeadm version in the node image exactly.
+- The owner must be a `MachineDeployment`; a `MachinePool` owner is refused.
+- The webhook rejects, on a kubeadm `KairosConfig`: `role: control-plane`, an inline
+  bootstrap token, `unsafeSkipCAVerification`, `discovery.file`, any `{{` in
+  `spec.kubeadm`, and a `nodeRegistration.name` that is not a DNS-1123 subdomain.
+  It runs on `KairosConfig`, not on `KairosConfigTemplate`.
+- The control-plane kinds a worker may join are `KubeadmControlPlane` and
+  `KamajiControlPlane`. The operator can add kinds with the manager flag
+  `--kubeadm-extra-controlplane-kinds` (see
+  [INSTALL.md](INSTALL.md#optional-manager-flags)).
+
+Reasons a kubeadm worker reports:
+
+| Resource | Condition and status | Reason | Meaning |
+|----------|----------------------|--------|---------|
+| `KairosConfig` | `Ready`, `BootstrapReady`, `DataSecretAvailable`: `False` (Warning) | `BootstrapDataSecretGenerationFailed` | The control-plane check refused to mint a token, or rendering failed. The cause is in `status.failureMessage`. Not retried on a timer; delete the Machine after fixing the cause. |
+| `KairosConfig` | `BootstrapReady`: `False` (Warning) | `BootstrapTokenRefreshCapExceeded` | The Machine still has no Node 24 hours after creation, so the controller stopped re-minting tokens. It does not delete the Machine; a `MachineHealthCheck` with `spec.checks.nodeStartupTimeoutSeconds` is what replaces it. |
+| `KairosControlPlane` | `Ready`, `Available`: `False` (Warning) | `UnsupportedDistribution` | The effective distribution is `kubeadm`, which `KairosControlPlane` does not support in this release. See [KairosControlPlane refuses kubeadm](KUBEADM_WORKERS.md#kairoscontrolplane-refuses-kubeadm). |
+
+While the control plane is not yet initialized, or the kubeconfig Secret or
+workload cluster is not yet reachable, the controller requeues every 10 seconds
+and leaves conditions unchanged; the reason is in the bootstrap manager log.
 
 ### Example
 
@@ -188,6 +233,25 @@ spec:
   k3sTokenSecretRef:
     name: k3s-worker-token
     key: token
+```
+
+For kubeadm workers, no token is set: the controller mints one. `Machine.spec.version`
+must be set on the owning `MachineDeployment`:
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KairosConfigTemplate
+metadata:
+  name: kairos-kubeadm-worker
+  namespace: default
+spec:
+  template:
+    spec:
+      role: worker
+      distribution: kubeadm
+      kubernetesVersion: "v1.36.1"
+      userPasswordSecretRef:
+        name: kairos-user-password
 ```
 
 ---
@@ -250,7 +314,7 @@ spec:
 |-------|------|----------|---------|-------------|
 | `replicas` | `*int32` | No | `1` | Number of control plane machines. One of `1`, `3`, or `5` — the validating webhook rejects even counts (they provide the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance). `1` configures a single-node control plane. `3` or `5` configure a highly-available control plane; set `ha.vip` for infrastructure providers that do not supply a load-balanced endpoint (CAPV, CAPM3, CAPD). |
 | `version` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. Changing it on an HA control plane replaces the control-plane Machines one at a time. On a single-node control plane it replaces nothing, because a replacement would start a separate, empty cluster; see [MachinesUpToDate condition](#machinesuptodate-condition). |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d — see [Multi-Node Control Planes](#multi-node-control-planes)). |
+| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. `"kubeadm"` is not accepted: it is rejected at admission, and a referenced `KairosConfigTemplate` with `distribution: kubeadm` sets `Ready` and `Available` to `False` with reason `UnsupportedDistribution` (see [kubeadm workers](#kubeadm-workers)). k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d — see [Multi-Node Control Planes](#multi-node-control-planes)). |
 | `machineTemplate` | `KairosControlPlaneMachineTemplate` | Yes | — | Template for creating control plane Machines. |
 | `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | — | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
 | `rolloutStrategy` | `RolloutStrategy` | No | — | Strategy for rolling out updates. |
@@ -335,7 +399,7 @@ Cross-field validation (enforced by the validating webhook, not expressible as k
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
 | `updatedReplicas` | `int32` | Number of Machines running the desired version. |
 | `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
@@ -439,7 +503,7 @@ Reports whether every control-plane Machine runs `spec.version`.
 
 ## Persistence behavior
 
-The provider injects `/system/oem/12_kairos-capi-persistency.yaml` into every node's cloud-config via `write_files`. The file uses immucore's `extra-layout.env` mechanism (not `cos-layout.env`), so its `PERSISTENT_STATE_PATHS` value is **unioned** with the stock image's persistent paths — never overwriting them. A custom or stock Kairos image is unaffected; the provider's persistent paths are added on top of whatever the image already persists.
+The provider injects `/system/oem/12_kairos-capi-persistency.yaml` into every k0s and k3s node's cloud-config via `write_files`. The kubeadm worker cloud-config does not include it: with `distribution: kubeadm`, the node image must already persist the paths kubeadm writes (see [Kubeadm workers](KUBEADM_WORKERS.md#prerequisites)). The file uses immucore's `extra-layout.env` mechanism (not `cos-layout.env`), so its `PERSISTENT_STATE_PATHS` value is **unioned** with the stock image's persistent paths — never overwriting them. A custom or stock Kairos image is unaffected; the provider's persistent paths are added on top of whatever the image already persists.
 
 The provider declares the following paths as persistent across reboots and A/B upgrades:
 
@@ -466,7 +530,7 @@ Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence
 
 ## Writing files to nodes
 
-`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on all distributions (k0s, k3s) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3, and the Kairos fleet provider).
+`KairosConfig.spec.files` (and the equivalent field inside `KairosConfigTemplate.spec.template.spec.files`) writes files onto the node's filesystem via the cloud-config `write_files:` list. The files are rendered at bootstrap time on all distributions (k0s, k3s, kubeadm) and all infrastructure providers (CAPV, CAPK, CAPD, CAPM3, and the Kairos fleet provider).
 
 ### Limits
 
@@ -552,8 +616,9 @@ For `KairosConfig` with `role: worker`:
 
 - **k0s**: Set `workerToken` or `workerTokenSecretRef`. `workerTokenSecretRef` is preferred.
 - **k3s**: Set `k3sToken` or `k3sTokenSecretRef`. `k3sTokenSecretRef` is preferred.
+- **kubeadm**: Set no token. The controller mints a short-lived bootstrap token in the workload cluster; an inline token in `spec.kubeadm.joinConfiguration` is rejected by the webhook.
 
-The controller fails reconciliation if no token is provided for a worker.
+The controller fails reconciliation if no token is provided for a k0s or k3s worker.
 
 ### Single-Node Mode
 
@@ -577,5 +642,6 @@ See the `k0sSingleNode` row above for the field reference, and `config/samples/f
 
 - Provide credentials via `userPasswordSecretRef` (recommended) or `sshPublicKey` / `githubUser`. Inline `userPassword` is stored in the KairosConfig spec and readable by anyone who can `kubectl get kairosconfig`.
 - Worker tokens should use the `*SecretRef` variants. Inline tokens in specs are readable without Secret RBAC.
+- For kubeadm workers, the bootstrap token (valid 15 minutes) is never written to `spec` or `status`, but it is part of the rendered bootstrap data Secret. Restrict read access to bootstrap data Secrets as for any other distribution.
 - **HA etcd health/leave signals are node-self-reported and forgeable (KD-51).** Both day-2 HA signal channels — the per-cluster etcd-status Secret and the workload `kube-system/kairos-etcd-leave` ConfigMap leave acknowledgement — are written by control-plane nodes with vanilla RBAC on objects shared across the control plane, so a compromised control-plane node can forge them. This is not a privilege escalation (a compromised control-plane node already holds cluster-admin-equivalent access) and cannot force an unsafe deletion, because the quorum-safety decision is made independently of, and before, any node signal is consulted. A forged signal can only self-downgrade the clean-leave/health guarantee. Per-member-scoped signals are tracked as future hardening.
 - All Secrets referenced by `*SecretRef` fields must exist in the management cluster before the KairosConfig is reconciled. Missing Secrets cause a transient failure that clears automatically when the Secret is created.

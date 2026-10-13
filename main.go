@@ -21,12 +21,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -34,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
@@ -135,6 +141,7 @@ func main() {
 	var probeAddr string
 	var controllersFlag string
 	var namespaceFlag string
+	var kubeadmExtraKindsFlag string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -154,6 +161,18 @@ func main() {
 	flag.StringVar(&namespaceFlag, "namespace", "",
 		"If set, restrict the manager to watch only this namespace "+
 			"(takes precedence over the WATCH_NAMESPACE env var).")
+	// --kubeadm-extra-controlplane-kinds is the OPERATOR-level allowlist widener for
+	// the kubeadm worker-join trust check (ADR 0010 OQ-9). KubeadmControlPlane,
+	// KamajiControlPlane, and a kubeadm KairosControlPlane are trusted by default;
+	// any other control-plane kind must be opted in HERE (never via a per-Cluster
+	// field). Comma-separated "Kind.group" entries, e.g.
+	// "FooControlPlane.controlplane.example.com". Only grant this for a provider
+	// whose kubeconfig you fully control — a trusted control plane's kubeconfig
+	// points the bootstrap manager at a URL it will dial from inside the
+	// management network.
+	flag.StringVar(&kubeadmExtraKindsFlag, "kubeadm-extra-controlplane-kinds", "",
+		"Comma-separated additional control-plane kinds (\"Kind.group\") a kubeadm worker "+
+			"may trust, beyond the built-in allowlist. Operator-level opt-in only.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -226,12 +245,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One signal-handler context for both the clustercache setup (its lifecycle is
+	// tied to this ctx) and mgr.Start. SetupSignalHandler must be called exactly once.
+	ctx := ctrl.SetupSignalHandler()
+
+	kubeadmExtraKinds, err := parseGroupKinds(kubeadmExtraKindsFlag)
+	if err != nil {
+		setupLog.Error(err, "invalid --kubeadm-extra-controlplane-kinds")
+		os.Exit(1)
+	}
+
 	// Register controllers and webhooks gated by the resolved role. The two
 	// helpers log the specific controller/webhook that failed (preserving the
 	// prior structured log lines) and return a non-nil error, which we turn
 	// into a non-zero exit here.
 	setupLog.Info("registering controllers", "role", controllersFlag)
-	if err := registerControllers(mgr, role); err != nil {
+	if err := registerControllers(ctx, mgr, role, kubeadmExtraKinds); err != nil {
 		os.Exit(1)
 	}
 	if err := registerWebhooks(mgr, role); err != nil {
@@ -249,10 +278,33 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// parseGroupKinds parses the comma-separated "Kind.group" operator flag into a set
+// of GroupKinds (ADR 0010 OQ-9). The Kind is the text before the first dot; the
+// group is the remainder (fully-qualified). Empty input yields a nil map.
+func parseGroupKinds(s string) (map[schema.GroupKind]bool, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	out := map[schema.GroupKind]bool{}
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		dot := strings.Index(entry, ".")
+		if dot <= 0 || dot == len(entry)-1 {
+			return nil, fmt.Errorf("invalid control-plane kind %q: want \"Kind.group\" (e.g. \"FooControlPlane.controlplane.example.com\")", entry)
+		}
+		out[schema.GroupKind{Kind: entry[:dot], Group: entry[dot+1:]}] = true
+	}
+	return out, nil
 }
 
 // registerControllers wires the reconcilers this manager's role owns. It is
@@ -262,7 +314,7 @@ func main() {
 // the controllers it is responsible for. On failure it logs the specific
 // controller that failed and returns a non-nil error for the caller to
 // translate into a non-zero exit.
-func registerControllers(mgr manager.Manager, role controllerRole) error {
+func registerControllers(ctx context.Context, mgr manager.Manager, role controllerRole, kubeadmExtraKinds map[schema.GroupKind]bool) error {
 	if role.enablesBootstrap() {
 		// Wire the production management-endpoint resolver. Pulling the API
 		// server URL from mgr.GetConfig().Host preserves the pre-KD-33 behavior
@@ -295,10 +347,56 @@ func registerControllers(mgr manager.Manager, role controllerRole) error {
 			mgr.GetScheme(),
 			mgmtAPIServer,
 		)
+
+		// kubeadm worker-join source (ADR 0010 P1). It needs dependencies only
+		// main.go has: a workload-cluster client cache (for minting/refreshing the
+		// bootstrap token), an UNCACHED management reader (for the <cluster>-ca
+		// cross-check), and the operator-level trust allowlist. The ClusterCache's
+		// ClusterFilter is the COARSE gate — it only ever connects to clusters whose
+		// control-plane kind is on the kubeadm trust allowlist, so the bootstrap
+		// manager never dials a k0s/k3s cluster's node-pushed kubeconfig; the FINE,
+		// owner-verified trust check runs per-request in the source.
+		joinSources := map[string]bootstrap.JoinMaterialSource{}
+		clusterCache, err := clustercache.SetupWithManager(ctx, mgr, clustercache.Options{
+			SecretClient: mgr.GetClient(),
+			Client: clustercache.ClientOptions{
+				UserAgent: "cluster-api-provider-kairos-bootstrap",
+				Cache: clustercache.ClientCacheOptions{
+					// Never cache workload Secrets: we mint and read bootstrap-token
+					// Secrets and must see them live.
+					DisableFor: []client.Object{&corev1.Secret{}},
+				},
+			},
+			ClusterFilter: bootstrap.KubeadmTrustedClusterFilter(kubeadmExtraKinds),
+		}, controller.Options{MaxConcurrentReconciles: 10})
+		if err != nil {
+			setupLog.Error(err, "unable to set up workload cluster cache for kubeadm")
+			return err
+		}
+		// Uncached management reader for the <cluster>-ca cross-check (a planted or
+		// stale cached value must not be trusted).
+		uncachedReader, err := client.New(mgr.GetConfig(), client.Options{
+			Scheme: mgr.GetScheme(),
+			Mapper: mgr.GetRESTMapper(),
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to build uncached reader for kubeadm CA cross-check")
+			return err
+		}
+		joinSources[bootstrapv1beta2.DistributionKubeadm] = bootstrap.NewKubeadmJoinSource(
+			mgr.GetClient(),
+			uncachedReader,
+			func(ctx context.Context, key client.ObjectKey) (client.Client, error) {
+				return clusterCache.GetClient(ctx, key)
+			},
+			kubeadmExtraKinds,
+		)
+
 		if err := (&bootstrap.KairosConfigReconciler{
 			Client:               mgr.GetClient(),
 			Scheme:               mgr.GetScheme(),
 			MgmtEndpointResolver: mgmtResolver,
+			JoinSources:          joinSources,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "KairosConfig")
 			return err

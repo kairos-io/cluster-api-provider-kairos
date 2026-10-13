@@ -451,3 +451,153 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 	// Drain manager goroutine; ignore Canceled.
 	<-mgrErrCh
 }
+
+// TestBootstrapIntegration_K3sWorker exercises the k3s worker bootstrap path
+// end-to-end against a real apiserver: the data Secret is created, carries a
+// controller owner reference back to the KairosConfig, and is labelled with the
+// cluster name. The existing TestBootstrapIntegration covers a k0s control
+// plane; this is the k3s-worker companion the P0 seam adds so the worker
+// join-material path has integration coverage before it is refactored.
+func TestBootstrapIntegration_K3sWorker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	g := NewWithT(t)
+
+	crdPaths := []string{"../../config/crd/bases"}
+	if _, err := os.Stat("../../test/crd/capi/cluster-api-components.yaml"); err == nil {
+		crdPaths = append(crdPaths, "../../test/crd/capi")
+	}
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths:     crdPaths,
+		ErrorIfCRDPathMissing: false,
+	}
+	cfg, err := testEnv.Start()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cfg).NotTo(BeNil())
+	defer func() {
+		g.Expect(testEnv.Stop()).To(Succeed())
+	}()
+
+	scheme := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+
+	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	reconciler := &bootstrap.KairosConfigReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
+	g.Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgrErrCh := make(chan error, 1)
+	go func() { mgrErrCh <- mgr.Start(ctx) }()
+	g.Eventually(func() bool { return mgr.GetCache().WaitForCacheSync(ctx) }, 10*time.Second).Should(BeTrue())
+
+	const (
+		nsName      = "k3s-worker"
+		clusterName = "k3s-worker-cluster"
+		machineName = "k3s-worker-machine"
+		kcName      = "k3s-worker-kc"
+	)
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	g.Expect(mgr.GetClient().Create(ctx, ns)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: nsName},
+		Spec: clusterv1.ClusterSpec{
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io",
+				Kind:     "DockerCluster",
+				Name:     clusterName,
+			},
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
+		},
+	}
+	g.Expect(mgr.GetClient().Create(ctx, cluster)).To(Succeed())
+	g.Expect(markClusterInfrastructureProvisioned(ctx, mgr.GetClient(), cluster)).To(Succeed())
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      machineName,
+			Namespace: nsName,
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: clusterName},
+		},
+		Spec: clusterv1.MachineSpec{
+			ClusterName: clusterName,
+			Bootstrap: clusterv1.Bootstrap{
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: bootstrapv1beta2.GroupVersion.Group,
+					Kind:     "KairosConfig",
+					Name:     kcName,
+				},
+			},
+			InfrastructureRef: testMachineInfraRef("infra"),
+		},
+	}
+	g.Expect(mgr.GetClient().Create(ctx, machine)).To(Succeed())
+
+	kc := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kcName,
+			Namespace: nsName,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(machine, clusterv1.GroupVersion.WithKind("Machine")),
+			},
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "worker",
+			Distribution:      "k3s",
+			KubernetesVersion: "v1.30.0+k3s1",
+			UserName:          "kairos",
+			UserPassword:      "test-password",
+			UserGroups:        []string{"admin"},
+			K3sToken:          "worker-k3s-token",
+		},
+	}
+	g.Expect(mgr.GetClient().Create(ctx, kc)).To(Succeed())
+
+	// Wait for bootstrap data to be generated.
+	g.Eventually(func() bool {
+		got := &bootstrapv1beta2.KairosConfig{}
+		if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: kcName, Namespace: nsName}, got); err != nil {
+			return false
+		}
+		return got.Status.DataSecretName != nil && *got.Status.DataSecretName != ""
+	}, 30*time.Second, 1*time.Second).Should(BeTrue())
+
+	got := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(mgr.GetClient().Get(ctx, types.NamespacedName{Name: kcName, Namespace: nsName}, got)).To(Succeed())
+	secretName := *got.Status.DataSecretName
+	g.Expect(secretName).To(Equal(kcName), "worker bootstrap Secret must be named deterministically after the KairosConfig")
+
+	secret := &corev1.Secret{}
+	g.Eventually(func() error {
+		return mgr.GetClient().Get(ctx, types.NamespacedName{Name: secretName, Namespace: nsName}, secret)
+	}, 10*time.Second).Should(Succeed())
+
+	// Owned by the KairosConfig (controller ref, resolvable GVK, matching UID).
+	ownerRef := metav1.GetControllerOf(secret)
+	g.Expect(ownerRef).NotTo(BeNil(), "bootstrap Secret must have a controller owner reference")
+	g.Expect(ownerRef.Kind).To(Equal("KairosConfig"))
+	g.Expect(ownerRef.APIVersion).To(Equal(bootstrapv1beta2.GroupVersion.String()))
+	g.Expect(ownerRef.UID).To(Equal(got.UID))
+
+	// Labelled with the cluster name (KD-15 watch predicate).
+	g.Expect(secret.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, clusterName))
+
+	// Carries a k3s worker cloud-config with the join token.
+	g.Expect(secret.Data).To(HaveKey("value"))
+	cloudConfig := string(secret.Data["value"])
+	g.Expect(cloudConfig).To(ContainSubstring("#cloud-config"))
+	g.Expect(cloudConfig).To(ContainSubstring("k3s"))
+	g.Expect(cloudConfig).To(ContainSubstring("worker-k3s-token"))
+
+	cancel()
+	<-mgrErrCh
+}

@@ -121,6 +121,15 @@ rules:
   - patch
   - update
 - apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - kamajicontrolplanes
+  - kubeadmcontrolplanes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
