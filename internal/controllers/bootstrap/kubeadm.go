@@ -45,6 +45,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	kubeadmtypes "sigs.k8s.io/cluster-api/bootstrap/kubeadm/types"
 	"sigs.k8s.io/cluster-api/controllers/external"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -70,6 +71,15 @@ const (
 	// kubeadmBootstrapTokenGroups is the extra-groups value CABPK sets so the token
 	// authenticates as a node bootstrapper (kubeadmconfig_controller token.go).
 	kubeadmBootstrapTokenGroups = "system:bootstrappers:kubeadm:default-node-token"
+
+	// kubeadmTokenOwnerLabel marks a bootstrap-token Secret in the WORKLOAD cluster
+	// as minted for one KairosConfig, valued with that KairosConfig's UID. It is what
+	// makes the token set reconcilable: the owner of a token is a property of the
+	// token itself, so a rotation can revoke what it replaces without depending on
+	// status.bootstrapTokenID having been written (kairos-io/kairos#5467). The UID is
+	// used rather than the name because a UID is unique across deletions and is
+	// always a legal 36-character label value.
+	kubeadmTokenOwnerLabel = "bootstrap.cluster.x-k8s.io/kairosconfig-uid"
 
 	// workloadKubeconfigSecretKey is the data key CAPI kubeconfig Secrets use.
 	workloadKubeconfigSecretKey = "value"
@@ -219,11 +229,18 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 		return WorkerJoinMaterial{}, newNotReady("WorkloadClusterUnreachable",
 			"waiting to reach the workload cluster to mint a bootstrap token: %v", err)
 	}
-	token, tokenID, err := mintBootstrapToken(ctx, wc, s.ttl(), s.clock())
+	owner := string(req.Config.UID)
+	token, tokenID, err := mintBootstrapToken(ctx, wc, s.ttl(), s.clock(), owner)
 	if err != nil {
 		return WorkerJoinMaterial{}, newNotReady("TokenMintFailed",
 			"waiting to mint a bootstrap token in the workload cluster: %v", err)
 	}
+
+	// Revoke what this one replaces. The new token exists by now, so there is no
+	// window in which the worker has none, and the sweep is keyed on the owner
+	// label rather than on status.bootstrapTokenID: a status write that failed
+	// after a previous mint leaves a token this still collects.
+	revokeSupersededTokens(ctx, wc, owner, tokenID)
 
 	joinCfgYAML, err := s.renderJoinConfiguration(req, trusted, token)
 	if err != nil {
@@ -517,8 +534,14 @@ func (s *kubeadmJoinSource) TokenNeedsRefresh(ctx context.Context, req JoinReque
 }
 
 // bootstrapTokenExpiry returns the expiry of the bootstrap token Secret for tokenID
-// in the workload cluster. found is false when the Secret is absent. A token Secret
-// with no expiration key is treated as non-expiring (far-future expiry).
+// in the workload cluster. found is false when the Secret is absent.
+//
+// A token Secret with no expiration key never expires, and kubeadm honours it
+// forever. Every token this controller mints carries one, so a missing key means
+// the Secret was rewritten in the workload cluster. Reporting it as far-future
+// expiry would mean the refresh never fires again and the non-expiring token stays
+// in use; reporting it as already due replaces it and lets the rotation sweep
+// revoke it (kairos-io/kairos#5467).
 func bootstrapTokenExpiry(ctx context.Context, wc client.Client, tokenID string) (time.Time, bool, error) {
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: bootstraputil.BootstrapTokenSecretName(tokenID)}
@@ -530,7 +553,7 @@ func bootstrapTokenExpiry(ctx context.Context, wc client.Client, tokenID string)
 	}
 	raw, ok := secret.Data[bootstrapapi.BootstrapTokenExpirationKey]
 	if !ok || len(raw) == 0 {
-		return time.Now().Add(100 * 365 * 24 * time.Hour), true, nil
+		return time.Time{}, true, nil
 	}
 	t, err := time.Parse(time.RFC3339, string(raw))
 	if err != nil {
@@ -561,8 +584,10 @@ func appendUninitializedTaint(in *[]corev1.Taint) *[]corev1.Taint {
 // cluster's kube-system namespace and returns the full token and its non-secret ID.
 // It mirrors CABPK's createToken (groups/usages/keys/type); the token value is
 // never logged. (k8s.io/cluster-bootstrap is the canonical source and is already
-// pulled in by the spec.kubeadm embedding.)
-func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration, now time.Time) (token, tokenID string, err error) {
+// pulled in by the spec.kubeadm embedding.) owner is the minting KairosConfig's
+// UID, recorded in kubeadmTokenOwnerLabel so revokeSupersededTokens can find every
+// token this KairosConfig has outstanding.
+func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration, now time.Time, owner string) (token, tokenID string, err error) {
 	token, err = bootstraputil.GenerateBootstrapToken()
 	if err != nil {
 		return "", "", fmt.Errorf("generate bootstrap token: %w", err)
@@ -574,10 +599,20 @@ func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration
 	tokenID = subs[1]
 	tokenSecret := subs[2]
 
+	// An empty owner would label every token alike, which is worse than not
+	// labelling: the sweep is keyed on this value. It is unreachable for a
+	// KairosConfig the API server served, so leave the token unlabelled and let it
+	// expire on its own.
+	var labels map[string]string
+	if owner != "" {
+		labels = map[string]string{kubeadmTokenOwnerLabel: owner}
+	}
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      bootstraputil.BootstrapTokenSecretName(tokenID),
 			Namespace: metav1.NamespaceSystem,
+			Labels:    labels,
 		},
 		Type: bootstrapapi.SecretTypeBootstrapToken,
 		Data: map[string][]byte{
@@ -594,6 +629,57 @@ func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration
 		return "", "", fmt.Errorf("create bootstrap token Secret in workload cluster: %w", err)
 	}
 	return token, tokenID, nil
+}
+
+// revokeSupersededTokens deletes every bootstrap-token Secret in the workload
+// cluster that owner minted, except keepTokenID, the one just minted. Letting the
+// previous token expire instead would leave it usable for up to its remaining TTL
+// against system:bootstrappers:kubeadm:default-node-token, and a status write that
+// fails after a mint would make them accumulate at the reconcile rate rather than
+// at the rotation rate (kairos-io/kairos#5467). CABPK revokes on rotation too.
+//
+// It is BEST EFFORT and deliberately returns nothing: the worker's join depends on
+// the token that was just created, not on the removal of the one it replaces, and
+// the expiry plus kube-controller-manager's tokencleaner remains the backstop. A
+// failure is logged and collected by the next mint.
+//
+// The workload client never caches Secrets, so this List is a live, label-selected
+// API read and starts no Secret informer in the workload cluster.
+func revokeSupersededTokens(ctx context.Context, wc client.Client, owner, keepTokenID string) {
+	log := ctrl.LoggerFrom(ctx)
+	if owner == "" {
+		// Nothing to key the sweep on. Only reachable for a KairosConfig with no
+		// UID, which the API server does not serve.
+		return
+	}
+
+	var secrets corev1.SecretList
+	if err := wc.List(ctx, &secrets,
+		client.InNamespace(metav1.NamespaceSystem),
+		client.MatchingLabels{kubeadmTokenOwnerLabel: owner},
+	); err != nil {
+		log.V(2).Info("could not list superseded bootstrap tokens, leaving them to expire", "error", err.Error())
+		return
+	}
+
+	keep := bootstraputil.BootstrapTokenSecretName(keepTokenID)
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		// The label is ours, but the type and the name are what make the object a
+		// bootstrap token. Deleting on the label alone would delete anything that
+		// carried it.
+		if secret.Name == keep ||
+			secret.Type != bootstrapapi.SecretTypeBootstrapToken ||
+			!strings.HasPrefix(secret.Name, bootstrapapi.BootstrapTokenSecretPrefix) {
+			continue
+		}
+		if err := wc.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			log.V(2).Info("could not revoke a superseded bootstrap token, leaving it to expire",
+				"secret", secret.Name, "error", err.Error())
+			continue
+		}
+		log.V(4).Info("revoked a superseded bootstrap token", "secret", secret.Name)
+	}
 }
 
 // kubeadmJoinEndpoint returns spec.serverAddress as host:port when set (the CA pin

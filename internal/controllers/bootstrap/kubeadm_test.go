@@ -45,6 +45,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 
@@ -55,6 +56,7 @@ const (
 	testKubeadmCluster   = "wl"
 	testKubeadmNamespace = "default"
 	testCPUID            = types.UID("cp-uid-1234")
+	testConfigUID        = types.UID("kairosconfig-uid-1234")
 	testEndpointHost     = "10.0.0.42"
 	testEndpointPort     = int32(6443)
 )
@@ -238,7 +240,7 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 		Spec:       clusterv1.MachineSpec{Version: "v1.30.0"},
 	}
 	req := JoinRequest{Config: &bootstrapv1beta2.KairosConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: testKubeadmNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: testKubeadmNamespace, UID: testConfigUID},
 		Spec:       bootstrapv1beta2.KairosConfigSpec{Distribution: bootstrapv1beta2.DistributionKubeadm, Role: "worker"},
 	}, Machine: machine, Cluster: cluster}
 	return src, req, workload
@@ -687,5 +689,120 @@ func TestKubeadmTokenNeedsRefresh(t *testing.T) {
 		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(need).To(BeFalse())
+	})
+	// A token Secret with no expiration key is valid forever, so reading it as
+	// far-future expiry parked the refresh permanently: the worker kept a
+	// non-expiring credential and no rotation ever revoked it. Only reachable by a
+	// rewrite in the workload cluster, since every minted token carries the key.
+	t.Run("no expiration key -> refresh", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+		src.now = func() time.Time { return now }
+		g.Expect(workload.Create(context.Background(), &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"},
+			Type:       bootstrapapi.SecretTypeBootstrapToken,
+			Data:       map[string][]byte{bootstrapapi.BootstrapTokenIDKey: []byte("abcdef")},
+		})).To(Succeed())
+		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(need).To(BeTrue())
+	})
+}
+
+// TestKubeadmWorkerJoin_RevokesSupersededTokens pins the rotation half of
+// kairos-io/kairos#5467: a mint revokes the tokens it supersedes instead of leaving
+// them to expire, and it finds them by the owner label rather than by
+// status.bootstrapTokenID, so a status write that failed after an earlier mint
+// cannot make them accumulate.
+func TestKubeadmWorkerJoin_RevokesSupersededTokens(t *testing.T) {
+	ca := genTestCA(t, "cluster-ca")
+	ctx := context.Background()
+
+	exists := func(workload client.Client, name string) bool {
+		err := workload.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: name}, &corev1.Secret{})
+		return err == nil
+	}
+
+	t.Run("a second mint revokes the first", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+
+		first, err := src.WorkerJoin(ctx, req)
+		g.Expect(err).NotTo(HaveOccurred())
+		second, err := src.WorkerJoin(ctx, req)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(second.Kubeadm.TokenID).NotTo(Equal(first.Kubeadm.TokenID))
+
+		g.Expect(exists(workload, "bootstrap-token-"+first.Kubeadm.TokenID)).To(BeFalse(),
+			"the superseded token must be revoked, not left to expire")
+		g.Expect(exists(workload, "bootstrap-token-"+second.Kubeadm.TokenID)).To(BeTrue())
+	})
+
+	// The sweep reads the owner off the token itself, so it collects a token minted
+	// before a status write that never landed -- the unbounded-accumulation edge.
+	t.Run("revokes a token the status never recorded", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+
+		orphan := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: metav1.NamespaceSystem,
+				Name:      "bootstrap-token-orphan",
+				Labels:    map[string]string{kubeadmTokenOwnerLabel: string(testConfigUID)},
+			},
+			Type: bootstrapapi.SecretTypeBootstrapToken,
+		}
+		g.Expect(workload.Create(ctx, orphan)).To(Succeed())
+
+		_, err := src.WorkerJoin(ctx, req)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(exists(workload, "bootstrap-token-orphan")).To(BeFalse())
+	})
+
+	t.Run("leaves another KairosConfig's tokens and non-token Secrets alone", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+
+		// Another KairosConfig's worker, mid-join.
+		g.Expect(workload.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: metav1.NamespaceSystem,
+				Name:      "bootstrap-token-other1",
+				Labels:    map[string]string{kubeadmTokenOwnerLabel: "a-different-kairosconfig"},
+			},
+			Type: bootstrapapi.SecretTypeBootstrapToken,
+		})).To(Succeed())
+		// Carries our label but is not a bootstrap token: the label alone must not
+		// be enough to delete something in kube-system.
+		g.Expect(workload.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: metav1.NamespaceSystem,
+				Name:      "not-a-token",
+				Labels:    map[string]string{kubeadmTokenOwnerLabel: string(testConfigUID)},
+			},
+			Type: corev1.SecretTypeOpaque,
+		})).To(Succeed())
+
+		_, err := src.WorkerJoin(ctx, req)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(exists(workload, "bootstrap-token-other1")).To(BeTrue())
+		g.Expect(exists(workload, "not-a-token")).To(BeTrue())
+	})
+
+	// The worker joins with the token that was just minted; the removal of the one
+	// it replaces is housekeeping, and the expiry is still the backstop.
+	t.Run("a failed sweep does not fail the join", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, _ := buildSource(t, defaultFixture(ca), nil)
+		workload := fake.NewClientBuilder().WithScheme(kubeadmTestScheme(t)).WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return fmt.Errorf("workload cluster refused the list")
+			},
+		}).Build()
+		src.workloadClient = func(context.Context, client.ObjectKey) (client.Client, error) { return workload, nil }
+
+		mat, err := src.WorkerJoin(ctx, req)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(exists(workload, "bootstrap-token-"+mat.Kubeadm.TokenID)).To(BeTrue())
 	})
 }
