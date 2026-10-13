@@ -36,6 +36,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
@@ -103,18 +104,6 @@ var allowlistedControlPlaneKinds = map[schema.GroupKind]bool{
 	{Group: controlPlaneGroup, Kind: "KairosControlPlane"}:  true,
 }
 
-// coarseTrustedControlPlaneKinds is the allowlist for the clustercache ClusterFilter
-// (the coarse, connect-level gate). It deliberately EXCLUDES KairosControlPlane:
-// kubeadm control planes are unsupported in this release, so the bootstrap manager's
-// workload-client cache must never dial a k0s/k3s KairosControlPlane cluster. The
-// fine per-request WorkerJoin check keeps the KairosControlPlane
-// (distribution==kubeadm) branch for forward-compatibility; it just never admits a
-// connection today.
-var coarseTrustedControlPlaneKinds = map[schema.GroupKind]bool{
-	{Group: controlPlaneGroup, Kind: "KubeadmControlPlane"}: true,
-	{Group: controlPlaneGroup, Kind: "KamajiControlPlane"}:  true,
-}
-
 // bootstrapNotReadyError is the typed not-ready signal for the kubeadm join path
 // (ADR 0010 P1 item 6). reconcileBootstrapData maps it to a 10s requeue and leaves
 // conditions untouched — the KairosConfig is NOT parked. Every transient failure
@@ -138,10 +127,14 @@ func newNotReady(reason, format string, args ...any) error {
 }
 
 // workloadClientFactory returns a client to the workload cluster identified by
-// clusterKey. The production implementation is clustercache-backed with a
-// ClusterFilter, so it only ever connects to clusters that pass the coarse
-// allowlist gate; tests inject a fake.
-type workloadClientFactory func(ctx context.Context, clusterKey client.ObjectKey) (client.Client, error)
+// clusterKey, built from the kubeconfig the caller has already verified.
+//
+// Taking the kubeconfig as an argument is what keeps the connection on-demand and
+// trust-gated. There is no resident accessor that could connect ahead of a join,
+// and the only bytes a connection can be built from are the ones verifyTrustChain
+// returned, so a caller that has not run the trust check has nothing to pass.
+// Tests inject a fake.
+type workloadClientFactory func(ctx context.Context, clusterKey client.ObjectKey, kubeconfig []byte) (client.Client, error)
 
 // kubeadmJoinSource is the kubeadm worker JoinMaterialSource (ADR 0010 P1). It runs
 // the owner-verified trust check, mints a short-lived bootstrap token in the
@@ -200,20 +193,50 @@ func NewKubeadmJoinSource(mgmt, caReader client.Reader, workloadClient workloadC
 	return newKubeadmJoinSource(mgmt, caReader, workloadClient, extraKinds)
 }
 
-// KubeadmTrustedClusterFilter returns a clustercache ClusterFilter that admits only
-// clusters whose control-plane kind is on the kubeadm trust allowlist (built-in
-// kinds plus the operator-level extraKinds). It is the COARSE gate so the bootstrap
-// manager's workload-client cache never connects to a k0s/k3s cluster; the FINE,
-// owner-verified trust check still runs per worker in WorkerJoin.
-func KubeadmTrustedClusterFilter(extraKinds map[schema.GroupKind]bool) func(*clusterv1.Cluster) bool {
-	return func(cluster *clusterv1.Cluster) bool {
-		if cluster == nil {
-			return false
+// NewOnDemandWorkloadClient is the production workloadClientFactory main.go wires
+// in. It builds a direct client from the verified kubeconfig, once, for the join
+// that asked for it.
+//
+// It replaces a clustercache-backed factory. clustercache is not lazy: its own
+// Cluster reconciler creates an accessor and calls Connect() for every cluster its
+// ClusterFilter admits and whose infrastructure is provisioned, then health-probes
+// it on a timer, whether or not a kubeadm KairosConfig exists. Because the filter
+// could only see Cluster.spec.controlPlaneRef, installing this provider meant the
+// bootstrap manager held admin connections to every KubeadmControlPlane and
+// KamajiControlPlane cluster in the management cluster, Kairos or not, with no
+// feature gate and no opt-out. Building the client here instead means a connection
+// exists only while a worker of ours is actually joining, and only to a cluster
+// whose kubeconfig passed the full ADR 0010 trust check.
+//
+// There is nothing to cache: the only workload objects this provider touches are
+// bootstrap-token Secrets, which must be read live, and which the clustercache
+// client already excluded from its cache.
+func NewOnDemandWorkloadClient() workloadClientFactory {
+	return func(_ context.Context, clusterKey client.ObjectKey, kubeconfig []byte) (client.Client, error) {
+		if len(kubeconfig) == 0 {
+			return nil, fmt.Errorf("refusing to connect to workload cluster %s without a verified kubeconfig", clusterKey)
 		}
-		gk := schema.GroupKind{Group: cluster.Spec.ControlPlaneRef.APIGroup, Kind: cluster.Spec.ControlPlaneRef.Kind}
-		return coarseTrustedControlPlaneKinds[gk] || extraKinds[gk]
+		restCfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+		if err != nil {
+			return nil, fmt.Errorf("parse verified kubeconfig for workload cluster %s: %w", clusterKey, err)
+		}
+		restCfg.UserAgent = workloadClientUserAgent
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			return nil, err
+		}
+		wc, err := client.New(restCfg, client.Options{Scheme: scheme})
+		if err != nil {
+			return nil, fmt.Errorf("build workload client for cluster %s: %w", clusterKey, err)
+		}
+		return wc, nil
 	}
 }
+
+// workloadClientUserAgent identifies this provider's outbound workload-cluster
+// calls in a workload apiserver's audit log. It is the user agent the
+// clustercache-backed client used, kept so audit trails survive the change.
+const workloadClientUserAgent = "cluster-api-provider-kairos-bootstrap"
 
 // WorkerJoin runs the trust check, reuses (or, if there is none, mints) the
 // worker's bootstrap token, and renders the kubeadm JoinConfiguration for a worker
@@ -224,7 +247,7 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 		return WorkerJoinMaterial{}, err
 	}
 
-	wc, err := s.workloadClient(ctx, trusted.clusterKey)
+	wc, err := s.workloadClient(ctx, trusted.clusterKey, trusted.kubeconfig)
 	if err != nil {
 		return WorkerJoinMaterial{}, newNotReady("WorkloadClusterUnreachable",
 			"waiting to reach the workload cluster to mint a bootstrap token: %v", err)
@@ -363,6 +386,11 @@ type trustedControlPlane struct {
 	endpointHost string
 	endpointPort int32
 	caCertHashes []string
+	// kubeconfig is the verified <cluster>-kubeconfig payload. It is the only
+	// thing a workload-cluster connection may be built from: it has passed the
+	// owner leg and one of the two independent anchors below, so the address it
+	// steers a client at is not tenant-chosen.
+	kubeconfig []byte
 }
 
 // verifyTrustChain implements ADR 0010 P1 step 1 (the security core). On any
@@ -509,6 +537,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 		endpointHost: cluster.Spec.ControlPlaneEndpoint.Host,
 		endpointPort: cluster.Spec.ControlPlaneEndpoint.Port,
 		caCertHashes: hashes,
+		kubeconfig:   kcData,
 	}, nil
 }
 
@@ -671,7 +700,7 @@ func (s *kubeadmJoinSource) trustedWorkloadClient(ctx context.Context, req JoinR
 	if err != nil {
 		return nil, err
 	}
-	wc, err := s.workloadClient(ctx, trusted.clusterKey)
+	wc, err := s.workloadClient(ctx, trusted.clusterKey, trusted.kubeconfig)
 	if err != nil {
 		return nil, newNotReady("WorkloadClusterUnreachable",
 			"waiting to reach the workload cluster to %s the bootstrap token: %v", verb, err)

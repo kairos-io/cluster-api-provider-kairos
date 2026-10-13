@@ -138,6 +138,21 @@ bootstrap controller does the following for each Machine:
    the controller deletes the token Secret and clears
    `status.bootstrapTokenID`.
 
+### Which clusters the bootstrap manager connects to
+
+Step 2 is also the connect gate, not only the mint gate. The bootstrap manager
+opens a workload-cluster connection in step 3, for the join that asked for it,
+built from the kubeconfig step 2 just verified. It closes with that request.
+
+So installing this provider does not, on its own, connect the manager to
+anything. A cluster the provider has no kubeadm `KairosConfig` for is never
+dialled, whatever its control-plane kind, and the only address the manager ever
+dials is one that passed the anchors in step 2.
+
+The token refresh in step 6 re-runs step 2 before it reconnects, so a
+`<cluster>-kubeconfig` Secret that is replaced or re-pointed between joins is
+re-verified rather than trusted on the strength of the first join.
+
 ## Prerequisites
 
 **Control plane.** An existing Cluster whose `spec.controlPlaneRef` is a

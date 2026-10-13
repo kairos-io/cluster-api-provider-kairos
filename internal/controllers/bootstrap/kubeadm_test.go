@@ -43,6 +43,7 @@ import (
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
@@ -238,7 +239,7 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 	src := &kubeadmJoinSource{
 		mgmt:           mgmt,
 		caReader:       caReader,
-		workloadClient: func(_ context.Context, _ client.ObjectKey) (client.Client, error) { return workload, nil },
+		workloadClient: func(_ context.Context, _ client.ObjectKey, _ []byte) (client.Client, error) { return workload, nil },
 		extraKinds:     extraKinds,
 		tokenTTL:       defaultKubeadmTokenTTL,
 		now:            func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
@@ -267,37 +268,93 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 
 func ptrBool(b bool) *bool { return &b }
 
-// TestKubeadmTrustedClusterFilter pins the COARSE connect-level filter: it admits
-// only KubeadmControlPlane and KamajiControlPlane (plus operator-flag kinds) and
-// EXCLUDES KairosControlPlane, so clustercache never dials a k0s/k3s KairosControlPlane
-// cluster. The fine per-request WorkerJoin check still refuses non-kubeadm anyway.
-func TestKubeadmTrustedClusterFilter(t *testing.T) {
-	cp := func(group, kind string) *clusterv1.Cluster {
-		return &clusterv1.Cluster{Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{APIGroup: group, Kind: kind, Name: "cp"},
-		}}
+// TestOnDemandWorkloadClient_RefusesUnverifiedKubeconfig pins the property that
+// replaced the clustercache ClusterFilter (kairos-io/kairos#5466): the only thing a
+// workload-cluster connection can be built from is a kubeconfig the trust check
+// returned. There is no resident accessor and no cluster-shaped argument that could
+// make the factory dial on its own, so a caller holding nothing but a cluster name
+// cannot open a connection.
+func TestOnDemandWorkloadClient_RefusesUnverifiedKubeconfig(t *testing.T) {
+	g := NewWithT(t)
+	factory := NewOnDemandWorkloadClient()
+	key := client.ObjectKey{Namespace: "ns", Name: "c"}
+
+	for _, kubeconfig := range [][]byte{nil, {}} {
+		wc, err := factory(context.Background(), key, kubeconfig)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(wc).To(BeNil())
+		g.Expect(err.Error()).To(ContainSubstring("without a verified kubeconfig"))
 	}
-	cases := []struct {
-		name    string
-		cluster *clusterv1.Cluster
-		extra   map[schema.GroupKind]bool
-		want    bool
-	}{
-		{"KubeadmControlPlane admitted", cp(controlPlaneGroup, "KubeadmControlPlane"), nil, true},
-		{"KamajiControlPlane admitted", cp(controlPlaneGroup, "KamajiControlPlane"), nil, true},
-		{"KairosControlPlane excluded from coarse filter", cp(controlPlaneGroup, "KairosControlPlane"), nil, false},
-		{"unknown kind rejected", cp(controlPlaneGroup, "SomethingElse"), nil, false},
-		{"lookalike in another group rejected", cp("evil.example.com", "KubeadmControlPlane"), nil, false},
-		{"operator-flag kind admitted", cp("x.example.com", "FooControlPlane"), map[schema.GroupKind]bool{{Group: "x.example.com", Kind: "FooControlPlane"}: true}, true},
-		{"nil cluster rejected", nil, nil, false},
+
+	// Bytes that are not a kubeconfig fail to parse rather than producing a client
+	// aimed at nothing.
+	wc, err := factory(context.Background(), key, []byte("not a kubeconfig"))
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(wc).To(BeNil())
+}
+
+// TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig proves the factory builds its
+// client from the kubeconfig it was handed, so the address it dials is the one the
+// trust check's anchors pinned, and that the client can address the only workload
+// objects this provider touches (bootstrap-token Secrets).
+func TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	kubeconfig := makeKubeconfig(t, "https://10.0.0.1:6443", ca)
+
+	wc, err := NewOnDemandWorkloadClient()(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, kubeconfig)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(wc).NotTo(BeNil())
+	gvk, err := apiutil.GVKForObject(&corev1.Secret{}, wc.Scheme())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(gvk.Kind).To(Equal("Secret"))
+}
+
+// TestKubeadmExtendWorkerToken_ReverifiesTrust pins that the extend path runs the
+// trust check before it reconnects. It used to lean on the clustercache
+// ClusterFilter, which is gone; a refresh that reconnected on bytes nothing
+// re-verified would be the one path that dials an unchecked address after the
+// kubeconfig Secret has been replaced.
+func TestKubeadmExtendWorkerToken_ReverifiesTrust(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	fx := defaultFixture(ca)
+	// Break the owner leg the way a planted replacement Secret would: the
+	// kubeconfig Secret is no longer owned by the resolved control plane.
+	fx.ownerUID = types.UID("someone-else")
+	s, req, _ := buildSource(t, fx, nil)
+
+	var connected bool
+	s.workloadClient = func(_ context.Context, _ client.ObjectKey, _ []byte) (client.Client, error) {
+		connected = true
+		return nil, errors.New("should not be reached")
 	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			g.Expect(KubeadmTrustedClusterFilter(tc.extra)(tc.cluster)).To(Equal(tc.want))
-		})
+
+	_, err := s.ExtendWorkerToken(context.Background(), req, "abcdef")
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(connected).To(BeFalse(), "extend connected to the workload cluster without re-verifying trust")
+}
+
+// TestKubeadmExtendWorkerToken_ConnectsOnVerifiedTrust is the other half: when trust
+// still holds, the extend path does reach the workload cluster, and it is handed
+// the kubeconfig the check verified rather than a cluster name to resolve itself.
+func TestKubeadmExtendWorkerToken_ConnectsOnVerifiedTrust(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	s, req, workload := buildSource(t, defaultFixture(ca), nil)
+
+	var got []byte
+	s.workloadClient = func(_ context.Context, _ client.ObjectKey, kubeconfig []byte) (client.Client, error) {
+		got = kubeconfig
+		return workload, nil
 	}
+
+	// No token Secret in the workload cluster: ExtendWorkerToken reports it is
+	// gone, and the caller re-renders so WorkerJoin mints a replacement.
+	found, err := s.ExtendWorkerToken(context.Background(), req, "abcdef")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeFalse())
+	g.Expect(got).To(Equal(makeKubeconfig(t, fmt.Sprintf("https://%s:%d", testEndpointHost, testEndpointPort), ca)))
 }
 
 // TestKubeadmWorkerJoin_Accepts covers the three legitimate trust shapes and
@@ -557,7 +614,7 @@ func TestKubeadmWorkerJoin_NotReady(t *testing.T) {
 		{"no control-plane endpoint", func(fx *kubeadmFixture) { fx.endpoint = false }, nil},
 		{"kubeconfig Secret absent", func(fx *kubeadmFixture) { fx.noKubeconfig = true }, nil},
 		{"workload cluster unreachable", nil, func(s *kubeadmJoinSource) {
-			s.workloadClient = func(_ context.Context, _ client.ObjectKey) (client.Client, error) {
+			s.workloadClient = func(_ context.Context, _ client.ObjectKey, _ []byte) (client.Client, error) {
 				return nil, errors.New("dial tcp: timeout")
 			}
 		}},

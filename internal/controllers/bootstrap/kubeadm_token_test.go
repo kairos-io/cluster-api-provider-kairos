@@ -255,7 +255,7 @@ func TestKubeadmExtendWorkerToken(t *testing.T) {
 	t.Run("empty or malformed ID -> not found, workload not contacted", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, _ := buildSource(t, defaultFixture(ca), nil)
-		src.workloadClient = func(context.Context, client.ObjectKey) (client.Client, error) {
+		src.workloadClient = func(context.Context, client.ObjectKey, []byte) (client.Client, error) {
 			t.Fatalf("workload cluster must not be contacted")
 			return nil, nil
 		}
@@ -280,7 +280,7 @@ func TestKubeadmExtendWorkerToken(t *testing.T) {
 	t.Run("workload unreachable -> not ready", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, _ := buildSource(t, defaultFixture(ca), nil)
-		src.workloadClient = func(context.Context, client.ObjectKey) (client.Client, error) {
+		src.workloadClient = func(context.Context, client.ObjectKey, []byte) (client.Client, error) {
 			return nil, errors.New("connection refused")
 		}
 		_, err := src.ExtendWorkerToken(context.Background(), req, "abcdef")
@@ -310,7 +310,7 @@ func TestKubeadmRevokeWorkerToken(t *testing.T) {
 	t.Run("malformed ID -> no-op", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, _ := buildSource(t, defaultFixture(ca), nil)
-		src.workloadClient = func(context.Context, client.ObjectKey) (client.Client, error) {
+		src.workloadClient = func(context.Context, client.ObjectKey, []byte) (client.Client, error) {
 			t.Fatalf("workload cluster must not be contacted")
 			return nil, nil
 		}
