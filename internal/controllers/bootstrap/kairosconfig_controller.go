@@ -83,7 +83,8 @@ type KairosConfigReconciler struct {
 	// distribution name. It is optional: a nil map or a missing key uses the
 	// built-in source over r.Client, so existing construction sites (main.go,
 	// envtest, unit tests) need no change. P1 wires a "kubeadm" source here, which
-	// needs dependencies only main.go has (cached/uncached readers, clustercache).
+	// needs dependencies only main.go has (cached/uncached management readers and
+	// the on-demand workload-client factory).
 	JoinSources map[string]JoinMaterialSource
 	// Now is an injectable clock used by the kubeadm token-refresh hard cap
 	// (ADR 0010 P1 item 7). Nil means time.Now; tests set it to drive the cap.
@@ -516,7 +517,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		// Typed not-ready signal from a JoinMaterialSource (ADR 0010 P1 item 6):
-		// transient workload-cluster/clustercache/API conditions on the kubeadm
+		// transient workload-cluster connect and API conditions on the kubeadm
 		// path. Requeue and leave conditions alone — do NOT park the KairosConfig.
 		var notReady *bootstrapNotReadyError
 		if errors.As(err, &notReady) {

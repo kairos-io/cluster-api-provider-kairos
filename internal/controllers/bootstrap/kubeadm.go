@@ -34,6 +34,7 @@ import (
 	"github.com/blang/semver/v4"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -176,9 +177,10 @@ func newKubeadmJoinSource(mgmt, caReader client.Reader, workloadClient workloadC
 // KairosConfigReconciler.JoinSources["kubeadm"] (ADR 0010 P1). It returns the
 // JoinMaterialSource interface; the reconciler finds the optional token-refresh
 // capability by type assertion. mgmt is a cached management reader; caReader is an
-// UNCACHED management reader for the <cluster>-ca cross-check; workloadClient is a
-// clustercache-backed, ClusterFilter-gated workload-client factory; extraKinds is
-// the operator-level allowlist widener.
+// UNCACHED management reader for the <cluster>-ca cross-check; workloadClient
+// builds a workload-cluster client on demand from the kubeconfig the trust check
+// has just verified (NewOnDemandWorkloadClient in production); extraKinds is the
+// operator-level allowlist widener.
 func NewKubeadmJoinSource(mgmt, caReader client.Reader, workloadClient workloadClientFactory, extraKinds map[schema.GroupKind]bool) JoinMaterialSource {
 	return newKubeadmJoinSource(mgmt, caReader, workloadClient, extraKinds)
 }
@@ -202,6 +204,13 @@ func NewKubeadmJoinSource(mgmt, caReader client.Reader, workloadClient workloadC
 // bootstrap-token Secrets, which must be read live, and which the clustercache
 // client already excluded from its cache.
 func NewOnDemandWorkloadClient() workloadClientFactory {
+	return newOnDemandWorkloadClient(workloadClientTimeout)
+}
+
+// newOnDemandWorkloadClient is NewOnDemandWorkloadClient with the per-request
+// timeout as a parameter, so a test can prove the timeout is honoured without
+// waiting the production ten seconds.
+func newOnDemandWorkloadClient(timeout time.Duration) workloadClientFactory {
 	return func(_ context.Context, clusterKey client.ObjectKey, kubeconfig []byte) (client.Client, error) {
 		if len(kubeconfig) == 0 {
 			return nil, fmt.Errorf("refusing to connect to workload cluster %s without a verified kubeconfig", clusterKey)
@@ -211,16 +220,38 @@ func NewOnDemandWorkloadClient() workloadClientFactory {
 			return nil, fmt.Errorf("parse verified kubeconfig for workload cluster %s: %w", clusterKey, err)
 		}
 		restCfg.UserAgent = workloadClientUserAgent
+		restCfg.Timeout = timeout
 		scheme := runtime.NewScheme()
 		if err := corev1.AddToScheme(scheme); err != nil {
 			return nil, err
 		}
-		wc, err := client.New(restCfg, client.Options{Scheme: scheme})
+		wc, err := client.New(restCfg, client.Options{Scheme: scheme, Mapper: workloadRESTMapper()})
 		if err != nil {
 			return nil, fmt.Errorf("build workload client for cluster %s: %w", clusterKey, err)
 		}
 		return wc, nil
 	}
+}
+
+// workloadClientTimeout bounds every request this client makes, as the
+// clustercache client's rest.Config did. It is not redundant with the reconcile
+// context: a workload API server that completes the TCP and TLS handshakes and
+// then never answers blocks the call for as long as the context allows, and the
+// KairosConfig controller runs a single worker, so one such cluster would stall
+// every KairosConfig reconcile in the management cluster, k0s and k3s included.
+const workloadClientTimeout = 10 * time.Second
+
+// workloadRESTMapper is the REST mapper the on-demand client uses. It is static
+// because the factory runs per join: a discovery-backed mapper would re-run full
+// discovery against the workload cluster on every mint and every token refresh,
+// for one mapping that cannot change. core/v1 Secret is the only workload kind
+// this provider touches (mintBootstrapToken creates one, bootstrapTokenExpiry
+// reads one), so anything outside it is a programming error and should fail here
+// with "no matches for kind" rather than silently cost a discovery round trip.
+func workloadRESTMapper() meta.RESTMapper {
+	m := meta.NewDefaultRESTMapper([]schema.GroupVersion{corev1.SchemeGroupVersion})
+	m.Add(corev1.SchemeGroupVersion.WithKind("Secret"), meta.RESTScopeNamespace)
+	return m
 }
 
 // workloadClientUserAgent identifies this provider's outbound workload-cluster

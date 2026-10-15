@@ -66,7 +66,8 @@ var bootstrapDistributions = map[string]bootstrapDistribution{
 		builtinJoin: func(c client.Reader) JoinMaterialSource { return k3sJoinSource{c: c} },
 	},
 	// kubeadm (ADR 0010 P1): builtinJoin is nil — the worker JoinMaterialSource
-	// needs dependencies only main.go has (clustercache, an uncached reader, the
+	// needs dependencies only main.go has (the on-demand workload-client factory,
+	// an uncached reader, the
 	// control-plane GroupKind allowlist), so it is injected via JoinSources and
 	// joinSourceFor hard-fails if that wiring is missing (N2). fillTemplateData
 	// copies the minted join material from the source and builds the providerID

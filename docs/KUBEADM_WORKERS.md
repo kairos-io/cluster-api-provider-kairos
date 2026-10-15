@@ -126,13 +126,26 @@ bootstrap controller does the following for each Machine:
 ### Which clusters the bootstrap manager connects to
 
 Step 2 is also the connect gate, not only the mint gate. The bootstrap manager
-opens a workload-cluster connection in step 3, for the join that asked for it,
-built from the kubeconfig step 2 just verified. It closes with that request.
+builds a workload-cluster client in step 3, for the join that asked for it, from
+the kubeconfig step 2 just verified. The client is discarded with that request
+and every call it makes is bounded by a 10-second timeout. The TCP connection
+itself can outlive it: client-go caches transports process-wide by TLS
+configuration, so a later join to the same cluster may reuse an idle connection.
+Nothing polls or health-probes it, and no connection is held open for a cluster
+that is not joining a worker.
 
 So installing this provider does not, on its own, connect the manager to
 anything. A cluster the provider has no kubeadm `KairosConfig` for is never
-dialled, whatever its control-plane kind, and the only address the manager ever
-dials is one that passed the anchors in step 2.
+dialled, whatever its control-plane kind.
+
+What the anchors in step 2 constrain about that address depends on which anchor
+held. Under the endpoint anchor it is `Cluster.spec.controlPlaneEndpoint`
+itself. Under the `<cluster>-ca` anchor the kubeconfig's `server` is deliberately
+not constrained, because Kamaji publishes an internal address there; what the
+anchor pins is the CA, so whatever answers must serve a certificate issued by
+the CA in the `<cluster>-ca` Secret. Protect that Secret accordingly: for a
+cluster relying on the second anchor it, rather than the `server` field, is what
+keeps the manager's admin credentials from being steered elsewhere.
 
 The token refresh in step 6 re-runs step 2 before it reconnects, so a
 `<cluster>-kubeconfig` Secret that is replaced or re-pointed between joins is

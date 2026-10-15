@@ -242,8 +242,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// One signal-handler context for both the clustercache setup (its lifecycle is
-	// tied to this ctx) and mgr.Start. SetupSignalHandler must be called exactly once.
+	// One signal-handler context for both controller registration (whose
+	// lifecycle is tied to this ctx) and mgr.Start. SetupSignalHandler must be
+	// called exactly once.
 	ctx := ctrl.SetupSignalHandler()
 
 	kubeadmExtraKinds, err := parseGroupKinds(kubeadmExtraKindsFlag)
