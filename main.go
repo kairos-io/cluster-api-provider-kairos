@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -201,6 +202,35 @@ func managerOptions(role controllerRole, metricsAddr, probeAddr string, enableLe
 	return opts
 }
 
+// lastAppliedConfigAnnotation is kubectl's record of the object as applied. On
+// a Secret it is the full object, data included, so it defeats a metadata-only
+// watch unless it is stripped before the object reaches the cache.
+const lastAppliedConfigAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
+
+// stripSecretCachePayload removes everything that can carry Secret data into
+// the cache through ObjectMeta. It is a cache transform, so it runs on the
+// cache's own copy and never on an object handed back to a caller by a live
+// (uncached) read.
+func stripSecretCachePayload(in any) (any, error) {
+	obj, err := meta.Accessor(in)
+	if err != nil {
+		// Not an API object (a cache.DeletedFinalStateUnknown tombstone, say).
+		// Nothing to strip, and dropping it would lose the delete event.
+		return in, nil
+	}
+	// Nil-check before setting, per kubernetes/kubernetes#124337.
+	if obj.GetManagedFields() != nil {
+		obj.SetManagedFields(nil)
+	}
+	if annotations := obj.GetAnnotations(); annotations != nil {
+		if _, ok := annotations[lastAppliedConfigAnnotation]; ok {
+			delete(annotations, lastAppliedConfigAnnotation)
+			obj.SetAnnotations(annotations)
+		}
+	}
+	return in, nil
+}
+
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
@@ -284,6 +314,23 @@ func main() {
 	}
 
 	mgrOptions := managerOptions(role, metricsAddr, probeAddr, enableLeaderElection, watchNamespace, watchSingle)
+
+	// Secret cache hygiene. The three Secret watches are metadata-only, so the
+	// cache holds PartialObjectMetadata and never the Secret body — but
+	// ObjectMeta still carries two things that can hold the body anyway:
+	//
+	//   - managedFields, which is pure bookkeeping for anything we do here;
+	//   - the kubectl.kubernetes.io/last-applied-configuration annotation,
+	//     which is the full serialised object, data included, for any Secret
+	//     created with `kubectl apply`.
+	//
+	// Strip both before the object is committed to the cache. Keyed by
+	// corev1.Secret: the cache resolves ByObject entries by GVK, and a
+	// PartialObjectMetadata for v1/Secret resolves to the same GVK, so this
+	// reaches the metadata informers.
+	mgrOptions.Cache.ByObject = map[client.Object]cache.ByObject{
+		&corev1.Secret{}: {Transform: stripSecretCachePayload},
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
