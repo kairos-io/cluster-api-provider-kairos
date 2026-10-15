@@ -153,8 +153,14 @@ func (r controllerRole) leaderElectionID() string {
 // predicates select on, so a selector-scoped cache would still hold them.
 // Not caching them at all is what removes the resident copy.
 //
-// This costs a GET per read on paths that run per reconcile, and it starts no
-// informer, which is why the generated role no longer needs watch on secrets.
+// This costs a GET per read on paths that run per reconcile. It does NOT remove
+// every resident copy: three controllers still call Watches on corev1.Secret
+// (kairosconfig_controller.go, kairoscontrolplane_controller.go), and Watches
+// builds its informer on mgr.GetCache() directly, which Client.Cache.DisableFor
+// does not reach. So the manager still caches Secrets through those watches, and
+// the role still needs watch on secrets — without it the reflector's WATCH is
+// refused and it falls back to re-LISTing every Secret in scope on a timer,
+// which is strictly worse. Narrowing those three watches is kairos-io/kairos#5499.
 var uncachedTypes = []client.Object{&corev1.Secret{}}
 
 // managerOptions builds the options ctrl.NewManager is called with. It is the
