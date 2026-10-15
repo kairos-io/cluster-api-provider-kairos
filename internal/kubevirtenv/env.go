@@ -36,7 +36,7 @@ type Environment struct {
 	// clusterctl version by EnsurePinnedCLIs if empty.
 	CAPIVersion string
 
-	// CAPKInfra is the --infrastructure argument (e.g. "kubevirt", "kubevirt:v1.2.3"). Empty defaults to kubevirt / CAPK_VERSION env in InstallCAPK.
+	// CAPKInfra is the --infrastructure argument (e.g. "kubevirt", "kubevirt:v1.2.3"). Empty defaults to kubevirt / CAPK_VERSION env in InstallCAPIAndCAPK.
 	CAPKInfra string
 
 	// Stdout/Stderr for kind, kubectl, clusterctl child processes (nil = os.Stdout / os.Stderr).
