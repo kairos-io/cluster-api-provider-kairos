@@ -157,7 +157,7 @@ const kubeconfigReadyTimeout = controlplanev1beta2.KubeconfigReadyTimeout
 // verbs borrowed from the sibling bootstrap controller's grant; declared here
 // explicitly. (KD-46 minimization: no delete — the join-token/kubeconfig Secrets
 // cascade via owner references, not direct deletes.)
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;create;update;patch
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 //

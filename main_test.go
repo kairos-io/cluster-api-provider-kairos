@@ -181,8 +181,17 @@ func TestControllerRole_LeaderElectionIDsAreDistinct(t *testing.T) {
 //   - internal/controllers/controlplane: the HA token, etcd and SSH-fallback Secrets
 //   - clustercache's SecretClient, which resolves <cluster>-kubeconfig on connect
 //
-// If a later change drops this the leak is silent: nothing fails, the process
-// just starts holding credentials again. Hence a test rather than a comment.
+// If a later change drops this the regression is silent: nothing fails, those
+// reads just start populating the cache again. Hence a test rather than a comment.
+//
+// What this does NOT cover, and what no assertion on manager.Options can: the
+// three Watches(&corev1.Secret{}) calls in kairosconfig_controller.go and
+// kairoscontrolplane_controller.go build their informers on mgr.GetCache()
+// directly, which Client.Cache.DisableFor does not reach, so Secret data from
+// the watched scope is still resident. Covering that needs an envtest running
+// the manager under the generated ClusterRole and asserting on the cache, and
+// narrowing the watches themselves is kairos-io/kairos#5499. Read a pass here as
+// "the client read path does not cache Secrets", not as "no Secret is cached".
 func TestManagerOptions_SecretsAreNotCached(t *testing.T) {
 	secretGVK, err := apiutil.GVKForObject(&corev1.Secret{}, scheme)
 	if err != nil {
