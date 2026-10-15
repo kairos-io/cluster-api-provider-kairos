@@ -25,6 +25,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 
 	"fmt"
 	"math/big"
@@ -33,6 +36,8 @@ import (
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -651,4 +656,102 @@ func TestKubeadmWorkerJoin_MissingVersionTerminal(t *testing.T) {
 	g.Expect(err.Error()).To(ContainSubstring("Machine.spec.version"))
 	var nr *bootstrapNotReadyError
 	g.Expect(errors.As(err, &nr)).To(BeFalse())
+}
+
+// TestOnDemandWorkloadClient_TimesOut pins that a workload API server which
+// completes the connection and then never answers cannot hold the call open.
+// The KairosConfig controller runs a single worker, so one such cluster would
+// otherwise stall every KairosConfig reconcile in the management cluster, k0s
+// and k3s included. The clustercache client this factory replaced bounded its
+// requests the same way.
+func TestOnDemandWorkloadClient_TimesOut(t *testing.T) {
+	g := NewWithT(t)
+
+	// The handler blocks until the test is over: the server accepts and keeps
+	// the request, which is the shape a hung apiserver presents.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	const timeout = 300 * time.Millisecond
+	wc, err := newOnDemandWorkloadClient(timeout)(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, makeKubeconfig(t, srv.URL, nil))
+	g.Expect(err).NotTo(HaveOccurred())
+
+	// A context with no deadline: only the client's own timeout can end this. The
+	// Get runs in its own goroutine so an unbounded client fails this test in
+	// seconds instead of hanging until the package deadline.
+	done := make(chan error, 1)
+	go func() {
+		done <- wc.Get(context.Background(), client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"}, &corev1.Secret{})
+	}()
+
+	select {
+	case getErr := <-done:
+		g.Expect(getErr).To(HaveOccurred(), "the client returned success from a server that never answers")
+	case <-time.After(10 * timeout):
+		t.Fatal("the request was not bounded by the client timeout")
+	}
+
+	// And the production factory carries a bound rather than none.
+	g.Expect(workloadClientTimeout).To(BeNumerically(">", time.Duration(0)))
+}
+
+// TestOnDemandWorkloadClient_RunsNoDiscovery pins that building the client per
+// join does not pay for discovery per join. The factory runs on every mint and
+// every token refresh, and the only workload kind this provider touches is a
+// core/v1 Secret, so a discovery-backed REST mapper would re-list every group
+// and resource in the workload cluster to re-derive one mapping that cannot
+// change.
+func TestOnDemandWorkloadClient_RunsNoDiscovery(t *testing.T) {
+	g := NewWithT(t)
+
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
+	}))
+	defer srv.Close()
+
+	factory := newOnDemandWorkloadClient(5 * time.Second)
+	key := client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"}
+	// Two clients, as a mint followed by a refresh would build.
+	for i := 0; i < 2; i++ {
+		wc, err := factory(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, makeKubeconfig(t, srv.URL, nil))
+		g.Expect(err).NotTo(HaveOccurred())
+		err = wc.Get(context.Background(), key, &corev1.Secret{})
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "unexpected error from the workload server: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	g.Expect(paths).To(Equal([]string{
+		"/api/v1/namespaces/kube-system/secrets/bootstrap-token-abcdef",
+		"/api/v1/namespaces/kube-system/secrets/bootstrap-token-abcdef",
+	}), "the client made requests other than the Secret GET; discovery is back")
+}
+
+// TestWorkloadRESTMapper_CoversOnlyTheSecret states the mapper's contract: the
+// bootstrap-token Secret maps, and a kind this provider has no business reading
+// in a workload cluster fails here rather than reaching the apiserver.
+func TestWorkloadRESTMapper_CoversOnlyTheSecret(t *testing.T) {
+	g := NewWithT(t)
+	m := workloadRESTMapper()
+
+	mapping, err := m.RESTMapping(schema.GroupKind{Kind: "Secret"}, "v1")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(mapping.Resource.Resource).To(Equal("secrets"))
+	g.Expect(mapping.Scope.Name()).To(Equal(meta.RESTScopeNameNamespace))
+
+	_, err = m.RESTMapping(schema.GroupKind{Kind: "Node"}, "v1")
+	g.Expect(err).To(HaveOccurred())
 }
