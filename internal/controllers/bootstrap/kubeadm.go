@@ -67,9 +67,19 @@ const (
 	// the operational backstop.
 	kubeadmTokenRefreshCap = 24 * time.Hour
 
+	// minTokenRecheckInterval floors the extension cadence so an operator-set TTL of
+	// a few seconds cannot turn the requeue into a hot loop against the workload API.
+	minTokenRecheckInterval = 30 * time.Second
+
 	// kubeadmBootstrapTokenGroups is the extra-groups value CABPK sets so the token
 	// authenticates as a node bootstrapper (kubeadmconfig_controller token.go).
 	kubeadmBootstrapTokenGroups = "system:bootstrappers:kubeadm:default-node-token"
+
+	// kubeadmTokenOwnerLabel records the UID of the KairosConfig a token was minted
+	// for. A token whose ID never reached status (a failed status write after a
+	// successful mint) is otherwise unattributable; with the label it is still
+	// collectable by whoever cleans up after the owning object.
+	kubeadmTokenOwnerLabel = "bootstrap.cluster.x-k8s.io/kairosconfig-uid"
 
 	// workloadKubeconfigSecretKey is the data key CAPI kubeconfig Secrets use.
 	workloadKubeconfigSecretKey = "value"
@@ -219,7 +229,14 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 		return WorkerJoinMaterial{}, newNotReady("WorkloadClusterUnreachable",
 			"waiting to reach the workload cluster to mint a bootstrap token: %v", err)
 	}
-	token, tokenID, err := mintBootstrapToken(ctx, wc, s.ttl(), s.clock())
+	// ownerUID labels the minted token with the KairosConfig it belongs to. Guard
+	// the nil Config the way the rest of WorkerJoin's inputs are guarded: the trust
+	// check already tolerates it, so a nil must not panic here either.
+	var ownerUID string
+	if req.Config != nil {
+		ownerUID = string(req.Config.UID)
+	}
+	token, tokenID, err := mintBootstrapToken(ctx, wc, s.ttl(), s.clock(), ownerUID)
 	if err != nil {
 		return WorkerJoinMaterial{}, newNotReady("TokenMintFailed",
 			"waiting to mint a bootstrap token in the workload cluster: %v", err)
@@ -483,60 +500,111 @@ func (s *kubeadmJoinSource) resolveCP(ctx context.Context, ref clusterv1.Contrac
 	return external.GetObjectFromContractVersionedRef(ctx, s.mgmt, ref, namespace)
 }
 
-// TokenNeedsRefresh implements workerTokenRefresher (ADR 0010 P1 item 7). It is
-// READ-ONLY and is only ever reached AFTER a prior successful WorkerJoin: the
-// reconciler calls it with the non-secret tokenID persisted in status, which is set
-// only once the full trust check passed and a token was minted. It mints nothing and
-// re-verifies no trust itself; the coarse clustercache ClusterFilter still gates the
-// workload client it uses, and the next regeneration re-runs the full trust check. It
-// reads the token Secret the ID points at and rotates when the token is gone or past
-// half its TTL — CABPK's shouldRotate, keyed by the stored ID so we never need the
-// secret half. Transient workload-cluster errors are returned as bootstrapNotReadyError.
-func (s *kubeadmJoinSource) TokenNeedsRefresh(ctx context.Context, req JoinRequest, tokenID string) (bool, error) {
+// EnsureWorkerToken implements workerTokenRefresher (ADR 0010 P1 item 7). It is
+// only ever reached AFTER a prior successful WorkerJoin: the reconciler calls it
+// with the non-secret tokenID persisted in status, which is set only once the full
+// trust check passed and a token was minted. It re-verifies no trust itself; the
+// coarse clustercache ClusterFilter still gates the workload client it uses, and
+// the next regeneration re-runs the full trust check.
+//
+// It EXTENDS the recorded token rather than minting a replacement. The booting node
+// is holding the token the infrastructure provider copied into its userdata at the
+// first render, and nothing rewrites that copy, so a replacement token would never
+// reach the node: only moving this token's expiry keeps a slow install able to join.
+// remint is therefore true only when the Secret is gone and there is nothing left to
+// extend. The returned nextCheck puts the following check on the token's own clock.
+func (s *kubeadmJoinSource) EnsureWorkerToken(ctx context.Context, req JoinRequest, tokenID string) (bool, time.Duration, error) {
 	if tokenID == "" {
-		// No token on record (never minted, or lost the ID): (re)mint.
-		return true, nil
+		// No token on record (never minted, or lost the ID): mint a fresh one.
+		return true, 0, nil
 	}
 	if req.Cluster == nil {
-		return false, newNotReady("WaitingForCluster", "waiting for the owning Cluster to check the bootstrap token")
+		return false, 0, newNotReady("WaitingForCluster", "waiting for the owning Cluster to extend the bootstrap token")
 	}
-	clusterKey := client.ObjectKey{Namespace: req.Cluster.Namespace, Name: req.Cluster.Name}
-	wc, err := s.workloadClient(ctx, clusterKey)
+	wc, err := s.workloadClientFor(ctx, req, "extend")
 	if err != nil {
-		return false, newNotReady("WorkloadClusterUnreachable", "waiting to reach the workload cluster to check the bootstrap token: %v", err)
+		return false, 0, err
 	}
-	expiry, found, err := bootstrapTokenExpiry(ctx, wc, tokenID)
-	if err != nil {
-		return false, newNotReady("TokenLookupFailed", "waiting to read the bootstrap token status: %v", err)
-	}
-	if !found {
-		// Expired and garbage-collected, or deleted: re-mint.
-		return true, nil
-	}
-	return expiry.Before(s.clock().Add(s.ttl() / 2)), nil
-}
 
-// bootstrapTokenExpiry returns the expiry of the bootstrap token Secret for tokenID
-// in the workload cluster. found is false when the Secret is absent. A token Secret
-// with no expiration key is treated as non-expiring (far-future expiry).
-func bootstrapTokenExpiry(ctx context.Context, wc client.Client, tokenID string) (time.Time, bool, error) {
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: bootstraputil.BootstrapTokenSecretName(tokenID)}
 	if err := wc.Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return time.Time{}, false, nil
+			// Expired and collected by tokencleaner, or deleted: nothing to extend.
+			return true, 0, nil
 		}
-		return time.Time{}, false, err
+		return false, 0, newNotReady("TokenLookupFailed", "waiting to read the bootstrap token to extend it: %v", err)
 	}
-	raw, ok := secret.Data[bootstrapapi.BootstrapTokenExpirationKey]
-	if !ok || len(raw) == 0 {
-		return time.Now().Add(100 * 365 * 24 * time.Hour), true, nil
+
+	want := s.clock().UTC().Add(s.ttl())
+	// A Secret with no expiration key, or one we cannot parse, is treated as DUE:
+	// we write our own expiry rather than trust a value we could not read. (Reading
+	// a missing key as "never expires" would leave a token the controller believes
+	// is valid for as long as the apiserver keeps it.)
+	if raw, ok := secret.Data[bootstrapapi.BootstrapTokenExpirationKey]; ok && len(raw) > 0 {
+		if cur, perr := time.Parse(time.RFC3339, string(raw)); perr == nil && !cur.Before(want) {
+			// Already good for a full TTL or more; leave the Secret alone.
+			return false, tokenRecheckInterval(s.ttl()), nil
+		}
 	}
-	t, err := time.Parse(time.RFC3339, string(raw))
+
+	patch := client.MergeFrom(secret.DeepCopy())
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
+	}
+	secret.Data[bootstrapapi.BootstrapTokenExpirationKey] = []byte(want.Format(time.RFC3339))
+	if err := wc.Patch(ctx, secret, patch); err != nil {
+		return false, 0, newNotReady("TokenExtendFailed", "waiting to extend the bootstrap token expiry: %v", err)
+	}
+	return false, tokenRecheckInterval(s.ttl()), nil
+}
+
+// RevokeWorkerToken implements workerTokenRefresher. It deletes the token Secret
+// the ID points at, and tolerates an already-absent Secret so a repeated call after
+// a failed status write is harmless.
+func (s *kubeadmJoinSource) RevokeWorkerToken(ctx context.Context, req JoinRequest, tokenID string) error {
+	if tokenID == "" {
+		return nil
+	}
+	if req.Cluster == nil {
+		return newNotReady("WaitingForCluster", "waiting for the owning Cluster to revoke the bootstrap token")
+	}
+	wc, err := s.workloadClientFor(ctx, req, "revoke")
 	if err != nil {
-		return time.Time{}, true, fmt.Errorf("parse token expiration: %w", err)
+		return err
 	}
-	return t, true, nil
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: metav1.NamespaceSystem,
+		Name:      bootstraputil.BootstrapTokenSecretName(tokenID),
+	}}
+	if err := wc.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+		return newNotReady("TokenRevokeFailed", "waiting to revoke the bootstrap token: %v", err)
+	}
+	return nil
+}
+
+// workloadClientFor builds the workload-cluster client for a token operation on
+// req's Cluster, reporting an unreachable cluster as a bootstrapNotReadyError so the
+// reconciler requeues instead of parking the KairosConfig. verb names the operation
+// in that message.
+func (s *kubeadmJoinSource) workloadClientFor(ctx context.Context, req JoinRequest, verb string) (client.Client, error) {
+	clusterKey := client.ObjectKey{Namespace: req.Cluster.Namespace, Name: req.Cluster.Name}
+	wc, err := s.workloadClient(ctx, clusterKey)
+	if err != nil {
+		return nil, newNotReady("WorkloadClusterUnreachable",
+			"waiting to reach the workload cluster to %s the bootstrap token: %v", verb, err)
+	}
+	return wc, nil
+}
+
+// tokenRecheckInterval is how long to wait before looking at a token again: a third
+// of its TTL, so two consecutive checks can be missed before the token lapses. The
+// floor keeps a very short configured TTL from turning the requeue into a hot loop.
+func tokenRecheckInterval(ttl time.Duration) time.Duration {
+	if d := ttl / 3; d > minTokenRecheckInterval {
+		return d
+	}
+	return minTokenRecheckInterval
 }
 
 // appendUninitializedTaint adds the node.cluster.x-k8s.io/uninitialized taint
@@ -562,7 +630,7 @@ func appendUninitializedTaint(in *[]corev1.Taint) *[]corev1.Taint {
 // It mirrors CABPK's createToken (groups/usages/keys/type); the token value is
 // never logged. (k8s.io/cluster-bootstrap is the canonical source and is already
 // pulled in by the spec.kubeadm embedding.)
-func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration, now time.Time) (token, tokenID string, err error) {
+func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration, now time.Time, ownerUID string) (token, tokenID string, err error) {
 	token, err = bootstraputil.GenerateBootstrapToken()
 	if err != nil {
 		return "", "", fmt.Errorf("generate bootstrap token: %w", err)
@@ -589,6 +657,9 @@ func mintBootstrapToken(ctx context.Context, wc client.Client, ttl time.Duration
 			bootstrapapi.BootstrapTokenExtraGroupsKey:      []byte(kubeadmBootstrapTokenGroups),
 			bootstrapapi.BootstrapTokenDescriptionKey:      []byte("token minted by cluster-api-provider-kairos (kubeadm worker join)"),
 		},
+	}
+	if ownerUID != "" {
+		secret.Labels = map[string]string{kubeadmTokenOwnerLabel: ownerUID}
 	}
 	if err := wc.Create(ctx, secret); err != nil {
 		return "", "", fmt.Errorf("create bootstrap token Secret in workload cluster: %w", err)
@@ -749,4 +820,9 @@ func hasMachinePoolOwner(refs []metav1.OwnerReference) bool {
 		}
 	}
 	return false
+}
+
+// TokenRecheckInterval implements workerTokenRefresher.
+func (s *kubeadmJoinSource) TokenRecheckInterval() time.Duration {
+	return tokenRecheckInterval(s.ttl())
 }

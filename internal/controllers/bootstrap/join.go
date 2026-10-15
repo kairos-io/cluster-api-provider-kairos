@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"time"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,18 +50,41 @@ type JoinMaterialSource interface {
 }
 
 // workerTokenRefresher is an OPTIONAL capability a JoinMaterialSource may implement
-// (found by type assertion, never required). The reconciler consults it while the
-// owning Machine has no nodeRef to decide whether the previously-minted token needs
-// re-minting before it expires (ADR 0010 P1 item 7). kubeadm implements it; k0s/k3s
-// do not — their worker tokens are long-lived or externally managed, so the
-// reconciler simply skips the refresh for them.
+// (found by type assertion, never required). The reconciler consults it to keep a
+// worker's already-minted bootstrap token usable while the owning Machine has no
+// nodeRef, and to revoke it once the node has registered (ADR 0010 P1 item 7).
+// kubeadm implements it; k0s/k3s do not — their worker tokens are long-lived or
+// externally managed, so the reconciler simply skips this for them.
 type workerTokenRefresher interface {
-	// TokenNeedsRefresh reports whether the token identified by tokenID (the
-	// non-secret ID persisted in status) should be re-minted — because it is
-	// missing from the workload cluster, or past half its TTL. A transient
-	// workload-cluster error MUST be returned as a bootstrapNotReadyError so the
-	// reconciler requeues instead of parking the KairosConfig.
-	TokenNeedsRefresh(ctx context.Context, req JoinRequest, tokenID string) (bool, error)
+	// EnsureWorkerToken keeps the token identified by tokenID (the non-secret ID
+	// persisted in status) valid for a node that is still booting. It EXTENDS that
+	// token's expiry in place; it does not mint a replacement. The infrastructure
+	// provider has already copied the token the node holds into the VM's userdata,
+	// so a newly minted token value would never reach the node — only the expiry of
+	// the token it is already holding can be moved.
+	//
+	// remint is true only when there is nothing left to extend: no ID on record, or
+	// the Secret is gone from the workload cluster. The caller then re-renders the
+	// bootstrap data, which mints a fresh token. nextCheck is when the caller should
+	// look again, derived from the token's own TTL so the extension is driven by the
+	// token's clock rather than by unrelated reconcile traffic.
+	//
+	// A transient workload-cluster error MUST be returned as a bootstrapNotReadyError
+	// so the reconciler requeues instead of parking the KairosConfig.
+	EnsureWorkerToken(ctx context.Context, req JoinRequest, tokenID string) (remint bool, nextCheck time.Duration, err error)
+
+	// RevokeWorkerToken deletes the bootstrap token tokenID from the workload
+	// cluster. It is called once the owning Machine has a nodeRef, where the node
+	// has finished joining and no longer needs the token. It is a no-op when tokenID
+	// is empty or the Secret is already gone, and reports a transient
+	// workload-cluster failure as a bootstrapNotReadyError.
+	RevokeWorkerToken(ctx context.Context, req JoinRequest, tokenID string) error
+
+	// TokenRecheckInterval is the cadence at which the reconciler should come back
+	// to extend a token, derived from the source's own TTL. The reconciler uses it
+	// to requeue right after a token is first minted, so the extension loop starts
+	// on the token's clock instead of waiting for an unrelated event.
+	TokenRecheckInterval() time.Duration
 }
 
 // JoinRequest is the read-only input to a JoinMaterialSource.

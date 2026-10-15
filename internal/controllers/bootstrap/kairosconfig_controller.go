@@ -447,19 +447,24 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 				}
 			}
 
-			// kubeadm worker bootstrap-token refresh (ADR 0010 P1 item 7), outside the
-			// render-once short-circuit below: while the Machine has no nodeRef, keep
-			// the token fresh by regenerating the bootstrap data before it expires.
-			switch decision, derr := r.decideKubeadmTokenRefresh(ctx, log, kairosConfig, machine, cluster); {
+			// kubeadm worker bootstrap-token lifecycle (ADR 0010 P1 item 7), outside
+			// the render-once short-circuit below: while the Machine has no nodeRef the
+			// token the node is holding is extended in place, and the requeue below puts
+			// the next extension on the token's own clock rather than on whatever
+			// unrelated event happens to wake this reconcile.
+			var tokenRequeue time.Duration
+			switch decision, nextCheck, derr := r.reconcileKubeadmToken(ctx, log, kairosConfig, machine, cluster); {
 			case derr != nil:
 				var notReady *bootstrapNotReadyError
 				if errors.As(derr, &notReady) {
-					log.Info("Waiting to check the kubeadm bootstrap token", "reason", notReady.Reason())
+					log.Info("Waiting to reconcile the kubeadm bootstrap token", "reason", notReady.Reason())
 					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 				}
-				return ctrl.Result{}, fmt.Errorf("kubeadm bootstrap token refresh check: %w", derr)
+				return ctrl.Result{}, fmt.Errorf("kubeadm bootstrap token reconcile: %w", derr)
+			case decision == kubeadmRefreshExtended:
+				tokenRequeue = nextCheck
 			case decision == kubeadmRefreshRegenerate:
-				log.Info("kubeadm bootstrap token is due for refresh; regenerating bootstrap data",
+				log.Info("kubeadm bootstrap token is gone; regenerating bootstrap data to mint a new one",
 					"secret", *kairosConfig.Status.DataSecretName)
 				needsRegeneration = true
 			case decision == kubeadmRefreshCapped:
@@ -499,7 +504,9 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 					}
 				}
 
-				return ctrl.Result{}, nil
+				// Requeue on the bootstrap token's own clock when there is one to keep
+				// alive; otherwise this reconcile is done and waits for a watch.
+				return ctrl.Result{RequeueAfter: tokenRequeue}, nil
 			}
 		}
 	}
@@ -680,6 +687,17 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		}
 		if updated {
 			log.Info("Sanitized CAPK userdata secret", "secret", secretName)
+		}
+	}
+
+	// A worker whose token was just minted has not joined yet: requeue on that
+	// token's own clock so the extension loop (reconcileKubeadmToken) starts here
+	// rather than waiting for some unrelated event to wake this KairosConfig.
+	if joinMaterial.Kubeadm != nil && machine != nil && machine.Status.NodeRef.Name == "" {
+		if src, serr := r.joinSourceFor(bootstrapv1beta2.DistributionKubeadm); serr == nil {
+			if refresher, ok := src.(workerTokenRefresher); ok {
+				return ctrl.Result{RequeueAfter: refresher.TokenRecheckInterval()}, nil
+			}
 		}
 	}
 
@@ -981,59 +999,85 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 // surfaced without re-minting or hammering the workqueue.
 const kubeadmTokenRefreshCapRequeue = 10 * time.Minute
 
-// kubeadmRefreshDecision is the outcome of decideKubeadmTokenRefresh.
+// kubeadmRefreshDecision is the outcome of reconcileKubeadmToken.
 type kubeadmRefreshDecision int
 
 const (
-	// kubeadmRefreshNone: no refresh applies (not a kubeadm worker, the node has
-	// already registered, or the source cannot refresh).
+	// kubeadmRefreshNone: no token work applies (not a kubeadm worker, nothing on
+	// record, or the source cannot refresh).
 	kubeadmRefreshNone kubeadmRefreshDecision = iota
-	// kubeadmRefreshRegenerate: re-mint now by regenerating the bootstrap data.
+	// kubeadmRefreshExtended: the recorded token was extended (or was already good
+	// for a full TTL). The caller must requeue at the returned nextCheck so the next
+	// extension is driven by the token's own clock.
+	kubeadmRefreshExtended
+	// kubeadmRefreshRegenerate: there is nothing left to extend, so the bootstrap
+	// data must be re-rendered to mint a fresh token.
 	kubeadmRefreshRegenerate
-	// kubeadmRefreshCapped: the hard cap elapsed; stop re-minting and surface a condition.
+	// kubeadmRefreshRevoked: the node has registered and the token was deleted.
+	kubeadmRefreshRevoked
+	// kubeadmRefreshCapped: the hard cap elapsed; stop refreshing and surface a condition.
 	kubeadmRefreshCapped
 )
 
-// decideKubeadmTokenRefresh decides whether a kubeadm worker's bootstrap token
-// should be refreshed (ADR 0010 P1 item 7). It applies only to a kubeadm worker
-// whose Machine has not yet registered a Node, and only when the join source
-// implements workerTokenRefresher. A transient workload-cluster check returns a
-// bootstrapNotReadyError (the caller requeues). It never logs the token.
-func (r *KairosConfigReconciler) decideKubeadmTokenRefresh(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (kubeadmRefreshDecision, error) {
+// reconcileKubeadmToken drives a kubeadm worker's bootstrap-token lifecycle (ADR
+// 0010 P1 item 7). It applies only to a kubeadm worker whose join source implements
+// workerTokenRefresher. While the owning Machine has no nodeRef the recorded token
+// is EXTENDED in place, because the node is already holding the token value the
+// infrastructure provider copied into its userdata; once the Machine has a nodeRef
+// the token is revoked and the recorded ID cleared. A transient workload-cluster
+// failure returns a bootstrapNotReadyError (the caller requeues). It never logs the
+// token.
+//
+// nextCheck is non-zero only for kubeadmRefreshExtended.
+func (r *KairosConfigReconciler) reconcileKubeadmToken(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (decision kubeadmRefreshDecision, nextCheck time.Duration, err error) {
 	if bootstrapv1beta2.EffectiveDistribution(kairosConfig.Spec.Distribution) != bootstrapv1beta2.DistributionKubeadm {
-		return kubeadmRefreshNone, nil
+		return kubeadmRefreshNone, 0, nil
 	}
 	if resolveRole(kairosConfig, machine) != "worker" {
-		return kubeadmRefreshNone, nil
+		return kubeadmRefreshNone, 0, nil
 	}
-	// Stop refreshing once the node has registered (nodeRef set) — the token is no
-	// longer needed. Also skip if there is no Machine to anchor the cap on.
-	if machine == nil || machine.Status.NodeRef.Name != "" {
-		return kubeadmRefreshNone, nil
+	// No Machine means there is nothing to anchor the cap on and no nodeRef to read.
+	if machine == nil {
+		return kubeadmRefreshNone, 0, nil
 	}
 	src, err := r.joinSourceFor(bootstrapv1beta2.DistributionKubeadm)
 	if err != nil {
-		return kubeadmRefreshNone, err // terminal wiring error (N2)
+		return kubeadmRefreshNone, 0, err // terminal wiring error (N2)
 	}
 	refresher, ok := src.(workerTokenRefresher)
 	if !ok {
-		return kubeadmRefreshNone, nil
+		return kubeadmRefreshNone, 0, nil
 	}
-	// Hard cap: stop re-minting once the Machine has waited too long for a Node.
+	req := JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster}
+
+	// The node has registered: the token has done its job. Revoke it now rather than
+	// leaving a usable credential until it expires, and forget the ID so a later
+	// reconcile does not try to revoke it again.
+	if machine.Status.NodeRef.Name != "" {
+		if kairosConfig.Status.BootstrapTokenID == "" {
+			return kubeadmRefreshNone, 0, nil
+		}
+		if err := refresher.RevokeWorkerToken(ctx, req, kairosConfig.Status.BootstrapTokenID); err != nil {
+			return kubeadmRefreshNone, 0, err
+		}
+		log.V(4).Info("Revoked the kubeadm bootstrap token: the node has registered")
+		kairosConfig.Status.BootstrapTokenID = ""
+		return kubeadmRefreshRevoked, 0, nil
+	}
+
+	// Hard cap: stop refreshing once the Machine has waited too long for a Node.
 	if !machine.CreationTimestamp.IsZero() && r.now().Sub(machine.CreationTimestamp.Time) > kubeadmTokenRefreshCap {
-		return kubeadmRefreshCapped, nil
+		return kubeadmRefreshCapped, 0, nil
 	}
-	need, err := refresher.TokenNeedsRefresh(ctx,
-		JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster},
-		kairosConfig.Status.BootstrapTokenID)
+	remint, nextCheck, err := refresher.EnsureWorkerToken(ctx, req, kairosConfig.Status.BootstrapTokenID)
 	if err != nil {
-		return kubeadmRefreshNone, err // bootstrapNotReadyError (transient) or terminal
+		return kubeadmRefreshNone, 0, err // bootstrapNotReadyError (transient) or terminal
 	}
-	if need {
-		log.V(4).Info("kubeadm bootstrap token due for refresh")
-		return kubeadmRefreshRegenerate, nil
+	if remint {
+		log.V(4).Info("No kubeadm bootstrap token left to extend; re-rendering to mint one")
+		return kubeadmRefreshRegenerate, 0, nil
 	}
-	return kubeadmRefreshNone, nil
+	return kubeadmRefreshExtended, nextCheck, nil
 }
 
 // now returns the current time, overridable in tests via r.Now.
