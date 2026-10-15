@@ -1,5 +1,94 @@
 # Upgrading Kairos CAPI Provider
 
+## v0.1.3 → v0.1.4
+
+Full release notes: [v0.1.4](release-notes/v0.1.4.md).
+
+No CRD schema change: the CRDs differ from v0.1.3 only in field descriptions.
+There is one check to run first.
+
+### Before upgrading: references to another namespace
+
+v0.1.4 rejects references to another namespace (#119):
+- the Secret references on `KairosConfig`: `userPasswordSecretRef`,
+  `workerTokenSecretRef`, `k3sTokenSecretRef` and
+  `controlPlaneJoinTokenSecretRef`;
+- `KairosControlPlane.spec.machineTemplate.infrastructureRef`.
+
+After the upgrade:
+- an update to an object that still carries such a reference is rejected;
+- a `KairosConfig` stamped from a `KairosConfigTemplate` that carries one is
+  rejected when Cluster API creates it, which stalls that MachineDeployment's
+  scale-up.
+
+Both commands print nothing when there is nothing to fix:
+
+```bash
+kubectl get kairosconfigs,kairosconfigtemplates -A -o json | jq -r '
+  .items[] | . as $o
+  | ($o.spec.template.spec // $o.spec) as $s
+  | ("userPasswordSecretRef", "workerTokenSecretRef", "k3sTokenSecretRef", "controlPlaneJoinTokenSecretRef") as $f
+  | ($s[$f].namespace // "") as $ns
+  | select($ns != "" and $ns != $o.metadata.namespace)
+  | "\($o.kind) \($o.metadata.namespace)/\($o.metadata.name): \($f) -> \($ns)"'
+
+kubectl get kairoscontrolplanes -A -o json | jq -r '
+  .items[]
+  | (.spec.machineTemplate.infrastructureRef.namespace // "") as $ns
+  | select($ns != "" and $ns != .metadata.namespace)
+  | "KairosControlPlane \(.metadata.namespace)/\(.metadata.name): machineTemplate.infrastructureRef -> \($ns)"'
+```
+
+For each line printed, copy the Secret or template into the object's own
+namespace. Then point the reference at that copy, or clear its `namespace`.
+`tokenSecretRef` is not affected, because the controller has always ignored
+its namespace.
+
+### If your `clusterctl.yaml` uses `releases/latest/download/`
+
+Drop the `download/` segment. A `clusterctl` provider `url` has the form
+`https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/bootstrap-components.yaml`,
+or `releases/<tag>/...` to pin a version. The `download/` form works only until
+`clusterctl` falls back to the GitHub API, for example on a rate-limited or
+proxied network. See [INSTALL.md](INSTALL.md).
+
+### Upgrade
+
+`clusterctl upgrade`, or re-applying the flat manifest, is enough:
+
+```bash
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
+```
+
+Under `clusterctl`, the control-plane provider's role gains `get` on
+`kubevirt.io/virtualmachineinstances`. That role change is what lets a CAPK
+cluster installed with `clusterctl` become reachable.
+
+### Behaviour changes to expect
+
+- **Single-node control planes** are no longer rolled out by replacement. A
+  `spec.version` change leaves the Machine alone, and `MachinesUpToDate`
+  reports `False` with reason `SingleNodeRolloutUnsupported`. On v0.1.3 that
+  change replaced the only control plane with an empty cluster.
+- **HA rollouts** remove an outdated Machine only after every up-to-date
+  Machine has joined, with one membership change in flight at a time.
+  Expect them to take longer.
+- **`machineTemplate.nodeDrainTimeout`**, if you set it, now bounds the drain
+  of control-plane Machines, existing ones included. On v0.1.3 it was
+  ignored.
+- **`machineTemplate.metadata`** is now applied to the `Machine` as well as
+  the infrastructure machine, existing Machines included. Labels in Cluster
+  API's synced domains (`node-role.kubernetes.io/*`,
+  `node-restriction.kubernetes.io/*`, `*.node.cluster.x-k8s.io/*`) then reach
+  the Node. Removing a key from the template does not remove it from
+  Machines that already carry it.
+- **Pause:** a paused Cluster stops both controllers, and holds a
+  `KairosControlPlane` deletion until it is unpaused.
+- **`caCertHashes` or `caCertSecretRef`:** setting either returns an
+  admission warning. Neither has ever had an effect.
+
+---
+
 ## v0.1.2 → v0.1.3
 
 Full release notes: [v0.1.3](release-notes/v0.1.3.md).

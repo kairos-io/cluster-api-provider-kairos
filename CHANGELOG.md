@@ -8,6 +8,72 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.1.4] — 2026-10-15
+
+A fix release for the v0.1 series: ten control-plane and bootstrap fixes and
+the Go security updates published since v0.1.3. It is cut from `main` before
+the kubeadm worker distribution merged, which ships in v0.2.0. There is no CRD
+schema change. Updates that reference another namespace are now rejected, so
+check for those before upgrading; see the
+[v0.1.4 release notes](docs/release-notes/v0.1.4.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md).
+
+### Fixed
+
+- **A control-plane rollout could delete a member before its replacement
+  joined** (#117). On HA, an etcd member was removed while its replacement
+  was still booting. On a single-node control plane, a `spec.version` change
+  replaced the only control plane with an empty cluster.
+  - Single-node control planes are no longer rolled out by replacement;
+    `MachinesUpToDate` reports `SingleNodeRolloutUnsupported`.
+  - HA removes an outdated Machine only after every up-to-date Machine has
+    joined, one membership change at a time.
+- **A CAPK cluster installed with `clusterctl` never became reachable**
+  (#118). The control-plane provider's role could not read
+  VirtualMachineInstances, so the API load balancer never got a backend. The
+  flat manifest was unaffected.
+- **`Cluster.spec.paused` was ignored** by both reconcilers (#109). Deleting a
+  `KairosControlPlane` while its Cluster was paused went straight into
+  teardown (#120). Both now wait for the unpause.
+- **`clusterctl move` left the referenced machine template and
+  `KairosConfigTemplate` behind** (#110). They now carry a (non-controller)
+  owner reference to the Cluster.
+- **`machineTemplate.nodeDrainTimeout` was ignored** (#112). It now reaches
+  the Machine, existing Machines included, and a value too large for int32
+  seconds is capped rather than wrapping to "no deadline" (#115).
+- **`machineTemplate.metadata` never reached the `Machine`**, only the
+  infrastructure machine, so its labels never reached the Node (#114). It is
+  now applied to new and existing Machines, additively.
+- **`caCertHashes` and `caCertSecretRef` were documented as securing the join
+  but are read by nothing.** Setting either now returns an admission warning
+  (#116).
+
+### Security
+
+- **References to another namespace are refused** (#119). A `KairosConfig`
+  Secret reference could name any namespace, and the controller copied that
+  Secret into bootstrap data the author can read. A `KairosControlPlane`
+  `machineTemplate.infrastructureRef` in another namespace was cloned, and
+  given an owner reference that let the garbage collector delete it. Both
+  webhooks and the controllers now refuse these.
+- **The image is built with Go 1.26.9**, clearing thirteen standard-library
+  advisories, eight of them in `net/http` and HTTP/2. The release notes list
+  each one.
+- **`golang.org/x/net` v0.58.0 to v0.60.0** (#143), clearing GO-2026-6603,
+  GO-2026-6610, GO-2026-6611, GO-2026-6612 and GO-2026-6617, with
+  `golang.org/x/crypto` to v0.57.0 alongside.
+
+### Changed
+
+- `github.com/go-logr/logr` v1.4.3 to v1.4.4 (#129).
+
+### Documentation
+
+- The `clusterctl` provider URLs in `docs/INSTALL.md` are now in the form
+  `clusterctl` parses. `releases/latest/download/...` works only until
+  `clusterctl` falls back to the GitHub API. The sample manifests are
+  repaired so the API server accepts them (#111).
+
 ## [v0.1.3] — 2026-09-17
 
 A fix and supply-chain release. One real bootstrap bug, found on bare metal,
