@@ -240,6 +240,10 @@ make uninstall
 
 ### `--kubeadm-extra-controlplane-kinds`
 
+Not in v0.1.4. This flag ships with the kubeadm worker distribution, which is
+planned for v0.2.0. A v0.1.4 manager given this flag refuses to start, with
+`flag provided but not defined`.
+
 Applies to the bootstrap manager only. It widens the set of control-plane kinds
 that a kubeadm worker (a `KairosConfig` with `distribution: kubeadm`) may join.
 See [Kubeadm workers](KUBEADM_WORKERS.md) for how the worker join uses it.
