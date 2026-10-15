@@ -1953,25 +1953,34 @@ func (r *KairosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error 
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.clusterToKairosControlPlane),
 		).
+		// OnlyMetadata: this watch exists to re-enqueue a KairosControlPlane when
+		// a node pushes its kubeconfig Secret, and neither the predicate nor the
+		// mapper needs the Secret body. A typed watch would make the manager's
+		// cache hold every Secret in every watched namespace for the process
+		// lifetime, data included, which on a shared management cluster means
+		// every workload cluster's kubeconfig and Kamaji's CA key material.
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.secretToKairosControlPlane),
-			// KD-15-compliant predicate: filter by Type and the
-			// cluster-name label, never by name suffix. The previous
-			// strings.HasSuffix predicate matched anything-kubeconfig,
-			// including unrelated workload-cluster Secrets and any
-			// future tenant that happens to suffix with -kubeconfig.
-			// The KD-3b push payload always stamps both fields, so a
-			// node-pushed kubeconfig Secret reliably matches.
+			builder.OnlyMetadata,
+			// KD-15-compliant predicate: filter by the cluster-name label,
+			// never by name suffix. The previous strings.HasSuffix
+			// predicate matched anything-kubeconfig, including unrelated
+			// workload-cluster Secrets and any future tenant that happens
+			// to suffix with -kubeconfig. The KD-3b push payload always
+			// stamps the label, so a node-pushed kubeconfig Secret
+			// reliably matches.
+			//
+			// The Type == ClusterSecretType half of this predicate is gone,
+			// because PartialObjectMetadata carries no Type. It was only ever
+			// a pre-filter: the mapper below resolves the named Cluster and
+			// returns a request only when its controlPlaneRef is a
+			// KairosControlPlane, so nothing else can be enqueued. The cost is
+			// that a Secret which carries a cluster-name label but is not a
+			// CAPI-typed one now reaches the mapper, where it pays one cached
+			// Cluster read.
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-				secret, ok := obj.(*corev1.Secret)
-				if !ok {
-					return false
-				}
-				if secret.Type != clusterv1.ClusterSecretType {
-					return false
-				}
-				return secret.Labels[clusterv1.ClusterNameLabel] != ""
+				return obj.GetLabels()[clusterv1.ClusterNameLabel] != ""
 			})),
 		).
 		Complete(r)
@@ -2049,18 +2058,15 @@ func (r *KairosControlPlaneReconciler) clusterToKairosControlPlane(ctx context.C
 // label, not the legacy `strings.TrimSuffix(secret.Name, "-kubeconfig")`
 // heuristic that would mis-match user-created secrets named *-kubeconfig.
 func (r *KairosControlPlaneReconciler) secretToKairosControlPlane(ctx context.Context, o client.Object) []reconcile.Request {
-	secret, ok := o.(*corev1.Secret)
-	if !ok {
-		return nil
-	}
-
-	clusterName := secret.Labels[clusterv1.ClusterNameLabel]
+	// Reads metadata only: the watch that feeds this mapper is OnlyMetadata, so
+	// o is a *metav1.PartialObjectMetadata, not a *corev1.Secret.
+	clusterName := o.GetLabels()[clusterv1.ClusterNameLabel]
 	if clusterName == "" {
 		return nil
 	}
 
 	cluster := &clusterv1.Cluster{}
-	if err := r.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: secret.Namespace}, cluster); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: o.GetNamespace()}, cluster); err != nil {
 		return nil
 	}
 
@@ -2072,7 +2078,7 @@ func (r *KairosControlPlaneReconciler) secretToKairosControlPlane(ctx context.Co
 		{
 			NamespacedName: types.NamespacedName{
 				Name:      cluster.Spec.ControlPlaneRef.Name,
-				Namespace: secret.Namespace,
+				Namespace: o.GetNamespace(),
 			},
 		},
 	}
