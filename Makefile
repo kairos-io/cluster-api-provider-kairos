@@ -222,6 +222,9 @@ GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
+# Pinned because `make release-manifests` renders the release artifacts with it. v5.8.3 requires
+# go >= 1.27 and broke the v0.1.4 release job (GOTOOLCHAIN=local, go.mod Go). v5.8.1 rendered v0.1.3.
+KUSTOMIZE_VERSION ?= v5.8.1
 GOLANGCI_LINT_VERSION ?= v1.60.0
 # Pinned so `make test-envtest` is reproducible (rule 4: no unpinned @latest / floating envtest assets).
 # ENVTEST_K8S_VERSION is the Kubernetes API-server/etcd binary version the controllers are tested
@@ -240,7 +243,7 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
-	test -s $(LOCALBIN)/kustomize || GOBIN=$(LOCALBIN) go install sigs.k8s.io/kustomize/kustomize/v5@latest
+	test -s $(LOCALBIN)/kustomize || GOBIN=$(LOCALBIN) go install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
