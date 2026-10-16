@@ -16,7 +16,8 @@ users:
 # produced on the init controller (k0s token create --role=controller) and
 # delivered by the Phase-3 controller through .JoinToken (TOKEN-INV). The join
 # target is k0s's own gossip/etcd peer discovery seeded by the token, NOT the
-# VIP block.
+# VIP block. Like the init node, a joiner's api.sans in /etc/k0s/k0s.yaml MUST
+# include the stable control-plane endpoint: the VIP can fail over to any member.
 k0s:
   enabled: true
   args:
@@ -109,6 +110,8 @@ write_files:
           # would make k0s reject the config, so when no address can be found the
           # resolver deletes this line instead (KD-55 fail-open).
           address: __API_ADDR__
+          sans:
+            - 192.168.1.240
         storage:
           etcd:
             # Per-node etcd peer address. The API advertise address alone is not
