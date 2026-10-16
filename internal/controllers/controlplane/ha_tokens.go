@@ -24,9 +24,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -52,10 +50,9 @@ func joinTokenSecretName(clusterName string) string {
 //     (crypto/rand). If the Secret already has a non-empty token, it is left
 //     untouched (never regenerated — regenerating would orphan the running
 //     etcd cluster's token).
-//   - k0s: the Secret is created EMPTY. The init node mints the controller-join
-//     token via `k0s token create` and pushes it back over the node-push
-//     channel (RBAC for that write is granted by the bootstrap node SA). The
-//     join machines are gated until the token lands (initMachineJoinable).
+//   - k0s: the Secret is created EMPTY. The KCP mints the controller-join token
+//     into it when it admits a joiner (ensureK0sControllerJoinToken, ADR 0013)
+//     and is its only writer; nodes have no write access to it.
 //
 // The token value is NEVER logged (root rule § "No secrets in logs").
 func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
@@ -82,8 +79,8 @@ func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context
 			secret.Data = map[string][]byte{}
 		}
 		// k3s: generate the shared server token exactly once. Never overwrite an
-		// existing non-empty token. k0s: leave the data empty for the init node
-		// to populate over the node-push channel.
+		// existing non-empty token. k0s: leave the data alone; the KCP's join
+		// path writes the token and its ID annotation (ADR 0013).
 		if distribution == "k3s" {
 			if len(secret.Data[joinTokenSecretDataKey]) == 0 {
 				tok, genErr := generateJoinToken()
@@ -104,23 +101,6 @@ func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context
 	log.V(4).Info("Ensured HA join-token secret",
 		"secret", joinTokenSecretName(cluster.Name), "namespace", cluster.Namespace, "distribution", distribution)
 	return nil
-}
-
-// joinTokenSecretValue returns the current join-token value from the per-cluster
-// join-token Secret, or "" if the Secret is missing or the token is empty (the
-// k0s init node has not pushed it yet). NotFound is treated as empty, not an
-// error, so callers can use "" as the not-ready signal. The returned value is
-// NEVER logged.
-func (r *KairosControlPlaneReconciler) joinTokenSecretValue(ctx context.Context, cluster *clusterv1.Cluster) (string, error) {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Name: joinTokenSecretName(cluster.Name), Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
-		return "", fmt.Errorf("get join-token secret %s/%s: %w", key.Namespace, key.Name, err)
-	}
-	return string(secret.Data[joinTokenSecretDataKey]), nil
 }
 
 // generateJoinToken returns a strong random join token suitable for use as a k3s

@@ -118,7 +118,7 @@ func TestCreateControlPlaneMachine_PropagatesTemplateMetadata(t *testing.T) {
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle)).To(Succeed())
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),
@@ -149,7 +149,7 @@ func TestCreateControlPlaneMachine_InfraMachineKeepsTemplateMetadata(t *testing.
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle)).To(Succeed())
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
 
 	infraMachine := &unstructured.Unstructured{}
 	infraMachine.SetGroupVersionKind(schema.GroupVersionKind{
@@ -230,7 +230,7 @@ func TestCreateControlPlaneMachine_EtcdHookWinsOverTemplateAnnotation(t *testing
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0,
-		bootstrapv1beta2.ControlPlaneRoleInit)).To(Succeed())
+		bootstrapv1beta2.ControlPlaneRoleInit, "")).To(Succeed())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),

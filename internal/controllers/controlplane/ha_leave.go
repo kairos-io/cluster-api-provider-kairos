@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -147,6 +148,7 @@ func shouldStampEtcdLeaveHook(kcp *controlplanev1beta2.KairosControlPlane, role 
 // `<cluster>-kubeconfig` Secret (the KD-3b node-push payload; its server URL
 // already points at the VIP, which quorum guarantees is up). Used when the
 // reconciler's WorkloadClientFactory seam is not overridden (tests inject a fake).
+// It backs the etcd-leave handshake and the k0s join-token path.
 func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-kubeconfig", cluster.Name)}
@@ -163,6 +165,11 @@ func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context
 	}
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	// discovery/v1: the k0s join-token path reads the default/kubernetes
+	// EndpointSlices to find live members (ADR 0013).
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
 	wc, err := client.New(restCfg, client.Options{Scheme: scheme})

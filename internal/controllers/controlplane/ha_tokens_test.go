@@ -112,7 +112,8 @@ func TestEnsureJoinTokenSecret_K3sIdempotent(t *testing.T) {
 }
 
 // TestEnsureJoinTokenSecret_K0sEmpty asserts the k0s join-token Secret is created
-// empty — the init node fills it over the node-push channel, not the controller.
+// empty, and that re-ensuring it leaves a stored token and its ID annotation
+// alone. The token is minted by the join path (ADR 0013), not here.
 func TestEnsureJoinTokenSecret_K0sEmpty(t *testing.T) {
 	g := NewWithT(t)
 	scheme := haTestScheme(g)
@@ -130,12 +131,18 @@ func TestEnsureJoinTokenSecret_K0sEmpty(t *testing.T) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: joinTokenSecretName("c"), Namespace: "default"}
 	g.Expect(c.Get(context.Background(), key, secret)).To(Succeed())
-	g.Expect(secret.Data[joinTokenSecretDataKey]).To(BeEmpty(), "k0s token is filled by the init node, not the controller")
+	g.Expect(secret.Data[joinTokenSecretDataKey]).To(BeEmpty(),
+		"the k0s token is minted when a joiner is admitted, not when the Secret is created")
+	g.Expect(secret.Annotations).ToNot(HaveKey(k0sJoinTokenIDAnnotation))
 
-	// joinTokenSecretValue reflects the empty state.
-	val, err := r.joinTokenSecretValue(context.Background(), cluster)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(val).To(BeEmpty())
+	// A second pass must not touch a token the join path stored, nor its ID.
+	secret.Data = map[string][]byte{joinTokenSecretDataKey: []byte("stored")}
+	secret.Annotations = map[string]string{k0sJoinTokenIDAnnotation: "abc123"}
+	g.Expect(c.Update(context.Background(), secret)).To(Succeed())
+	g.Expect(r.ensureJoinTokenSecret(context.Background(), log.Log, kcp, cluster)).To(Succeed())
+	g.Expect(c.Get(context.Background(), key, secret)).To(Succeed())
+	g.Expect(string(secret.Data[joinTokenSecretDataKey])).To(Equal("stored"))
+	g.Expect(secret.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, "abc123"))
 }
 
 // TestGenerateJoinToken_StrongAndUnique asserts tokens are non-empty, URL-safe,
