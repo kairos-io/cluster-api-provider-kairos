@@ -58,14 +58,15 @@ func nodeMachine(name string, deleting bool, addrs ...string) *clusterv1.Machine
 	return m
 }
 
-// leavingMachine is the Machine being removed: deleting, hooked, with a Node.
+// leavingMachine is the Machine being removed: deleting, hooked, with a Node,
+// at CAPI's pre-terminate stage.
 func leavingMachine(name string, annotations map[string]string, addrs ...string) *clusterv1.Machine {
 	m := nodeMachine(name, true, addrs...)
 	m.Annotations = map[string]string{etcdLeaveHookAnnotation(): ""}
 	for k, v := range annotations {
 		m.Annotations[k] = v
 	}
-	return m
+	return atPreTerminateHook(m)
 }
 
 func noNodeRef(m *clusterv1.Machine) *clusterv1.Machine {
