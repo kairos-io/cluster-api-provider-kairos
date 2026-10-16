@@ -51,8 +51,11 @@ The fix is the same as for standard Kairos: build a fully-installed disk. The su
 
 1. Build the Hadron ISO with `auroraboot`:
    ```bash
-   auroraboot build-iso -n <name> docker:<hadron-image>
+   # Name --output: the next step has to find the ISO, and the auroraboot
+   # default for it is not the same in every release.
+   auroraboot build-iso -n <name> --output . docker:<hadron-image>
    # e.g.: docker:quay.io/kairos/hadron:v0.0.4-standard-amd64-generic-v4.0.3-k3s-v1.35.2-k3s1
+   # writes ./<name>.iso and ./<name>.iso.sha256
    ```
 2. Boot that ISO in QEMU against a blank 20 G raw disk with an install cloud-config (same QEMU procedure described below), allowing Kairos to install and power off.
 3. Verify with `losetup`: the `state` partition (label `state`) must be present alongside `recovery`.
