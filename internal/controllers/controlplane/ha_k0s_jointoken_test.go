@@ -100,88 +100,124 @@ func kubernetesSlice(name string, addressType discoveryv1.AddressType, eps ...di
 	}
 }
 
+// memberMachine is a control-plane Machine of this KCP reporting addrs.
+func memberMachine(name string, deleting bool, addrs ...string) *clusterv1.Machine {
+	m := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
+	for _, a := range addrs {
+		m.Status.Addresses = append(m.Status.Addresses, clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
+	}
+	if deleting {
+		m.DeletionTimestamp = ptr.To(metav1.Now())
+	}
+	return m
+}
+
 func TestLiveK0sJoinServers(t *testing.T) {
 	notReady := discoveryv1.Endpoint{Addresses: []string{"10.0.0.7"}, Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(false)}}
 	terminating := discoveryv1.Endpoint{Addresses: []string{"10.0.0.8"}, Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true), Terminating: ptr.To(true)}}
 	nilReady := discoveryv1.Endpoint{Addresses: []string{"10.0.0.9"}} // nil Ready means ready
 
-	otherService := kubernetesSlice("other", discoveryv1.AddressTypeIPv4, epReady("10.0.0.1"))
-	otherService.Labels[discoveryv1.LabelServiceName] = "not-kubernetes"
-	otherNamespace := kubernetesSlice("elsewhere", discoveryv1.AddressTypeIPv4, epReady("10.0.0.2"))
+	// A slice some other controller writes, with the same service-name label
+	// and a lower address that is even one of our Machines'.
+	foreign := kubernetesSlice("kubernetes-extra", discoveryv1.AddressTypeIPv4, epReady("10.0.0.1"))
+	otherNamespace := kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.2"))
 	otherNamespace.Namespace = "kube-system"
 
+	all := memberMachine("cp-0", false, "10.0.0.1", "10.0.0.2", "10.0.0.4", "10.0.0.5", "10.0.0.6",
+		"10.0.0.7", "10.0.0.8", "10.0.0.9", "10.0.0.30", "fd00::5")
+
 	tests := []struct {
-		name     string
-		objs     []client.Object
-		excluded map[string]bool
-		want     []string
+		name          string
+		objs          []client.Object
+		machines      []*clusterv1.Machine
+		want          []string
+		wantUnmatched int
 	}{
 		{
 			name: "sorted lowest first, de-duplicated",
 			objs: []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4,
 				epReady("10.0.0.30"), epReady("10.0.0.4"), epReady("10.0.0.30"), nilReady)},
-			want: []string{"https://10.0.0.4:9443", "https://10.0.0.9:9443", "https://10.0.0.30:9443"},
+			machines: []*clusterv1.Machine{all},
+			want:     []string{"https://10.0.0.4:9443", "https://10.0.0.9:9443", "https://10.0.0.30:9443"},
 		},
 		{
-			name: "IPv6 is bracketed",
-			objs: []client.Object{kubernetesSlice("kubernetes-v6", discoveryv1.AddressTypeIPv6, epReady("fd00:0::5"))},
-			want: []string{"https://[fd00::5]:9443"},
+			name:     "IPv6 is bracketed",
+			objs:     []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv6, epReady("fd00:0::5"))},
+			machines: []*clusterv1.Machine{all},
+			want:     []string{"https://[fd00::5]:9443"},
 		},
 		{
-			name: "not ready and terminating are skipped",
-			objs: []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, notReady, terminating, epReady("10.0.0.5"))},
-			want: []string{"https://10.0.0.5:9443"},
+			name:     "not ready and terminating are skipped",
+			objs:     []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, notReady, terminating, epReady("10.0.0.5"))},
+			machines: []*clusterv1.Machine{all},
+			want:     []string{"https://10.0.0.5:9443"},
 		},
 		{
-			name:     "a deleting Machine's address is skipped",
-			objs:     []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.5", "10.0.0.6"))},
-			excluded: map[string]bool{"10.0.0.5": true},
-			want:     []string{"https://10.0.0.6:9443"},
+			name:     "only the slice named kubernetes is read; a foreign slice with the same label is ignored",
+			objs:     []client.Object{foreign, kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.5"))},
+			machines: []*clusterv1.Machine{all},
+			want:     []string{"https://10.0.0.5:9443"},
+		},
+		{
+			name:          "an address that is no Machine of ours is ignored",
+			objs:          []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("192.0.2.66", "10.0.0.5"))},
+			machines:      []*clusterv1.Machine{memberMachine("cp-0", false, "10.0.0.5")},
+			want:          []string{"https://10.0.0.5:9443"},
+			wantUnmatched: 1,
+		},
+		{
+			name:          "a Machine being deleted is not a target, even if another Machine reports its address",
+			objs:          []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.5", "10.0.0.6"))},
+			machines:      []*clusterv1.Machine{memberMachine("cp-0", false, "10.0.0.5", "10.0.0.6"), memberMachine("cp-old", true, "10.0.0.5")},
+			want:          []string{"https://10.0.0.6:9443"},
+			wantUnmatched: 1,
 		},
 		{
 			name: "non-IP, loopback and unspecified values are rejected",
 			objs: []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4,
 				epReady("cp.example.com", "127.0.0.1", "0.0.0.0", "10.0.0.5; rm -rf /", "10.0.0.6"))},
-			want: []string{"https://10.0.0.6:9443"},
+			machines: []*clusterv1.Machine{all},
+			want:     []string{"https://10.0.0.6:9443"},
 		},
 		{
-			name: "FQDN slices are ignored",
-			objs: []client.Object{kubernetesSlice("fqdn", discoveryv1.AddressTypeFQDN, epReady("cp.example.com"))},
-			want: []string{},
+			name:          "no address is one of ours",
+			objs:          []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.5", "10.0.0.6"))},
+			machines:      []*clusterv1.Machine{memberMachine("cp-0", false)},
+			wantUnmatched: 2,
 		},
 		{
-			name: "only default/kubernetes slices count",
-			objs: []client.Object{otherService, otherNamespace},
-			want: []string{},
+			name:     "FQDN address type is ignored",
+			objs:     []client.Object{kubernetesSlice("kubernetes", discoveryv1.AddressTypeFQDN, epReady("cp.example.com"))},
+			machines: []*clusterv1.Machine{all},
 		},
 		{
-			name: "empty",
-			want: []string{},
+			name:     "only default/kubernetes counts",
+			objs:     []client.Object{foreign, otherNamespace},
+			machines: []*clusterv1.Machine{all},
+		},
+		{
+			name:     "no slice at all",
+			machines: []*clusterv1.Machine{all},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			wc := fake.NewClientBuilder().WithScheme(workloadTestScheme(g)).WithObjects(tc.objs...).Build()
-			got, err := liveK0sJoinServers(context.Background(), wc, tc.excluded)
+			got, err := liveK0sJoinServers(context.Background(), wc, tc.machines)
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(got).To(Equal(tc.want))
+			g.Expect(got.urls).To(Equal(tc.want))
+			g.Expect(got.unmatched).To(Equal(tc.wantUnmatched))
 		})
 	}
 }
 
-func TestDeletingMachineAddresses(t *testing.T) {
+func TestOwnMemberAddresses(t *testing.T) {
 	g := NewWithT(t)
-	live := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "live"}}
-	live.Status.Addresses = clusterv1.MachineAddresses{{Type: clusterv1.MachineInternalIP, Address: "10.0.0.1"}}
-	now := metav1.Now()
-	gone := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "gone", DeletionTimestamp: &now}}
-	gone.Status.Addresses = clusterv1.MachineAddresses{
-		{Type: clusterv1.MachineInternalIP, Address: "10.0.0.2"},
-		{Type: clusterv1.MachineInternalIP, Address: "fd00:0::2"},
-		{Type: clusterv1.MachineHostName, Address: "gone"},
-	}
-	g.Expect(deletingMachineAddresses([]*clusterv1.Machine{live, gone})).To(Equal(map[string]bool{"10.0.0.2": true, "fd00::2": true}))
+	live := memberMachine("live", false, "10.0.0.1", "10.0.0.3")
+	live.Status.Addresses = append(live.Status.Addresses, clusterv1.MachineAddress{Type: clusterv1.MachineHostName, Address: "live"})
+	gone := memberMachine("gone", true, "10.0.0.2", "fd00:0::2", "10.0.0.3")
+	g.Expect(ownMemberAddresses([]*clusterv1.Machine{live, gone})).To(Equal(map[string]bool{"10.0.0.1": true}))
 }
 
 func mustToken(t *testing.T, id, secret string) k0sjointoken.BootstrapToken {
@@ -218,6 +254,7 @@ type policyOpts struct {
 	storedAnno   string          // management ID annotation
 	workload     []client.Object // extra workload objects
 	liveAddrs    []string        // default/kubernetes ready addresses
+	memberAddrs  []string        // the init Machine's status.addresses; nil means liveAddrs
 	machines     []*clusterv1.Machine
 	configs      []client.Object // KairosConfigs
 	etcdHealthy  []string        // node names reporting healthy+voting
@@ -306,6 +343,13 @@ func newPolicyEnv(t *testing.T, o policyOpts) *policyEnv {
 
 	env := &policyEnv{t: t, mgmt: mgmt, wc: wc, kcp: kcp, cluster: cluster, recorder: record.NewFakeRecorder(100), logs: &logSink{}}
 	init := cpMachine("cp-0", "cp-0", policyNow.Add(-48*time.Hour), "")
+	members := o.memberAddrs
+	if members == nil {
+		members = o.liveAddrs
+	}
+	for _, a := range members {
+		init.Status.Addresses = append(init.Status.Addresses, clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
+	}
 	env.machines = append([]*clusterv1.Machine{init}, o.machines...)
 	env.r = &KairosControlPlaneReconciler{
 		Client: mgmt, Scheme: scheme, Recorder: env.recorder,
@@ -558,6 +602,23 @@ func TestEnsureK0sJoinToken_NoLiveMemberMintsNothing(t *testing.T) {
 	g.Expect(e.workloadTokenIDs()).To(BeEmpty())
 }
 
+// TestEnsureK0sJoinToken_NoOwnMemberMintsNothing: the apiserver lists live
+// addresses, but none is the address of one of our Machines. No token is
+// issued, and the KCP says why.
+func TestEnsureK0sJoinToken_NoOwnMemberMintsNothing(t *testing.T) {
+	g := NewWithT(t)
+	e := newPolicyEnv(t, policyOpts{liveAddrs: []string{"10.0.0.20", "10.0.0.21"}, memberAddrs: []string{"10.0.0.99"}})
+	before := e.mgmtSecret()
+
+	id, reason, err := e.ensure()
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(BeEmpty())
+	g.Expect(reason).To(ContainSubstring("lists 2 ready address(es)"))
+	g.Expect(e.mgmtSecret().ResourceVersion).To(Equal(before.ResourceVersion), "no write")
+	g.Expect(e.workloadTokenIDs()).To(BeEmpty())
+	g.Expect(e.events()).To(ContainElement(HavePrefix("Warning K0sJoinTokenNoLiveMember")))
+}
+
 func TestEnsureK0sJoinToken_NeverMintsOverAPendingJoiner(t *testing.T) {
 	g := NewWithT(t)
 	enc, ws := issued(t, "aaaaaa", "https://10.0.0.9:9443", policyNow.Add(10*time.Minute))
@@ -741,6 +802,7 @@ func TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending(t *testing.T) {
 		return m
 	}
 	m0 := withConfig(rolloutMachine(kcp, "test-kcp-0", kcp.Spec.Version, 3*time.Hour, true))
+	m0.Status.Addresses = clusterv1.MachineAddresses{{Type: clusterv1.MachineInternalIP, Address: "10.0.0.20"}}
 	m1 := withConfig(rolloutMachine(kcp, "test-kcp-1", kcp.Spec.Version, 2*time.Hour, true))
 	m2 := withConfig(rolloutMachine(kcp, "test-kcp-2", kcp.Spec.Version, 10*time.Minute, false))
 	initCfg := joinConfig("test-kcp-0", "")
