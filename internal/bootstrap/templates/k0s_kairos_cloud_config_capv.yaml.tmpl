@@ -67,7 +67,8 @@ users:
 # produced on the init controller (k0s token create --role=controller) and
 # delivered by the Phase-3 controller through .JoinToken (TOKEN-INV). The join
 # target is k0s's own gossip/etcd peer discovery seeded by the token, NOT the
-# VIP block.
+# VIP block. Like the init node, a joiner's api.sans in /etc/k0s/k0s.yaml MUST
+# include the stable control-plane endpoint: the VIP can fail over to any member.
 {{- end }}
 k0s:
   enabled: true
@@ -193,12 +194,18 @@ write_files:
       ExecStart=/usr/bin/k0s controller{{ if .SingleNode }}{{ if .K0sSingleNode }} --single{{ else }} --enable-worker{{ end }}{{ end }}{{ if or .PodCIDR .ServiceCIDR .IsInitControlPlane }} --config /etc/k0s/k0s.yaml{{ end }}{{ if .IsJoinControlPlane }} --token-file=/etc/k0s/controller-token{{ end }}{{ if .RenderKubeVIP }} --enable-worker{{ end }}{{ if and .ProviderID (not .Metal3) }} --kubelet-extra-args=--provider-id={{ .ProviderID }}{{ end }}
   {{- end }}
   {{- /*
-    HA-init nodes always emit /etc/k0s/k0s.yaml so the apiserver cert covers the
-    stable control-plane endpoint (api.sans). The pre-existing CIDR-only path is
-    preserved byte-for-byte: when not an init node, the gate and body are exactly
-    as before (.IsInitControlPlane is false for single/join/worker/empty role).
+    Every HA control-plane member, init AND join, always emits /etc/k0s/k0s.yaml
+    so its apiserver cert covers the stable control-plane endpoint (api.sans). The
+    endpoint (the kube-vip VIP or the InfraCluster endpoint) is not pinned to the
+    init node: when the member holding it is replaced, the VIP moves to a
+    survivor, and every TLS-verifying client of the endpoint, the management
+    cluster's KCP controller included, then lands on THAT node's apiserver. A
+    joiner whose cert only covers its own addresses fails that handshake and
+    stalls the rollout. The pre-existing CIDR-only path is preserved
+    byte-for-byte: .IsHAControlPlane is false for single/worker/empty role, so
+    the gate and body are exactly as before.
   */ -}}
-  {{- $haSans := and .IsInitControlPlane .ManagementEndpoint .ManagementEndpoint.ControlPlaneEndpointHost }}
+  {{- $haSans := and .IsHAControlPlane .ManagementEndpoint .ManagementEndpoint.ControlPlaneEndpointHost }}
   {{- $apiAddr := and .IsHAControlPlane .ManagementEndpoint .ManagementEndpoint.ControlPlaneEndpointHost }}
   {{- if and (eq .Role "control-plane") (or .PodCIDR .ServiceCIDR $haSans $apiAddr) }}
   - path: /etc/k0s/k0s.yaml
