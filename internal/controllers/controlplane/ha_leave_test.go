@@ -240,7 +240,8 @@ func TestReconcileMemberLeave_AbsentFromEtcdStatusRemovesHook(t *testing.T) {
 }
 
 // TestReconcileMemberLeave_TimeoutRemovesHook: a node that never acks within
-// memberLeaveTimeout must not wedge deletion — the hook is removed (member may be
+// memberLeaveTimeout must not wedge deletion. Here the workload cluster has no
+// EtcdMember to hand the leave to, so the hook is removed (member may be
 // orphaned) and a Warning event is emitted.
 func TestReconcileMemberLeave_TimeoutRemovesHook(t *testing.T) {
 	g := NewWithT(t)
@@ -428,23 +429,47 @@ func TestReconcileMemberLeave_ReadErrorBeforeTimeoutRetainsHook(t *testing.T) {
 
 // TestReconcileMemberLeave_ReadErrorPastTimeoutReachesBackstop: once the
 // leave is older than memberLeaveTimeout, a failed workload read no longer
-// returns ahead of the timeout backstop. The 2026-10-16 lab cluster stayed
-// at leave-requested for more than 13 minutes because it did.
+// returns ahead of the timeout. The 2026-10-16 lab cluster stayed at
+// leave-requested for more than 13 minutes because it did. With nothing to
+// hand the leave to, the KCP starts the etcdMemberLeaveCap clock and keeps
+// the hook; once the cap has passed, it removes the hook with a warning.
 func TestReconcileMemberLeave_ReadErrorPastTimeoutReachesBackstop(t *testing.T) {
-	g := NewWithT(t)
-	scheme := haTestScheme(g)
 	old := time.Now().Add(-2 * memberLeaveTimeout).UTC().Format(time.RFC3339)
-	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: old})
-	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
+	capped := time.Now().Add(-2 * etcdMemberLeaveCap).UTC().Format(time.RFC3339)
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		wantDone    bool
+	}{
+		{"inside the cap: the clock starts and the hook stays", map[string]string{etcdLeaveRequestedAtAnnotation: old}, false},
+		{"past the cap: the hook goes with a warning", map[string]string{etcdLeaveRequestedAtAnnotation: old, etcdMemberLeaveRequestedAtAnnotation: capped}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := haTestScheme(g)
+			target := hookedMachine("cp-0", "cp-0", tc.annotations)
+			mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
+			wc := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
 
-	rec := record.NewFakeRecorder(4)
-	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: rec, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(done).To(BeTrue())
-	assertHookGone(g, mgmt, "cp-0")
-	g.Expect(rec.Events).To(Receive(ContainSubstring("EtcdMemberLeaveTimedOut")))
+			rec := record.NewFakeRecorder(4)
+			r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: rec, WorkloadClientFactory: staticWorkloadClient(wc)}
+			done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+			got := &clusterv1.Machine{}
+			g.Expect(mgmt.Get(context.Background(), types.NamespacedName{Name: "cp-0", Namespace: "default"}, got)).To(Succeed())
+			if tc.wantDone {
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(done).To(BeTrue())
+				g.Expect(hasEtcdLeaveHook(got)).To(BeFalse())
+				g.Expect(rec.Events).To(Receive(ContainSubstring("EtcdMemberLeaveTimedOut")))
+				return
+			}
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(done).To(BeFalse())
+			g.Expect(hasEtcdLeaveHook(got)).To(BeTrue())
+			g.Expect(got.Annotations).To(HaveKey(etcdMemberLeaveRequestedAtAnnotation))
+			g.Expect(rec.Events).ToNot(Receive())
+		})
+	}
 }
 
 // TestReconcileMemberLeave_WaitingReassertsMissingRequest: a waiting reconcile

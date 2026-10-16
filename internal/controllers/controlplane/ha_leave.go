@@ -235,19 +235,22 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //     target and skip the leave for healthy members too.)
 //  2. Non-k0s carrying the hook (should never happen) → remove hook, done.
 //  3. Node acked `left` in the workload ConfigMap → remove hook, done.
-//  4. Already-requested AND (member gone from etcd-status OR past
-//     memberLeaveTimeout) → remove hook, done (timeout warns: member may be
+//  4. Already-requested AND member gone from etcd-status → remove hook, done.
+//  5. Already-requested AND past memberLeaveTimeout → delegateMemberLeave:
+//     set spec.leave on the member's k0s EtcdMember and remove the hook once
+//     k0s reports Joined=False. Without that API or object, or after
+//     etcdMemberLeaveCap, remove the hook with a warning (the member may be
 //     orphaned).
-//  5. Otherwise → write the leave-requested sentinel, stamp the first-request
+//  6. Otherwise → write the leave-requested sentinel, stamp the first-request
 //     timestamp, requeue (done=false).
 //
 // SECURITY / fail-safe (ADR 0005 §E.5): a workload-client BUILD error or a
 // ConfigMap READ error, on every apiserver connectForLeave tries, or a failed
 // write, returns the error with the hook STILL SET — the delete stays blocked
-// and quorum is preserved. The one exception is the timeout backstop of step
-// 4, which applies whether or not the workload cluster answers: before, a
-// failed read returned ahead of it, so a leave whose reads kept failing was
-// never bounded.
+// and quorum is preserved. The one exception is the timeout of step 5, which
+// is bounded whether or not the workload cluster answers: before, a failed
+// read returned ahead of it, so a leave whose reads kept failing was never
+// bounded.
 func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (bool, error) {
 	// (1) Never-registered node: nothing to leave, nothing alive to run it.
 	if !target.Status.NodeRef.IsDefined() {
@@ -309,22 +312,19 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 			}
 		}
 	}
-	// Timeout backstop: an unreachable/stuck node must not wedge deletion, and
-	// neither must an unreachable workload cluster.
+	// Timeout: the node has not acked in time. Hand the leave to k0s's
+	// EtcdMember, falling back to removing the hook with a warning. This is
+	// bounded whether or not the workload cluster answers: an unreachable or
+	// stuck node must not wedge deletion, and neither must an unreachable
+	// workload cluster.
 	if leaveTimedOut(target) {
-		log.Info("etcd-leave: timed out waiting for node ack; removing hook (etcd member may be orphaned)",
-			"machine", target.Name, "node", nodeName, "timeout", memberLeaveTimeout)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
-				"Control-plane node %q did not leave etcd within %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout)
-		}
-		return true, r.removeEtcdLeaveHook(ctx, target)
+		return r.delegateMemberLeave(ctx, log, kcp, machines, target, conn, connErr)
 	}
 	if connErr != nil {
 		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)
 	}
 
-	// (5) Still waiting: keep the sentinel present (preserving a just-written `left`
+	// (6) Still waiting: keep the sentinel present (preserving a just-written `left`
 	// against a racy overwrite), then requeue.
 	if err := r.ensureLeaveRequested(ctx, conn.client, leaveConfigMapKey, nodeName, false); err != nil {
 		return false, err
@@ -368,7 +368,13 @@ func (r *KairosControlPlaneReconciler) ensureLeaveRequested(ctx context.Context,
 // The ORIGINAL timestamp is preserved on subsequent calls so the timeout window
 // is anchored to when we first asked, not the latest reconcile.
 func (r *KairosControlPlaneReconciler) stampLeaveRequestedAt(ctx context.Context, m *clusterv1.Machine) error {
-	if _, ok := m.Annotations[etcdLeaveRequestedAtAnnotation]; ok {
+	return r.stampAnnotationOnce(ctx, m, etcdLeaveRequestedAtAnnotation)
+}
+
+// stampAnnotationOnce sets the annotation key on the Machine to the current
+// time (RFC3339), unless it is already set.
+func (r *KairosControlPlaneReconciler) stampAnnotationOnce(ctx context.Context, m *clusterv1.Machine, key string) error {
+	if _, ok := m.Annotations[key]; ok {
 		return nil
 	}
 	helper, err := patch.NewHelper(m, r.Client)
@@ -378,9 +384,9 @@ func (r *KairosControlPlaneReconciler) stampLeaveRequestedAt(ctx context.Context
 	if m.Annotations == nil {
 		m.Annotations = map[string]string{}
 	}
-	m.Annotations[etcdLeaveRequestedAtAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	m.Annotations[key] = time.Now().UTC().Format(time.RFC3339)
 	if err := helper.Patch(ctx, m); err != nil {
-		return fmt.Errorf("stamp etcd-leave-requested-at on machine %s: %w", m.Name, err)
+		return fmt.Errorf("stamp %s on machine %s: %w", key, m.Name, err)
 	}
 	return nil
 }
