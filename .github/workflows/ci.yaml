@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# Every job only reads the repository. Without this block the jobs get the
+# repository's default token, which may be read-write, while running test and
+# build steps that execute dependency code.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
