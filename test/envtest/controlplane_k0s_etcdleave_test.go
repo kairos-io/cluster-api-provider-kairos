@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -147,16 +148,27 @@ func (m *recordingMembers) addresses() []string {
 	return out
 }
 
-// TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone is the
-// 2026-10-16 lab case after a controller upgrade: a k0s control-plane Machine
-// has been held at the etcd-leave hook for 20 minutes, its node never acked,
-// and the control-plane endpoint does not answer. The KCP reaches a staying
-// member directly, sets spec.leave on the leaving node's EtcdMember only, and
-// removes the hook only after k0s reports that member Joined=False.
-func TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
+// k0sLeaveCluster is a three-member k0s control plane in envtest whose
+// Machine <kcp>-0 (Node leaver-node, 10.11.0.10, holding the VIP) is being
+// deleted. The envtest apiserver is also the workload cluster. The
+// control-plane endpoint does not answer; every member address reaches the
+// envtest apiserver, and each one asked for is recorded.
+type k0sLeaveCluster struct {
+	ctx       context.Context
+	c         client.Client // management
+	wc        client.Client // workload
+	members   *recordingMembers
+	nsName    string
+	kcpName   string
+	leaverKey types.NamespacedName
+}
+
+const k0sLeaverIP = "10.11.0.10"
+
+// startK0sLeaveCluster builds the cluster. leaverAnnotations are set on the
+// leaving Machine next to the etcd-leave hook, before it is deleted.
+func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[string]string) (*k0sLeaveCluster, func()) {
+	t.Helper()
 	g := NewWithT(t)
 	members := &recordingMembers{dialed: map[string]bool{}}
 	ctx, c, cfg, _, teardown := startKCPEnvtest(t, func(r *controlplane.KairosControlPlaneReconciler, cfg *rest.Config) {
@@ -170,25 +182,18 @@ func TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone(t *testin
 			return envtestWorkloadClient(t, cfg), nil
 		}
 	})
-	defer teardown()
 	installK0sEtcdMemberCRD(t, cfg)
-	wc := envtestWorkloadClient(t, cfg)
-
-	const (
-		nsName      = "ha-k0s-leave"
-		clusterName = "ha-k0s-leave-cluster"
-		kcpName     = "ha-k0s-leave-kcp"
-		leaverIP    = "10.11.0.10"
-	)
-	haFixture(t, ctx, c, nsName, clusterName, kcpName, "k0s")
+	k := &k0sLeaveCluster{ctx: ctx, c: c, wc: envtestWorkloadClient(t, cfg), members: members, nsName: name, kcpName: name + "-kcp"}
+	clusterName := name + "-cluster"
+	haFixture(t, ctx, c, k.nsName, clusterName, k.kcpName, "k0s")
 	endpointHost := testControlPlaneEndpoint().Host
-	vip := getKCP(g, ctx, c, nsName, kcpName).Spec.HA.VIP.Address
+	vip := getKCP(g, ctx, c, k.nsName, k.kcpName).Spec.HA.VIP.Address
 
 	// Every node reported a healthy voting member at boot.
 	etcdStatusName := bootstrapv1beta2.EtcdStatusSecretName(clusterName)
 	g.Eventually(func() error {
 		es := &corev1.Secret{}
-		if err := c.Get(ctx, types.NamespacedName{Name: etcdStatusName, Namespace: nsName}, es); err != nil {
+		if err := c.Get(ctx, types.NamespacedName{Name: etcdStatusName, Namespace: k.nsName}, es); err != nil {
 			return err
 		}
 		es.Data = map[string][]byte{}
@@ -199,17 +204,17 @@ func TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone(t *testin
 	}, 15*time.Second, 500*time.Millisecond).Should(Succeed())
 
 	// k0s's view: one EtcdMember per controller, all joined.
-	createK0sEtcdMember(t, ctx, wc, "leaver-node", leaverIP)
-	createK0sEtcdMember(t, ctx, wc, "keeper-a", "10.11.0.11")
-	createK0sEtcdMember(t, ctx, wc, "keeper-b", "10.11.0.12")
+	createK0sEtcdMember(t, ctx, k.wc, "leaver-node", k0sLeaverIP)
+	createK0sEtcdMember(t, ctx, k.wc, "keeper-a", "10.11.0.11")
+	createK0sEtcdMember(t, ctx, k.wc, "keeper-b", "10.11.0.12")
 
 	// The Machines. The leaver holds the VIP; a keeper reports the endpoint
 	// host too. Neither address may ever be dialled.
-	kcp := getKCP(g, ctx, c, nsName, kcpName)
+	kcp := getKCP(g, ctx, c, k.nsName, k.kcpName)
 	mk := func(name, node string, annotations map[string]string, addrs ...string) *clusterv1.Machine {
 		m := &clusterv1.Machine{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: name, Namespace: nsName,
+				Name: name, Namespace: k.nsName,
 				Labels:          map[string]string{clusterv1.ClusterNameLabel: clusterName, clusterv1.MachineControlPlaneLabel: ""},
 				Annotations:     annotations,
 				Finalizers:      []string{"test.kairos.io/hold"},
@@ -231,35 +236,83 @@ func TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone(t *testin
 		g.Expect(c.Status().Update(ctx, m)).To(Succeed())
 		return m
 	}
-	stuckSince := time.Now().Add(-20 * time.Minute).UTC().Format(time.RFC3339)
-	leaver := mk(kcpName+"-0", "leaver-node", map[string]string{etcdLeaveHookKey: "", etcdLeaveRequestedAtKey: stuckSince}, leaverIP, vip)
-	mk(kcpName+"-1", "keeper-a", nil, "10.11.0.11", endpointHost)
-	mk(kcpName+"-2", "keeper-b", nil, "10.11.0.12")
-	g.Expect(c.Delete(ctx, leaver)).To(Succeed())
-
-	leaverKey := types.NamespacedName{Name: leaver.Name, Namespace: nsName}
-	getLeaver := func() *clusterv1.Machine {
-		m := &clusterv1.Machine{}
-		g.Expect(c.Get(ctx, leaverKey, m)).To(Succeed())
-		return m
+	annotations := map[string]string{etcdLeaveHookKey: ""}
+	for key, v := range leaverAnnotations {
+		annotations[key] = v
 	}
+	leaver := mk(k.kcpName+"-0", "leaver-node", annotations, k0sLeaverIP, vip)
+	mk(k.kcpName+"-1", "keeper-a", nil, "10.11.0.11", endpointHost)
+	mk(k.kcpName+"-2", "keeper-b", nil, "10.11.0.12")
+	g.Expect(c.Delete(ctx, leaver)).To(Succeed())
+	k.leaverKey = types.NamespacedName{Name: leaver.Name, Namespace: k.nsName}
+	return k, teardown
+}
+
+func (k *k0sLeaveCluster) leaver(g *WithT) *clusterv1.Machine {
+	m := &clusterv1.Machine{}
+	g.Expect(k.c.Get(k.ctx, k.leaverKey, m)).To(Succeed())
+	return m
+}
+
+// setLeaverDeletingReason plays CAPI's Machine controller: it reports the
+// stage of the leaver's deletion in the v1beta2 Deleting condition.
+func (k *k0sLeaveCluster) setLeaverDeletingReason(g *WithT, reason string) {
+	g.Eventually(func() error {
+		m := &clusterv1.Machine{}
+		if err := k.c.Get(k.ctx, k.leaverKey, m); err != nil {
+			return err
+		}
+		apimeta.SetStatusCondition(&m.Status.Conditions, metav1.Condition{
+			Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: reason,
+		})
+		return k.c.Status().Update(k.ctx, m)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+}
+
+// leaveRequestFor returns the leave ConfigMap's value for node, "" when there
+// is none.
+func (k *k0sLeaveCluster) leaveRequestFor(node string) string {
+	cm := &corev1.ConfigMap{}
+	if err := k.wc.Get(k.ctx, types.NamespacedName{Namespace: "kube-system", Name: "kairos-etcd-leave"}, cm); err != nil {
+		return ""
+	}
+	return cm.Data[node]
+}
+
+// TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone is the
+// 2026-10-16 lab case after a controller upgrade: a k0s control-plane Machine
+// has been held at the etcd-leave hook for 20 minutes, its node never acked,
+// and the control-plane endpoint does not answer. The KCP reaches a staying
+// member directly, sets spec.leave on the leaving node's EtcdMember only, and
+// removes the hook only after k0s reports that member Joined=False. CAPI's
+// Deleting condition is not set at all here: a leave already requested
+// carries on whatever stage CAPI reports.
+func TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	g := NewWithT(t)
+	stuckSince := time.Now().Add(-20 * time.Minute).UTC().Format(time.RFC3339)
+	k, teardown := startK0sLeaveCluster(t, "ha-k0s-leave", map[string]string{etcdLeaveRequestedAtKey: stuckSince})
+	defer teardown()
+	ctx, c, wc := k.ctx, k.c, k.wc
 
 	// The KCP hands the leave to k0s, through a member.
 	g.Eventually(func() (bool, error) { return k0sEtcdMemberLeave(ctx, wc, "leaver-node") },
 		30*time.Second, 500*time.Millisecond).Should(BeTrue(), "spec.leave must be set on the leaving node's EtcdMember")
-	got := getLeaver()
+	got := k.leaver(g)
 	g.Expect(got.Annotations).To(HaveKey(etcdMemberLeaveRequestedAtKey))
 	g.Expect(got.Annotations).To(HaveKey(etcdLeaveHookKey))
 
 	// While k0s still reports the member joined, the hook stays.
-	touchKCP(g, ctx, c, nsName, kcpName)
-	g.Consistently(func() map[string]string { return getLeaver().Annotations },
+	touchKCP(g, ctx, c, k.nsName, k.kcpName)
+	g.Consistently(func() map[string]string { return k.leaver(g).Annotations },
 		4*time.Second, 500*time.Millisecond).Should(HaveKey(etcdLeaveHookKey))
 
 	// k0s removes the member and reports it.
-	setK0sEtcdMemberJoined(t, ctx, wc, "leaver-node", leaverIP, "False")
-	touchKCP(g, ctx, c, nsName, kcpName)
-	g.Eventually(func() map[string]string { return getLeaver().Annotations },
+	setK0sEtcdMemberJoined(t, ctx, wc, "leaver-node", k0sLeaverIP, "False")
+	touchKCP(g, ctx, c, k.nsName, k.kcpName)
+	g.Eventually(func() map[string]string { return k.leaver(g).Annotations },
 		45*time.Second, 500*time.Millisecond).ShouldNot(HaveKey(etcdLeaveHookKey), "the hook goes once k0s reports Joined=False")
 
 	// No other member was touched, and the leave never went to the leaving
@@ -269,6 +322,44 @@ func TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone(t *testin
 		g.Expect(err).ToNot(HaveOccurred())
 		g.Expect(leave).To(BeFalse(), "EtcdMember %s must not be asked to leave", keeper)
 	}
-	g.Expect(members.addresses()).ToNot(BeEmpty())
-	g.Expect(members.addresses()).To(HaveEach(BeElementOf("10.11.0.11", "10.11.0.12")))
+	g.Expect(k.members.addresses()).ToNot(BeEmpty())
+	g.Expect(k.members.addresses()).To(HaveEach(BeElementOf("10.11.0.11", "10.11.0.12")))
+}
+
+// TestHA_K0sEtcdLeave_StartsOnlyAtPreTerminate: a hooked k0s Machine whose
+// Node CAPI is still draining gets no leave request and no workload traffic;
+// the hook stays. Once CAPI reports it is waiting on the pre-terminate hooks,
+// the KCP requests the leave through a staying member and starts the
+// timeout clock then.
+func TestHA_K0sEtcdLeave_StartsOnlyAtPreTerminate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	g := NewWithT(t)
+	k, teardown := startK0sLeaveCluster(t, "ha-k0s-leave-drain", nil)
+	defer teardown()
+	k.setLeaverDeletingReason(g, clusterv1.MachineDeletingDrainingNodeReason)
+
+	// While CAPI drains, nothing happens to etcd.
+	touchKCP(g, k.ctx, k.c, k.nsName, k.kcpName)
+	g.Consistently(func() string { return k.leaveRequestFor("leaver-node") },
+		6*time.Second, 500*time.Millisecond).Should(BeEmpty(), "no leave is requested while CAPI drains the node")
+	got := k.leaver(g)
+	g.Expect(got.Annotations).ToNot(HaveKey(etcdLeaveRequestedAtKey))
+	g.Expect(got.Annotations).To(HaveKey(etcdLeaveHookKey))
+	g.Expect(k.members.addresses()).To(BeEmpty(), "no workload traffic while CAPI drains the node")
+
+	// CAPI is done with the Node and waits on the pre-terminate hooks.
+	k.setLeaverDeletingReason(g, clusterv1.MachineDeletingWaitingForPreTerminateHookReason)
+	g.Eventually(func() string { return k.leaveRequestFor("leaver-node") },
+		30*time.Second, 500*time.Millisecond).Should(Equal("leave-requested"))
+	g.Eventually(func() map[string]string { return k.leaver(g).Annotations },
+		10*time.Second, 500*time.Millisecond).Should(HaveKey(etcdLeaveRequestedAtKey))
+	got = k.leaver(g)
+	requestedAt, err := time.Parse(time.RFC3339, got.Annotations[etcdLeaveRequestedAtKey])
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(requestedAt).To(BeTemporally(">", got.DeletionTimestamp.Add(5*time.Second)),
+		"the timeout clock starts at the request, not at the deletion")
+	g.Expect(got.Annotations).To(HaveKey(etcdLeaveHookKey))
+	g.Expect(k.members.addresses()).To(HaveEach(BeElementOf("10.11.0.11", "10.11.0.12")))
 }
