@@ -171,20 +171,10 @@ type ManagementEndpoint struct {
 	KubeconfigSecretNamespace string
 	ClusterName               string
 	ControlPlaneEndpointHost  string
-	// JoinTokenSecretName, when non-empty AND the render is a k0s HA init node
-	// (IsInitControlPlane), enables the controller-join-token push block: the
-	// init node runs `k0s token create --role=controller` and PUSHes the token
-	// into this Secret over the same node-push channel as the kubeconfig (ADR
-	// 0005 Phase 3). The Secret lives in KubeconfigSecretNamespace (the cluster
-	// namespace) and is pre-created empty + owner-ref'd by the KCP controller.
-	// The token is base64-enveloped into data.token; it is NEVER interpolated
-	// through text/template. Only meaningful for k0s init; k3s uses a
-	// controller-generated token and never runs this block.
-	JoinTokenSecretName string
 	// EtcdStatusSecretName, when non-empty, enables the etcd-health reporter
 	// block (ADR 0005 §E.1): every HA control-plane node (init AND join) reports
 	// its own etcd member health into this per-cluster Secret over the same
-	// node-push channel as the kubeconfig/join-token. The Secret lives in
+	// node-push channel as the kubeconfig. The Secret lives in
 	// KubeconfigSecretNamespace, is pre-created empty + Cluster-owned by the KCP
 	// controller, and each node PATCHes only its own member key. etcd membership
 	// is non-sensitive cluster metadata (no secret material) but is still never

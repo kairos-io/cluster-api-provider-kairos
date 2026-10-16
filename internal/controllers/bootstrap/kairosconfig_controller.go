@@ -1006,14 +1006,10 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 	// The join token is only meaningful for init/join nodes. single needs none.
 	switch kairosConfig.Spec.ControlPlaneRole {
 	case bootstrapv1beta2.ControlPlaneRoleInit:
-		// k0s init: the token does not exist until the node is up. The init node
-		// mints it via `k0s token create` and pushes it over the node-push
-		// channel; the renderer needs the target Secret name to build that push
-		// block. The init node does NOT embed a token in its own k0s config.
+		// k0s init: the init node needs no token, and it no longer mints or
+		// pushes one. The KairosControlPlane issues the controller-join token for
+		// each joiner through the workload API (ADR 0013).
 		if distribution == "k0s" {
-			if td.ManagementEndpoint != nil && cluster != nil {
-				td.ManagementEndpoint.JoinTokenSecretName = bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
-			}
 			break
 		}
 		// k3s init carries the controller-generated shared server token (written
