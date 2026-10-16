@@ -244,7 +244,10 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // SECURITY / fail-safe (ADR 0005 §E.5): a workload-client BUILD error or a
 // ConfigMap READ error, on every apiserver connectForLeave tries, or a failed
 // write, returns the error with the hook STILL SET — the delete stays blocked
-// and quorum is preserved. The hook is never removed on an error path.
+// and quorum is preserved. The one exception is the timeout backstop of step
+// 4, which applies whether or not the workload cluster answers: before, a
+// failed read returned ahead of it, so a leave whose reads kept failing was
+// never bounded.
 func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (bool, error) {
 	// (1) Never-registered node: nothing to leave, nothing alive to run it.
 	if !target.Status.NodeRef.IsDefined() {
@@ -260,11 +263,9 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	_, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]
 
 	// Find a workload apiserver that answers, and read the leave ConfigMap
-	// through it. Nothing answering is fail-safe: hook retained.
-	conn, err := r.connectForLeave(ctx, log, kcp, cluster, machines, target)
-	if err != nil {
-		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", err)
-	}
+	// through it. Nothing answering is fail-safe: hook retained, except that
+	// the timeout backstop below is still evaluated once a leave was requested.
+	conn, connErr := r.connectForLeave(ctx, log, kcp, cluster, machines, target)
 
 	// (3) First entry for THIS eviction cycle (no timestamp stamped yet). FORCE the
 	// leave-requested sentinel, overwriting any STALE `left` a prior eviction of a
@@ -276,6 +277,9 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// ack) next reconcile rather than leaving a stale `left` visible once
 	// requested==true. Terminal checks are deliberately NOT evaluated on this pass.
 	if !requested {
+		if connErr != nil {
+			return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)
+		}
 		if err := r.ensureLeaveRequested(ctx, conn.client, leaveConfigMapKey, nodeName, true /*force*/); err != nil {
 			return false, err
 		}
@@ -288,31 +292,36 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 
 	// (4) This cycle has requested a leave — terminal checks below are now valid for
 	// THIS cycle (a `left` seen here was written by the node in response to our
-	// request, not a stale prior ack).
-	// Node acked the leave → done.
-	if conn.cm.Data[nodeName] == etcdLeftValue {
-		log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
+	// request, not a stale prior ack). The ack and etcd-status checks need an
+	// answer from the workload cluster; the timeout does not.
+	if connErr == nil {
+		// Node acked the leave → done.
+		if conn.cm.Data[nodeName] == etcdLeftValue {
+			log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
+			return true, r.removeEtcdLeaveHook(ctx, target)
+		}
+		// Member gone from node-reported etcd-status → treat as left. Best-effort: a
+		// read error leaves the member "present" so we keep waiting, never skip.
+		if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
+			if _, present := status[nodeName]; !present {
+				log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
+				return true, r.removeEtcdLeaveHook(ctx, target)
+			}
+		}
+	}
+	// Timeout backstop: an unreachable/stuck node must not wedge deletion, and
+	// neither must an unreachable workload cluster.
+	if leaveTimedOut(target) {
+		log.Info("etcd-leave: timed out waiting for node ack; removing hook (etcd member may be orphaned)",
+			"machine", target.Name, "node", nodeName, "timeout", memberLeaveTimeout)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
+				"Control-plane node %q did not leave etcd within %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout)
+		}
 		return true, r.removeEtcdLeaveHook(ctx, target)
 	}
-	// Member gone from node-reported etcd-status → treat as left. Best-effort: a
-	// read error leaves the member "present" so we keep waiting, never skip.
-	if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
-		if _, present := status[nodeName]; !present {
-			log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
-			return true, r.removeEtcdLeaveHook(ctx, target)
-		}
-	}
-	// Timeout backstop: an unreachable/stuck node must not wedge deletion.
-	if requestedAt, perr := time.Parse(time.RFC3339, target.Annotations[etcdLeaveRequestedAtAnnotation]); perr == nil {
-		if time.Since(requestedAt) > memberLeaveTimeout {
-			log.Info("etcd-leave: timed out waiting for node ack; removing hook (etcd member may be orphaned)",
-				"machine", target.Name, "node", nodeName, "timeout", memberLeaveTimeout)
-			if r.Recorder != nil {
-				r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
-					"Control-plane node %q did not leave etcd within %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout)
-			}
-			return true, r.removeEtcdLeaveHook(ctx, target)
-		}
+	if connErr != nil {
+		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)
 	}
 
 	// (5) Still waiting: keep the sentinel present (preserving a just-written `left`
@@ -322,6 +331,13 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	}
 	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName, "via", conn.via)
 	return false, nil
+}
+
+// leaveTimedOut reports whether the leave of m was first requested more than
+// memberLeaveTimeout ago. An unparsable stamp never times out.
+func leaveTimedOut(m *clusterv1.Machine) bool {
+	requestedAt, err := time.Parse(time.RFC3339, m.Annotations[etcdLeaveRequestedAtAnnotation])
+	return err == nil && time.Since(requestedAt) > memberLeaveTimeout
 }
 
 // ensureLeaveRequested upserts the workload-cluster ConfigMap and sets this
