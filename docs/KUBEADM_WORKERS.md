@@ -1,7 +1,7 @@
 # Kubeadm Workers
 
 Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: not
-yet released (follows v0.1.3).
+yet released. It is not in v0.1.4, and is planned for v0.2.0.
 
 Verification status, by control plane:
 
