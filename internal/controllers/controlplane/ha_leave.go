@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -144,12 +145,44 @@ func shouldStampEtcdLeaveHook(kcp *controlplanev1beta2.KairosControlPlane, role 
 	return role == bootstrapv1beta2.ControlPlaneRoleInit || role == bootstrapv1beta2.ControlPlaneRoleJoin
 }
 
+// workloadRequestTimeout bounds every request the KCP's workload client sends
+// through the control-plane endpoint. Without it, one request to an apiserver
+// that accepts the connection but never answers blocks the reconcile for as
+// long as the TCP connection lives.
+const workloadRequestTimeout = 10 * time.Second
+
 // defaultWorkloadClient builds a client for the workload cluster from its
 // `<cluster>-kubeconfig` Secret (the KD-3b node-push payload; its server URL
-// already points at the VIP, which quorum guarantees is up). Used when the
-// reconciler's WorkloadClientFactory seam is not overridden (tests inject a fake).
-// It backs the etcd-leave handshake and the k0s join-token path.
+// points at the control-plane endpoint). Used when the reconciler's
+// WorkloadClientFactory seam is not overridden (tests inject a fake). It backs
+// the etcd-leave handshake and the k0s join-token path. Every request is
+// bounded by workloadRequestTimeout.
 func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error) {
+	restCfg, err := r.endpointRESTConfig(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+	wc, err := newWorkloadClient(restCfg)
+	if err != nil {
+		return nil, fmt.Errorf("build workload client for cluster %s/%s: %w", cluster.Namespace, cluster.Name, err)
+	}
+	return wc, nil
+}
+
+// endpointRESTConfig is the endpoint client's rest.Config: the workload
+// kubeconfig as it is, with every request bounded by workloadRequestTimeout.
+func (r *KairosControlPlaneReconciler) endpointRESTConfig(ctx context.Context, cluster *clusterv1.Cluster) (*rest.Config, error) {
+	restCfg, err := r.workloadRESTConfig(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+	restCfg.Timeout = workloadRequestTimeout
+	return restCfg, nil
+}
+
+// workloadRESTConfig parses the `<cluster>-kubeconfig` Secret into a fresh
+// rest.Config: the endpoint as server, the cluster CA, and the credential.
+func (r *KairosControlPlaneReconciler) workloadRESTConfig(ctx context.Context, cluster *clusterv1.Cluster) (*rest.Config, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-kubeconfig", cluster.Name)}
 	if err := r.Get(ctx, key, secret); err != nil {
@@ -163,6 +196,12 @@ func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context
 	if err != nil {
 		return nil, fmt.Errorf("parse workload kubeconfig %s: %w", key, err)
 	}
+	return restCfg, nil
+}
+
+// newWorkloadClient builds a workload-cluster client with the types the KCP
+// reads and writes there.
+func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		return nil, err
@@ -172,11 +211,7 @@ func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context
 	if err := discoveryv1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
-	wc, err := client.New(restCfg, client.Options{Scheme: scheme})
-	if err != nil {
-		return nil, fmt.Errorf("build workload client for cluster %s/%s: %w", cluster.Namespace, cluster.Name, err)
-	}
-	return wc, nil
+	return client.New(restCfg, client.Options{Scheme: scheme})
 }
 
 // reconcileMemberLeave drives the clean k0s etcd-leave handshake for a

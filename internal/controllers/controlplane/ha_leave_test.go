@@ -25,6 +25,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -455,6 +457,45 @@ func failConfigMapGets() interceptor.Funcs {
 		}
 		return c.Get(ctx, key, obj, opts...)
 	}}
+}
+
+// TestEndpointRESTConfig_BoundsEveryRequest: the endpoint client keeps the
+// kubeconfig's server, CA and credential, and gives up on any request after
+// workloadRequestTimeout instead of waiting on an apiserver that never answers.
+func TestEndpointRESTConfig_BoundsEveryRequest(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workloadKubeconfigSecret("https://192.0.2.10:6443")).Build()
+	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme}
+
+	cfg, err := r.endpointRESTConfig(context.Background(), testCluster())
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(cfg.Timeout).To(Equal(10 * time.Second))
+	g.Expect(cfg.Host).To(Equal("https://192.0.2.10:6443"))
+	g.Expect(cfg.CAData).To(Equal([]byte(testWorkloadCA)))
+	g.Expect(cfg.Insecure).To(BeFalse())
+	g.Expect(cfg.BearerToken).To(Equal("kcp-token"))
+}
+
+// testWorkloadCA is placeholder CA data: the config tests never dial.
+const testWorkloadCA = "test-ca-bundle"
+
+// workloadKubeconfigSecret is the `<cluster>-kubeconfig` Secret for
+// testCluster(), with the given server.
+func workloadKubeconfigSecret(server string) *corev1.Secret {
+	data, err := clientcmd.Write(clientcmdapi.Config{
+		Clusters:       map[string]*clientcmdapi.Cluster{"wl": {Server: server, CertificateAuthorityData: []byte(testWorkloadCA)}},
+		Contexts:       map[string]*clientcmdapi.Context{"wl": {Cluster: "wl", AuthInfo: "kcp"}},
+		CurrentContext: "wl",
+		AuthInfos:      map[string]*clientcmdapi.AuthInfo{"kcp": {Token: "kcp-token"}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName + "-kubeconfig", Namespace: "default"},
+		Data:       map[string][]byte{"value": data},
+	}
 }
 
 // staticWorkloadClient returns a factory that always yields the given client.
