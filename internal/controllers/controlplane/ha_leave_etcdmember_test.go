@@ -36,20 +36,32 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// testMemberID is the etcd member ID the test EtcdMembers carry by default.
+const testMemberID = "8e9e05c52164694d"
+
 // k0sEtcdMember builds an EtcdMember the way k0s writes it: named after the
-// node, with its peer address and a Joined condition.
+// node, with its peer address, testMemberID and a Joined condition.
 func k0sEtcdMember(name, peer string, leave bool, joined string) *unstructured.Unstructured {
+	return k0sEtcdMemberWithID(name, peer, testMemberID, leave, joined)
+}
+
+// k0sEtcdMemberWithID is k0sEtcdMember with the given member ID; "" leaves
+// status.memberID out.
+func k0sEtcdMemberWithID(name, peer, memberID string, leave bool, joined string) *unstructured.Unstructured {
+	status := map[string]interface{}{
+		"peerAddress": peer,
+		"conditions": []interface{}{map[string]interface{}{
+			"type":               "Joined",
+			"status":             joined,
+			"lastTransitionTime": "2026-10-16T09:00:00Z",
+		}},
+	}
+	if memberID != "" {
+		status["memberID"] = memberID
+	}
 	u := &unstructured.Unstructured{Object: map[string]interface{}{
-		"spec": map[string]interface{}{},
-		"status": map[string]interface{}{
-			"peerAddress": peer,
-			"memberID":    "8e9e05c52164694d",
-			"conditions": []interface{}{map[string]interface{}{
-				"type":               "Joined",
-				"status":             joined,
-				"lastTransitionTime": "2026-10-16T09:00:00Z",
-			}},
-		},
+		"spec":   map[string]interface{}{},
+		"status": status,
 	}}
 	u.SetGroupVersionKind(etcdMemberGVK)
 	u.SetName(name)
@@ -396,6 +408,117 @@ func TestDelegateMemberLeave_TransientErrorsKeepTheHook(t *testing.T) {
 			g.Expect(got.Annotations).To(HaveKey(etcdMemberLeaveRequestedAtAnnotation))
 			g.Expect(f.events()).To(BeEmpty())
 		})
+	}
+}
+
+// TestDelegateMemberLeave_PinsTheMemberID: the first inspection records the
+// member ID; while the EtcdMember keeps it, spec.leave is set and Joined=False
+// ends the leave with no warning.
+func TestDelegateMemberLeave_PinsTheMemberID(t *testing.T) {
+	g := NewWithT(t)
+	f := newLeaveFixture(g, map[string]string{etcdLeaveRequestedAtAnnotation: ago(2 * memberLeaveTimeout)},
+		[]client.Object{k0sEtcdMember("cp-0", "10.0.0.10", false, "True")}, nil)
+
+	done, err := f.reconcile()
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(done).To(BeFalse())
+	got := getMachine(g, f.mgmt, "cp-0")
+	g.Expect(got.Annotations).To(HaveKeyWithValue(etcdMemberLeaveMemberIDAnnotation, testMemberID))
+	g.Expect(leaveRequested(getEtcdMember(g, f.member, "cp-0"))).To(BeTrue())
+	g.Expect(f.events()).To(ConsistOf(ContainSubstring("Normal EtcdMemberLeaveDelegated")))
+
+	// k0s removes that member and reports it, keeping the ID.
+	member := getEtcdMember(g, f.member, "cp-0")
+	g.Expect(unstructured.SetNestedSlice(member.Object, []interface{}{map[string]interface{}{
+		"type": "Joined", "status": "False", "lastTransitionTime": "2026-10-16T09:10:00Z",
+	}}, "status", "conditions")).To(Succeed())
+	g.Expect(f.member.Update(context.Background(), member)).To(Succeed())
+	f.target, f.machines[0] = got, got
+	done, err = f.reconcile()
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(done).To(BeTrue())
+	assertHookGone(g, f.mgmt, "cp-0")
+	g.Expect(f.events()).To(BeEmpty(), "a clean end, not the timeout warning")
+}
+
+// TestDelegateMemberLeave_ChangedMemberIDIsNotTouched: an EtcdMember whose
+// member ID differs from the one recorded at the first inspection describes a
+// different etcd member. spec.leave is not set and Joined=False is not taken
+// as the end of this leave: the old timeout applies.
+func TestDelegateMemberLeave_ChangedMemberIDIsNotTouched(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		member *unstructured.Unstructured
+	}{
+		{"before spec.leave is set", k0sEtcdMemberWithID("cp-0", "10.0.0.10", "1a2b3c4d5e6f7a8b", false, "True")},
+		{"when k0s reports Joined=False", k0sEtcdMemberWithID("cp-0", "10.0.0.10", "1a2b3c4d5e6f7a8b", true, "False")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			wasLeave := leaveRequested(tc.member)
+			f := newLeaveFixture(g, map[string]string{
+				etcdLeaveRequestedAtAnnotation:       ago(2 * memberLeaveTimeout),
+				etcdMemberLeaveRequestedAtAnnotation: ago(time.Minute),
+				etcdMemberLeaveMemberIDAnnotation:    testMemberID,
+			}, []client.Object{tc.member}, nil)
+
+			done, err := f.reconcile()
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(done).To(BeTrue())
+			assertHookGone(g, f.mgmt, "cp-0")
+			g.Expect(leaveRequested(getEtcdMember(g, f.member, "cp-0"))).To(Equal(wasLeave), "the EtcdMember is not written")
+			g.Expect(getMachine(g, f.mgmt, "cp-0").Annotations).To(HaveKeyWithValue(etcdMemberLeaveMemberIDAnnotation, testMemberID))
+			g.Expect(f.events()).To(ConsistOf(And(ContainSubstring("Warning EtcdMemberLeaveTimedOut"), ContainSubstring("different etcd member"))))
+		})
+	}
+}
+
+// TestDelegateMemberLeave_MissingMemberIDIsNotTouched: an EtcdMember without a
+// usable member ID cannot be pinned. Whether that is so at the first
+// inspection or later, spec.leave is not set, Joined=False is not taken as the
+// end of this leave, and the old timeout applies.
+func TestDelegateMemberLeave_MissingMemberIDIsNotTouched(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorded bool
+		member   *unstructured.Unstructured
+	}{
+		{"missing at the first inspection", false, k0sEtcdMemberWithID("cp-0", "10.0.0.10", "", false, "True")},
+		{"not hexadecimal at the first inspection", false, k0sEtcdMemberWithID("cp-0", "10.0.0.10", "not-an-id", false, "True")},
+		{"missing later, when k0s reports Joined=False", true, k0sEtcdMemberWithID("cp-0", "10.0.0.10", "", true, "False")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			ann := map[string]string{etcdLeaveRequestedAtAnnotation: ago(2 * memberLeaveTimeout)}
+			if tc.recorded {
+				ann[etcdMemberLeaveRequestedAtAnnotation] = ago(time.Minute)
+				ann[etcdMemberLeaveMemberIDAnnotation] = testMemberID
+			}
+			wasLeave := leaveRequested(tc.member)
+			f := newLeaveFixture(g, ann, []client.Object{tc.member}, nil)
+
+			done, err := f.reconcile()
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(done).To(BeTrue())
+			assertHookGone(g, f.mgmt, "cp-0")
+			g.Expect(leaveRequested(getEtcdMember(g, f.member, "cp-0"))).To(Equal(wasLeave), "the EtcdMember is not written")
+			if !tc.recorded {
+				g.Expect(getMachine(g, f.mgmt, "cp-0").Annotations).ToNot(HaveKey(etcdMemberLeaveMemberIDAnnotation))
+			}
+			g.Expect(f.events()).To(ConsistOf(And(ContainSubstring("Warning EtcdMemberLeaveTimedOut"), ContainSubstring("no member ID"))))
+		})
+	}
+}
+
+// TestEtcdMemberID reads status.memberID in the form k0s writes it.
+func TestEtcdMemberID(t *testing.T) {
+	g := NewWithT(t)
+	id, ok := etcdMemberID(k0sEtcdMemberWithID("cp-0", "10.0.0.10", "8E9E05C52164694D", false, "True"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(id).To(Equal(testMemberID))
+	for _, bad := range []string{"", "not-an-id", "0", "1ffffffffffffffff"} {
+		_, ok := etcdMemberID(k0sEtcdMemberWithID("cp-0", "10.0.0.10", bad, false, "True"))
+		g.Expect(ok).To(BeFalse(), "memberID %q", bad)
 	}
 }
 

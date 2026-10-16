@@ -26,9 +26,10 @@ package controlplane
 // node acks through an apiserver that may itself have lost etcd.
 //
 // The KCP sets spec.leave only on the EtcdMember of the Machine it is
-// removing: the one named after that Machine's Node, and only when no other
-// Machine reports its peer address. It removes the hook once k0s reports
-// Joined=False. Without the EtcdMember API, without an EtcdMember for the
+// removing: the one named after that Machine's Node, only when no other
+// Machine reports its peer address, and only while it carries the member ID
+// recorded when the KCP first inspected it. It removes the hook once k0s
+// reports Joined=False on that same member. Without the EtcdMember API, without an EtcdMember for the
 // node, or once etcdMemberLeaveCap has passed, it falls back to the old
 // behaviour: a warning, and the hook removed.
 
@@ -36,6 +37,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -55,6 +57,11 @@ const (
 	// tried to hand a timed-out leave to k0s. It anchors etcdMemberLeaveCap, so
 	// a Machine whose leave was requested long ago still gets the full wait.
 	etcdMemberLeaveRequestedAtAnnotation = "controlplane.cluster.x-k8s.io/etcd-member-leave-requested-at"
+
+	// etcdMemberLeaveMemberIDAnnotation records the status.memberID of the
+	// EtcdMember the KCP first inspected for this leave. k0s removes a member
+	// by that ID, so the KCP acts on the object only while it still carries it.
+	etcdMemberLeaveMemberIDAnnotation = "controlplane.cluster.x-k8s.io/etcd-member-leave-member-id"
 
 	// etcdMemberLeaveCap bounds the wait for k0s to report the member gone.
 	// k0s v1.36 waits up to 5 minutes for the member's controller lease to
@@ -82,9 +89,12 @@ var etcdMemberGVK = schema.GroupVersionKind{Group: "etcd.k0sproject.io", Version
 //     timeout path.
 //   - The EtcdMember's peer address belongs to another Machine: it is not
 //     the leaving member's. Leave it alone, and take the old timeout path.
-//   - Otherwise: stamp, set spec.leave if it is not set, and remove the hook
-//     once k0s reports Joined=False. After etcdMemberLeaveCap, the old
-//     timeout path.
+//   - The EtcdMember has no member ID, or not the one recorded at the first
+//     inspection: it may describe another member. Leave it alone, and take
+//     the old timeout path.
+//   - Otherwise: stamp, record the member ID, set spec.leave if it is not
+//     set, and remove the hook once k0s reports Joined=False. After
+//     etcdMemberLeaveCap, the old timeout path.
 func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, target *clusterv1.Machine, conn leaveConn, connErr error) (bool, error) {
 	nodeName := target.Status.NodeRef.Name
 	if connErr != nil {
@@ -120,7 +130,25 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 		return true, r.abandonMemberLeave(ctx, log, kcp, target, fmt.Sprintf("its EtcdMember has the peer address of Machine %q", owner))
 	}
 
-	if err := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); err != nil {
+	// k0s removes the member by status.memberID. The ID seen at the first
+	// inspection is recorded, and the object is acted on only while it still
+	// carries it: both the spec.leave write and the Joined=False below are
+	// read from this object, and the patch is pinned to its resourceVersion.
+	memberID, ok := etcdMemberID(member)
+	if !ok {
+		log.Info("etcd-leave: EtcdMember named after the node reports no member ID; not touching it",
+			"machine", target.Name, "node", nodeName)
+		return true, r.abandonMemberLeave(ctx, log, kcp, target, "its EtcdMember reports no member ID")
+	}
+	if recorded, set := target.Annotations[etcdMemberLeaveMemberIDAnnotation]; set && recorded != memberID {
+		log.Info("etcd-leave: EtcdMember named after the node has a different member ID than first seen; not touching it",
+			"machine", target.Name, "node", nodeName, "recordedMemberID", recorded, "memberID", memberID)
+		return true, r.abandonMemberLeave(ctx, log, kcp, target, "its EtcdMember now describes a different etcd member")
+	}
+	if err := r.annotateOnce(ctx, target, map[string]string{
+		etcdMemberLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339),
+		etcdMemberLeaveMemberIDAnnotation:    memberID,
+	}); err != nil {
 		return false, err
 	}
 	if leave, _, _ := unstructured.NestedBool(member.Object, "spec", "leave"); !leave {
@@ -137,7 +165,7 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 			return false, fmt.Errorf("etcd-leave: set spec.leave on EtcdMember %s via %s: %w", nodeName, conn.via, err)
 		}
 		log.Info("etcd-leave: node did not ack; asked k0s to remove the etcd member",
-			"machine", target.Name, "node", nodeName, "via", conn.via, "timeout", memberLeaveTimeout)
+			"machine", target.Name, "node", nodeName, "memberID", memberID, "via", conn.via, "timeout", memberLeaveTimeout)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(kcp, corev1.EventTypeNormal, "EtcdMemberLeaveDelegated",
 				"Control-plane node %q did not acknowledge its etcd leave within %s; asked k0s to remove its etcd member", nodeName, memberLeaveTimeout)
@@ -201,6 +229,21 @@ func etcdMemberPeerOwner(member *unstructured.Unstructured, machines []*clusterv
 		}
 	}
 	return ""
+}
+
+// etcdMemberID returns the EtcdMember's status.memberID in canonical form
+// (lowercase hex, as k0s writes it), and false when it is missing or is not a
+// hexadecimal etcd member ID.
+func etcdMemberID(member *unstructured.Unstructured) (string, bool) {
+	raw, _, _ := unstructured.NestedString(member.Object, "status", "memberID")
+	if raw == "" {
+		return "", false
+	}
+	id, err := strconv.ParseUint(raw, 16, 64)
+	if err != nil || id == 0 {
+		return "", false
+	}
+	return strconv.FormatUint(id, 16), true
 }
 
 // etcdMemberJoinedStatus returns the status of the EtcdMember's Joined

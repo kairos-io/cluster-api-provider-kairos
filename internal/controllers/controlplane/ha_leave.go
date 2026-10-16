@@ -19,6 +19,8 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -375,9 +377,22 @@ func (r *KairosControlPlaneReconciler) stampLeaveRequestedAt(ctx context.Context
 // stampAnnotationOnce sets the annotation key on the Machine to the current
 // time (RFC3339), unless it is already set.
 func (r *KairosControlPlaneReconciler) stampAnnotationOnce(ctx context.Context, m *clusterv1.Machine, key string) error {
-	if _, ok := m.Annotations[key]; ok {
+	return r.annotateOnce(ctx, m, map[string]string{key: time.Now().UTC().Format(time.RFC3339)})
+}
+
+// annotateOnce sets, in one patch, each of values on the Machine that is not
+// set yet. Values already present are kept.
+func (r *KairosControlPlaneReconciler) annotateOnce(ctx context.Context, m *clusterv1.Machine, values map[string]string) error {
+	var keys []string
+	for k := range values {
+		if _, ok := m.Annotations[k]; !ok {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
 		return nil
 	}
+	sort.Strings(keys)
 	helper, err := patch.NewHelper(m, r.Client)
 	if err != nil {
 		return err
@@ -385,9 +400,11 @@ func (r *KairosControlPlaneReconciler) stampAnnotationOnce(ctx context.Context, 
 	if m.Annotations == nil {
 		m.Annotations = map[string]string{}
 	}
-	m.Annotations[key] = time.Now().UTC().Format(time.RFC3339)
+	for _, k := range keys {
+		m.Annotations[k] = values[k]
+	}
 	if err := helper.Patch(ctx, m); err != nil {
-		return fmt.Errorf("stamp %s on machine %s: %w", key, m.Name, err)
+		return fmt.Errorf("stamp %s on machine %s: %w", strings.Join(keys, ", "), m.Name, err)
 	}
 	return nil
 }
