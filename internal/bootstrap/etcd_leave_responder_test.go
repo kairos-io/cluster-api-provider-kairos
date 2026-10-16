@@ -102,6 +102,14 @@ func TestEtcdLeaveResponder_IsBounded(t *testing.T) {
 					t.Errorf("responder script missing %q", want)
 				}
 			}
+			// A failed leave must never be reported as done, and its stderr must
+			// reach the journal.
+			for _, forbidden := range []string{"acking anyway", "already left", "etcd leave 2>/dev/null"} {
+				if strings.Contains(script, forbidden) {
+					t.Errorf("responder script still contains %q", forbidden)
+				}
+			}
+
 			f := filepath.Join(t.TempDir(), "kairos-etcd-leave.sh")
 			if err := os.WriteFile(f, []byte(script), 0o600); err != nil {
 				t.Fatalf("write temp script: %v", err)
@@ -256,6 +264,7 @@ case "$1" in
     esac
     ;;
   etcd)
+    echo "stub-k0s: etcd leave diagnostics" >&2
     exit "${STUB_LEAVE_RC}"
     ;;
 esac
@@ -358,10 +367,38 @@ func TestEtcdLeaveResponder_Behaviour(t *testing.T) {
 			run:          responderRun{getValue: requested, timeoutFires: true},
 			wantExitZero: false, wantLeaves: 0, wantPatches: 0, wantMarker: false,
 		},
+		// Every way the leave can fail leaves the membership unknown. None of
+		// them may produce an ack or a marker: the ack would make the controller
+		// drop its hook at once, and the marker would pin that result.
 		{
-			name:         "a leave that errors (already left) is acked and marked",
+			name:         "etcd refusing the removal is not acked and not marked",
 			run:          responderRun{getValue: requested, leaveRC: 1},
-			wantExitZero: true, wantLeaves: 1, wantPatches: 1, wantMarker: true,
+			wantExitZero: false, wantLeaves: 1, wantPatches: 0, wantMarker: false,
+		},
+		{
+			name:         "a usage or config error (rc 2) is not acked and not marked",
+			run:          responderRun{getValue: requested, leaveRC: 2},
+			wantExitZero: false, wantLeaves: 1, wantPatches: 0, wantMarker: false,
+		},
+		{
+			name:         "timeout(1) failing to run the command (rc 125) is not acked and not marked",
+			run:          responderRun{getValue: requested, leaveRC: 125},
+			wantExitZero: false, wantLeaves: 1, wantPatches: 0, wantMarker: false,
+		},
+		{
+			name:         "a command that cannot be executed (rc 126) is not acked and not marked",
+			run:          responderRun{getValue: requested, leaveRC: 126},
+			wantExitZero: false, wantLeaves: 1, wantPatches: 0, wantMarker: false,
+		},
+		{
+			name:         "a missing command (rc 127) is not acked and not marked",
+			run:          responderRun{getValue: requested, leaveRC: 127},
+			wantExitZero: false, wantLeaves: 1, wantPatches: 0, wantMarker: false,
+		},
+		{
+			name:         "a killed leave (rc 137) is not acked and not marked",
+			run:          responderRun{getValue: requested, leaveRC: 137},
+			wantExitZero: false, wantLeaves: 1, wantPatches: 0, wantMarker: false,
 		},
 	}
 	for _, fl := range etcdLeaveFlavours {
@@ -394,6 +431,10 @@ func TestEtcdLeaveResponder_Behaviour(t *testing.T) {
 					if !strings.Contains(l, fl.server) || !strings.Contains(l, "--request-timeout=10s") {
 						t.Errorf("unbounded or mis-targeted kubectl call: %s", l)
 					}
+				}
+				// The leave's stderr is not discarded.
+				if tc.wantLeaves > 0 && !strings.Contains(res.output, "stub-k0s: etcd leave diagnostics") {
+					t.Errorf("k0s etcd leave stderr did not reach the output:\n%s", res.output)
 				}
 				// The leave, when it runs, is wrapped in timeout 120.
 				if tc.wantLeaves > 0 || tc.run.timeoutFires {

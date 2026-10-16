@@ -464,27 +464,24 @@ write_files:
         # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
         # configured peer address — no ConfigMap/operator-derived value reaches the
         # command. It has no deadline of its own, so bound it with timeout(1); an
-        # image without timeout(1) keeps the unbounded call.
+        # image without timeout(1) keeps the unbounded call. Its stderr goes to the
+        # journal.
         rc=0
         if command -v timeout >/dev/null 2>&1; then
-          timeout 120 k0s etcd leave 2>/dev/null || rc=$?
+          timeout 120 k0s etcd leave || rc=$?
         else
-          k0s etcd leave 2>/dev/null || rc=$?
+          k0s etcd leave || rc=$?
         fi
-        case "${rc}" in
-          0)
-            echo "etcd-leave: left etcd cluster"
-            ;;
-          124|137|143)
-            # Timed out or killed: whether the member was removed is unknown, so do
-            # not report `left`. No marker either; the next run tries again.
-            echo "etcd-leave: k0s etcd leave did not finish in 120s (rc=${rc}); not acking, will retry on the next run" >&2
-            exit 1
-            ;;
-          *)
-            echo "etcd-leave: k0s etcd leave returned ${rc} (already left?); acking anyway"
-            ;;
-        esac
+        # Anything but a clean exit (a timeout, etcd refusing the removal, a peer
+        # address that cannot be found, a config that fails to load, a missing
+        # binary) leaves the membership unknown, so report nothing: no `left` and no
+        # marker. The next run tries again, and if it keeps failing the controller's
+        # own timeout handles the member.
+        if [ "${rc}" -ne 0 ]; then
+          echo "etcd-leave: k0s etcd leave failed (rc=${rc}); not acking, will retry on the next run" >&2
+          exit 1
+        fi
+        echo "etcd-leave: left etcd cluster"
         touch "${leave_marker}"
       fi
       # Ack by patching our own key to `left` via the VIP. Only member_key
