@@ -28,6 +28,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/k0sjointoken"
 )
 
 // TestHA_K0sJoinToken_BootstrapRendersOnlyTheIssuedToken: a k0s join
@@ -47,9 +48,15 @@ func TestHA_K0sJoinToken_BootstrapRendersOnlyTheIssuedToken(t *testing.T) {
 		nsName      = "ha-k0s-idmatch"
 		clusterName = "ha-k0s-idmatch-cluster"
 		kcpName     = "ha-k0s-idmatch-kcp"
-		staleToken  = "k0s-token-for-aaaaaa"
-		issuedToken = "k0s-token-for-bbbbbb"
 	)
+	encode := func(id string) string {
+		tok, err := k0sjointoken.NewBootstrapToken(id, "0123456789"+id)
+		g.Expect(err).ToNot(HaveOccurred())
+		enc, err := k0sjointoken.Encode("https://192.0.2.10:9443", []byte("ca"), tok)
+		g.Expect(err).ToNot(HaveOccurred())
+		return enc
+	}
+	staleToken, issuedToken := encode("aaaaaa"), encode("bbbbbb")
 	idAnno := bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation
 	haFixture(t, ctx, c, nsName, clusterName, kcpName, "k0s")
 
