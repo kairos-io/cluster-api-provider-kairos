@@ -1287,24 +1287,29 @@ func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&bootstrapv1beta2.KairosConfig{}).
+		// Userdata Secret watch. OnlyMetadata: the watch exists to re-enqueue a
+		// KairosConfig when its userdata Secret changes, and the mapper needs
+		// nothing but name, namespace and labels. Without it the manager's cache
+		// would hold every Secret in every watched namespace, data included —
+		// the <cluster>-kubeconfig of every workload cluster present, Kairos or
+		// not. Secret data is still read live, through the uncached client path.
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.secretToKairosConfig),
+			ctrlbuilder.OnlyMetadata,
 		).
 		// HA join-token Secret watch (ADR 0005 Phase 3, BLOCKER-2). Label-filtered
 		// to the join-token secret-type label so a join KairosConfig is
 		// re-reconciled the moment the k0s init node pushes the token, instead of
 		// waiting for the requeue backstop. Distinct handler from the userdata
-		// Secret watch above.
+		// Secret watch above. Also metadata-only: the predicate and the mapper
+		// read labels only.
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.joinTokenSecretToKairosConfig),
+			ctrlbuilder.OnlyMetadata,
 			ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-				secret, ok := obj.(*corev1.Secret)
-				if !ok {
-					return false
-				}
-				return secret.Labels[bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel] == bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue
+				return obj.GetLabels()[bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel] == bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue
 			})),
 		).
 		Watches(
@@ -1344,23 +1349,21 @@ func (r *KairosConfigReconciler) gvkExists(mgr ctrl.Manager, gvk schema.GroupVer
 
 // secretToKairosConfig maps CAPK userdata secrets to their owning KairosConfig
 func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o client.Object) []reconcile.Request {
-	secret, ok := o.(*corev1.Secret)
-	if !ok {
+	// Reads metadata only: the watch that feeds this mapper is OnlyMetadata, so
+	// o is a *metav1.PartialObjectMetadata, not a *corev1.Secret.
+	if !strings.HasSuffix(o.GetName(), "-userdata") {
 		return nil
 	}
-	if !strings.HasSuffix(secret.Name, "-userdata") {
-		return nil
-	}
-	if _, ok := secret.Labels[clusterv1.ClusterNameLabel]; !ok {
+	if _, ok := o.GetLabels()[clusterv1.ClusterNameLabel]; !ok {
 		return nil
 	}
 
 	machineList := &clusterv1.MachineList{}
-	if err := r.List(ctx, machineList, client.InNamespace(secret.Namespace)); err != nil {
+	if err := r.List(ctx, machineList, client.InNamespace(o.GetNamespace())); err != nil {
 		return nil
 	}
 
-	bootstrapSecretName := strings.TrimSuffix(secret.Name, "-userdata")
+	bootstrapSecretName := strings.TrimSuffix(o.GetName(), "-userdata")
 	for _, machine := range machineList.Items {
 		if machine.Spec.Bootstrap.DataSecretName == nil {
 			continue
@@ -1402,20 +1405,19 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 // reconcile itself is idempotent and no-ops for configs whose bootstrap data is
 // already generated, so over-enqueueing is harmless.
 func (r *KairosConfigReconciler) joinTokenSecretToKairosConfig(ctx context.Context, o client.Object) []reconcile.Request {
-	secret, ok := o.(*corev1.Secret)
-	if !ok {
+	// Reads metadata only: the watch that feeds this mapper is OnlyMetadata, so
+	// o is a *metav1.PartialObjectMetadata, not a *corev1.Secret.
+	labels := o.GetLabels()
+	if labels[bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel] != bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue {
 		return nil
 	}
-	if secret.Labels[bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeLabel] != bootstrapv1beta2.ControlPlaneJoinTokenSecretTypeValue {
-		return nil
-	}
-	clusterName := secret.Labels[clusterv1.ClusterNameLabel]
+	clusterName := labels[clusterv1.ClusterNameLabel]
 	if clusterName == "" {
 		return nil
 	}
 
 	kcList := &bootstrapv1beta2.KairosConfigList{}
-	if err := r.List(ctx, kcList, client.InNamespace(secret.Namespace),
+	if err := r.List(ctx, kcList, client.InNamespace(o.GetNamespace()),
 		client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
 		return nil
 	}
