@@ -233,6 +233,8 @@ write_files:
   # --enable-worker is needed as on k0s); the instances leader-elect on the
   # plndr-cp-lock Lease (hence the RBAC) and the leader ARPs the floating
   # control-plane VIP, so VIP ownership fails over when the leader's Node dies.
+  # Each instance elects through its own Node's apiserver (127.0.0.1:6443), so a
+  # member keeps the VIP only while its own apiserver can write to etcd (ADR 0014).
   - path: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
     permissions: "0644"
     owner: root
