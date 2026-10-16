@@ -100,7 +100,7 @@ func goldenCases() []goldenCase {
 		{"k3s_capk_single", RenderK3sCloudConfig, base(bootstrapv1beta2.ControlPlaneRoleSingle, true, true, false)},
 
 		// --- init (HA first node, CAPV: kube-vip + etcd-health reporter rendered) ---
-		{"k0s_capv_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinTokenSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-control-plane-join-token"), "ha-cluster-etcd-status")},
+		{"k0s_capv_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-etcd-status")},
 		{"k3s_capv_init", RenderK3sCloudConfig, withEtcdStatusSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-etcd-status")},
 
 		// --- join (HA subsequent node, CAPV: kube-vip + etcd-health reporter rendered) ---
@@ -112,7 +112,7 @@ func goldenCases() []goldenCase {
 		// snapshots exercise the etcd-health reporter block (ADR 0005 §E.1 port to
 		// CAPK); k0s additionally carries the etcd-leave responder (ADR 0005 §E.3),
 		// gated only on IsHAControlPlane, acking via ControlPlaneLBEndpoint (no VIP).
-		{"k0s_capk_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinTokenSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-control-plane-join-token"), "ha-cluster-etcd-status")},
+		{"k0s_capk_init", RenderK0sCloudConfig, withEtcdStatusSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-etcd-status")},
 		{"k3s_capk_init", RenderK3sCloudConfig, withEtcdStatusSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-etcd-status")},
 		{"k0s_capk_join", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
 		{"k3s_capk_join", RenderK3sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
@@ -121,15 +121,6 @@ func goldenCases() []goldenCase {
 
 func withJoinToken(d TemplateData) TemplateData {
 	d.JoinToken = "K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::server:bbbbbbbbbbbbbbbbbbbbbbbb"
-	return d
-}
-
-// withJoinTokenSecretName stamps the k0s HA init-node push-block gate
-// (ManagementEndpoint.JoinTokenSecretName). Only the k0s init render mints
-// `k0s token create` and pushes the token; this makes the golden snapshot
-// exercise that highest-blast-radius block. Requires ManagementEndpoint set.
-func withJoinTokenSecretName(d TemplateData, name string) TemplateData {
-	d.ManagementEndpoint.JoinTokenSecretName = name
 	return d
 }
 

@@ -58,8 +58,8 @@ const controlPlaneLBServiceSuffix = "control-plane-lb"
 var errLBEndpointNotReady = errors.New("control plane load balancer endpoint not ready")
 
 // errTokenNotReady signals that a referenced join-token Secret does not exist
-// yet (the controller has not generated it, or the init node has not pushed it
-// over the node-push channel). reconcileBootstrapData maps it to a timed
+// yet, or does not yet hold the token this KairosConfig was issued (the
+// controller has not written it). reconcileBootstrapData maps it to a timed
 // requeue rather than a hard failure. (Formerly errK3sTokenNotReady; generalized
 // for the Phase-3 control-plane-join token path — ADR 0005.)
 var errTokenNotReady = errors.New("join token secret not ready")
@@ -1076,8 +1076,9 @@ func (r *KairosConfigReconciler) generateCloudConfigM(ctx context.Context, log l
 //
 // The join token is resolved from the distribution-appropriate *SecretRef
 // (TOKEN-INV: *SecretRef only). A missing token Secret surfaces as
-// errTokenNotReady so reconcileBootstrapData requeues — the init node may not
-// have pushed the k0s controller-join token yet. The token is never logged.
+// errTokenNotReady so reconcileBootstrapData requeues — the KCP may not have
+// written the k0s controller-join token for this joiner yet. The token is never
+// logged.
 func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context, td *bootstrap.TemplateData, kairosConfig *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster, role string) error {
 	if role != "control-plane" {
 		return nil // CPR-INV-1: workers never consume ControlPlaneRole/VIP.
@@ -1110,14 +1111,10 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 	// The join token is only meaningful for init/join nodes. single needs none.
 	switch kairosConfig.Spec.ControlPlaneRole {
 	case bootstrapv1beta2.ControlPlaneRoleInit:
-		// k0s init: the token does not exist until the node is up. The init node
-		// mints it via `k0s token create` and pushes it over the node-push
-		// channel; the renderer needs the target Secret name to build that push
-		// block. The init node does NOT embed a token in its own k0s config.
+		// k0s init: the init node needs no token, and it no longer mints or
+		// pushes one. The KairosControlPlane issues the controller-join token for
+		// each joiner through the workload API (ADR 0013).
 		if distribution == "k0s" {
-			if td.ManagementEndpoint != nil && cluster != nil {
-				td.ManagementEndpoint.JoinTokenSecretName = bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
-			}
 			break
 		}
 		// k3s init carries the controller-generated shared server token (written
@@ -1293,9 +1290,9 @@ func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		// HA join-token Secret watch (ADR 0005 Phase 3, BLOCKER-2). Label-filtered
 		// to the join-token secret-type label so a join KairosConfig is
-		// re-reconciled the moment the k0s init node pushes the token, instead of
-		// waiting for the requeue backstop. Distinct handler from the userdata
-		// Secret watch above.
+		// re-reconciled the moment the KCP writes the k0s token it issued for it
+		// (ADR 0013), instead of waiting for the requeue backstop. Distinct
+		// handler from the userdata Secret watch above.
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.joinTokenSecretToKairosConfig),
@@ -1394,9 +1391,9 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 // the control-plane KairosConfigs in its cluster that are waiting on the token
 // (ADR 0005 Phase 3, BLOCKER-2). It is label-filtered (the join-token
 // secret-type label + the cluster-name label), never name-suffix matched
-// (KD-15). When the k0s init node PATCHes its `k0s token create` output into the
-// Secret, this wakes every pending join KairosConfig immediately instead of
-// waiting for the 10s requeue.
+// (KD-15). When the KCP writes the k0s controller-join token it issued into the
+// Secret (ADR 0013), this wakes every pending join KairosConfig immediately
+// instead of waiting for the 10s requeue.
 //
 // It enqueues all control-plane KairosConfigs for the cluster (a small set); the
 // reconcile itself is idempotent and no-ops for configs whose bootstrap data is

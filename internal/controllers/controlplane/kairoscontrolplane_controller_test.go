@@ -125,6 +125,7 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 		cluster,
 		0,
 		bootstrapv1beta2.ControlPlaneRoleSingle,
+		"",
 	)
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -226,6 +227,7 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 		cluster,
 		0,
 		bootstrapv1beta2.ControlPlaneRoleInit,
+		"",
 	)
 
 	g.Expect(err).NotTo(HaveOccurred())
