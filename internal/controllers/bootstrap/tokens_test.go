@@ -189,13 +189,65 @@ func TestResolveToken_K3sWorkerPrecedence(t *testing.T) {
 func TestResolveToken_ControlPlaneJoin(t *testing.T) {
 	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"}}
 
+	const idAnno = bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation
+	k0sRef := &bootstrapv1beta2.WorkerTokenSecretReference{Name: "cp-join"}
+	k0sSpec := bootstrapv1beta2.KairosConfigSpec{Distribution: "k0s", ControlPlaneJoinTokenSecretRef: k0sRef}
+	issuedSecret := func(id, value string) *corev1.Secret {
+		s := tokenSecret("cp-join", "default", "token", value)
+		if id != "" {
+			s.Annotations = map[string]string{idAnno: id}
+		}
+		return s
+	}
+
 	tests := []struct {
-		name  string
-		spec  bootstrapv1beta2.KairosConfigSpec
-		objs  []client.Object
-		want  string
-		errIs error
+		name        string
+		spec        bootstrapv1beta2.KairosConfigSpec
+		annotations map[string]string
+		objs        []client.Object
+		want        string
+		errIs       error
 	}{
+		{
+			name:        "k0s renders the token the KCP issued for this config",
+			spec:        k0sSpec,
+			annotations: map[string]string{idAnno: "bbbbbb"},
+			objs:        []client.Object{issuedSecret("bbbbbb", "token-bbbbbb")},
+			want:        "token-bbbbbb",
+		},
+		{
+			name:        "k0s requeues while the Secret still holds an earlier token",
+			spec:        k0sSpec,
+			annotations: map[string]string{idAnno: "bbbbbb"},
+			objs:        []client.Object{issuedSecret("aaaaaa", "token-aaaaaa")},
+			errIs:       errTokenNotReady,
+		},
+		{
+			name:        "k0s requeues while the Secret holds an un-annotated token",
+			spec:        k0sSpec,
+			annotations: map[string]string{idAnno: "bbbbbb"},
+			objs:        []client.Object{issuedSecret("", "init-node-token")},
+			errIs:       errTokenNotReady,
+		},
+		{
+			name:        "k0s requeues when the ID matches but the token is empty",
+			spec:        k0sSpec,
+			annotations: map[string]string{idAnno: "bbbbbb"},
+			objs:        []client.Object{issuedSecret("bbbbbb", "")},
+			errIs:       errTokenNotReady,
+		},
+		{
+			name:        "k0s requeues when the Secret does not exist yet",
+			spec:        k0sSpec,
+			annotations: map[string]string{idAnno: "bbbbbb"},
+			errIs:       errTokenNotReady,
+		},
+		{
+			name: "k0s config from an older KCP renders whatever the Secret holds",
+			spec: k0sSpec,
+			objs: []client.Object{issuedSecret("aaaaaa", "token-aaaaaa")},
+			want: "token-aaaaaa",
+		},
 		{
 			name: "k3s resolves shared server token from K3sTokenSecretRef",
 			spec: bootstrapv1beta2.KairosConfigSpec{
@@ -230,13 +282,20 @@ func TestResolveToken_ControlPlaneJoin(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			kc := &bootstrapv1beta2.KairosConfig{
-				ObjectMeta: metav1.ObjectMeta{Name: "kc", Namespace: "default"},
+				ObjectMeta: metav1.ObjectMeta{Name: "kc", Namespace: "default", Annotations: tc.annotations},
 				Spec:       tc.spec,
 			}
 			r := tokenReconciler(g, tc.objs...)
 			got, err := r.resolveToken(context.Background(), tokenKindControlPlaneJoin, kc, cluster)
 			if tc.errIs != nil {
 				g.Expect(err).To(MatchError(tc.errIs))
+				for _, o := range tc.objs {
+					for _, v := range o.(*corev1.Secret).Data {
+						if len(v) > 0 {
+							g.Expect(err.Error()).ToNot(ContainSubstring(string(v)), "the token value must not reach the error")
+						}
+					}
+				}
 				return
 			}
 			g.Expect(err).ToNot(HaveOccurred())
