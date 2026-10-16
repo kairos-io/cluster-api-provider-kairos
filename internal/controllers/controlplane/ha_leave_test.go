@@ -426,6 +426,27 @@ func TestReconcileMemberLeave_ReadErrorBeforeTimeoutRetainsHook(t *testing.T) {
 	g.Expect(rec.Events).ToNot(Receive())
 }
 
+// TestReconcileMemberLeave_ReadErrorPastTimeoutReachesBackstop: once the
+// leave is older than memberLeaveTimeout, a failed workload read no longer
+// returns ahead of the timeout backstop. The 2026-10-16 lab cluster stayed
+// at leave-requested for more than 13 minutes because it did.
+func TestReconcileMemberLeave_ReadErrorPastTimeoutReachesBackstop(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+	old := time.Now().Add(-2 * memberLeaveTimeout).UTC().Format(time.RFC3339)
+	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: old})
+	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
+	wc := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
+
+	rec := record.NewFakeRecorder(4)
+	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: rec, WorkloadClientFactory: staticWorkloadClient(wc)}
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(done).To(BeTrue())
+	assertHookGone(g, mgmt, "cp-0")
+	g.Expect(rec.Events).To(Receive(ContainSubstring("EtcdMemberLeaveTimedOut")))
+}
+
 // TestReconcileMemberLeave_WaitingReassertsMissingRequest: a waiting reconcile
 // that finds the workload ConfigMap gone writes the request back and keeps
 // waiting, rather than reading the missing key as an ack.
