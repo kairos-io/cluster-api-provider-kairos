@@ -166,24 +166,22 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		//   services:get                          — REMOVED. No template path
 		//                                            reads Services with the node
 		//                                            SA token; it was a dead grant.
-		//   secrets get/update/patch (join-token) — ADR 0005 Phase 3: the k0s HA
-		//                                            init node PATCHes the
-		//                                            controller-created,
-		//                                            owner-ref'd join-token Secret
-		//                                            with its `k0s token create`
-		//                                            output over the node-push
-		//                                            channel. No create verb: the
-		//                                            controller pre-creates the
-		//                                            Secret, so the node only
-		//                                            updates it. Named Secret only;
-		//                                            deliberate, bounded widening.
-		joinTokenSecretName := bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
+		//   secrets get/update/patch (join-token) — REMOVED (ADR 0013). The k0s
+		//                                            init node used to PATCH its
+		//                                            `k0s token create` output into
+		//                                            the join-token Secret. The
+		//                                            KairosControlPlane now mints
+		//                                            that token and is the Secret's
+		//                                            only writer, so no node is
+		//                                            granted it. Rewriting the rules
+		//                                            on every Resolve narrows Roles
+		//                                            created by older releases too.
 		// ADR 0005 §E.1: HA control-plane nodes also PATCH their own member key
 		// into the per-cluster etcd-status Secret over this same node-push
 		// channel. Add it to the resourceNames-scoped get/update/patch rule (no
 		// create — the controller pre-creates it, Cluster-owned). Named Secret
-		// only; deliberate, bounded widening, identical in shape to the join-token
-		// grant. Non-HA clusters never create the Secret, so the grant is inert.
+		// only; deliberate, bounded widening. Non-HA clusters never create the
+		// Secret, so the grant is inert.
 		etcdStatusSecretName := bootstrapv1beta2.EtcdStatusSecretName(cluster.Name)
 		role.Rules = []rbacv1.PolicyRule{
 			{
@@ -194,7 +192,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"secrets"},
-				ResourceNames: []string{secretName, joinTokenSecretName, etcdStatusSecretName},
+				ResourceNames: []string{secretName, etcdStatusSecretName},
 				Verbs:         []string{"get", "update", "patch"},
 			},
 		}
