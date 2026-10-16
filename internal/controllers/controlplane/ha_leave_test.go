@@ -23,6 +23,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
@@ -77,7 +78,8 @@ func TestShouldStampEtcdLeaveHook(t *testing.T) {
 }
 
 // hookedMachine builds a k0s HA control-plane Machine carrying the etcd-leave
-// hook, with the given node name (empty → no NodeRef).
+// hook, with the given node name (empty → no NodeRef), at CAPI's
+// pre-terminate stage.
 func hookedMachine(name, node string, extraAnnotations map[string]string) *clusterv1.Machine {
 	ann := map[string]string{etcdLeaveHookAnnotation(): ""}
 	for k, v := range extraAnnotations {
@@ -89,6 +91,22 @@ func hookedMachine(name, node string, extraAnnotations map[string]string) *clust
 	if node != "" {
 		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: node}
 	}
+	return atPreTerminateHook(m)
+}
+
+// atPreTerminateHook puts m where CAPI's Machine controller is once it has
+// finished with the Node (pre-drain hooks, drain, volume detach) and waits on
+// pre-terminate hooks: the Deleting condition True, reason
+// WaitingForPreTerminateHook.
+func atPreTerminateHook(m *clusterv1.Machine) *clusterv1.Machine {
+	return withDeletingReason(m, clusterv1.MachineDeletingWaitingForPreTerminateHookReason)
+}
+
+// withDeletingReason sets m's Deleting condition to True with reason.
+func withDeletingReason(m *clusterv1.Machine, reason string) *clusterv1.Machine {
+	apimeta.SetStatusCondition(&m.Status.Conditions, metav1.Condition{
+		Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: reason,
+	})
 	return m
 }
 
