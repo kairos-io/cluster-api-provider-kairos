@@ -686,7 +686,8 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// terminating and still carries our hook. This single sweep covers the
 	// controller's own quorum-approved deletes below, operator/MHC-initiated
 	// Machine deletes, and crash recovery — the hook keeps CAPI paused (after
-	// drain, node still up) until the member has cleanly left etcd. A workload
+	// drain, node still up) until the member has cleanly left etcd, and the
+	// leave starts only once CAPI has reached that pause. A workload
 	// client/read error keeps the hook set (fail-safe: the delete stays blocked
 	// and quorum is preserved) and requeues; an in-progress leave requeues so we
 	// do not churn other machines while a member is draining out of etcd.

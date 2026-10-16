@@ -100,8 +100,13 @@ type leaveFixture struct {
 }
 
 func newLeaveFixture(g *WithT, annotations map[string]string, workload []client.Object, intercept *interceptor.Funcs) *leaveFixture {
+	return newLeaveFixtureFor(g, leavingMachine("cp-0", annotations, "10.0.0.10"), workload, intercept)
+}
+
+// newLeaveFixtureFor is newLeaveFixture with a prepared leaving Machine cp-0.
+func newLeaveFixtureFor(g *WithT, target *clusterv1.Machine, workload []client.Object, intercept *interceptor.Funcs) *leaveFixture {
 	f := &leaveFixture{scheme: haTestScheme(g)}
-	f.target = leavingMachine("cp-0", annotations, "10.0.0.10")
+	f.target = target
 	f.machines = []*clusterv1.Machine{f.target, nodeMachine("cp-1", false, "10.0.0.11"), nodeMachine("cp-2", false, "10.0.0.12")}
 	f.mgmt = fake.NewClientBuilder().WithScheme(f.scheme).WithObjects(f.target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
 	b := fake.NewClientBuilder().WithScheme(f.scheme).

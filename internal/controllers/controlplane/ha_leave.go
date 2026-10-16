@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -237,6 +238,9 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //     Machine is already `Deleting`, so a phase check would fire for every
 //     target and skip the leave for healthy members too.)
 //  2. Non-k0s carrying the hook (should never happen) → remove hook, done.
+//     Then, until a leave has been requested, wait (done=false, no workload
+//     traffic) while CAPI is still draining the Node or detaching its
+//     volumes (machineAtPreTerminate).
 //  3. Node acked `left` in the workload ConfigMap → remove hook, done.
 //  4. Already-requested AND member gone from etcd-status → remove hook, done.
 //  5. Already-requested AND past memberLeaveTimeout → delegateMemberLeave:
@@ -267,6 +271,18 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 
 	nodeName := target.Status.NodeRef.Name
 	_, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]
+
+	// (2b) Not before CAPI has finished with the Node. The drain and the volume
+	// detach go through the workload apiserver: once this member has left
+	// etcd its own apiserver cannot serve them, and while it holds the VIP
+	// neither can the endpoint. So nothing is requested, and nothing is sent
+	// to the workload cluster, until CAPI waits on the pre-terminate hooks. A
+	// leave already requested (by an earlier pass, or by a KCP without this
+	// gate) carries on whatever CAPI reports.
+	if !requested && !machineAtPreTerminate(target) {
+		log.Info("etcd-leave: waiting for CAPI to finish with the node before the leave", "machine", target.Name, "node", nodeName)
+		return false, nil
+	}
 
 	// Find a workload apiserver that answers, and read the leave ConfigMap
 	// through it. Nothing answering is fail-safe: hook retained, except that
@@ -334,6 +350,16 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	}
 	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName, "via", conn.via)
 	return false, nil
+}
+
+// machineAtPreTerminate reports whether CAPI's Machine controller has
+// finished with m's Node (pre-drain hooks, drain, volume detach) and is
+// waiting on its pre-terminate hooks: the v1beta2 Deleting condition is True
+// with reason WaitingForPreTerminateHook. The kubeadm control plane in CAPI
+// waits for the same state before it touches etcd.
+func machineAtPreTerminate(m *clusterv1.Machine) bool {
+	c := apimeta.FindStatusCondition(m.Status.Conditions, clusterv1.MachineDeletingCondition)
+	return c != nil && c.Status == metav1.ConditionTrue && c.Reason == clusterv1.MachineDeletingWaitingForPreTerminateHookReason
 }
 
 // leaveTimedOut reports whether the leave of m was first requested more than
