@@ -254,7 +254,9 @@ write_files:
   # concatenated into the YAML. The DaemonSet runs one kube-vip per control-plane
   # Node; the instances leader-elect on the plndr-cp-lock Lease (hence the RBAC)
   # and the leader ARPs the floating control-plane VIP, so VIP ownership fails
-  # over when the leader's Node dies.
+  # over when the leader's Node dies. Each instance elects through its own Node's
+  # apiserver (127.0.0.1:6443), so a member keeps the VIP only while its own
+  # apiserver can write to etcd (ADR 0014).
   - path: /var/lib/k0s/manifests/kube-vip/kube-vip.yaml
     permissions: "0644"
     owner: root
@@ -363,18 +365,15 @@ write_files:
                             value: "1"
                           - name: bgp_enable
                             value: "false"
+                          - name: KUBERNETES_SERVICE_HOST
+                            value: 127.0.0.1
+                          - name: KUBERNETES_SERVICE_PORT
+                            value: "6443"
                         securityContext:
                           capabilities:
                               add:
                                   - NET_ADMIN
                                   - NET_RAW
-                        volumeMounts:
-                          - mountPath: /etc/kubernetes/admin.conf
-                            name: kubeconfig
-                  volumes:
-                      - name: kubeconfig
-                        hostPath:
-                          path: /etc/kubernetes/admin.conf
           updateStrategy:
               type: RollingUpdate
   - path: /usr/local/etc/hostname
