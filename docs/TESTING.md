@@ -1,12 +1,12 @@
 # Testing
 
-Last verified against: Go toolchain 1.26.3, provider v0.1.3.
+Last verified against: provider v0.1.3. The Go toolchain used was not recorded; `go.mod` requires 1.26.4 or later.
 
 See [Install guide](INSTALL.md) for development install.
 
 ## Prerequisites
 
-- Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0`; the toolchain line pins `go1.26.0` for reproducibility). The `go.mod` line is `go 1.26.0`; both refer to the same release series.
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
 
 ## Unit tests
 
@@ -97,6 +97,6 @@ Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3,
 | Fleet | k0s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 | Fleet | k3s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 
-Kubeadm workers (`distribution: kubeadm`, see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. They are covered by unit and envtest tests only: the envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. No end-to-end run against a live Kamaji or `KubeadmControlPlane` cluster has been done.
+**Not in v0.1.4; planned for v0.2.0.** On `main`, kubeadm workers (`distribution: kubeadm`, see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. They are covered by unit and envtest tests only: the envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. No end-to-end run against a live Kamaji or `KubeadmControlPlane` cluster has been done.
 
 Hadron is the musl-libc-based next-generation Kairos OS; it is exercised alongside standard (glibc) Kairos images to confirm compatibility with both targets.

@@ -36,6 +36,40 @@ Worked samples:
 
 See the [CAPV HA quickstart walkthrough](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane) for the full procedure.
 
+## Known issue: k0s HA rollouts on v0.1.4
+
+Affects k0s HA control planes on every infrastructure provider except CAPK
+(CAPV, CAPM3, the Kairos fleet provider, and the generic path), in v0.1.4 and
+earlier. k3s and CAPK are not affected.
+
+In these releases only the first control-plane node puts the control-plane
+endpoint in its API server certificate. The nodes that join after it do not.
+Creating the cluster works. But when the first node is removed, for example during a rollout after a `spec.version` change,
+the VIP moves to a joiner, and every client that checks the certificate
+against the endpoint fails. That includes the management cluster. The rollout
+then stops at the first node, with a `KairosControlPlane` message such as:
+
+```text
+failed to reconcile etcd member leave for <cluster>-cp-0: ... tls: failed to verify certificate: x509: certificate is valid for ..., not <endpoint>
+```
+
+The fix renders the endpoint into every control-plane member's certificate,
+and ships in the next release. Until then, avoid changes that replace the first
+control-plane node of an affected cluster.
+
+A second issue affects the same k0s clusters, CAPK included. The token that new
+control-plane members join with is created once, by the first control-plane
+node. It points at that node's own address and expires 24 hours after it was
+created. A member created after the first node has been removed, or more than
+24 hours after the cluster was created, therefore cannot join. Its Machine
+stays `Provisioned` without a Node, and the `KairosControlPlane` keeps waiting
+for it to join. This affects rollouts, remediation and scale-up. A fix that
+has the control plane issue a fresh join token for each new member is being
+prepared for the next release. A member stuck this way does not recover on its
+own: after upgrading to that release, delete its Machine so that a replacement
+is created with a fresh token. The stuck Machine has no Node yet, so deleting
+it does not touch etcd.
+
 ## Scale-up: joiners are created one at a time
 
 Bringing up a 3 or 5-replica control plane provisions the init node first, then

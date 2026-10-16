@@ -8,7 +8,11 @@
 # plane. For the full walkthrough, prerequisites, and troubleshooting, see
 # docs/KUBEADM_WORKERS.md.
 #
-# SCOPE (this release):
+# AVAILABILITY: not in v0.1.4. The kubeadm distribution is on main and is
+# planned for v0.2.0. The v0.1.4 CRDs accept only k0s and k3s, so applying this
+# file to a v0.1.4 install fails validation.
+#
+# SCOPE (on main):
 #   - Workers only. distribution: kubeadm with role: control-plane is rejected on
 #     a KairosConfig at admission and again when the cloud-config is rendered
 #     (KairosConfigTemplate has no webhook, so a template is caught at render

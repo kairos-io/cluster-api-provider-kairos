@@ -84,8 +84,25 @@ cluster installed with `clusterctl` become reachable.
   Machines that already carry it.
 - **Pause:** a paused Cluster stops both controllers, and holds a
   `KairosControlPlane` deletion until it is unpaused.
+- **Templates are owned by the Cluster.** On its first reconcile after the
+  upgrade, each `KairosControlPlane` adds the Cluster as an owner of the two
+  templates it references: the infrastructure machine template and the
+  `KairosConfigTemplate`. This is what lets `clusterctl move` carry them.
+  Kubernetes deletes an object once all of its owners are gone, so deleting
+  the last Cluster that owns a template now deletes the template too. This
+  matches upstream `KubeadmControlPlane`. A template shared by several
+  Clusters stays until the last of them is deleted. If you delete a Cluster
+  and expect its templates to remain, for example to re-create the Cluster
+  from the same manifests, apply the templates again as well.
 - **`caCertHashes` or `caCertSecretRef`:** setting either returns an
   admission warning. Neither has ever had an effect.
+
+### Nothing to do about the Go update
+
+The image is built with Go 1.26.9, which fixes thirteen Go standard-library
+advisories, eight of them in `net/http` and HTTP/2. Pulling the new image is
+the whole change. The [release notes](release-notes/v0.1.4.md#security) list
+each advisory.
 
 ---
 
