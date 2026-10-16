@@ -438,8 +438,8 @@ func TestResolve_MultipleConfigsSameCluster_OwnedByCluster(t *testing.T) {
 
 // TestResolve_GrantsEtcdStatusSecret asserts the node SA's Role is granted
 // get/update/patch (and NOT create) on the per-cluster etcd-status Secret
-// (ADR 0005 §E.1), on the same resourceNames-scoped rule as the kubeconfig +
-// join-token Secrets — a bounded named-Secret widening, no new rule.
+// (ADR 0005 §E.1), on the same resourceNames-scoped rule as the kubeconfig
+// Secret — a bounded named-Secret widening, no new rule.
 func TestResolve_GrantsEtcdStatusSecret(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
@@ -460,6 +460,57 @@ func TestResolve_GrantsEtcdStatusSecret(t *testing.T) {
 	g.Expect(roleGrantsNamedSecret(role, etcdName, "update")).To(BeTrue(), "node SA must update the etcd-status Secret")
 	g.Expect(roleGrantsNamedSecret(role, etcdName, "patch")).To(BeTrue(), "node SA must patch the etcd-status Secret")
 	g.Expect(roleGrantsNamedSecret(role, etcdName, "create")).To(BeFalse(), "node SA must NOT create the etcd-status Secret (controller pre-creates it)")
+}
+
+// TestResolve_NoJoinTokenSecretGrant pins ADR 0013: the KairosControlPlane is
+// the only writer of the k0s join-token Secret, so the per-cluster node
+// ServiceAccount's Role grants nothing on it, for any role or distribution. A
+// Role created by an older release, which did grant it, is narrowed by the
+// next Resolve. The node's other named grants are untouched.
+func TestResolve_NoJoinTokenSecretGrant(t *testing.T) {
+	joinToken := bootstrapv1beta2.ControlPlaneJoinTokenSecretName("test-cluster")
+	etcdStatus := bootstrapv1beta2.EtcdStatusSecretName("test-cluster")
+	kubeconfig := "test-cluster-kubeconfig"
+
+	for _, tc := range []struct{ name, role, distribution string }{
+		{"k0s control plane", "control-plane", "k0s"},
+		{"k3s control plane", "control-plane", "k3s"},
+		{"k0s worker", "worker", "k0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := newResolverScheme(t)
+			// The Role an older release created: the join-token Secret in the
+			// named get/update/patch rule.
+			stale := &rbacv1.Role{
+				ObjectMeta: metav1.ObjectMeta{Name: kubeconfigWriterName("test-cluster"), Namespace: "default"},
+				Rules: []rbacv1.PolicyRule{
+					{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"create"}},
+					{APIGroups: []string{""}, Resources: []string{"secrets"},
+						ResourceNames: []string{kubeconfig, joinToken, etcdStatus}, Verbs: []string{"get", "update", "patch"}},
+				},
+			}
+			r, kc, cluster := newResolverFixture(scheme, &fakeSubResourceClient{token: "tok"}, "https://mgmt:6443", stale)
+			kc.Spec.Role = tc.role
+			kc.Spec.Distribution = tc.distribution
+
+			_, err := r.Resolve(context.Background(), kc, cluster)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			role := &rbacv1.Role{}
+			g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: kubeconfigWriterName("test-cluster"), Namespace: "default"}, role)).To(Succeed())
+			for _, verb := range []string{"get", "list", "watch", "create", "update", "patch", "delete"} {
+				g.Expect(roleGrantsNamedSecret(role, joinToken, verb)).To(BeFalse(), "node SA must not %s the join-token Secret", verb)
+			}
+			for _, rule := range role.Rules {
+				g.Expect(rule.ResourceNames).ToNot(ContainElement(joinToken))
+			}
+			for _, verb := range []string{"get", "update", "patch"} {
+				g.Expect(roleGrantsNamedSecret(role, kubeconfig, verb)).To(BeTrue(), "kubeconfig push grant kept (%s)", verb)
+				g.Expect(roleGrantsNamedSecret(role, etcdStatus, verb)).To(BeTrue(), "etcd-status grant kept (%s)", verb)
+			}
+		})
+	}
 }
 
 // roleGrantsNamedSecret reports whether the Role grants the given verb on the

@@ -121,7 +121,6 @@ func validateTemplateData(d *TemplateData) error {
 			{"managementEndpoint.token", d.ManagementEndpoint.Token},
 			{"managementEndpoint.kubeconfigSecretName", d.ManagementEndpoint.KubeconfigSecretName},
 			{"managementEndpoint.kubeconfigSecretNamespace", d.ManagementEndpoint.KubeconfigSecretNamespace},
-			{"managementEndpoint.joinTokenSecretName", d.ManagementEndpoint.JoinTokenSecretName},
 		}
 		for _, f := range nested {
 			if err := rejectControlChars(f.name, f.value); err != nil {

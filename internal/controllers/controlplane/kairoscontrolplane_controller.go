@@ -71,11 +71,11 @@ type KairosControlPlaneReconciler struct {
 const controlPlaneLBServiceSuffix = "control-plane-lb"
 
 // joinerGateRequeueAfter is the backstop requeue interval while waiting for the
-// HA init machine to become joinable (NodeRef + KubeconfigReady, plus the k0s
-// join-token Secret) before creating the next join machine (ADR 0005 Phase 3,
-// OQ-A). The Machine and Secret watches normally wake the reconcile on the
-// relevant transitions; this is the safety net for the k0s-token-Secret-appears
-// case until that Secret lands.
+// HA init machine to become joinable (NodeRef + KubeconfigReady + etcd health)
+// before creating the next join machine (ADR 0005 Phase 3, OQ-A), and while a
+// k0s joiner is pending: the k0s join-token extension (ADR 0013) runs on these
+// requeues. The Machine and Secret watches normally wake the reconcile on the
+// relevant transitions; this is the safety net.
 const joinerGateRequeueAfter = 15 * time.Second
 
 // The HA join-token Secret name/labels/data-key are defined once in the
@@ -571,7 +571,22 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 	return nil, nil
 }
 
-func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (ctrl.Result, error) {
+func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (result ctrl.Result, retErr error) {
+	// While a k0s joiner is pending, come back at least every
+	// k0sJoinTokenRecheckInterval so its join token is extended before it lapses
+	// (ADR 0013). Without this, a pending last joiner (machines == replicas)
+	// leaves nothing to requeue the KCP: the gate requeue only runs while a
+	// machine is still to be created, and the KCP has no resync.
+	var k0sJoinerPending bool
+	defer func() {
+		if retErr != nil || !k0sJoinerPending || result.Requeue {
+			return
+		}
+		if result.RequeueAfter == 0 || result.RequeueAfter > k0sJoinTokenRecheckInterval {
+			result.RequeueAfter = k0sJoinTokenRecheckInterval
+		}
+	}()
+
 	// Get desired replica count
 	desiredReplicas := int32(1)
 	if kcp.Spec.Replicas != nil {
@@ -632,8 +647,9 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	// HA: ensure the per-cluster join-token Secret exists before any joiner is
 	// created (ADR 0005 Phase 3). For k3s the controller generates the shared
-	// server token up front; for k0s the Secret is created empty and the init
-	// node fills it over the node-push channel. Single-node clusters skip this.
+	// server token up front; for k0s the Secret is created empty and the KCP
+	// mints the controller-join token into it when it admits a joiner (ADR
+	// 0013). Single-node clusters skip this.
 	if desiredReplicas > 1 {
 		if err := r.ensureJoinTokenSecret(ctx, log, kcp, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to ensure join-token secret: %w", err)
@@ -644,6 +660,12 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		// EtcdHealthyCondition, and the quorum-safe-replacement guard.
 		if err := r.ensureEtcdStatusSecret(ctx, log, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to ensure etcd-status secret: %w", err)
+		}
+		// ADR 0013: keep the k0s join token of every pending joiner alive, and say
+		// why a joiner is stuck when the KCP cannot help it. Best effort: it never
+		// fails the reconcile and never gates the scale or rollout logic below.
+		if distributionOf(kcp) == "k0s" && conditions.IsTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition) {
+			k0sJoinerPending = r.reconcileK0sJoinTokenLifetime(ctx, log, kcp, cluster, machines)
 		}
 	}
 
@@ -678,20 +700,23 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 		// HA joiner-sequencing gate (ADR 0005 Phase 3, OQ-A): a join machine is
 		// not created until the init machine is joinable — NodeRef set,
-		// KubeconfigReady, and (k0s) the controller-join token Secret populated.
-		// Creating a joiner before the init endpoint exists would fail the join.
+		// KubeconfigReady, etcd healthy, every earlier joiner joined — and, on
+		// k0s, the KCP holds a controller-join token for it (ADR 0013). Creating a
+		// joiner before the init endpoint exists would fail the join.
+		var joinTokenID string
 		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
-			joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+			admission, err := r.admitJoiner(ctx, log, kcp, cluster, machines)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
-			if !joinable {
-				log.Info("Holding back join machine until init machine is joinable", "reason", reason)
+			if !admission.admitted {
+				log.Info("Holding back join machine until init machine is joinable", "reason", admission.reason)
 				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 			}
+			joinTokenID = admission.k0sJoinTokenID
 		}
 
-		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine: %w", err)
 		}
 		// Only create one per reconcile to avoid over-scaling
@@ -743,14 +768,45 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 	return bootstrapv1beta2.ControlPlaneRoleJoin
 }
 
+// joinAdmission is the outcome of admitJoiner.
+type joinAdmission struct {
+	// admitted is true when the next join machine may be created now.
+	admitted bool
+	// reason says why not, for the hold-back log line.
+	reason string
+	// k0sJoinTokenID is the ID of the k0s controller-join token the new join
+	// KairosConfig must be stamped with. Empty for k3s.
+	k0sJoinTokenID string
+}
+
+// admitJoiner decides whether the next join machine may be created. It runs the
+// read-only join gate (initMachineJoinable) and, once that opens on k0s, makes
+// sure the KCP holds a controller-join token for the joiner (ADR 0013). The
+// token step replaced the gate's old "the init node pushed a token" clause.
+func (r *KairosControlPlaneReconciler) admitJoiner(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) (joinAdmission, error) {
+	joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+	if err != nil || !joinable {
+		return joinAdmission{reason: reason}, err
+	}
+	if distributionOf(kcp) != "k0s" {
+		return joinAdmission{admitted: true}, nil
+	}
+	id, reason, err := r.ensureK0sControllerJoinToken(ctx, log, kcp, cluster, machines)
+	if err != nil {
+		return joinAdmission{}, err
+	}
+	if id == "" {
+		return joinAdmission{reason: reason}, nil
+	}
+	return joinAdmission{admitted: true, k0sJoinTokenID: id}, nil
+}
+
 // initMachineJoinable reports whether it is safe to create another join
-// machine. The gate is (ADR 0005 Phase 3, OQ-A):
+// machine. It reads state and writes nothing. The gate is (ADR 0005 Phase 3,
+// OQ-A):
 //   - the init machine has Status.NodeRef set (it registered as a Node), AND
 //   - KubeconfigReadyCondition is True on the KCP (the node pushed its
 //     kubeconfig — KD-3b), AND
-//   - for k0s only, the join-token Secret has a non-empty token (the init node
-//     minted `k0s token create` and pushed it back). For k3s the token is
-//     controller-generated up front, so this clause is skipped, AND
 //   - the init node has reported a healthy voting etcd member into the
 //     etcd-status Secret (ADR 0005 §E.1) — strict for k0s (authoritative
 //     `k0s etcd member-list`), advisory for k3s (block only on an explicit
@@ -760,6 +816,10 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 //     clauses above stay true while a joiner is still booting and a second
 //     joiner is cut loose, so two concurrent `etcd member add`s break quorum
 //     before either member serves. See the loop below for the full failure mode.
+//
+// On k0s, admitJoiner then makes sure a controller-join token exists for the
+// joiner. That used to be a clause here ("the init node pushed its token");
+// the KCP now mints the token itself (ADR 0013).
 //
 // reason is a short human-readable explanation when not joinable (for
 // logging/conditions).
@@ -778,15 +838,6 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 	distribution := kcp.Spec.Distribution
 	if distribution == "" {
 		distribution = "k0s"
-	}
-	if distribution == "k0s" {
-		token, err := r.joinTokenSecretValue(ctx, cluster)
-		if err != nil {
-			return false, "", err
-		}
-		if token == "" {
-			return false, "k0s controller-join token not yet pushed by init node", nil
-		}
 	}
 
 	// ADR 0005 §E.1: gate joiners on the init node having reported a healthy,
@@ -850,7 +901,12 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 	return true, "", nil
 }
 
-func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole) error {
+// createControlPlaneMachine creates the KairosConfig, infrastructure Machine and
+// Machine for one control-plane member. joinTokenID is the k0s controller-join
+// token ID admitJoiner returned for a k0s join, stamped on the KairosConfig so
+// the bootstrap controller renders exactly that token (ADR 0013); it is empty
+// for every other role and for k3s.
+func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) error {
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
 	// Create KairosConfig
@@ -899,10 +955,22 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	// only when Role == "control-plane" (CPR-INV-1), which holds here.
 	r.applyControlPlaneHASpec(&kairosConfig.Spec, kcp, cluster, role)
 	log.Info("Assigned control-plane role", "role", role, "singleNode", kairosConfig.Spec.SingleNode)
+	if joinTokenID != "" {
+		kairosConfig.Annotations = map[string]string{k0sJoinTokenIDAnnotation: joinTokenID}
+	}
 
 	if err := r.Create(ctx, kairosConfig); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
+		}
+		// A retry after a partial create (the infrastructure Machine failed last
+		// time) finds the KairosConfig already there. The token may have been
+		// replaced since, so point the config at the current one as long as it
+		// has not been rendered yet.
+		if joinTokenID != "" {
+			if err := r.restampJoinConfigTokenID(ctx, log, kairosConfig.Namespace, kairosConfig.Name, joinTokenID); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -965,6 +1033,30 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	}
 
 	return r.Create(ctx, machine)
+}
+
+// restampJoinConfigTokenID points an existing, not yet rendered join
+// KairosConfig at the given k0s join-token ID. A config that already has
+// bootstrap data keeps its annotation: its token is fixed in that data.
+func (r *KairosControlPlaneReconciler) restampJoinConfigTokenID(ctx context.Context, log logr.Logger, namespace, name, joinTokenID string) error {
+	existing := &bootstrapv1beta2.KairosConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing); err != nil {
+		return fmt.Errorf("get existing KairosConfig %s/%s: %w", namespace, name, err)
+	}
+	if existing.Annotations[k0sJoinTokenIDAnnotation] == joinTokenID ||
+		existing.Status.DataSecretName != nil || !existing.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	base := existing.DeepCopy()
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	existing.Annotations[k0sJoinTokenIDAnnotation] = joinTokenID
+	if err := r.Patch(ctx, existing, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("update the k0s join-token ID on KairosConfig %s/%s: %w", namespace, name, err)
+	}
+	log.Info("Updated the k0s join-token ID on an existing join KairosConfig", "kairosConfig", name, "tokenID", joinTokenID)
+	return nil
 }
 
 func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machineName string) (client.Object, error) {
