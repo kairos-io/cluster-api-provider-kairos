@@ -1,6 +1,6 @@
 # Quickstart: CAPK (KubeVirt)
 
-Last verified against: Kairos v4.1.2, CAPI v1.13.4, KubeVirt v1.9, CAPK v0.1.x, provider v0.1.3.
+Last verified against: provider v0.1.4, 2026-10-16, with Kairos v3.6.0 (Ubuntu 25.10, k0s v1.34.1), CAPI v1.12.2, KubeVirt v1.7.0, CDI v1.64.0, and CAPK v0.11.1: a single-node k0s cluster through the non-lab path below, with MetalLB assigning the control-plane endpoint. The HA samples were not re-run on v0.1.4; they were last verified on provider v0.1.3 with Kairos v4.1.2, CAPI v1.13.4, and KubeVirt v1.9.
 
 This guide covers two paths:
 

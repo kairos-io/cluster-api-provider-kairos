@@ -1,7 +1,10 @@
 # Install Guide
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
-provider v0.1.3. The "Registering the Kairos fleet infrastructure
+Last verified against: provider v0.1.4, 2026-10-16. The `clusterctl` path was
+run with `clusterctl` v1.13.4 against a fresh kind management cluster
+(Kubernetes v1.34.0): CAPI v1.13.4, cert-manager v1.20.3, CAPV v1.17.0. The
+flat-manifest path was run as an in-place upgrade on a k0s management cluster
+with CAPI v1.12.2. The "Registering the Kairos fleet infrastructure
 provider" section below documents `cluster-api-provider-kairos-fleet`
 v0.1.3's own `clusterctl.yaml` entry; it has not been re-verified by
 running `clusterctl init --infrastructure kairos-fleet` in this repository's
@@ -304,8 +307,50 @@ kubeconfig back to a Secret in the management cluster.
 fleet / Tinkerbell and any future provider) must have network reachability to
 the management cluster's API server URL.** This includes bare-metal nodes
 provisioned via Metal3 and nodes claimed via the Kairos fleet provider — they
-POST their kubeconfig to a Secret in the management cluster. Verify
-reachability from a sample workload node before deploying:
+POST their kubeconfig to a Secret in the management cluster.
+
+### Set the URL the nodes push to
+
+By default, the bootstrap provider gives nodes the API server URL it uses
+itself. Inside the management cluster that is the in-cluster Service URL,
+typically `https://10.96.0.1:443`. KubeVirt VMs run as pods and can reach it,
+so CAPK needs nothing more. Nodes on any other infrastructure are on another
+network and cannot, so their kubeconfig is never pushed and the
+`KairosControlPlane` waits forever on `KubeconfigReady`.
+
+For those providers, set `KAIROS_MANAGEMENT_API_OVERRIDE` on the bootstrap
+provider's Deployment to a URL the nodes can reach, such as a management
+control-plane node address or a load balancer in front of the API server:
+
+```bash
+# clusterctl install (Path 1): the bootstrap provider has its own Deployment
+kubectl -n capi-kairos-bootstrap-system set env \
+  deployment/capi-kairos-bootstrap-controller-manager \
+  KAIROS_MANAGEMENT_API_OVERRIDE=https://<mgmt-api-server-host>:6443
+
+# flat manifest (Path 2): one Deployment runs both providers
+kubectl -n kairos-capi-system set env \
+  deployment/kairos-capi-controller-manager \
+  KAIROS_MANAGEMENT_API_OVERRIDE=https://<mgmt-api-server-host>:6443
+```
+
+The provider manifests do not set this variable, and `clusterctl` has no
+setting for it, so set it after `clusterctl init`. Check that it is still set
+after a `clusterctl upgrade`. Re-applying the flat manifest with
+`kubectl apply` keeps it.
+
+To confirm the value, look for `Overriding management API server URL from
+environment` in the bootstrap provider's log. It prints the original and the
+override. The URL is rendered into each control-plane node's bootstrap data
+when that data is generated, so changing the variable does not affect nodes
+that have already been rendered.
+
+If the management cluster is a kind cluster, its API server listens on
+`127.0.0.1` by default. Set `networking.apiServerAddress` (and, if needed,
+`networking.apiServerPort`) in the kind configuration to a host address the
+nodes can reach, and use that address in the override.
+
+Verify reachability from a sample workload node before deploying:
 
 ```bash
 curl -k https://<mgmt-api-server-host>:6443/api

@@ -36,6 +36,27 @@ Worked samples:
 
 See the [CAPV HA quickstart walkthrough](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane) for the full procedure.
 
+## Known issue: k0s HA rollouts on v0.1.4
+
+Affects k0s HA control planes on every infrastructure provider except CAPK
+(CAPV, CAPM3, the Kairos fleet provider, and the generic path), in v0.1.4 and
+earlier. k3s and CAPK are not affected.
+
+In these releases only the first control-plane node puts the control-plane
+endpoint in its API server certificate. The nodes that join after it do not.
+Creating the cluster works. But when the first node is removed, for example during a rollout after a `spec.version` change,
+the VIP moves to a joiner, and every client that checks the certificate
+against the endpoint fails. That includes the management cluster. The rollout
+then stops at the first node, with a `KairosControlPlane` message such as:
+
+```text
+failed to reconcile etcd member leave for <cluster>-cp-0: ... tls: failed to verify certificate: x509: certificate is valid for ..., not <endpoint>
+```
+
+The fix renders the endpoint into every control-plane member's certificate,
+and ships in the next release. Until then, avoid changes that replace the first
+control-plane node of an affected cluster.
+
 ## Scale-up: joiners are created one at a time
 
 Bringing up a 3 or 5-replica control plane provisions the init node first, then

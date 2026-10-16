@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPM3 (Metal3 / bare metal)
 
-Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.3. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
+Last verified against: provider v0.1.4, 2026-10-16, with Kairos v4.1.2 (Hadron v0.4.0, k0s v1.34.8), CAPI v1.12.2, CAPM3 v1.13.0, and Ironic 38.1: a single-node k0s cluster on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM), with the Machine and Node providerIDs matching. Earlier releases were verified against Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, and BMO v0.13.0, on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
 
 This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). k0s and k3s use the identical flow and differ only in distribution and version fields. For a 3-node HA control plane, see [High-Availability control plane](#high-availability-control-plane) below.
 
@@ -347,7 +347,7 @@ kubectl --kubeconfig=kairos-m3-kubeconfig.yaml get nodes
 kubectl --kubeconfig=kairos-m3-kubeconfig.yaml get pods -n kube-system
 ```
 
-**Node-push behavior:** The control-plane node posts its kubeconfig to a Secret in the management cluster at bootstrap time. The node must have network reachability to the management cluster's API server (`<mgmt-api-server-host>:6443`). See [INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) for verification steps.
+**Node-push behavior:** The control-plane node posts its kubeconfig to a Secret in the management cluster at bootstrap time. The node must have network reachability to the management cluster's API server (`<mgmt-api-server-host>:6443`), and the bootstrap provider must be told that URL with `KAIROS_MANAGEMENT_API_OVERRIDE`: without it, nodes are given the in-cluster Service URL, which a bare-metal node cannot reach. See [INSTALL.md](INSTALL.md#set-the-url-the-nodes-push-to) for how to set it, and [Network reachability](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) for verification steps.
 
 If the node cannot reach the management API server, enable the opt-in [Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback) on the `KairosControlPlane`.
 
