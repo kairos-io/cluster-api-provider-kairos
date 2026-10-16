@@ -155,8 +155,9 @@ const workloadRequestTimeout = 10 * time.Second
 // `<cluster>-kubeconfig` Secret (the KD-3b node-push payload; its server URL
 // points at the control-plane endpoint). Used when the reconciler's
 // WorkloadClientFactory seam is not overridden (tests inject a fake). It backs
-// the etcd-leave handshake and the k0s join-token path. Every request is
-// bounded by workloadRequestTimeout.
+// the k0s join-token path, and the etcd-leave handshake when no member answers
+// directly (connectForLeave). Every request is bounded by
+// workloadRequestTimeout.
 func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error) {
 	restCfg, err := r.endpointRESTConfig(ctx, cluster)
 	if err != nil {
@@ -219,8 +220,12 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // pre-terminate hook (ADR 0005 §E.3). It is called from the reconcileMachines
 // sweep for any owned, terminating, hooked Machine — which covers the
 // controller's own quorum-approved rollout/scale-down deletes, operator/MHC
-// deletes, and crash recovery. It returns done=true only once it is safe for
-// CAPI to proceed (the hook has been removed); done=false requeues.
+// deletes, and crash recovery. machines is the KCP-owned set that sweep works
+// on. It returns done=true only once it is safe for CAPI to proceed (the hook
+// has been removed); done=false requeues.
+//
+// The workload-cluster traffic goes through one member that is staying, not
+// through the control-plane endpoint (connectForLeave, ADR 0014).
 //
 // State machine:
 //  1. NodeRef == nil → the Machine never registered a Node: no member key to
@@ -237,10 +242,10 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //     timestamp, requeue (done=false).
 //
 // SECURITY / fail-safe (ADR 0005 §E.5): a workload-client BUILD error or a
-// ConfigMap READ error returns the error with the hook STILL SET — the delete
-// stays blocked and quorum is preserved. The hook is never removed on an error
-// path.
-func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, target *clusterv1.Machine) (bool, error) {
+// ConfigMap READ error, on every apiserver connectForLeave tries, or a failed
+// write, returns the error with the hook STILL SET — the delete stays blocked
+// and quorum is preserved. The hook is never removed on an error path.
+func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (bool, error) {
 	// (1) Never-registered node: nothing to leave, nothing alive to run it.
 	if !target.Status.NodeRef.IsDefined() {
 		log.Info("etcd-leave: target has no NodeRef; removing hook without leave handshake", "machine", target.Name)
@@ -254,16 +259,12 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	nodeName := target.Status.NodeRef.Name
 	_, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]
 
-	// Build the workload client on demand. Build error is fail-safe: hook retained.
-	factory := r.WorkloadClientFactory
-	if factory == nil {
-		factory = r.defaultWorkloadClient
-	}
-	wc, err := factory(ctx, cluster)
+	// Find a workload apiserver that answers, and read the leave ConfigMap
+	// through it. Nothing answering is fail-safe: hook retained.
+	conn, err := r.connectForLeave(ctx, log, kcp, cluster, machines, target)
 	if err != nil {
-		return false, fmt.Errorf("etcd-leave: build workload client: %w", err)
+		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", err)
 	}
-	cmKey := types.NamespacedName{Namespace: etcdLeaveConfigMapNamespace, Name: etcdLeaveConfigMapName}
 
 	// (3) First entry for THIS eviction cycle (no timestamp stamped yet). FORCE the
 	// leave-requested sentinel, overwriting any STALE `left` a prior eviction of a
@@ -275,27 +276,22 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// ack) next reconcile rather than leaving a stale `left` visible once
 	// requested==true. Terminal checks are deliberately NOT evaluated on this pass.
 	if !requested {
-		if err := r.ensureLeaveRequested(ctx, wc, cmKey, nodeName, true /*force*/); err != nil {
+		if err := r.ensureLeaveRequested(ctx, conn.client, leaveConfigMapKey, nodeName, true /*force*/); err != nil {
 			return false, err
 		}
 		if err := r.stampLeaveRequestedAt(ctx, target); err != nil {
 			return false, err
 		}
-		log.Info("etcd-leave: leave-requested written; awaiting node ack", "machine", target.Name, "node", nodeName)
+		log.Info("etcd-leave: leave-requested written; awaiting node ack", "machine", target.Name, "node", nodeName, "via", conn.via)
 		return false, nil
 	}
 
 	// (4) This cycle has requested a leave — terminal checks below are now valid for
 	// THIS cycle (a `left` seen here was written by the node in response to our
 	// request, not a stale prior ack).
-	cm := &corev1.ConfigMap{}
-	if err := wc.Get(ctx, cmKey, cm); err != nil && !apierrors.IsNotFound(err) {
-		// Read error is fail-safe: hook retained, requeue.
-		return false, fmt.Errorf("etcd-leave: read workload ConfigMap %s: %w", cmKey, err)
-	}
 	// Node acked the leave → done.
-	if cm.Data[nodeName] == etcdLeftValue {
-		log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName)
+	if conn.cm.Data[nodeName] == etcdLeftValue {
+		log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
 		return true, r.removeEtcdLeaveHook(ctx, target)
 	}
 	// Member gone from node-reported etcd-status → treat as left. Best-effort: a
@@ -321,10 +317,10 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 
 	// (5) Still waiting: keep the sentinel present (preserving a just-written `left`
 	// against a racy overwrite), then requeue.
-	if err := r.ensureLeaveRequested(ctx, wc, cmKey, nodeName, false); err != nil {
+	if err := r.ensureLeaveRequested(ctx, conn.client, leaveConfigMapKey, nodeName, false); err != nil {
 		return false, err
 	}
-	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName)
+	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName, "via", conn.via)
 	return false, nil
 }
 

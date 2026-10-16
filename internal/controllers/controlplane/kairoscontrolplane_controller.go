@@ -66,6 +66,14 @@ type KairosControlPlaneReconciler struct {
 	// tests inject a fake. Kept as a struct field (not a hard dependency on
 	// remote.NewClusterClient) so unit tests need no live workload cluster.
 	WorkloadClientFactory func(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error)
+
+	// MemberClientFactory builds a client for the kube-apiserver of one
+	// control-plane member, addressed by an IP from its Machine's
+	// status.addresses. The etcd-leave handshake uses it so that, while any
+	// staying member answers, its traffic does not go through the
+	// control-plane endpoint (ADR 0014). nil → defaultMemberClient; tests
+	// inject a fake.
+	MemberClientFactory func(ctx context.Context, cluster *clusterv1.Cluster, ip string) (client.Client, error)
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
@@ -636,7 +644,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		if m.DeletionTimestamp.IsZero() || !hasEtcdLeaveHook(m) {
 			continue
 		}
-		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, m)
+		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, machines, m)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile etcd member leave for %s: %w", m.Name, err)
 		}
