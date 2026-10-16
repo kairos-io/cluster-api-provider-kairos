@@ -6,7 +6,7 @@ See [Install guide](INSTALL.md) for development install.
 
 ## Prerequisites
 
-- Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0`; the toolchain line pins `go1.26.0` for reproducibility). The `go.mod` line is `go 1.26.0`; both refer to the same release series.
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
 
 ## Unit tests
 

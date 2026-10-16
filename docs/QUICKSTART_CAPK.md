@@ -293,6 +293,8 @@ kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager
 
 **LoadBalancer Service has no external IP**: ensure MetalLB (or equivalent) is installed and has an address pool configured. Without a LoadBalancer IP, the control-plane endpoint is not resolvable and `KairosControlPlane.status.initialized` will not become `true`.
 
+**The API load balancer never gets a backend, on a `clusterctl` install**: on v0.1.3 and earlier, the `clusterctl` control-plane role cannot read `VirtualMachineInstance` objects, so the control-plane controller never adds a backend and the cluster never becomes reachable. The control-plane provider's manager log (namespace `capi-kairos-control-plane-system`) shows `Cannot read the VirtualMachineInstance for the control-plane load balancer; check the control-plane manager's RBAC` on v0.1.4 and later, where the forbidden read is logged at the default level. Upgrade to v0.1.4 or later, which grants `get` on `kubevirt.io/virtualmachineinstances`. The flat manifest is not affected.
+
 **`nodeSelector` scheduling failure**: if you have the `nodeSelector` for a specific hostname and that node does not have KVM or is not schedulable, the VM pod stays `Pending`. Either remove the selector (if all nodes have KVM) or update the hostname to match a schedulable KVM node.
 
 **KubeVirt emulation warnings**: if `/dev/kvm` is not available, `kubevirt-env` enables software emulation (`KUBEVIRT_USE_EMULATION=true`). This is substantially slower. Expect install + boot to take several minutes.

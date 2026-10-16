@@ -2,6 +2,8 @@
 
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.3.
 
+Kubeadm worker support (`distribution: kubeadm`, `spec.kubeadm`, `status.bootstrapTokenID`, and the `UnsupportedDistribution` reason) is on `main` and is not in v0.1.4. It is planned for v0.2.0. The v0.1.4 CRDs serve none of it.
+
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md). Joining Kairos workers to a Kamaji or `KubeadmControlPlane` control plane: [Kubeadm workers](KUBEADM_WORKERS.md).
 
 ## Table of Contents
@@ -58,7 +60,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `manifests` | `[]Manifest` | No | — | Kubernetes manifests placed in the distribution's auto-apply directory. k0s: `/var/lib/k0s/manifests/{name}/{file}`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/{file}`. Applied automatically by the distribution at cluster startup. |
 | `preCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
 | `postCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
-| `pause` | `bool` | No | `false` | When `true`, pauses reconciliation of this KairosConfig. |
+| `pause` | `bool` | No | `false` | When `true`, pauses reconciliation of this KairosConfig. A paused Cluster pauses it as well; see [Pause](#pause). |
 | `kubeadm` | `KubeadmConfig` | No | — | kubeadm-specific inputs for a worker join. Honoured only when `distribution` is `kubeadm` and `role` is `worker`; ignored for k0s and k3s. All fields are optional. See [KubeadmConfig](#kubeadmconfig). |
 
 #### UserPasswordSecretReference
@@ -325,8 +327,8 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. A different namespace is rejected: the template must live beside the `KairosControlPlane`. |
-| `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates and scale-down. Propagated to `Machine.spec.deletion.nodeDrainTimeoutSeconds`, which is where Cluster API reads the deadline from, so the value is truncated to whole seconds. Unset means CAPI's default: drain with no deadline. Editing it applies to the Machines that already exist, including one that is draining right now. |
+| `infrastructureRef` | `ObjectReference` | Yes | Reference to the infrastructure template (e.g., `DockerMachineTemplate`, `VSphereMachineTemplate`, `KubevirtMachineTemplate`, `Metal3MachineTemplate`, `KairosFleetMachineTemplate`, or any other CAPI-conformant `<Kind>MachineTemplate`). If `namespace` is omitted, it defaults to the `KairosControlPlane`'s own namespace, matching the CAPI convention that `clusterctl generate cluster` templates rely on. A different namespace is rejected: the template must live beside the `KairosControlPlane`. The control plane makes the Cluster an owner of this template; see [Template ownership](#template-ownership). |
+| `nodeDrainTimeout` | `Duration` | No | Timeout for draining nodes during updates and scale-down. Propagated to `Machine.spec.deletion.nodeDrainTimeoutSeconds`, which is where Cluster API reads the deadline from, so the value is truncated to whole seconds. Unset means CAPI's default: drain with no deadline. A value of zero or less is the same as unset. A value above 2147483647 seconds (about 68 years) is capped at 2147483647 seconds. Editing it applies to the Machines that already exist, including one that is draining right now. |
 | `metadata` | `ObjectMeta` | No | Labels and annotations to apply to the objects created for each control-plane replica: the `Machine`, and the infrastructure Machine cloned from `infrastructureRef`. Labels reach the Node through Cluster API, which syncs the `node-role.kubernetes.io/*`, `node-restriction.kubernetes.io/*` and `*.node.cluster.x-k8s.io/*` labels it finds on the `Machine`. Adding or changing an entry applies to the Machines that already exist; removing one leaves it in place on them, since the control plane does not own the whole metadata of a Machine. `cluster.x-k8s.io/cluster-name` and `cluster.x-k8s.io/control-plane` are set by the controller and cannot be overridden, because it selects its own Machines by them. |
 
 #### KairosConfigTemplateReference
@@ -475,6 +477,14 @@ Reports whether every control-plane Machine runs `spec.version`.
 | `True` | — | No control-plane Machine is outdated. |
 | `False` (Info) | `RollingOut` | Outdated Machines are being replaced, one at a time. A replacement is added and must register a Node before an outdated Machine is removed, and the rollout waits while any control-plane Machine is still being deleted. |
 | `False` (Warning) | `SingleNodeRolloutUnsupported` | A single-node control plane (`replicas: 1`) has a Machine whose version differs from `spec.version`. The Machine is left unchanged: it runs the whole cluster, so a replacement would start a separate, empty cluster. Set `spec.version` back to the version the Machine runs to clear the condition. |
+
+### Template ownership
+
+The control plane makes the owning `Cluster` an owner of the templates it references: the machine template named by `machineTemplate.infrastructureRef`, and the `KairosConfigTemplate` named by `kairosConfigTemplate`. `clusterctl move` carries an object only if an owner-reference chain links it to the Cluster, so this is what moves the templates together with the cluster.
+
+- It is a plain owner reference, not a controller reference, so several control planes can reference the same template.
+- It applies to templates whose kind ends in `Template`, in the Cluster's own namespace. A template that does not exist yet is skipped on that reconcile.
+- Kubernetes deletes an object once all of its owners are gone. Deleting the last Cluster that owns a template therefore deletes the template. A template shared by several Clusters stays until the last of them is deleted.
 
 ---
 
@@ -637,6 +647,14 @@ See the `k0sSingleNode` row above for the field reference, and `config/samples/f
 `KairosControlPlane.spec.replicas` accepts `1`, `3`, or `5`. The validating webhook rejects even counts (they give the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement — always use the next-higher odd number instead) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance for a control plane).
 
 `3` and `5` configure a highly-available control plane. Set `spec.ha.vip` on CAPV, CAPM3, and CAPD clusters so kube-vip provides a stable, failover-capable endpoint — do not set it on CAPK, which supplies its own LoadBalancer-backed endpoint. See [HAConfig](#haconfig) and [EtcdHealthy condition](#etcdhealthy-condition) above, and [docs/HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md) for the full day-2 behavior (quorum-safe replacement, k0s clean etcd-leave, and the k3s orphaned-member limitation tracked as KD-5d).
+
+### Pause
+
+Both controllers stop reconciling an object while its Cluster is paused (`Cluster.spec.paused: true`) or the object carries the `cluster.x-k8s.io/paused` annotation. This is the Cluster API pause contract, and `clusterctl move` relies on it. `KairosConfig.spec.pause` is a separate switch for a single `KairosConfig`.
+
+- **`KairosConfig`:** while paused, no bootstrap data is rendered.
+- **`KairosControlPlane`:** while paused, the controller creates and deletes no Machines.
+- **Deleting a `KairosControlPlane` while its Cluster is paused:** the object stays, with its finalizer, and teardown starts when the Cluster is unpaused. Teardown marks every control-plane Machine for deletion and cannot be undone, so it is held. If the Cluster no longer exists, only the annotation on the `KairosControlPlane` holds the deletion.
 
 ### Security Considerations
 

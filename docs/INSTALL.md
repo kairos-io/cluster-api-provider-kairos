@@ -51,13 +51,13 @@ parses it as
 reads everything after `releases/` as the version. The
 `releases/download/<tag>/<file>` form that `kubectl apply -f` and `curl` use
 elsewhere in this guide is correct for them, but wrong here in both of its
-variants: `releases/download/v0.1.3/...` fails immediately with `release not
+variants: `releases/download/v0.1.4/...` fails immediately with `release not
 found for version download` (`clusterctl` reads the literal string `download`
 as the version), and `releases/latest/download/...` is the more dangerous case
 — it appears to work, because `clusterctl`'s fast path builds its own download
 URL from the file name alone, and only fails once it falls back to the GitHub
 API — on a failed direct download, under `GOPROXY=off`, or on a rate-limited or
-proxied network — with `failed to get file "metadata.yaml" from "v0.1.3"
+proxied network — with `failed to get file "metadata.yaml" from "v0.1.4"
 release`.
 
 ### Registering the Kairos fleet infrastructure provider
@@ -197,7 +197,7 @@ Use this if you are hacking on the provider itself.
 
 ### Prerequisites
 
-- Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0` / toolchain `go1.26.0`).
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
 - A Kubernetes cluster acting as the management cluster.
 - cert-manager and Cluster API core installed (same as Path 2).
 - `kubectl` configured to use the management cluster.
@@ -325,4 +325,4 @@ for the full configuration steps.
 - [Fleet Quickstart](QUICKSTART_FLEET.md) — create a cluster from AuroraBoot-claimed nodes with the Kairos fleet infrastructure provider.
 - [Kubeadm workers](KUBEADM_WORKERS.md) — join Kairos workers to a Kamaji or `KubeadmControlPlane` control plane.
 
-For the current release status, breaking changes, and security caveats, read the [v0.1.0 release notes](release-notes/v0.1.0.md).
+For the current release status, read the [v0.1.4 release notes](release-notes/v0.1.4.md). For the breaking changes and security caveats of the first non-beta release, read the [v0.1.0 release notes](release-notes/v0.1.0.md).
