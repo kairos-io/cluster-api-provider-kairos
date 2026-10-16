@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/k0sjointoken"
 )
 
 // resolveWorkerToken walks the shared worker/legacy precedence tail:
@@ -178,11 +179,13 @@ func (r *KairosConfigReconciler) resolveControlPlaneJoinToken(ctx context.Contex
 }
 
 // k0sIssuedControlPlaneJoinToken reads the k0s controller-join token from the
-// join-token Secret, but only when the Secret's ID annotation is wantID, the
-// token the KCP issued for this KairosConfig (ADR 0013). Any other state, a
-// different or missing ID or an empty token, is errTokenNotReady: the KCP is
-// the Secret's only writer and the right value is on its way. The token value
-// is never logged or put in an error; the IDs are public.
+// join-token Secret, but only when it is the token the KCP issued for this
+// KairosConfig (ADR 0013): the Secret's ID annotation is wantID, and so is the
+// ID of the bootstrap token inside the encoded join token. Any other state, a
+// different or missing ID, an empty value or one that does not decode, is
+// errTokenNotReady: the KCP is the Secret's only writer and the right value is
+// on its way. The token value is never logged or put in an error; the IDs are
+// public.
 func k0sIssuedControlPlaneJoinToken(ctx context.Context, c client.Reader, ownerNamespace string, ref *bootstrapv1beta2.WorkerTokenSecretReference, wantID string) (string, error) {
 	const label = "k0s control-plane join token"
 	secretKey, err := secretRefKey(ownerNamespace, ref.Namespace, ref.Name)
@@ -197,7 +200,7 @@ func k0sIssuedControlPlaneJoinToken(ctx context.Context, c client.Reader, ownerN
 		return "", fmt.Errorf("failed to get %s secret %s/%s: %w", label, secretKey.Namespace, secretKey.Name, err)
 	}
 	if got := secret.Annotations[bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation]; got != wantID {
-		return "", fmt.Errorf("%w: %s secret %s/%s holds token %q, this config needs %q",
+		return "", fmt.Errorf("%w: %s secret %s/%s holds token ID %q, this config needs %q",
 			errTokenNotReady, label, secretKey.Namespace, secretKey.Name, got, wantID)
 	}
 	key := ref.Key
@@ -208,6 +211,17 @@ func k0sIssuedControlPlaneJoinToken(ctx context.Context, c client.Reader, ownerN
 	if len(token) == 0 {
 		return "", fmt.Errorf("%w: %s secret %s/%s has no token under key %q",
 			errTokenNotReady, label, secretKey.Namespace, secretKey.Name, key)
+	}
+	// The annotation and the value are written in one patch, but check the value
+	// itself too, the same way the KCP does before it reuses a stored token.
+	decoded, err := k0sjointoken.Decode(string(token))
+	if err != nil {
+		return "", fmt.Errorf("%w: %s secret %s/%s does not hold a k0s join token under key %q",
+			errTokenNotReady, label, secretKey.Namespace, secretKey.Name, key)
+	}
+	if got := decoded.Token.ID(); got != wantID {
+		return "", fmt.Errorf("%w: %s secret %s/%s holds a join token with token ID %q, this config needs %q",
+			errTokenNotReady, label, secretKey.Namespace, secretKey.Name, got, wantID)
 	}
 	return string(token), nil
 }
