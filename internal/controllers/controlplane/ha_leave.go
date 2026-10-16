@@ -171,7 +171,8 @@ func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context
 }
 
 // endpointRESTConfig is the endpoint client's rest.Config: the workload
-// kubeconfig as it is, with every request bounded by workloadRequestTimeout.
+// kubeconfig, with every request bounded by the client timeout,
+// workloadRequestTimeout.
 func (r *KairosControlPlaneReconciler) endpointRESTConfig(ctx context.Context, cluster *clusterv1.Cluster) (*rest.Config, error) {
 	restCfg, err := r.workloadRESTConfig(ctx, cluster)
 	if err != nil {
