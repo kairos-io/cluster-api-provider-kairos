@@ -201,6 +201,7 @@ Use this if you are hacking on the provider itself.
 - A Kubernetes cluster acting as the management cluster.
 - cert-manager and Cluster API core installed (same as Path 2).
 - `kubectl` configured to use the management cluster.
+- `kustomize` on your `PATH`. `make deploy` and `make undeploy` call it directly. `make kustomize` installs a pinned copy into `bin/`, which those two targets do not use.
 
 ### Install
 
@@ -216,16 +217,18 @@ This installs CRDs, RBAC, webhooks, and the controller to the `kairos-capi-syste
 IMG=MY_REGISTRY/cluster-api-provider-kairos:dev make deploy
 ```
 
-**CRD installation note**: `make deploy` uses `kustomize build config/crd | kubectl apply -f -`, which applies kustomize-managed labels that CAPI's conversion webhook expects (`cluster.x-k8s.io/v1beta1`, `cluster.x-k8s.io/v1beta2`). If you apply raw CRD YAML via `kubectl apply -f config/crd/bases/`, those labels are absent and CAPI core may reject the CRDs. Use `make deploy` or `bin/kustomize build config/crd | kubectl apply -f -`.
+**CRD installation note**: `make deploy` runs `kustomize edit set image` in `config/manager`, which rewrites `config/manager/kustomization.yaml` in your checkout, and then `kustomize build config/default | kubectl apply -f -`. `config/default` includes `config/crd`, which adds the `cluster.x-k8s.io/v1beta1: v1beta2` and `cluster.x-k8s.io/v1beta2: v1beta2` contract labels. CAPI core needs those labels to resolve this provider's object references. The generated CRDs in `config/crd/bases/` do not carry them, so applying them directly with `kubectl apply -f config/crd/bases/` leaves CAPI core unable to resolve the references; see [UPGRADING.md](UPGRADING.md). Use `make deploy`, or `kustomize build config/crd | kubectl apply -f -`.
 
 ### Run the controller on your host (optional)
 
 To run the controller on your host instead of deploying to the cluster:
 
 ```bash
-make install     # installs only the CRDs via kustomize
-make run         # runs the controller in the foreground against your kubeconfig
+kustomize build config/crd | kubectl apply -f -   # installs only the CRDs, with the contract labels
+make run                                          # runs the controller in the foreground against your kubeconfig
 ```
+
+Do not use `make install` for the first step against a management cluster that runs Cluster API. It runs `kubectl apply -f config/crd/bases`, which applies the CRDs without the contract labels described in the CRD installation note above.
 
 ### Uninstall
 

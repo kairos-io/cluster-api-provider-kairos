@@ -15,7 +15,10 @@
 #   3. baremetal-operator (BMO) v0.13+ and Ironic running and accessible.
 #      Verify: kubectl get baremetalhosts -A
 #
-#   4. Kairos CAPI provider v0.1.3+ installed.
+#   4. Kairos CAPI provider v0.1.3+ installed. v0.1.3 makes the bootstrap
+#      provider wait for the control-plane endpoint before it renders bootstrap
+#      data. Earlier releases could render it too early, and a node that has
+#      installed from that data does not recover.
 #      kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
 #
 #   5. A fully-installed Kairos k3s disk image served over HTTP.

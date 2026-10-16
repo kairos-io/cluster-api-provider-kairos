@@ -206,7 +206,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
    kubectl get crd metal3clusters.infrastructure.cluster.x-k8s.io
    ```
 
-5. **Kairos CAPI Provider**: v0.1.0+ installed (see [INSTALL.md](INSTALL.md)).
+5. **Kairos CAPI Provider**: v0.1.3+ installed (see [INSTALL.md](INSTALL.md)). v0.1.3 makes the bootstrap provider wait for the control-plane endpoint before it renders bootstrap data. Earlier releases could render it too early, and a node that has installed from that data does not recover.
 
 6. **Fully-installed Kairos disk image**: See "Building the disk image" above.
 
