@@ -473,7 +473,10 @@ func TestEnsureK0sJoinToken_MintsWhenAbsent(t *testing.T) {
 	g.Expect(e.events()).To(ContainElement(HavePrefix("Normal K0sJoinTokenMinted")))
 }
 
-func TestEnsureK0sJoinToken_HealthyTokenIsReused(t *testing.T) {
+// TestEnsureK0sJoinToken_UnboundTokenIsReused: a healthy token that no Machine
+// was created with yet (an admission whose Machine create failed and is being
+// retried) is still this joiner's, so it is reused rather than re-minted.
+func TestEnsureK0sJoinToken_UnboundTokenIsReused(t *testing.T) {
 	g := NewWithT(t)
 	enc, ws := issued(t, "aaaaaa", "https://10.0.0.20:9443", policyNow.Add(45*time.Minute))
 	e := newPolicyEnv(t, policyOpts{storedToken: enc, storedAnno: "aaaaaa", workload: []client.Object{ws}, liveAddrs: []string{"10.0.0.21", "10.0.0.20"}})
@@ -486,6 +489,35 @@ func TestEnsureK0sJoinToken_HealthyTokenIsReused(t *testing.T) {
 	after := e.mgmtSecret()
 	g.Expect(after.ResourceVersion).To(Equal(before.ResourceVersion), "no write")
 	g.Expect(e.workloadTokenIDs()).To(Equal([]string{"aaaaaa"}))
+}
+
+// TestEnsureK0sJoinToken_NeverReusesATokenGivenToAMachine: one token per
+// joiner. Once a Machine exists with the stored token, the next joiner gets a
+// new one even though the stored token is otherwise healthy.
+func TestEnsureK0sJoinToken_NeverReusesATokenGivenToAMachine(t *testing.T) {
+	for _, state := range []string{"joined", "deleting"} {
+		t.Run(state, func(t *testing.T) {
+			g := NewWithT(t)
+			enc, ws := issued(t, "aaaaaa", "https://10.0.0.20:9443", policyNow.Add(50*time.Minute))
+			prev := cpMachine("cp-1", "cp-1", policyNow.Add(-time.Hour), "")
+			healthy := []string{"cp-1"}
+			if state == "deleting" {
+				prev.DeletionTimestamp = ptr.To(metav1.NewTime(policyNow))
+				healthy = nil
+			}
+			e := newPolicyEnv(t, policyOpts{
+				storedToken: enc, storedAnno: "aaaaaa", workload: []client.Object{ws}, liveAddrs: []string{"10.0.0.20"},
+				machines: []*clusterv1.Machine{prev}, configs: []client.Object{joinConfig("cp-1", "aaaaaa")}, etcdHealthy: healthy,
+			})
+			id, reason, err := e.ensure()
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(reason).To(BeEmpty())
+			g.Expect(id).To(MatchRegexp(`^[a-z0-9]{6}$`))
+			g.Expect(id).ToNot(Equal("aaaaaa"), "a token is given to one joiner only")
+			g.Expect(e.mgmtSecret().Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, id))
+			g.Expect(e.workloadTokenIDs()).To(Equal([]string{id}), "the previous joiner's token is deleted")
+		})
+	}
 }
 
 func TestEnsureK0sJoinToken_RotatesAndCleansUp(t *testing.T) {
@@ -765,22 +797,106 @@ func TestK0sJoinTokenLifetime_MissingTokenSaysWhy(t *testing.T) {
 	g.Expect(e.workloadTokenIDs()).To(BeEmpty(), "a missing token is reported, not re-created")
 }
 
-func TestK0sJoinTokenLifetime_JoinedOrDeletingMembersAreNotPending(t *testing.T) {
+// TestK0sJoinTokenLifetime_RemovesTheTokenOfAJoinerThatIsDone: once its
+// Machine has joined (NodeRef plus a healthy voting member) or is being
+// deleted, a joiner's token is deleted, the join-token Secret is cleared if it
+// still holds it, and the KairosConfig is marked so this happens only once.
+func TestK0sJoinTokenLifetime_RemovesTheTokenOfAJoinerThatIsDone(t *testing.T) {
 	g := NewWithT(t)
-	enc, ws := issued(t, "aaaaaa", "https://10.0.0.20:9443", policyNow.Add(10*time.Minute))
+	encA, wsA := issued(t, "aaaaaa", "https://10.0.0.20:9443", policyNow.Add(40*time.Minute))
+	_, wsB := issued(t, "bbbbbb", "https://10.0.0.20:9443", policyNow.Add(40*time.Minute))
 	deleting := cpMachine("cp-2", "", policyNow.Add(-time.Hour), "")
 	deleting.DeletionTimestamp = ptr.To(metav1.NewTime(policyNow))
 	e := newPolicyEnv(t, policyOpts{
-		storedToken: enc, storedAnno: "aaaaaa", workload: []client.Object{ws}, liveAddrs: []string{"10.0.0.20"},
+		storedToken: encA, storedAnno: "aaaaaa", workload: []client.Object{wsA, wsB}, liveAddrs: []string{"10.0.0.20"},
 		machines:    []*clusterv1.Machine{cpMachine("cp-1", "cp-1", policyNow.Add(-time.Hour), ""), deleting},
+		configs:     []client.Object{joinConfig("cp-1", "aaaaaa"), joinConfig("cp-2", "bbbbbb")},
+		etcdHealthy: []string{"cp-1"},
+	})
+
+	g.Expect(e.r.reconcileK0sJoinTokenLifetimeAt(context.Background(), e.logs.logger(), e.kcp, e.cluster, e.machines, policyNow)).
+		To(BeFalse(), "nothing pending, so no extra requeue")
+	g.Expect(e.workloadTokenIDs()).To(BeEmpty(), "both done joiners' tokens are deleted")
+	s := e.mgmtSecret()
+	g.Expect(s.Data).ToNot(HaveKey(joinTokenSecretDataKey), "the Secret no longer holds the joined member's token")
+	g.Expect(s.Annotations).ToNot(HaveKey(k0sJoinTokenIDAnnotation))
+	for _, name := range []string{"cp-1", "cp-2"} {
+		kc := &bootstrapv1beta2.KairosConfig{}
+		g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, kc)).To(Succeed())
+		g.Expect(kc.Annotations).To(HaveKey(k0sJoinTokenRemovedAtAnnotation), name)
+		g.Expect(kc.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, map[string]string{"cp-1": "aaaaaa", "cp-2": "bbbbbb"}[name]))
+	}
+
+	// Done once: a later reconcile does not go back to the workload cluster.
+	calls := e.factoryCalls
+	e.lifetime()
+	g.Expect(e.factoryCalls).To(Equal(calls))
+}
+
+// TestK0sJoinTokenLifetime_KeepsASharedTokenWhileAJoinerUsesIt: tokens issued
+// before one-token-per-joiner could be shared. A joined member's token is kept
+// while another pending member references the same ID.
+func TestK0sJoinTokenLifetime_KeepsASharedTokenWhileAJoinerUsesIt(t *testing.T) {
+	g := NewWithT(t)
+	enc, ws := issued(t, "aaaaaa", "https://10.0.0.20:9443", policyNow.Add(40*time.Minute))
+	e := newPolicyEnv(t, policyOpts{
+		storedToken: enc, storedAnno: "aaaaaa", workload: []client.Object{ws}, liveAddrs: []string{"10.0.0.20"},
+		machines: []*clusterv1.Machine{
+			cpMachine("cp-1", "cp-1", policyNow.Add(-2*time.Hour), ""),
+			cpMachine("cp-2", "", policyNow.Add(-time.Hour), ""),
+		},
 		configs:     []client.Object{joinConfig("cp-1", "aaaaaa"), joinConfig("cp-2", "aaaaaa")},
 		etcdHealthy: []string{"cp-1"},
 	})
-	e.lifetime()
-	got, err := e.workloadToken("aaaaaa")
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(got.Data["expiration"]).To(Equal(ws.Data["expiration"]), "no pending joiner, so the idle token lapses")
-	g.Expect(e.factoryCalls).To(BeZero())
+	g.Expect(e.r.reconcileK0sJoinTokenLifetimeAt(context.Background(), e.logs.logger(), e.kcp, e.cluster, e.machines, policyNow)).To(BeTrue())
+	g.Expect(e.workloadTokenIDs()).To(Equal([]string{"aaaaaa"}))
+	kc := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: "cp-1", Namespace: "default"}, kc)).To(Succeed())
+	g.Expect(kc.Annotations).ToNot(HaveKey(k0sJoinTokenRemovedAtAnnotation))
+}
+
+// TestK0sJoinToken_OneTokenPerJoinerAcrossAScaleUp walks two sequential joins:
+// each joiner gets its own token, only that token is extended while it joins,
+// and it is gone once the joiner has joined.
+func TestK0sJoinToken_OneTokenPerJoinerAcrossAScaleUp(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	e := newPolicyEnv(t, policyOpts{liveAddrs: []string{"10.0.0.20"}})
+
+	admitAndJoin := func(name string, joinedAt time.Time) string {
+		id, reason, err := e.ensure()
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(reason).To(BeEmpty())
+		g.Expect(e.mgmt.Create(ctx, joinConfig(name, id))).To(Succeed())
+		m := cpMachine(name, "", policyNow, "")
+		e.machines = append(e.machines, m)
+
+		// Pending, 45m in: its own token is extended.
+		e.r.reconcileK0sJoinTokenLifetimeAt(ctx, e.logs.logger(), e.kcp, e.cluster, e.machines, policyNow.Add(45*time.Minute))
+		ws, err := e.workloadToken(id)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(string(ws.Data["expiration"])).To(Equal(policyNow.Add(105 * time.Minute).UTC().Format(time.RFC3339)))
+		// A second admission is refused while it is pending.
+		_, reason, err = e.ensure()
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(reason).To(ContainSubstring(name))
+
+		// It joins: its token goes away.
+		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: name}
+		es := &corev1.Secret{}
+		g.Expect(e.mgmt.Get(ctx, types.NamespacedName{Name: etcdStatusSecretName("c"), Namespace: "default"}, es)).To(Succeed())
+		es.Data[name] = []byte(`{"name":"` + name + `","healthy":true,"voting":true,"members":3,"reportedAt":"t"}`)
+		g.Expect(e.mgmt.Update(ctx, es)).To(Succeed())
+		e.r.reconcileK0sJoinTokenLifetimeAt(ctx, e.logs.logger(), e.kcp, e.cluster, e.machines, joinedAt)
+		_, err = e.workloadToken(id)
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the joined member's token is deleted")
+		return id
+	}
+
+	first := admitAndJoin("cp-1", policyNow.Add(50*time.Minute))
+	second := admitAndJoin("cp-2", policyNow.Add(50*time.Minute))
+	g.Expect(second).ToNot(Equal(first))
+	g.Expect(e.workloadTokenIDs()).To(BeEmpty())
 }
 
 // TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending: once every replica
@@ -823,7 +939,7 @@ func TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		return res
 	}
-	common := []client.Object{m0, m1, initCfg, joinConfig("test-kcp-1", "aaaaaa"), joinConfig("test-kcp-2", "aaaaaa"), jt, machineMetaInfraTemplate()}
+	common := []client.Object{m0, m1, initCfg, joinConfig("test-kcp-1", "bbbbbb"), joinConfig("test-kcp-2", "aaaaaa"), jt, machineMetaInfraTemplate()}
 
 	// test-kcp-2 has no Node yet: keep reconciling.
 	res := run(append(common, m2.DeepCopy(), rolloutEtcdStatus(cluster, m0, m1))...)
@@ -884,11 +1000,14 @@ func TestK0sJoinToken_NeverLogged(t *testing.T) {
 
 	// Extend a pending joiner's token, with a dead server and a legacy joiner.
 	enc3, ws3 := issued(t, "aaaaaa", "https://10.0.0.9:9443", policyNow.Add(time.Minute))
-	secrets = append(secrets, enc3, string(ws3.Data["token-secret"]))
+	_, wsDone := issued(t, "cccccc", "https://10.0.0.20:9443", policyNow.Add(time.Hour))
+	secrets = append(secrets, enc3, string(ws3.Data["token-secret"]), string(wsDone.Data["token-secret"]))
 	e3 := newPolicyEnv(t, policyOpts{
-		storedToken: enc3, storedAnno: "aaaaaa", workload: []client.Object{ws3}, liveAddrs: []string{"10.0.0.20"},
-		machines: []*clusterv1.Machine{cpMachine("cp-1", "", policyNow.Add(-time.Hour), ""), cpMachine("cp-2", "", policyNow.Add(-time.Hour), "")},
-		configs:  []client.Object{joinConfig("cp-1", "aaaaaa"), joinConfig("cp-2", "")},
+		storedToken: enc3, storedAnno: "aaaaaa", workload: []client.Object{ws3, wsDone}, liveAddrs: []string{"10.0.0.20"},
+		machines: []*clusterv1.Machine{cpMachine("cp-1", "", policyNow.Add(-time.Hour), ""), cpMachine("cp-2", "", policyNow.Add(-time.Hour), ""),
+			cpMachine("cp-3", "cp-3", policyNow.Add(-2*time.Hour), "")},
+		configs:     []client.Object{joinConfig("cp-1", "aaaaaa"), joinConfig("cp-2", ""), joinConfig("cp-3", "cccccc")},
+		etcdHealthy: []string{"cp-3"},
 	})
 	e3.lifetime()
 	finish(e3)
@@ -917,6 +1036,7 @@ func TestK0sJoinToken_NeverLogged(t *testing.T) {
 	g.Expect(secrets).ToNot(BeEmpty())
 	all := strings.Join(output, "\n")
 	g.Expect(all).To(ContainSubstring("Minted k0s controller-join token"), "the sink did capture the controller's logs")
+	g.Expect(all).To(ContainSubstring("Removed the k0s join token of a joiner that is done"))
 	for _, s := range secrets {
 		if len(s) < 8 {
 			continue

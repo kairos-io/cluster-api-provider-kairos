@@ -84,6 +84,12 @@ const (
 	// stuck for another reason, and its token is allowed to lapse.
 	k0sJoinTokenExtendCap = 24 * time.Hour
 
+	// k0sJoinTokenRemovedAtAnnotation is set on a join KairosConfig once the
+	// token issued for it has been deleted from the workload cluster, because its
+	// Machine joined or is being deleted. It keeps the cleanup to one workload
+	// call per joiner.
+	k0sJoinTokenRemovedAtAnnotation = "controlplane.cluster.x-k8s.io/k0s-join-token-removed-at"
+
 	// k0sJoinTokenRecheckInterval is the longest the KCP waits between two
 	// reconciles while a joiner is pending, so a token is always looked at well
 	// inside its k0sJoinTokenRenewWithin window.
@@ -243,22 +249,33 @@ func k0sMemberJoined(m *clusterv1.Machine, etcdStatus map[string]etcdMemberStatu
 	return ok && st.Healthy && st.Voting
 }
 
-// k0sJoiner is a control-plane joiner that has not finished joining.
-// tokenID is the ID stamped on its KairosConfig, or "" when an older KCP created
-// it and the init node's token was rendered into it.
-type k0sJoiner struct {
-	machine *clusterv1.Machine
-	tokenID string
+// k0sJoinMember is a control-plane Machine whose KairosConfig has the join
+// role. tokenID is the ID stamped on that KairosConfig when the KCP admitted
+// the Machine, or "" when an older KCP created it and the init node's token was
+// rendered into it. Each admitted joiner gets its own token, so tokenID binds
+// the token to this one Machine.
+type k0sJoinMember struct {
+	machine  *clusterv1.Machine
+	config   *bootstrapv1beta2.KairosConfig
+	tokenID  string
+	joined   bool
+	deleting bool
 }
 
-// k0sJoinersInFlight returns the non-deleting control-plane Machines whose
-// KairosConfig has the join role and that have not finished joining.
-func (r *KairosControlPlaneReconciler) k0sJoinersInFlight(ctx context.Context, machines []*clusterv1.Machine, etcdStatus map[string]etcdMemberStatus) ([]k0sJoiner, error) {
-	var out []k0sJoiner
+// pending reports whether the member is still joining.
+func (m k0sJoinMember) pending() bool { return !m.deleting && !m.joined }
+
+// tokenRemoved reports whether the member's token was already deleted.
+func (m k0sJoinMember) tokenRemoved() bool {
+	_, ok := m.config.Annotations[k0sJoinTokenRemovedAtAnnotation]
+	return ok
+}
+
+// k0sJoinMembers returns the control-plane Machines whose KairosConfig has the
+// join role, with their token binding and state.
+func (r *KairosControlPlaneReconciler) k0sJoinMembers(ctx context.Context, machines []*clusterv1.Machine, etcdStatus map[string]etcdMemberStatus) ([]k0sJoinMember, error) {
+	var out []k0sJoinMember
 	for _, m := range machines {
-		if !m.DeletionTimestamp.IsZero() || k0sMemberJoined(m, etcdStatus) {
-			continue
-		}
 		ref := m.Spec.Bootstrap.ConfigRef
 		if ref.Kind != "KairosConfig" || ref.Name == "" {
 			continue
@@ -273,7 +290,13 @@ func (r *KairosControlPlaneReconciler) k0sJoinersInFlight(ctx context.Context, m
 		if kc.Spec.ControlPlaneRole != bootstrapv1beta2.ControlPlaneRoleJoin {
 			continue
 		}
-		out = append(out, k0sJoiner{machine: m, tokenID: kc.Annotations[k0sJoinTokenIDAnnotation]})
+		out = append(out, k0sJoinMember{
+			machine:  m,
+			config:   kc,
+			tokenID:  kc.Annotations[k0sJoinTokenIDAnnotation],
+			joined:   k0sMemberJoined(m, etcdStatus),
+			deleting: !m.DeletionTimestamp.IsZero(),
+		})
 	}
 	return out, nil
 }
@@ -347,10 +370,16 @@ func (s storedK0sJoinToken) supersededIDs() []string {
 	return ids
 }
 
-// ensureK0sControllerJoinToken makes sure the join-token Secret holds a usable
-// KCP-minted token, minting one if needed, and returns its ID. It runs once the
-// join gate has opened and before the join Machine and KairosConfig are created.
-// The ID is stamped on the new KairosConfig.
+// ensureK0sControllerJoinToken issues the controller-join token for the joiner
+// about to be created and returns its ID. It runs once the join gate has opened
+// and before the join Machine and KairosConfig are created; the ID is stamped
+// on the new KairosConfig. Every admitted joiner gets its own token. The stored
+// token is reused only when no Machine was created with it yet, which is the
+// case when a create is retried after a partial failure.
+//
+// The join gate admits one joiner at a time, so one Secret slot is enough: by
+// the time the next joiner is admitted the previous one has joined, and its
+// token lives on only in its own bootstrap data until the KCP deletes it.
 //
 // When it cannot produce a token it returns "" and a reason, and the caller
 // holds the joiner and requeues. Workload-cluster failures are reported that
@@ -367,12 +396,21 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 	if err != nil {
 		return "", "", err
 	}
-	joiners, err := r.k0sJoinersInFlight(ctx, machines, etcdStatus)
+	members, err := r.k0sJoinMembers(ctx, machines, etcdStatus)
 	if err != nil {
 		return "", "", err
 	}
-	if len(joiners) > 0 {
-		return "", fmt.Sprintf("joiner %s has not finished joining", joiners[0].machine.Name), nil
+	// boundTo records which Machine each issued token was given to. A token is
+	// handed to exactly one joiner: once a Machine exists with it, the next
+	// joiner gets a new one.
+	boundTo := map[string]string{}
+	for _, m := range members {
+		if m.pending() {
+			return "", fmt.Sprintf("joiner %s has not finished joining", m.machine.Name), nil
+		}
+		if m.tokenID != "" {
+			boundTo[m.tokenID] = m.machine.Name
+		}
 	}
 
 	secret := &corev1.Secret{}
@@ -416,7 +454,11 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 		why = "the stored token was minted by the init node"
 	case stored.decoded.Token.ID() != stored.annotatedID:
 		why = "the stored token does not match its ID annotation"
+	case boundTo[stored.annotatedID] != "":
+		why = "the stored token was issued to control-plane Machine " + boundTo[stored.annotatedID]
 	default:
+		// Not yet given to any Machine: an earlier admission minted it, then the
+		// Machine create failed and is being retried. It is still this joiner's.
 		why, err = checkIssuedK0sJoinToken(ctx, wc, *stored.decoded, ca, live, now)
 		if err != nil {
 			return "", fmt.Sprintf("cannot read the issued k0s join token from the workload cluster: %v", err), nil
@@ -444,7 +486,7 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 }
 
 // checkIssuedK0sJoinToken reports why the token in the management Secret must
-// be replaced, or "" when it can be handed to the next joiner as is.
+// be replaced, or "" when the joiner being admitted can still use it.
 func checkIssuedK0sJoinToken(ctx context.Context, wc client.Client, stored k0sjointoken.Decoded, ca []byte, live []string, now time.Time) (string, error) {
 	ws := &corev1.Secret{}
 	if err := wc.Get(ctx, k0sjointoken.SecretKeyFor(stored.Token.ID()), ws); err != nil {
@@ -524,28 +566,41 @@ func (r *KairosControlPlaneReconciler) mintK0sControllerJoinToken(ctx context.Co
 }
 
 // deleteSupersededK0sJoinToken removes a replaced token from the workload
-// cluster, best effort. Only a controller-join-only bootstrap token is ever
-// deleted, and the delete is pinned to the UID that was checked.
+// cluster, best effort.
 func deleteSupersededK0sJoinToken(ctx context.Context, log logr.Logger, wc client.Client, id string) {
+	deleteK0sJoinToken(ctx, log, wc, id)
+}
+
+// deleteK0sJoinToken deletes the workload Secret of token id. Only a
+// controller-join-only bootstrap token is ever deleted, and the delete is
+// pinned to the UID that was checked. It reports whether there is nothing left
+// to do: deleted, already gone, or not a Secret this controller deletes. It
+// reports false only when the workload cluster could not be read or written.
+func deleteK0sJoinToken(ctx context.Context, log logr.Logger, wc client.Client, id string) bool {
 	if !k0sjointoken.ValidID(id) {
-		return
+		return true
 	}
 	ws := &corev1.Secret{}
 	if err := wc.Get(ctx, k0sjointoken.SecretKeyFor(id), ws); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.V(1).Info("Could not read a superseded k0s join token for cleanup", "tokenID", id, "error", err.Error())
+		if apierrors.IsNotFound(err) {
+			return true
 		}
-		return
+		log.V(1).Info("Could not read a k0s join token for cleanup", "tokenID", id, "error", err.Error())
+		return false
 	}
 	if !k0sjointoken.IsControllerJoinOnly(ws) {
-		log.Info("Leaving a superseded token Secret in place: it is not a controller-join-only bootstrap token", "tokenID", id)
-		return
+		log.Info("Leaving a token Secret in place: it is not a controller-join-only bootstrap token", "tokenID", id)
+		return true
 	}
-	deleteK0sJoinTokenSecretBestEffort(ctx, log, wc, ws)
-	log.Info("Deleted superseded k0s controller-join token", "tokenID", id)
+	if !deleteK0sJoinTokenSecretBestEffort(ctx, log, wc, ws) {
+		return false
+	}
+	log.Info("Deleted k0s controller-join token", "tokenID", id)
+	return true
 }
 
-func deleteK0sJoinTokenSecretBestEffort(ctx context.Context, log logr.Logger, wc client.Client, ws *corev1.Secret) {
+// deleteK0sJoinTokenSecretBestEffort deletes ws and reports whether it is gone.
+func deleteK0sJoinTokenSecretBestEffort(ctx context.Context, log logr.Logger, wc client.Client, ws *corev1.Secret) bool {
 	var opts []client.DeleteOption
 	if ws.UID != "" {
 		uid := ws.UID
@@ -554,17 +609,26 @@ func deleteK0sJoinTokenSecretBestEffort(ctx context.Context, log logr.Logger, wc
 	if err := wc.Delete(ctx, ws, opts...); err != nil && !apierrors.IsNotFound(err) {
 		log.V(1).Info("Could not delete a k0s join token Secret; it expires on its own",
 			"secret", ws.Namespace+"/"+ws.Name, "error", err.Error())
+		return false
 	}
+	return true
 }
 
-// reconcileK0sJoinTokenLifetime keeps the token of every pending joiner alive
-// and says why a joiner is stuck when the KCP cannot help it. It runs on every
-// reconcile of a k0s HA control plane whose kubeconfig has been observed.
+// reconcileK0sJoinTokenLifetime keeps the token of every pending joiner alive,
+// deletes the tokens of joiners that are done, and says why a joiner is stuck
+// when the KCP cannot help it. It runs on every reconcile of a k0s HA control
+// plane whose kubeconfig has been observed.
 //
 //   - A pending joiner is a non-deleting control-plane Machine whose join
 //     KairosConfig carries the token-ID annotation and which has not finished
-//     joining. Its token is extended in place when less than 30m remain, until
-//     the Machine is 24h old.
+//     joining. Its own token is extended in place when less than 30m remain,
+//     until 24h after the Machine was created.
+//   - Once that Machine has joined (NodeRef plus a healthy voting etcd member)
+//     or is being deleted, its token is deleted from the workload cluster, the
+//     management join-token Secret is cleared if it still holds that token,
+//     and the KairosConfig is marked so this happens once. A token that some
+//     pending Machine also references is kept until that one is done too; only
+//     tokens issued before one-token-per-joiner can be shared.
 //   - A joiner whose KairosConfig has no annotation was rendered with the token
 //     an older init node pushed. That token is never extended. The KCP says so
 //     and leaves remediation to the operator or a MachineHealthCheck.
@@ -586,33 +650,47 @@ func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetimeAt(ctx conte
 		log.Info("Cannot check pending k0s joiners", "error", err.Error())
 		return true
 	}
-	joiners, err := r.k0sJoinersInFlight(ctx, machines, etcdStatus)
+	members, err := r.k0sJoinMembers(ctx, machines, etcdStatus)
 	if err != nil {
 		log.Info("Cannot check pending k0s joiners", "error", err.Error())
 		return true
 	}
 
 	pending := map[string][]*clusterv1.Machine{}
-	for _, j := range joiners {
-		if j.tokenID == "" {
+	var done []k0sJoinMember
+	for _, m := range members {
+		switch {
+		case m.pending() && m.tokenID == "":
 			log.Info("Control-plane joiner was bootstrapped with a token from the init node; it is not extended",
-				"machine", j.machine.Name)
+				"machine", m.machine.Name)
 			r.k0sJoinTokenWarning(kcp, "K0sJoinTokenLegacy",
 				"Control-plane Machine %s was bootstrapped with a k0s join token minted by the init node, which the control plane cannot extend or re-issue. "+
 					"If it does not join, delete the Machine or let a MachineHealthCheck remediate it; its replacement gets a token from the control plane.",
-				j.machine.Name)
-			continue
+				m.machine.Name)
+		case m.pending():
+			pending[m.tokenID] = append(pending[m.tokenID], m.machine)
+		case m.tokenID != "" && !m.tokenRemoved():
+			done = append(done, m)
 		}
-		pending[j.tokenID] = append(pending[j.tokenID], j.machine)
 	}
-	if len(pending) == 0 {
+	if len(pending) == 0 && len(done) == 0 {
 		return false
 	}
 
 	wc, err := r.workloadClientFor(ctx, cluster)
 	if err != nil {
-		log.Info("Cannot reach the workload cluster to extend k0s join tokens", "error", err.Error())
-		return true
+		log.Info("Cannot reach the workload cluster to maintain k0s join tokens", "error", err.Error())
+		return len(pending) > 0
+	}
+
+	for _, m := range done {
+		if _, inUse := pending[m.tokenID]; inUse {
+			continue
+		}
+		r.removeK0sJoinToken(ctx, log, wc, cluster, m)
+	}
+	if len(pending) == 0 {
+		return false
 	}
 
 	// The joiner's server is the one in the stored token: the KCP never replaces
@@ -646,6 +724,42 @@ func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetimeAt(ctx conte
 		}
 	}
 	return true
+}
+
+// removeK0sJoinToken deletes the token issued to a joiner that has joined or is
+// being deleted, clears the management join-token Secret if it still holds that
+// token, and marks the joiner's KairosConfig. Any step that fails leaves the
+// mark off, so the next reconcile tries again; a token that is never deleted
+// still lapses within its TTL, since nothing extends it.
+func (r *KairosControlPlaneReconciler) removeK0sJoinToken(ctx context.Context, log logr.Logger, wc client.Client, cluster *clusterv1.Cluster, m k0sJoinMember) {
+	if !deleteK0sJoinToken(ctx, log, wc, m.tokenID) {
+		return
+	}
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: joinTokenSecretName(cluster.Name)}
+	if err := r.Get(ctx, key, secret); err != nil && !apierrors.IsNotFound(err) {
+		log.Info("Cannot read the join-token Secret to clear it", "error", err.Error())
+		return
+	} else if err == nil && secret.Annotations[k0sJoinTokenIDAnnotation] == m.tokenID {
+		base := secret.DeepCopy()
+		delete(secret.Data, joinTokenSecretDataKey)
+		delete(secret.Annotations, k0sJoinTokenIDAnnotation)
+		if err := r.Patch(ctx, secret, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			log.Info("Could not clear the join-token Secret; will retry", "tokenID", m.tokenID, "error", err.Error())
+			return
+		}
+	}
+	base := m.config.DeepCopy()
+	if m.config.Annotations == nil {
+		m.config.Annotations = map[string]string{}
+	}
+	m.config.Annotations[k0sJoinTokenRemovedAtAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	if err := r.Patch(ctx, m.config, client.MergeFrom(base)); err != nil && !apierrors.IsNotFound(err) {
+		log.Info("Could not mark the joiner's KairosConfig; will retry", "kairosConfig", m.config.Name, "error", err.Error())
+		return
+	}
+	log.Info("Removed the k0s join token of a joiner that is done",
+		"tokenID", m.tokenID, "machine", m.machine.Name, "joined", m.joined, "deleting", m.deleting)
 }
 
 // extendK0sJoinToken applies the extension rule to one token and the pending
