@@ -17,15 +17,8 @@ permissions and limitations under the License.
 package controlplane
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/base64"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -53,233 +46,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/yaml"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/k0sjointoken"
 )
 
-// The fixture under testdata/k0s-preshared-controller was produced by the real
-// k0s binary at the documented baseline (v1.34.8+k0s.0, taken from the image
-// quay.io/kairos/hadron:v0.4.0-standard-amd64-generic-v4.1.2-k0s-v1.34.8-k0s.0),
-// with no network and a throwaway CA:
-//
-//	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-//	  -keyout ca.key -out ca.crt -days 1 -subj "/CN=kairos-capi-k0s-token-fixture-ca"
-//	docker run --rm --network none --user "$(id -u):$(id -g)" \
-//	  -v "$PWD:/in:ro" -v "$PWD/out:/out" --entrypoint /usr/bin/k0s <image> \
-//	  token pre-shared --role controller --cert /in/ca.crt \
-//	  --url https://192.0.2.10:9443 --valid 1s --out /out
-//
-// `token` is out/token_<id>, `bootstrap-token-secret.yaml` is
-// out/bootstrap-token-<id>.yaml, and ca.key was discarded. The bootstrap token
-// expired one second after it was created and was never applied to any
-// cluster. Regenerate the fixture on every k0s baseline bump.
-const (
-	k0sFixtureDir    = "testdata/k0s-preshared-controller"
-	k0sFixtureServer = "https://192.0.2.10:9443"
-)
+// testCAPEM stands in for the cluster CA. The controller treats it as opaque
+// bytes: it copies it from the workload kubeconfig into the join token.
+var testCAPEM = []byte("-----BEGIN CERTIFICATE-----\nZml4dHVyZS1jYQ==\n-----END CERTIFICATE-----\n")
 
-func readK0sFixture(t *testing.T, name string) []byte {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join(k0sFixtureDir, name))
-	if err != nil {
-		t.Fatalf("read fixture %s: %v", name, err)
-	}
-	return data
-}
-
-func fixtureCA(t *testing.T) []byte { return readK0sFixture(t, "ca.crt") }
-
-// gunzipBase64 returns the kubeconfig inside an encoded k0s token.
-func gunzipBase64(t *testing.T, encoded string) []byte {
-	t.Helper()
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
-	if err != nil {
-		t.Fatalf("base64: %v", err)
-	}
-	gz, err := gzip.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		t.Fatalf("gzip: %v", err)
-	}
-	out, err := io.ReadAll(gz)
-	if err != nil {
-		t.Fatalf("gunzip: %v", err)
-	}
-	return out
-}
-
-func TestEncodeK0sControllerJoinToken_RoundTrip(t *testing.T) {
-	g := NewWithT(t)
-	tok, err := generateK0sBootstrapToken()
-	g.Expect(err).ToNot(HaveOccurred())
-	ca := fixtureCA(t)
-
-	for _, server := range []string{"https://10.0.0.5:9443", "https://[fd00::5]:9443"} {
-		enc, err := encodeK0sControllerJoinToken(server, ca, tok)
-		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(enc).To(MatchRegexp(`^[A-Za-z0-9+/]+=*$`), "standard base64, the alphabet k0s uses")
-
-		dec, err := decodeK0sControllerJoinToken(enc)
-		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(dec.server).To(Equal(server))
-		g.Expect(dec.caData).To(Equal(ca))
-		g.Expect(dec.user).To(Equal("controller-bootstrap"))
-		g.Expect(dec.token.bearer()).To(MatchRegexp(`^[a-z0-9]{6}\.[a-z0-9]{16}$`))
-		g.Expect(dec.token).To(Equal(tok))
-	}
-}
-
-// TestEncodeK0sControllerJoinToken_MatchesRealK0s compares our encoding with a
-// token real k0s produced. The decoded kubeconfigs must be structurally equal
-// when built from the same server, CA and bootstrap token.
-func TestEncodeK0sControllerJoinToken_MatchesRealK0s(t *testing.T) {
-	g := NewWithT(t)
-	fixture := string(readK0sFixture(t, "token"))
-	ca := fixtureCA(t)
-
-	want, err := clientcmd.Load(gunzipBase64(t, fixture))
-	g.Expect(err).ToNot(HaveOccurred())
-
-	// Our decoder reads the real token.
-	dec, err := decodeK0sControllerJoinToken(fixture)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(dec.server).To(Equal(k0sFixtureServer))
-	g.Expect(dec.caData).To(Equal(ca))
-	g.Expect(dec.user).To(Equal(k0sControllerBootstrapUser))
-
-	// Our encoder, given the same inputs, produces the same kubeconfig.
-	ours, err := encodeK0sControllerJoinToken(k0sFixtureServer, ca, dec.token)
-	g.Expect(err).ToNot(HaveOccurred())
-	got, err := clientcmd.Load(gunzipBase64(t, ours))
-	g.Expect(err).ToNot(HaveOccurred())
-
-	g.Expect(got.CurrentContext).To(Equal(want.CurrentContext))
-	g.Expect(got.CurrentContext).To(Equal("k0s"))
-	g.Expect(keys(got.Clusters)).To(Equal(keys(want.Clusters)))
-	g.Expect(keys(got.Contexts)).To(Equal(keys(want.Contexts)))
-	g.Expect(keys(got.AuthInfos)).To(Equal(keys(want.AuthInfos)))
-	for name, wc := range want.Clusters {
-		g.Expect(got.Clusters[name].Server).To(Equal(wc.Server))
-		g.Expect(got.Clusters[name].CertificateAuthorityData).To(Equal(wc.CertificateAuthorityData))
-		g.Expect(got.Clusters[name].InsecureSkipTLSVerify).To(Equal(wc.InsecureSkipTLSVerify))
-	}
-	for name, wctx := range want.Contexts {
-		g.Expect(got.Contexts[name].Cluster).To(Equal(wctx.Cluster))
-		g.Expect(got.Contexts[name].AuthInfo).To(Equal(wctx.AuthInfo))
-	}
-	for name, wa := range want.AuthInfos {
-		g.Expect(got.AuthInfos[name].Token).To(Equal(wa.Token))
-	}
-
-	// gzip at BestCompression has the same header k0s writes (no name, no mtime,
-	// XFL=2 for maximum compression).
-	rawOurs, _ := base64.StdEncoding.DecodeString(ours)
-	rawFixture, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(fixture))
-	g.Expect(rawOurs[:10]).To(Equal(rawFixture[:10]))
-}
-
-// TestNewK0sControllerJoinTokenSecret_MatchesRealK0s compares the workload
-// bootstrap-token Secret with the one `k0s token pre-shared` writes.
-func TestNewK0sControllerJoinTokenSecret_MatchesRealK0s(t *testing.T) {
-	g := NewWithT(t)
-	want := &corev1.Secret{}
-	g.Expect(yaml.Unmarshal(readK0sFixture(t, "bootstrap-token-secret.yaml"), want)).To(Succeed())
-
-	tok, err := generateK0sBootstrapToken()
-	g.Expect(err).ToNot(HaveOccurred())
-	got := newK0sControllerJoinTokenSecret(tok, time.Now().Add(time.Hour))
-
-	g.Expect(got.Type).To(Equal(want.Type))
-	g.Expect(got.Namespace).To(Equal(want.Namespace))
-	g.Expect(got.Name).To(HavePrefix("bootstrap-token-"))
-	g.Expect(want.Name).To(Equal("bootstrap-token-" + string(want.Data["token-id"])))
-	g.Expect(got.Name).To(Equal("bootstrap-token-" + tok.id))
-	g.Expect(keys(got.Data)).To(Equal(keys(want.Data)), "same data keys as k0s's own controller token")
-	for _, usage := range []string{"usage-bootstrap-controller-join", "usage-controller-join"} {
-		g.Expect(string(got.Data[usage])).To(Equal(string(want.Data[usage])))
-	}
-	_, err = time.Parse(time.RFC3339, string(want.Data["expiration"]))
-	g.Expect(err).ToNot(HaveOccurred())
-}
-
-func TestNewK0sControllerJoinTokenSecret_Shape(t *testing.T) {
-	g := NewWithT(t)
-	tok := k0sBootstrapToken{id: "abcdef", secret: "0123456789abcdef"}
-	expires := time.Date(2026, 10, 16, 13, 0, 0, 0, time.UTC)
-	s := newK0sControllerJoinTokenSecret(tok, expires)
-
-	g.Expect(s.Namespace).To(Equal("kube-system"))
-	g.Expect(s.Name).To(Equal("bootstrap-token-abcdef"))
-	g.Expect(s.Type).To(Equal(corev1.SecretType("bootstrap.kubernetes.io/token")))
-	g.Expect(s.Data).To(Equal(map[string][]byte{
-		"token-id":                        []byte("abcdef"),
-		"token-secret":                    []byte("0123456789abcdef"),
-		"expiration":                      []byte("2026-10-16T13:00:00Z"),
-		"description":                     []byte("k0s controller-join token minted by cluster-api-provider-kairos"),
-		"usage-bootstrap-controller-join": []byte("true"),
-		"usage-controller-join":           []byte("true"),
-	}))
-	// The token must not be able to authenticate to kube-apiserver at all.
-	for _, forbidden := range []string{"usage-bootstrap-authentication", "usage-bootstrap-signing", "auth-extra-groups"} {
-		g.Expect(s.Data).ToNot(HaveKey(forbidden))
-	}
-	g.Expect(isK0sControllerJoinTokenSecret(s)).To(BeTrue())
-
-	// The guard used before extending, reusing or deleting rejects anything else.
-	auth := s.DeepCopy()
-	auth.Data["usage-bootstrap-authentication"] = []byte("true")
-	g.Expect(isK0sControllerJoinTokenSecret(auth)).To(BeFalse())
-	groups := s.DeepCopy()
-	groups.Data["auth-extra-groups"] = []byte("system:bootstrappers:kubeadm:default-node-token")
-	g.Expect(isK0sControllerJoinTokenSecret(groups)).To(BeFalse())
-	noJoin := s.DeepCopy()
-	delete(noJoin.Data, "usage-bootstrap-controller-join")
-	delete(noJoin.Data, "usage-controller-join")
-	g.Expect(isK0sControllerJoinTokenSecret(noJoin)).To(BeFalse())
-	opaque := s.DeepCopy()
-	opaque.Type = corev1.SecretTypeOpaque
-	g.Expect(isK0sControllerJoinTokenSecret(opaque)).To(BeFalse())
-}
-
-func TestGenerateK0sBootstrapToken(t *testing.T) {
-	g := NewWithT(t)
-	re := regexp.MustCompile(`^[a-z0-9]{6}\.[a-z0-9]{16}$`)
-	seen := map[string]bool{}
-	for i := 0; i < 200; i++ {
-		tok, err := generateK0sBootstrapToken()
-		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(re.MatchString(tok.bearer())).To(BeTrue(), tok.String())
-		g.Expect(seen[tok.bearer()]).To(BeFalse())
-		seen[tok.bearer()] = true
-	}
-	tok := k0sBootstrapToken{id: "abcdef", secret: "0123456789abcdef"}
-	g.Expect(tok.String()).To(Equal("abcdef.<redacted>"))
-	g.Expect(fmt.Sprintf("%v %s %+v", tok, tok, tok)).ToNot(ContainSubstring("0123456789abcdef"))
-}
-
-func TestDecodeK0sControllerJoinToken_RejectsGarbageWithoutEchoingIt(t *testing.T) {
-	g := NewWithT(t)
-	gz := func(s string) string {
-		var b bytes.Buffer
-		w := gzip.NewWriter(&b)
-		_, _ = w.Write([]byte(s))
-		_ = w.Close()
-		return base64.StdEncoding.EncodeToString(b.Bytes())
-	}
-	for name, in := range map[string]string{
-		"not base64":     "!!!SECRETVALUE!!!",
-		"not gzip":       base64.StdEncoding.EncodeToString([]byte("SECRETVALUE")),
-		"not kubeconfig": gz("SECRETVALUE: [unclosed"),
-		"no context":     gz("apiVersion: v1\nkind: Config\nusers:\n- name: u\n  user:\n    token: SECRETVALUE\n"),
-		"bad bearer": gz("apiVersion: v1\nkind: Config\ncurrent-context: k0s\nclusters:\n- name: k0s\n  cluster:\n    server: https://10.0.0.1:9443\n" +
-			"contexts:\n- name: k0s\n  context:\n    cluster: k0s\n    user: controller-bootstrap\nusers:\n- name: controller-bootstrap\n  user:\n    token: SECRETVALUE\n"),
-	} {
-		_, err := decodeK0sControllerJoinToken(in)
-		g.Expect(err).To(HaveOccurred(), name)
-		g.Expect(err.Error()).ToNot(ContainSubstring("SECRETVALUE"), name)
-	}
-}
+func fixtureCA(*testing.T) []byte { return testCAPEM }
 
 func TestNormalizeK0sJoinServer(t *testing.T) {
 	g := NewWithT(t)
@@ -405,6 +182,15 @@ func TestDeletingMachineAddresses(t *testing.T) {
 		{Type: clusterv1.MachineHostName, Address: "gone"},
 	}
 	g.Expect(deletingMachineAddresses([]*clusterv1.Machine{live, gone})).To(Equal(map[string]bool{"10.0.0.2": true, "fd00::2": true}))
+}
+
+func mustToken(t *testing.T, id, secret string) k0sjointoken.BootstrapToken {
+	t.Helper()
+	tok, err := k0sjointoken.NewBootstrapToken(id, secret)
+	if err != nil {
+		t.Fatalf("token %s: %v", id, err)
+	}
+	return tok
 }
 
 // --- policy fixture ----------------------------------------------------------
@@ -564,12 +350,12 @@ func joinConfig(name, tokenID string) *bootstrapv1beta2.KairosConfig {
 // at expires.
 func issued(t *testing.T, id, server string, expires time.Time) (string, *corev1.Secret) {
 	t.Helper()
-	tok := k0sBootstrapToken{id: id, secret: "0123456789" + id}
-	enc, err := encodeK0sControllerJoinToken(server, fixtureCA(t), tok)
+	tok := mustToken(t, id, "0123456789"+id)
+	enc, err := k0sjointoken.Encode(server, fixtureCA(t), tok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return enc, newK0sControllerJoinTokenSecret(tok, expires)
+	return enc, k0sjointoken.NewSecret(tok, expires)
 }
 
 func (e *policyEnv) mgmtSecret() *corev1.Secret {
@@ -593,7 +379,7 @@ func (e *policyEnv) workloadTokenIDs() []string {
 
 func (e *policyEnv) workloadToken(id string) (*corev1.Secret, error) {
 	s := &corev1.Secret{}
-	return s, e.wc.Get(context.Background(), bootstrapTokenSecretKeyFor(id), s)
+	return s, e.wc.Get(context.Background(), k0sjointoken.SecretKeyFor(id), s)
 }
 
 func (e *policyEnv) events() []string {
@@ -629,17 +415,17 @@ func TestEnsureK0sJoinToken_MintsWhenAbsent(t *testing.T) {
 
 	s := e.mgmtSecret()
 	g.Expect(s.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, id))
-	dec, err := decodeK0sControllerJoinToken(string(s.Data[joinTokenSecretDataKey]))
+	dec, err := k0sjointoken.Decode(string(s.Data[joinTokenSecretDataKey]))
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(dec.server).To(Equal("https://10.0.0.20:9443"), "lowest live address")
-	g.Expect(dec.caData).To(Equal(fixtureCA(t)), "the CA from the workload kubeconfig")
-	g.Expect(dec.token.id).To(Equal(id))
+	g.Expect(dec.Server).To(Equal("https://10.0.0.20:9443"), "lowest live address")
+	g.Expect(dec.CAData).To(Equal(fixtureCA(t)), "the CA from the workload kubeconfig")
+	g.Expect(dec.Token.ID()).To(Equal(id))
 
 	ws, err := e.workloadToken(id)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(string(ws.Data["token-secret"])).To(Equal(dec.token.secret))
+	g.Expect(string(ws.Data["token-secret"])).To(Equal(dec.Token.Secret()))
 	g.Expect(string(ws.Data["expiration"])).To(Equal("2026-10-16T13:00:00Z"), "1h TTL")
-	g.Expect(isK0sControllerJoinTokenSecret(ws)).To(BeTrue())
+	g.Expect(k0sjointoken.IsControllerJoinOnly(ws)).To(BeTrue())
 	g.Expect(e.events()).To(ContainElement(HavePrefix("Normal K0sJoinTokenMinted")))
 }
 
@@ -746,10 +532,10 @@ func TestEnsureK0sJoinToken_RotatesAndCleansUp(t *testing.T) {
 
 			s := e.mgmtSecret()
 			g.Expect(s.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, id))
-			dec, err := decodeK0sControllerJoinToken(string(s.Data[joinTokenSecretDataKey]))
+			dec, err := k0sjointoken.Decode(string(s.Data[joinTokenSecretDataKey]))
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(dec.token.id).To(Equal(id))
-			g.Expect(dec.server).To(BeElementOf("https://10.0.0.20:9443", "https://10.0.0.21:9443"))
+			g.Expect(dec.Token.ID()).To(Equal(id))
+			g.Expect(dec.Server).To(BeElementOf("https://10.0.0.20:9443", "https://10.0.0.21:9443"))
 			g.Expect(e.workloadTokenIDs()).To(ContainElement(id))
 			if tc.wantGone {
 				_, err := e.workloadToken(tc.oldID)
@@ -1000,8 +786,8 @@ func TestK0sJoinToken_NeverLogged(t *testing.T) {
 		s := e.mgmtSecret()
 		if raw := string(s.Data[joinTokenSecretDataKey]); raw != "" {
 			secrets = append(secrets, raw)
-			if dec, err := decodeK0sControllerJoinToken(raw); err == nil {
-				secrets = append(secrets, dec.token.bearer(), dec.token.secret)
+			if dec, err := k0sjointoken.Decode(raw); err == nil {
+				secrets = append(secrets, dec.Token.Bearer(), dec.Token.Secret())
 			}
 		}
 		list := &corev1.SecretList{}
@@ -1052,8 +838,8 @@ func TestK0sJoinToken_NeverLogged(t *testing.T) {
 			if s, ok := obj.(*corev1.Secret); ok {
 				for _, v := range s.Data {
 					secrets = append(secrets, string(v))
-					if dec, err := decodeK0sControllerJoinToken(string(v)); err == nil {
-						secrets = append(secrets, dec.token.bearer(), dec.token.secret)
+					if dec, err := k0sjointoken.Decode(string(v)); err == nil {
+						secrets = append(secrets, dec.Token.Bearer(), dec.Token.Secret())
 					}
 				}
 				return fmt.Errorf("injected failure")
@@ -1170,13 +956,4 @@ func fleetMachineTemplate() *unstructured.Unstructured {
 	tmpl.SetNamespace("default")
 	_ = unstructured.SetNestedMap(tmpl.Object, map[string]interface{}{"group": "control-plane"}, "spec", "template", "spec")
 	return tmpl
-}
-
-func keys[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

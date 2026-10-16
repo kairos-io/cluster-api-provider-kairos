@@ -33,23 +33,19 @@ package controlplane
 // at a member that is live right now, keeps it short-lived, and extends it only
 // while a joiner that was rendered with it is still joining.
 //
+// The token and Secret format live in internal/k0sjointoken; this file is the
+// policy: when to mint, which member to point at, when to extend.
+//
 // Nothing here may log the token. Log the token ID (the public half), the
 // Secret identity and the server host only.
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
-	"errors"
 	"fmt"
-	"io"
-	"math/big"
 	"net"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -61,12 +57,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/k0sjointoken"
 )
 
 const (
@@ -92,250 +88,12 @@ const (
 	// reconciles while a joiner is pending, so a token is always looked at well
 	// inside its k0sJoinTokenRenewWithin window.
 	k0sJoinTokenRecheckInterval = 5 * time.Minute
-
-	// k0sJoinAPIPort is the port of the k0s controller join API. `k0s token
-	// create` uses the same port (APISpec.K0sControlPlaneAPIAddress).
-	k0sJoinAPIPort = "9443"
-
-	// k0sTokenKubeconfigName is the cluster and context name k0s uses inside a
-	// join token, and k0sControllerBootstrapUser the user name. The joiner
-	// refuses a controller token whose user is anything else.
-	k0sTokenKubeconfigName     = "k0s"
-	k0sControllerBootstrapUser = "controller-bootstrap"
-
-	// Bootstrap-token Secret layout (k8s.io/cluster-bootstrap/token/api). Spelled
-	// out here so this file needs no dependency beyond client-go and the stdlib.
-	bootstrapTokenSecretPrefix      = "bootstrap-token-"
-	bootstrapTokenIDKey             = "token-id"
-	bootstrapTokenSecretKey         = "token-secret"
-	bootstrapTokenExpirationKey     = "expiration"
-	bootstrapTokenDescriptionKey    = "description"
-	bootstrapTokenUsagePrefix       = "usage-bootstrap-"
-	bootstrapTokenExtraGroupsKey    = "auth-extra-groups"
-	bootstrapTokenUsageAuthKey      = bootstrapTokenUsagePrefix + "authentication"
-	bootstrapTokenUsageSigningKey   = bootstrapTokenUsagePrefix + "signing"
-	bootstrapTokenUsageCtrlJoinKey  = bootstrapTokenUsagePrefix + "controller-join"
-	k0sLegacyUsageControllerJoinKey = "usage-controller-join"
-
-	// k0sJoinTokenDescription is written into the bootstrap-token Secret so an
-	// operator listing tokens can tell where it came from.
-	k0sJoinTokenDescription = "k0s controller-join token minted by cluster-api-provider-kairos"
-
-	bootstrapTokenIDLength     = 6
-	bootstrapTokenSecretLength = 16
-	bootstrapTokenCharset      = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-	// maxK0sJoinTokenKubeconfigBytes bounds the decompressed size of a stored
-	// token we decode. A real one is about 1.5 KiB.
-	maxK0sJoinTokenKubeconfigBytes = 64 << 10
 )
-
-var (
-	bootstrapTokenIDPattern = regexp.MustCompile(`^[a-z0-9]{6}$`)
-	bootstrapTokenPattern   = regexp.MustCompile(`^([a-z0-9]{6})\.([a-z0-9]{16})$`)
-)
-
-// k0sBootstrapToken is the "<id>.<secret>" bearer inside a k0s join token. The
-// fields are unexported and String and MarshalLog redact the secret half, so an
-// accidental log call prints the ID only.
-type k0sBootstrapToken struct {
-	id     string
-	secret string
-}
-
-// bearer returns the full "<id>.<secret>" value. Never log it.
-func (t k0sBootstrapToken) bearer() string { return t.id + "." + t.secret }
-
-func (t k0sBootstrapToken) String() string { return t.id + ".<redacted>" }
-
-// MarshalLog implements logr.Marshaler.
-func (t k0sBootstrapToken) MarshalLog() any { return t.String() }
-
-// generateK0sBootstrapToken returns a new bootstrap token from crypto/rand over
-// [a-z0-9]: 6 characters of ID and 16 of secret, the format k0s and kubeadm use.
-// It is stdlib only, so the release-0.1 line can share it without
-// k8s.io/cluster-bootstrap.
-func generateK0sBootstrapToken() (k0sBootstrapToken, error) {
-	id, err := randomBootstrapTokenString(bootstrapTokenIDLength)
-	if err != nil {
-		return k0sBootstrapToken{}, err
-	}
-	secret, err := randomBootstrapTokenString(bootstrapTokenSecretLength)
-	if err != nil {
-		return k0sBootstrapToken{}, err
-	}
-	return k0sBootstrapToken{id: id, secret: secret}, nil
-}
-
-func randomBootstrapTokenString(n int) (string, error) {
-	limit := big.NewInt(int64(len(bootstrapTokenCharset)))
-	out := make([]byte, n)
-	for i := range out {
-		v, err := rand.Int(rand.Reader, limit)
-		if err != nil {
-			return "", fmt.Errorf("generate bootstrap token: %w", err)
-		}
-		out[i] = bootstrapTokenCharset[v.Int64()]
-	}
-	return string(out), nil
-}
-
-// encodeK0sControllerJoinToken builds a k0s controller join token: a kubeconfig
-// with cluster and context "k0s" and user "controller-bootstrap", gzipped at
-// BestCompression and base64-encoded with the standard alphabet. This is what
-// `k0s token create --role=controller` and `k0s token pre-shared` produce
-// (pkg/token/kubeconfig.go GenerateKubeconfig, pkg/token/joinencode.go).
-func encodeK0sControllerJoinToken(server string, caPEM []byte, tok k0sBootstrapToken) (string, error) {
-	kubeconfig, err := clientcmd.Write(clientcmdapi.Config{
-		Clusters: map[string]*clientcmdapi.Cluster{k0sTokenKubeconfigName: {
-			Server:                   server,
-			CertificateAuthorityData: caPEM,
-		}},
-		Contexts: map[string]*clientcmdapi.Context{k0sTokenKubeconfigName: {
-			Cluster:  k0sTokenKubeconfigName,
-			AuthInfo: k0sControllerBootstrapUser,
-		}},
-		CurrentContext: k0sTokenKubeconfigName,
-		AuthInfos: map[string]*clientcmdapi.AuthInfo{k0sControllerBootstrapUser: {
-			Token: tok.bearer(),
-		}},
-	})
-	if err != nil {
-		return "", errors.New("encode k0s join token: cannot serialize the kubeconfig")
-	}
-	var buf bytes.Buffer
-	gz, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-	if err != nil {
-		return "", fmt.Errorf("encode k0s join token: %w", err)
-	}
-	if _, err := gz.Write(kubeconfig); err != nil {
-		return "", fmt.Errorf("encode k0s join token: %w", err)
-	}
-	if err := gz.Close(); err != nil {
-		return "", fmt.Errorf("encode k0s join token: %w", err)
-	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
-}
-
-// decodedK0sJoinToken is a parsed k0s controller join token.
-type decodedK0sJoinToken struct {
-	server string
-	caData []byte
-	user   string
-	token  k0sBootstrapToken
-}
-
-// decodeK0sControllerJoinToken reverses encodeK0sControllerJoinToken. It also
-// reads tokens minted by k0s itself, which is how the KCP recognises the token
-// an older init node pushed. Errors never quote the input.
-func decodeK0sControllerJoinToken(encoded string) (decodedK0sJoinToken, error) {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
-	if err != nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: not base64")
-	}
-	gz, err := gzip.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: not gzip")
-	}
-	data, err := io.ReadAll(io.LimitReader(gz, maxK0sJoinTokenKubeconfigBytes+1))
-	if err != nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: corrupt gzip stream")
-	}
-	if len(data) > maxK0sJoinTokenKubeconfigBytes {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: kubeconfig too large")
-	}
-	cfg, err := clientcmd.Load(data)
-	if err != nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: not a kubeconfig")
-	}
-	kctx, ok := cfg.Contexts[cfg.CurrentContext]
-	if !ok || kctx == nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: no current context")
-	}
-	cluster, ok := cfg.Clusters[kctx.Cluster]
-	if !ok || cluster == nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: context names an unknown cluster")
-	}
-	auth, ok := cfg.AuthInfos[kctx.AuthInfo]
-	if !ok || auth == nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: context names an unknown user")
-	}
-	m := bootstrapTokenPattern.FindStringSubmatch(auth.Token)
-	if m == nil {
-		return decodedK0sJoinToken{}, errors.New("decode k0s join token: bearer is not a bootstrap token")
-	}
-	return decodedK0sJoinToken{
-		server: cluster.Server,
-		caData: cluster.CertificateAuthorityData,
-		user:   kctx.AuthInfo,
-		token:  k0sBootstrapToken{id: m[1], secret: m[2]},
-	}, nil
-}
-
-// newK0sControllerJoinTokenSecret returns the workload kube-system Secret that
-// backs tok, in the shape k0s gives its own controller tokens
-// (pkg/token/manager.go RandomBootstrapSecret): the controller-join usage in
-// both its current and legacy key, and nothing else. In particular there is no
-// authentication or signing usage and no extra group, so the token cannot be
-// used against kube-apiserver at all.
-func newK0sControllerJoinTokenSecret(tok k0sBootstrapToken, expires time.Time) *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      bootstrapTokenSecretPrefix + tok.id,
-			Namespace: metav1.NamespaceSystem,
-		},
-		Type: corev1.SecretTypeBootstrapToken,
-		Data: map[string][]byte{
-			bootstrapTokenIDKey:             []byte(tok.id),
-			bootstrapTokenSecretKey:         []byte(tok.secret),
-			bootstrapTokenExpirationKey:     []byte(expires.UTC().Format(time.RFC3339)),
-			bootstrapTokenDescriptionKey:    []byte(k0sJoinTokenDescription),
-			bootstrapTokenUsageCtrlJoinKey:  []byte("true"),
-			k0sLegacyUsageControllerJoinKey: []byte("true"),
-		},
-	}
-}
-
-// isK0sControllerJoinTokenSecret reports whether s is a bootstrap-token Secret
-// that carries the controller-join usage and cannot authenticate to
-// kube-apiserver. The KCP only extends, reuses or deletes Secrets that pass.
-func isK0sControllerJoinTokenSecret(s *corev1.Secret) bool {
-	if s.Type != corev1.SecretTypeBootstrapToken {
-		return false
-	}
-	ctrlJoin := string(s.Data[bootstrapTokenUsageCtrlJoinKey]) == "true" ||
-		string(s.Data[k0sLegacyUsageControllerJoinKey]) == "true"
-	if !ctrlJoin {
-		return false
-	}
-	if string(s.Data[bootstrapTokenUsageAuthKey]) == "true" || string(s.Data[bootstrapTokenUsageSigningKey]) == "true" {
-		return false
-	}
-	return len(s.Data[bootstrapTokenExtraGroupsKey]) == 0
-}
-
-// bootstrapTokenSecretExpiry returns the expiration of a bootstrap-token Secret.
-// ok is false when the key is missing or unparsable.
-func bootstrapTokenSecretExpiry(s *corev1.Secret) (time.Time, bool) {
-	raw, present := s.Data[bootstrapTokenExpirationKey]
-	if !present || len(raw) == 0 {
-		return time.Time{}, false
-	}
-	t, err := time.Parse(time.RFC3339, string(raw))
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
-func bootstrapTokenSecretKeyFor(id string) types.NamespacedName {
-	return types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: bootstrapTokenSecretPrefix + id}
-}
 
 // k0sJoinServerURL returns the join API URL for a member address.
 // net.JoinHostPort brackets IPv6 literals.
 func k0sJoinServerURL(ip net.IP) string {
-	return "https://" + net.JoinHostPort(ip.String(), k0sJoinAPIPort)
+	return "https://" + net.JoinHostPort(ip.String(), k0sjointoken.JoinAPIPort)
 }
 
 // normalizeK0sJoinServer canonicalises a token's server URL so it compares
@@ -343,7 +101,7 @@ func k0sJoinServerURL(ip net.IP) string {
 // not https://<ip>:9443.
 func normalizeK0sJoinServer(server string) (string, bool) {
 	u, err := url.Parse(server)
-	if err != nil || u.Scheme != "https" || u.Port() != k0sJoinAPIPort {
+	if err != nil || u.Scheme != "https" || u.Port() != k0sjointoken.JoinAPIPort {
 		return "", false
 	}
 	ip := net.ParseIP(u.Hostname())
@@ -531,7 +289,7 @@ func (r *KairosControlPlaneReconciler) workloadClusterCA(ctx context.Context, cl
 type storedK0sJoinToken struct {
 	annotatedID string
 	empty       bool
-	decoded     *decodedK0sJoinToken
+	decoded     *k0sjointoken.Decoded
 }
 
 func inspectStoredK0sJoinToken(secret *corev1.Secret) storedK0sJoinToken {
@@ -541,7 +299,7 @@ func inspectStoredK0sJoinToken(secret *corev1.Secret) storedK0sJoinToken {
 		out.empty = true
 		return out
 	}
-	if d, err := decodeK0sControllerJoinToken(string(raw)); err == nil {
+	if d, err := k0sjointoken.Decode(string(raw)); err == nil {
 		out.decoded = &d
 	}
 	return out
@@ -555,8 +313,8 @@ func (s storedK0sJoinToken) supersededIDs() []string {
 	if s.annotatedID != "" {
 		ids = append(ids, s.annotatedID)
 	}
-	if s.decoded != nil && s.decoded.token.id != s.annotatedID {
-		ids = append(ids, s.decoded.token.id)
+	if s.decoded != nil && s.decoded.Token.ID() != s.annotatedID {
+		ids = append(ids, s.decoded.Token.ID())
 	}
 	return ids
 }
@@ -623,7 +381,7 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 		why = "the stored value is not a k0s controller join token"
 	case stored.annotatedID == "":
 		why = "the stored token was minted by the init node"
-	case stored.decoded.token.id != stored.annotatedID:
+	case stored.decoded.Token.ID() != stored.annotatedID:
 		why = "the stored token does not match its ID annotation"
 	default:
 		why, err = checkIssuedK0sJoinToken(ctx, wc, *stored.decoded, ca, live, now)
@@ -632,7 +390,7 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 		}
 		if why == "" {
 			log.V(4).Info("Reusing k0s controller-join token", "tokenID", stored.annotatedID,
-				"server", k0sJoinServerHost(stored.decoded.server))
+				"server", k0sJoinServerHost(stored.decoded.Server))
 			return stored.annotatedID, "", nil
 		}
 	}
@@ -654,32 +412,32 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 
 // checkIssuedK0sJoinToken reports why the token in the management Secret must
 // be replaced, or "" when it can be handed to the next joiner as is.
-func checkIssuedK0sJoinToken(ctx context.Context, wc client.Client, stored decodedK0sJoinToken, ca []byte, live []string, now time.Time) (string, error) {
+func checkIssuedK0sJoinToken(ctx context.Context, wc client.Client, stored k0sjointoken.Decoded, ca []byte, live []string, now time.Time) (string, error) {
 	ws := &corev1.Secret{}
-	if err := wc.Get(ctx, bootstrapTokenSecretKeyFor(stored.token.id), ws); err != nil {
+	if err := wc.Get(ctx, k0sjointoken.SecretKeyFor(stored.Token.ID()), ws); err != nil {
 		if apierrors.IsNotFound(err) {
 			return "the issued token no longer exists in the workload cluster", nil
 		}
 		return "", err
 	}
-	if !isK0sControllerJoinTokenSecret(ws) {
+	if !k0sjointoken.IsControllerJoinOnly(ws) {
 		return "the workload token Secret is not a controller-join-only bootstrap token", nil
 	}
-	if subtle.ConstantTimeCompare(ws.Data[bootstrapTokenSecretKey], []byte(stored.token.secret)) != 1 {
+	if subtle.ConstantTimeCompare(ws.Data[k0sjointoken.SecretKey], []byte(stored.Token.Secret())) != 1 {
 		return "the workload token Secret does not match the stored token", nil
 	}
-	expires, ok := bootstrapTokenSecretExpiry(ws)
+	expires, ok := k0sjointoken.Expiry(ws)
 	if !ok {
 		return "the issued token has no valid expiration", nil
 	}
 	if expires.Sub(now) < k0sJoinTokenRenewWithin {
 		return "the issued token expires within " + k0sJoinTokenRenewWithin.String(), nil
 	}
-	server, ok := normalizeK0sJoinServer(stored.server)
+	server, ok := normalizeK0sJoinServer(stored.Server)
 	if !ok || !containsString(live, server) {
 		return "the token's server is no longer a live control-plane member", nil
 	}
-	if !bytes.Equal(stored.caData, ca) {
+	if !bytes.Equal(stored.CAData, ca) {
 		return "the token's CA no longer matches the cluster CA", nil
 	}
 	return "", nil
@@ -691,16 +449,16 @@ func checkIssuedK0sJoinToken(ctx context.Context, wc client.Client, stored decod
 // resourceVersion: a reconcile working from a stale cache gets a conflict
 // instead of overwriting a token another reconcile just issued.
 func (r *KairosControlPlaneReconciler) mintK0sControllerJoinToken(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, wc client.Client, mgmtSecret *corev1.Secret, ca []byte, server string, now time.Time, why string) (string, error) {
-	tok, err := generateK0sBootstrapToken()
+	tok, err := k0sjointoken.Generate()
 	if err != nil {
 		return "", err
 	}
 	expires := now.Add(k0sJoinTokenTTL)
-	ws := newK0sControllerJoinTokenSecret(tok, expires)
+	ws := k0sjointoken.NewSecret(tok, expires)
 	if err := wc.Create(ctx, ws); err != nil {
 		return "", fmt.Errorf("create bootstrap token Secret %s/%s in the workload cluster: %w", ws.Namespace, ws.Name, err)
 	}
-	encoded, err := encodeK0sControllerJoinToken(server, ca, tok)
+	encoded, err := k0sjointoken.Encode(server, ca, tok)
 	if err != nil {
 		deleteK0sJoinTokenSecretBestEffort(ctx, log, wc, ws)
 		return "", err
@@ -714,7 +472,7 @@ func (r *KairosControlPlaneReconciler) mintK0sControllerJoinToken(ctx context.Co
 	if mgmtSecret.Annotations == nil {
 		mgmtSecret.Annotations = map[string]string{}
 	}
-	mgmtSecret.Annotations[k0sJoinTokenIDAnnotation] = tok.id
+	mgmtSecret.Annotations[k0sJoinTokenIDAnnotation] = tok.ID()
 	if err := r.Patch(ctx, mgmtSecret, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		deleteK0sJoinTokenSecretBestEffort(ctx, log, wc, ws)
 		return "", fmt.Errorf("store the k0s join token in %s/%s: %w", mgmtSecret.Namespace, mgmtSecret.Name, err)
@@ -722,31 +480,31 @@ func (r *KairosControlPlaneReconciler) mintK0sControllerJoinToken(ctx context.Co
 
 	host := k0sJoinServerHost(server)
 	log.Info("Minted k0s controller-join token",
-		"tokenID", tok.id, "server", host, "expires", expires.UTC().Format(time.RFC3339),
+		"tokenID", tok.ID(), "server", host, "expires", expires.UTC().Format(time.RFC3339),
 		"secret", mgmtSecret.Namespace+"/"+mgmtSecret.Name, "reason", why)
 	if r.Recorder != nil {
 		r.Recorder.Eventf(kcp, corev1.EventTypeNormal, "K0sJoinTokenMinted",
 			"Issued k0s controller-join token %s for the next control-plane member; joiners reach %s:%s (%s)",
-			tok.id, host, k0sJoinAPIPort, why)
+			tok.ID(), host, k0sjointoken.JoinAPIPort, why)
 	}
-	return tok.id, nil
+	return tok.ID(), nil
 }
 
 // deleteSupersededK0sJoinToken removes a replaced token from the workload
 // cluster, best effort. Only a controller-join-only bootstrap token is ever
 // deleted, and the delete is pinned to the UID that was checked.
 func deleteSupersededK0sJoinToken(ctx context.Context, log logr.Logger, wc client.Client, id string) {
-	if !bootstrapTokenIDPattern.MatchString(id) {
+	if !k0sjointoken.ValidID(id) {
 		return
 	}
 	ws := &corev1.Secret{}
-	if err := wc.Get(ctx, bootstrapTokenSecretKeyFor(id), ws); err != nil {
+	if err := wc.Get(ctx, k0sjointoken.SecretKeyFor(id), ws); err != nil {
 		if !apierrors.IsNotFound(err) {
 			log.V(1).Info("Could not read a superseded k0s join token for cleanup", "tokenID", id, "error", err.Error())
 		}
 		return
 	}
-	if !isK0sControllerJoinTokenSecret(ws) {
+	if !k0sjointoken.IsControllerJoinOnly(ws) {
 		log.Info("Leaving a superseded token Secret in place: it is not a controller-join-only bootstrap token", "tokenID", id)
 		return
 	}
@@ -829,9 +587,9 @@ func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetimeAt(ctx conte
 	var storedServer, storedID string
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: joinTokenSecretName(cluster.Name)}, secret); err == nil {
-		if st := inspectStoredK0sJoinToken(secret); st.decoded != nil && st.annotatedID == st.decoded.token.id {
+		if st := inspectStoredK0sJoinToken(secret); st.decoded != nil && st.annotatedID == st.decoded.Token.ID() {
 			storedID = st.annotatedID
-			storedServer, _ = normalizeK0sJoinServer(st.decoded.server)
+			storedServer, _ = normalizeK0sJoinServer(st.decoded.Server)
 		}
 	}
 	live, liveErr := liveK0sJoinServers(ctx, wc, deletingMachineAddresses(machines))
@@ -869,12 +627,12 @@ func (r *KairosControlPlaneReconciler) extendK0sJoinToken(ctx context.Context, l
 	}
 	machinesStr := strings.Join(names, ",")
 
-	if !bootstrapTokenIDPattern.MatchString(id) {
+	if !k0sjointoken.ValidID(id) {
 		log.Info("Pending joiner carries a malformed k0s join-token ID; not extending", "machines", machinesStr)
 		return
 	}
 	ws := &corev1.Secret{}
-	if err := wc.Get(ctx, bootstrapTokenSecretKeyFor(id), ws); err != nil {
+	if err := wc.Get(ctx, k0sjointoken.SecretKeyFor(id), ws); err != nil {
 		if apierrors.IsNotFound(err) {
 			for _, n := range names {
 				r.k0sJoinTokenWarning(kcp, "K0sJoinTokenMissing",
@@ -886,7 +644,7 @@ func (r *KairosControlPlaneReconciler) extendK0sJoinToken(ctx context.Context, l
 		log.Info("Cannot read a pending joiner's k0s join token", "tokenID", id, "error", err.Error())
 		return
 	}
-	if !isK0sControllerJoinTokenSecret(ws) {
+	if !k0sjointoken.IsControllerJoinOnly(ws) {
 		log.Info("Not extending a token Secret that is not a controller-join-only bootstrap token", "tokenID", id)
 		return
 	}
@@ -898,13 +656,13 @@ func (r *KairosControlPlaneReconciler) extendK0sJoinToken(ctx context.Context, l
 		}
 		return
 	}
-	expires, ok := bootstrapTokenSecretExpiry(ws)
+	expires, ok := k0sjointoken.Expiry(ws)
 	if !ok || expires.Sub(now) >= k0sJoinTokenRenewWithin {
 		return
 	}
 	newExpiry := now.Add(k0sJoinTokenTTL)
 	base := ws.DeepCopy()
-	ws.Data[bootstrapTokenExpirationKey] = []byte(newExpiry.UTC().Format(time.RFC3339))
+	ws.Data[k0sjointoken.ExpirationKey] = []byte(newExpiry.UTC().Format(time.RFC3339))
 	if err := wc.Patch(ctx, ws, client.MergeFrom(base)); err != nil {
 		log.Info("Could not extend a pending joiner's k0s join token", "tokenID", id, "error", err.Error())
 		return
