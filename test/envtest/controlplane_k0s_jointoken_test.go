@@ -45,10 +45,9 @@ import (
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/controlplane"
 )
 
-// k0sEnvtestMemberAddr is a control-plane member address the k0s join-token
-// tests publish in the default/kubernetes EndpointSlices, next to whatever
-// address envtest's own apiserver advertises there.
-const k0sEnvtestMemberAddr = "192.0.2.10"
+// k0sEnvtestForeignAddr is an address a test publishes in an extra
+// EndpointSlice labelled for the kubernetes Service. The KCP must never pick it.
+const k0sEnvtestForeignAddr = "10.0.0.1"
 
 // withEnvtestAsWorkloadCluster makes the KCP use the envtest apiserver as the
 // workload cluster: the k0s join-token path then creates its bootstrap token
@@ -96,13 +95,34 @@ func k0sWorkloadKubeconfig(t *testing.T, cfg *rest.Config) []byte {
 	return data
 }
 
-// publishK0sMember adds a ready endpoint for addr to the default/kubernetes
-// EndpointSlices, the way a live k0s member's apiserver appears there.
-func publishK0sMember(t *testing.T, ctx context.Context, wc client.Client, addr string) {
+// envtestAPIServerAddress returns the address envtest's own kube-apiserver
+// publishes in the default/kubernetes EndpointSlice: in these tests it plays
+// the live init member, so the init Machine reports it as its address.
+func envtestAPIServerAddress(t *testing.T, ctx context.Context, wc client.Client) string {
+	t.Helper()
+	var addr string
+	NewWithT(t).Eventually(func() string {
+		slice := &discoveryv1.EndpointSlice{}
+		if err := wc.Get(ctx, types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "kubernetes"}, slice); err != nil {
+			return ""
+		}
+		for _, ep := range slice.Endpoints {
+			if len(ep.Addresses) > 0 {
+				addr = ep.Addresses[0]
+			}
+		}
+		return addr
+	}, 15*time.Second, 200*time.Millisecond).ShouldNot(BeEmpty(), "envtest's apiserver publishes default/kubernetes")
+	return addr
+}
+
+// publishForeignKubernetesSlice adds an EndpointSlice with the
+// kubernetes.io/service-name=kubernetes label that kube-apiserver did not write.
+func publishForeignKubernetesSlice(t *testing.T, ctx context.Context, wc client.Client, addr string) {
 	t.Helper()
 	slice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kairos-envtest-members",
+			Name:      "kubernetes-extra",
 			Namespace: metav1.NamespaceDefault,
 			Labels:    map[string]string{discoveryv1.LabelServiceName: "kubernetes"},
 		},
@@ -116,9 +136,9 @@ func publishK0sMember(t *testing.T, ctx context.Context, wc client.Client, addr 
 }
 
 // makeK0sInitJoinable puts the init machine of a haFixture cluster into the
-// state the join gate waits for: a Machine with a NodeRef, the kubeconfig
-// Secret, and a healthy voting etcd report.
-func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsName, clusterName, kcpName string, kubeconfig []byte) {
+// state the join gate waits for: a Machine with a NodeRef and the given
+// addresses, the kubeconfig Secret, and a healthy voting etcd report.
+func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsName, clusterName, kcpName string, kubeconfig []byte, addrs ...string) {
 	t.Helper()
 	g := NewWithT(t)
 	initMachine := &clusterv1.Machine{
@@ -143,6 +163,10 @@ func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsN
 	g.Expect(c.Create(ctx, initMachine)).To(Succeed())
 	initMachine.Status.NodeRef = clusterv1.MachineNodeReference{Name: "init-node"}
 	initMachine.Status.Phase = string(clusterv1.MachinePhaseRunning)
+	for _, a := range addrs {
+		initMachine.Status.Addresses = append(initMachine.Status.Addresses,
+			clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
+	}
 	g.Expect(c.Status().Update(ctx, initMachine)).To(Succeed())
 
 	g.Expect(c.Create(ctx, &corev1.Secret{
@@ -167,29 +191,6 @@ func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsN
 		es.Data["init-node"] = []byte(`{"name":"init-node","healthy":true,"voting":true,"members":1,"reportedAt":"t"}`)
 		return c.Update(ctx, es)
 	}, 15*time.Second, 500*time.Millisecond).Should(Succeed())
-}
-
-// liveJoinServersForTest lists https://<addr>:9443 for every ready,
-// non-loopback address in the default/kubernetes EndpointSlices.
-func liveJoinServersForTest(t *testing.T, ctx context.Context, wc client.Client) []string {
-	t.Helper()
-	slices := &discoveryv1.EndpointSliceList{}
-	NewWithT(t).Expect(wc.List(ctx, slices, client.InNamespace(metav1.NamespaceDefault),
-		client.MatchingLabels{discoveryv1.LabelServiceName: "kubernetes"})).To(Succeed())
-	var out []string
-	for _, sl := range slices.Items {
-		for _, ep := range sl.Endpoints {
-			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-				continue
-			}
-			for _, a := range ep.Addresses {
-				if ip := net.ParseIP(a); ip != nil && !ip.IsLoopback() {
-					out = append(out, "https://"+net.JoinHostPort(ip.String(), "9443"))
-				}
-			}
-		}
-	}
-	return out
 }
 
 // decodedJoinToken is a k0s join token decoded independently of the
@@ -240,8 +241,12 @@ func TestHA_K0sJoinToken_KCPMintsAndStampsJoinConfig(t *testing.T) {
 		kcpName     = "ha-k0s-mint-kcp"
 	)
 	haFixture(t, ctx, c, nsName, clusterName, kcpName, "k0s")
-	publishK0sMember(t, ctx, wc, k0sEnvtestMemberAddr)
-	makeK0sInitJoinable(t, ctx, c, nsName, clusterName, kcpName, k0sWorkloadKubeconfig(t, cfg))
+	// The init Machine reports the live apiserver's address and one more; an
+	// extra slice lists that other, lower address. Only the apiserver's own
+	// slice counts, so the token must point at the live apiserver.
+	apiAddr := envtestAPIServerAddress(t, ctx, wc)
+	publishForeignKubernetesSlice(t, ctx, wc, k0sEnvtestForeignAddr)
+	makeK0sInitJoinable(t, ctx, c, nsName, clusterName, kcpName, k0sWorkloadKubeconfig(t, cfg), apiAddr, k0sEnvtestForeignAddr)
 
 	joinCfg := &bootstrapv1beta2.KairosConfig{}
 	g.Eventually(func() (string, error) {
@@ -261,11 +266,8 @@ func TestHA_K0sJoinToken_KCPMintsAndStampsJoinConfig(t *testing.T) {
 		return secret.Annotations[bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation]
 	}, 10*time.Second, 200*time.Millisecond).Should(Equal(id))
 	tok := decodeJoinTokenForTest(t, secret.Data[bootstrapv1beta2.ControlPlaneJoinTokenSecretDataKey])
-	// The server is a live member's join API. envtest's apiserver also lists
-	// itself, under the host's address, so the member is one of a set here; the
-	// unit tests pin which one is picked.
-	g.Expect(tok.server).To(BeElementOf(liveJoinServersForTest(t, ctx, wc)), "a live member's join API")
-	g.Expect(tok.server).ToNot(ContainSubstring(testControlPlaneEndpoint().Host), "never the control-plane endpoint")
+	g.Expect(tok.server).To(Equal("https://"+net.JoinHostPort(apiAddr, "9443")),
+		"the live member's join API, never the endpoint or an address from another slice")
 	g.Expect(tok.user).To(Equal("controller-bootstrap"))
 	g.Expect(tok.ca).To(Equal(cfg.CAData), "the CA the workload kubeconfig verifies against")
 	g.Expect(regexp.MustCompile(`^` + id + `\.[a-z0-9]{16}$`).MatchString(tok.bearer)).To(BeTrue())

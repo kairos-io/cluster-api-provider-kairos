@@ -120,79 +120,107 @@ func k0sJoinServerHost(server string) string {
 	return u.Hostname()
 }
 
+// k0sJoinServers is the outcome of choosing a server for a join token.
+type k0sJoinServers struct {
+	// urls are the join API URLs of the live members that are Machines of this
+	// control plane, lowest address first.
+	urls []string
+	// unmatched counts the ready addresses the apiserver lists that are not
+	// the address of any Machine of this control plane.
+	unmatched int
+}
+
+// kubernetesEndpointSliceKey names the EndpointSlice kube-apiserver itself
+// maintains for the default/kubernetes Service (endpointsadapter.go names it
+// after the Service).
+var kubernetesEndpointSliceKey = types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "kubernetes"}
+
 // liveK0sJoinServers returns the join API URLs of the live control-plane
 // members, lowest address first.
 //
-// The source is the workload default/kubernetes EndpointSlice. kube-apiserver
-// advertises api.address, and with externalAddress unset k0s leaves the
-// apiserver's own lease-based endpoint reconciler in charge, so the slice lists
-// exactly the members whose apiserver is up (ADR 0013 GT-6). `k0s token create`
-// builds its URL from the same api.address.
+// Liveness comes from the EndpointSlice kube-apiserver writes for the
+// default/kubernetes Service, read by name. kube-apiserver advertises
+// api.address, and with externalAddress unset k0s leaves the apiserver's own
+// lease-based endpoint reconciler in charge, so that slice lists exactly the
+// members whose apiserver is up (ADR 0013 GT-6). `k0s token create` builds its
+// URL from the same api.address. Other slices carrying the
+// kubernetes.io/service-name=kubernetes label are not read.
 //
-// An address counts only if its endpoint is ready and not terminating and it
-// parses as a unicast IP. Loopback and unspecified addresses are dropped, as is
-// any address in excluded (the addresses of control-plane Machines that are
-// being deleted).
-func liveK0sJoinServers(ctx context.Context, wc client.Client, excluded map[string]bool) ([]string, error) {
-	slices := &discoveryv1.EndpointSliceList{}
-	if err := wc.List(ctx, slices,
-		client.InNamespace(metav1.NamespaceDefault),
-		client.MatchingLabels{discoveryv1.LabelServiceName: "kubernetes"},
-	); err != nil {
-		return nil, fmt.Errorf("list the workload default/kubernetes EndpointSlices: %w", err)
+// Membership comes from the management cluster: an address counts only if it
+// is in status.addresses of one of this control plane's Machines that is not
+// being deleted. A join token therefore always points at one of our own
+// members. An address also held by a Machine being deleted is left out, since
+// a member on its way out may still be listed.
+//
+// The address must also be on a ready, non-terminating endpoint and parse as a
+// unicast IP; loopback and unspecified addresses are dropped.
+func liveK0sJoinServers(ctx context.Context, wc client.Client, machines []*clusterv1.Machine) (k0sJoinServers, error) {
+	ours := ownMemberAddresses(machines)
+	slice := &discoveryv1.EndpointSlice{}
+	if err := wc.Get(ctx, kubernetesEndpointSliceKey, slice); err != nil {
+		if apierrors.IsNotFound(err) {
+			return k0sJoinServers{}, nil
+		}
+		return k0sJoinServers{}, fmt.Errorf("get the workload EndpointSlice %s: %w", kubernetesEndpointSliceKey, err)
 	}
+	if slice.AddressType != discoveryv1.AddressTypeIPv4 && slice.AddressType != discoveryv1.AddressTypeIPv6 {
+		return k0sJoinServers{}, nil
+	}
+	var out k0sJoinServers
 	seen := map[string]bool{}
 	var ips []net.IP
-	for i := range slices.Items {
-		slice := &slices.Items[i]
-		if slice.AddressType != discoveryv1.AddressTypeIPv4 && slice.AddressType != discoveryv1.AddressTypeIPv6 {
+	for _, ep := range slice.Endpoints {
+		if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
 			continue
 		}
-		for _, ep := range slice.Endpoints {
-			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+		if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+			continue
+		}
+		for _, addr := range ep.Addresses {
+			ip := net.ParseIP(addr)
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
 				continue
 			}
-			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+			key := ip.String()
+			if seen[key] {
 				continue
 			}
-			for _, addr := range ep.Addresses {
-				ip := net.ParseIP(addr)
-				if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
-					continue
-				}
-				key := ip.String()
-				if excluded[key] || seen[key] {
-					continue
-				}
-				seen[key] = true
-				ips = append(ips, ip)
+			seen[key] = true
+			if !ours[key] {
+				out.unmatched++
+				continue
 			}
+			ips = append(ips, ip)
 		}
 	}
 	sort.Slice(ips, func(i, j int) bool { return bytes.Compare(ips[i].To16(), ips[j].To16()) < 0 })
-	out := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		out = append(out, k0sJoinServerURL(ip))
+		out.urls = append(out.urls, k0sJoinServerURL(ip))
 	}
 	return out, nil
 }
 
-// deletingMachineAddresses returns the canonical IPs of every control-plane
-// Machine that is being deleted. A member on its way out may still be in the
-// EndpointSlice; a new joiner must not be pointed at it.
-func deletingMachineAddresses(machines []*clusterv1.Machine) map[string]bool {
-	out := map[string]bool{}
+// ownMemberAddresses returns the canonical IPs in status.addresses of this
+// control plane's Machines that are not being deleted, minus any IP a Machine
+// being deleted also reports. machines is the KCP-owned set reconcileMachines
+// works on.
+func ownMemberAddresses(machines []*clusterv1.Machine) map[string]bool {
+	live, leaving := map[string]bool{}, map[string]bool{}
 	for _, m := range machines {
-		if m.DeletionTimestamp.IsZero() {
-			continue
+		into := live
+		if !m.DeletionTimestamp.IsZero() {
+			into = leaving
 		}
 		for _, a := range m.Status.Addresses {
 			if ip := net.ParseIP(a.Address); ip != nil {
-				out[ip.String()] = true
+				into[ip.String()] = true
 			}
 		}
 	}
-	return out
+	for ip := range leaving {
+		delete(live, ip)
+	}
+	return live
 }
 
 func containsString(list []string, s string) bool {
@@ -364,12 +392,17 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 	if err != nil {
 		return "", fmt.Sprintf("cannot reach the workload cluster to issue a k0s join token: %v", err), nil
 	}
-	live, err := liveK0sJoinServers(ctx, wc, deletingMachineAddresses(machines))
+	servers, err := liveK0sJoinServers(ctx, wc, machines)
 	if err != nil {
 		return "", fmt.Sprintf("cannot list live control-plane members: %v", err), nil
 	}
+	live := servers.urls
 	if len(live) == 0 {
-		return "", "no live control-plane member is listed in the workload default/kubernetes EndpointSlice; cannot issue a k0s join token", nil
+		reason := fmt.Sprintf("no live control-plane member to issue a k0s join token for: the apiserver lists %d ready address(es) "+
+			"in the workload default/kubernetes EndpointSlice and none is in status.addresses of a control-plane Machine of this cluster",
+			servers.unmatched)
+		r.k0sJoinTokenWarning(kcp, "K0sJoinTokenNoLiveMember", "No join token issued for the next control-plane member: %s.", reason)
+		return "", reason, nil
 	}
 
 	stored := inspectStoredK0sJoinToken(secret)
@@ -592,7 +625,8 @@ func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetimeAt(ctx conte
 			storedServer, _ = normalizeK0sJoinServer(st.decoded.Server)
 		}
 	}
-	live, liveErr := liveK0sJoinServers(ctx, wc, deletingMachineAddresses(machines))
+	servers, liveErr := liveK0sJoinServers(ctx, wc, machines)
+	live := servers.urls
 
 	ids := make([]string, 0, len(pending))
 	for id := range pending {

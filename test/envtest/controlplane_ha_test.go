@@ -189,8 +189,9 @@ func TestHA_K0sJoinTokenSecret_CreatedEmpty(t *testing.T) {
 // machine is joinable (NodeRef + KubeconfigReady + the init node has reported a
 // healthy voting etcd member) and the KCP has minted a k0s controller-join token
 // (ADR 0013). We drive that state by hand (pre-create the init Machine with a
-// NodeRef, push the kubeconfig Secret, write the init node's etcd-status report,
-// publish a live member) and assert a join KairosConfig then appears.
+// NodeRef and the live apiserver's address, push the kubeconfig Secret, write
+// the init node's etcd-status report) and assert a join KairosConfig then
+// appears.
 func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -205,7 +206,7 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 		kcpName     = "ha-seq-kcp"
 	)
 	haFixture(t, ctx, c, nsName, clusterName, kcpName, "k0s")
-	publishK0sMember(t, ctx, envtestWorkloadClient(t, cfg), k0sEnvtestMemberAddr)
+	apiAddr := envtestAPIServerAddress(t, ctx, envtestWorkloadClient(t, cfg))
 
 	// The controller creates the KairosConfig for machine-0 (init) before infra
 	// cloning fails, so it should appear with role=init.
@@ -232,10 +233,11 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 		return err != nil // still not created
 	}, 4*time.Second, 500*time.Millisecond).Should(BeTrue(), "join config must not be created before init is joinable")
 
-	// Make the init machine joinable: NodeRef + Running, the kubeconfig Secret
-	// (opens KubeconfigReady), and a healthy voting etcd report (ADR 0005 §E.1).
-	// Nothing fills the join-token Secret by hand: the KCP mints the token.
-	makeK0sInitJoinable(t, ctx, c, nsName, clusterName, kcpName, k0sWorkloadKubeconfig(t, cfg))
+	// Make the init machine joinable: NodeRef + Running, the address of the live
+	// apiserver, the kubeconfig Secret (opens KubeconfigReady), and a healthy
+	// voting etcd report (ADR 0005 §E.1). Nothing fills the join-token Secret by
+	// hand: the KCP mints the token.
+	makeK0sInitJoinable(t, ctx, c, nsName, clusterName, kcpName, k0sWorkloadKubeconfig(t, cfg), apiAddr)
 
 	// The gate should now open and the controller should create the join config.
 	g.Eventually(func() (bootstrapv1beta2.ControlPlaneRole, error) {
