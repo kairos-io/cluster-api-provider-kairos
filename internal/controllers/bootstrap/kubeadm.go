@@ -355,29 +355,10 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 		return zero, fmt.Errorf("the %s Secret carries no certificate-authority-data: refusing to mint a token without a CA pin", kubeconfigKey.Name)
 	}
 
-	// Cross-check against <cluster>-ca if it exists (UNCACHED read, cert only). Do
-	// NOT require the Secret to exist or to be owned: Kamaji's default setup and an
-	// upstream-KCP user-supplied CA legitimately have no CAPI controller owner
-	// (ADR 0010 P1 step 1).
 	caKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + "-ca"}
-	caSecret := &corev1.Secret{}
-	caCrossChecked := false
-	if err := s.caReader.Get(ctx, caKey, caSecret); err == nil {
-		crt, ok := caSecret.Data[clusterCASecretCrtKey]
-		if !ok || len(crt) == 0 {
-			return zero, fmt.Errorf("the %s Secret has no %q: cannot cross-check the CA pin", caKey.Name, clusterCASecretCrtKey)
-		}
-		_, caDER, perr := caCertHashesFromPEM(crt)
-		if perr != nil {
-			return zero, fmt.Errorf("the %s Secret has an unparseable %q: %v", caKey.Name, clusterCASecretCrtKey, perr)
-		}
-		if !derCertSetsEqual(kubeconfigCADER, caDER) {
-			return zero, fmt.Errorf("the kubeconfig CA does not match the %s Secret's %q; inspect the Secret and re-pin if this change is expected",
-				caKey.Name, clusterCASecretCrtKey)
-		}
-		caCrossChecked = true
-	} else if !apierrors.IsNotFound(err) {
-		return zero, newNotReady("WaitingForClusterCA", "waiting to cross-check the %s Secret: %v", caKey.Name, err)
+	caCrossChecked, err := crossCheckClusterCA(ctx, s.caReader, cluster, kubeconfigCADER)
+	if err != nil {
+		return zero, err
 	}
 
 	// Exactly one of the two independent anchors must hold, because the owner
