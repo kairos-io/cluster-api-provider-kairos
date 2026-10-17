@@ -175,6 +175,10 @@ type KubeadmTemplateData struct {
 	// KubernetesVersion is the exact Kubernetes version the node must run
 	// (Machine.spec.version). The join unit refuses on a `kubeadm version` mismatch.
 	KubernetesVersion string
+	// PatchesDirectory is the absolute kubeadm patches directory that
+	// JoinConfiguration names. The join unit creates it, because kubeadm fails on
+	// a missing one, and ProviderIDPatch is written into it.
+	PatchesDirectory string
 }
 
 // HasKubeadm reports whether this render carries kubeadm worker-join inputs.

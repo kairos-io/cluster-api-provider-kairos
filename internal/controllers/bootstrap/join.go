@@ -94,6 +94,8 @@ type KubeadmJoinMaterial struct {
 	JoinConfiguration string
 	// KubernetesVersion is the exact version the node must run (Machine.spec.version).
 	KubernetesVersion string
+	// PatchesDirectory is the kubeadm patches directory named in JoinConfiguration.
+	PatchesDirectory string
 	// TokenID is the non-secret ID half ("[a-z0-9]{6}") of the minted bootstrap
 	// token, written to KairosConfig.status.bootstrapTokenID for audit. Never the
 	// secret half.

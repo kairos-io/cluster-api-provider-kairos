@@ -225,7 +225,7 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 			"waiting to mint a bootstrap token in the workload cluster: %v", err)
 	}
 
-	joinCfgYAML, err := s.renderJoinConfiguration(req, trusted, token)
+	joinCfgYAML, patchesDir, err := s.renderJoinConfiguration(req, trusted, token)
 	if err != nil {
 		// A render failure is terminal: it is a bad spec or version, not transient.
 		return WorkerJoinMaterial{}, err
@@ -234,6 +234,7 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 	return WorkerJoinMaterial{Kubeadm: &KubeadmJoinMaterial{
 		JoinConfiguration: joinCfgYAML,
 		KubernetesVersion: req.Machine.Spec.Version,
+		PatchesDirectory:  patchesDir,
 		TokenID:           tokenID,
 	}}, nil
 }
@@ -405,9 +406,9 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 
 // renderJoinConfiguration overlays the controller-owned fields onto the user's
 // JoinConfiguration (if any) and marshals it with the CAPI version-aware
-// marshaller. The minted token lands in discovery.bootstrapToken.token; it is
-// never logged.
-func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted trustedControlPlane, token string) (string, error) {
+// marshaller, returning it with the kubeadm patches directory it names. The
+// minted token lands in discovery.bootstrapToken.token; it is never logged.
+func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted trustedControlPlane, token string) (joinConfig, patchesDir string, err error) {
 	var jc kubeadmv1.JoinConfiguration
 	if req.Config != nil && req.Config.Spec.Kubeadm != nil && req.Config.Spec.Kubeadm.JoinConfiguration != nil {
 		jc = *req.Config.Spec.Kubeadm.JoinConfiguration.DeepCopy()
@@ -427,7 +428,7 @@ func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted tru
 	}
 	endpoint, err := kubeadmJoinEndpoint(serverAddress, trusted)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Bootstrap-token discovery: the minted token, the endpoint, and the CA pin.
@@ -447,16 +448,21 @@ func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted tru
 	// too, but KairosConfigTemplate has no webhook registered, so without this the
 	// only gate would be admission on the KairosConfig CAPI core derives from it.
 	jc.ControlPlane = nil
+	// kubeadm refuses --patches next to --config, so the directory the
+	// providerID patch lands in is carried by the configuration itself.
+	if jc.Patches.Directory == "" {
+		jc.Patches.Directory = defaultKubeadmPatchesDir
+	}
 
 	version, err := semver.ParseTolerant(req.Machine.Spec.Version)
 	if err != nil {
-		return "", fmt.Errorf("invalid Machine.spec.version %q: %w", req.Machine.Spec.Version, err)
+		return "", "", fmt.Errorf("invalid Machine.spec.version %q: %w", req.Machine.Spec.Version, err)
 	}
 	out, err := kubeadmtypes.MarshalJoinConfigurationForVersion(&jc, version)
 	if err != nil {
-		return "", fmt.Errorf("marshal kubeadm JoinConfiguration: %w", err)
+		return "", "", fmt.Errorf("marshal kubeadm JoinConfiguration: %w", err)
 	}
-	return out, nil
+	return out, jc.Patches.Directory, nil
 }
 
 func (s *kubeadmJoinSource) ttl() time.Duration {

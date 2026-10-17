@@ -233,8 +233,10 @@ field is optional. The controller sets or overwrites these:
   `spec.network.advertiseAddress`. The address must be covered by the API
   server certificate's SANs. The CA hash pins discovery either way.
 - `discovery.file`: cleared.
-- A kubelet `providerID` patch, applied through `kubeadm join --patches`, when the
-  infrastructure provider's providerID is known at render time.
+- `patches.directory`: `/etc/kubernetes/kairos-patches`, unless you set another one. It must be an absolute, clean path under `/etc/kubernetes/`: no `.` or `..` segments, no repeated or trailing slashes, no newline, CR or NUL. kubeadm applies every patch in it as root, and only root can write under `/etc/kubernetes/`. `/etc/kubernetes/manifests` and directories under it are refused: that is the kubelet's static pod directory. The node creates the directory before the join.
+- A kubelet `providerID` patch, `kubeletconfiguration0+merge.yaml` in that directory, when the infrastructure provider's providerID is known at render time.
+
+To patch the kubelet configuration kubeadm downloads from the cluster, for example to set `clusterDNS` or resource reservations, write a `kubeletconfiguration<suffix>+merge.yaml` file into the patches directory with `spec.files`. kubeadm applies patch files in alphanumeric order of their names. Do not use the name `kubeletconfiguration0+merge.yaml`: the providerID patch takes it.
 
 Everything else, such as `nodeRegistration.kubeletExtraArgs`, passes through.
 Do not set `joinConfiguration.controlPlane`: control-plane joins are not

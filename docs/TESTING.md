@@ -34,6 +34,14 @@ said the CI job was gated off with `if: false`. That was true when KD-19 was
 open; the job has since been enabled and there is no such gate in
 `.github/workflows/ci.yaml`.)
 
+## Kubeadm join command
+
+```bash
+make test-kubeadm
+```
+
+`make test-kubeadm` downloads kubeadm (`KUBEADM_VERSION`, Linux only), checks it against the sha256 pinned in `hack/kubeadm.sha256`, and runs `TestKubeadmJoinCommand` with it. A version without a pinned sum is refused; add its line to that file to test another version. The test renders the kubeadm worker cloud-config, runs its join script, and hands the resulting `kubeadm join` call to the real binary with every join phase skipped and `--dry-run`, so kubeadm parses the flags and loads the rendered configuration without touching the host or the network. Without `KUBEADM_BIN` the same test still runs in `go test` and checks the flags against a copy of kubeadm's rules. kubeadm's `--dry-run` creates `/etc/kubernetes/tmp` on the host whatever the test root is, so as a non-root user first create a directory you own: `sudo install -d -o "$(id -un)" /etc/kubernetes` (the CI job does the same). CI runs it in the `kubeadm-join` job against v1.30 (JoinConfiguration v1beta3) and v1.36 (v1beta4).
+
 ## Dependency vulnerability scanning
 
 Every pull request, every push to `main`, and a weekly run scan the module's

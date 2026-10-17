@@ -24,6 +24,8 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
 // providerIDPattern restricts ProviderID to the shape every CAPI infrastructure
@@ -192,6 +194,9 @@ func validateTemplateData(d *TemplateData) error {
 		}
 		if strings.Contains(d.Kubeadm.ProviderIDPatch, "{{") {
 			errs = append(errs, fmt.Errorf("kubeadm.providerIDPatch must not contain '{{'"))
+		}
+		if err := bootstrapv1beta2.ValidatePatchesDirectory(d.Kubeadm.PatchesDirectory); err != nil {
+			errs = append(errs, fmt.Errorf("kubeadm.patchesDirectory %q %w", d.Kubeadm.PatchesDirectory, err))
 		}
 	}
 	return errors.Join(errs...)
