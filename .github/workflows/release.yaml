@@ -1,10 +1,11 @@
 name: Release
 
 # Triggered by pushing a `v*` tag (e.g. `v0.1.0-alpha.1`). The workflow:
-#   1. Builds and pushes a multi-arch container image tagged with the tag name.
-#   2. Renders the all-in-one provider manifest (kustomize) against that image.
-#   3. Computes sha256 checksums.
-#   4. Publishes a GitHub release with the manifest + checksums attached, body
+#   1. Scans the tagged tree for known vulnerabilities and stops if any are open.
+#   2. Builds and pushes a multi-arch container image tagged with the tag name.
+#   3. Renders the all-in-one provider manifest (kustomize) against that image.
+#   4. Computes sha256 checksums.
+#   5. Publishes a GitHub release with the manifest + checksums attached, body
 #      taken from docs/release-notes/<tag>.md.
 #
 # Pre-conditions for a clean release:
@@ -23,7 +24,40 @@ permissions:
   packages: write  # push to ghcr.io
 
 jobs:
+  # A tag push matches none of osv-scanner.yaml's triggers (pull_request, push
+  # to main, the Monday cron), and that workflow is the only whole-tree scan in
+  # the repository. Without this job a release cut between two Mondays can
+  # publish while an advisory is already open against an unchanged dependency,
+  # with nothing red anywhere. Same reusable workflow, same SHA pin and same
+  # --config as osv-scanner.yaml, so the ignore list in osv-scanner.toml cannot
+  # fork between the two.
+  #
+  # The scan reads the tagged tree, not main: the release is what ships, and
+  # everything else about this workflow is already resolved at the tag. The
+  # trade-off is that an ignore added in the release commit silences this gate,
+  # so a change to osv-scanner.toml is a change that wants review on its own.
+  #
+  # upload-sarif is off. osv-scanner.yaml owns the Security > Code scanning
+  # view, keyed on main; a second analysis keyed on refs/tags/<tag> would add
+  # nothing a failed release job does not already say. The job still needs
+  # security-events: write, because a reusable workflow cannot request a
+  # permission its caller has not granted and the called job asks for it.
+  osv:
+    name: osv-scan (release gate)
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    with:
+      upload-sarif: false
+      scan-args: |-
+        --config=./osv-scanner.toml
+        -r
+        ./
+
   release:
+    needs: osv
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
