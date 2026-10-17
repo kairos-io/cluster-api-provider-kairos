@@ -382,8 +382,22 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		// manager never dials a k0s/k3s cluster's node-pushed kubeconfig; the FINE,
 		// owner-verified trust check runs per-request in the source.
 		joinSources := map[string]bootstrap.JoinMaterialSource{}
+		// Uncached management reader for the <cluster>-ca cross-check (a planted or
+		// stale cached value must not be trusted).
+		uncachedReader, err := client.New(mgr.GetConfig(), client.Options{
+			Scheme: mgr.GetScheme(),
+			Mapper: mgr.GetRESTMapper(),
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to build uncached reader for kubeadm CA cross-check")
+			return err
+		}
 		clusterCache, err := clustercache.SetupWithManager(ctx, mgr, clustercache.Options{
-			SecretClient: mgr.GetClient(),
+			// The ClusterCache loads `<cluster>-kubeconfig` only through this
+			// reader. It returns the sanitizer's rebuilt kubeconfig (inline
+			// credential and CA, anchored server), never the Secret's raw bytes,
+			// and fails closed for anything else (ADR 0011).
+			SecretClient: bootstrap.NewSanitizingKubeconfigReader(mgr.GetClient(), uncachedReader),
 			Client: clustercache.ClientOptions{
 				UserAgent: "cluster-api-provider-kairos-bootstrap",
 				Cache: clustercache.ClientCacheOptions{
@@ -396,16 +410,6 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		}, controller.Options{MaxConcurrentReconciles: 10})
 		if err != nil {
 			setupLog.Error(err, "unable to set up workload cluster cache for kubeadm")
-			return err
-		}
-		// Uncached management reader for the <cluster>-ca cross-check (a planted or
-		// stale cached value must not be trusted).
-		uncachedReader, err := client.New(mgr.GetConfig(), client.Options{
-			Scheme: mgr.GetScheme(),
-			Mapper: mgr.GetRESTMapper(),
-		})
-		if err != nil {
-			setupLog.Error(err, "unable to build uncached reader for kubeadm CA cross-check")
 			return err
 		}
 		joinSources[bootstrapv1beta2.DistributionKubeadm] = bootstrap.NewKubeadmJoinSource(

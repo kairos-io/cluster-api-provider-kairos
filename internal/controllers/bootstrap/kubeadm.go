@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 const (
@@ -374,6 +375,16 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 	if !sameServer(server, wantServer) && !caCrossChecked {
 		return zero, fmt.Errorf("the %s Secret's server %q does not equal the Cluster control-plane endpoint %q, and there is no %s Secret to cross-check its CA against: refusing to mint a token",
 			kubeconfigKey.Name, server, wantServer, caKey.Name)
+	}
+
+	// The kubeconfig must also survive the sanitizer (ADR 0011): the workload
+	// client that mints the token is built from its rebuilt (S5) form, never the
+	// raw bytes (SanitizingKubeconfigReader), so a kubeconfig the sanitizer
+	// refuses would never connect. Refuse here, before any token exists, with the
+	// rule that failed (never a byte of the content).
+	if _, err := kubeconfig.Sanitize(kcData, cluster.Name, anchoredServer(server, wantServer)); err != nil {
+		return zero, fmt.Errorf("the %s Secret is not a kubeconfig this controller will connect with: %v; refusing to mint a token",
+			kubeconfigKey.Name, err)
 	}
 
 	return trustedControlPlane{
