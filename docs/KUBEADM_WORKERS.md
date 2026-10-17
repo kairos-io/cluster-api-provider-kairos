@@ -103,8 +103,10 @@ bootstrap controller does the following for each Machine:
      @patrostkowski from a live Kamaji cluster. It does not weaken the anchor
      above, because `<cluster>-ca` still carries the tenant CA either way.
 3. Mints a bootstrap token in the workload cluster: a Secret named
-   `bootstrap-token-<id>` in `kube-system`, valid for 15 minutes. The
-   non-secret `<id>` is recorded in `KairosConfig.status.bootstrapTokenID`. The
+   `bootstrap-token-<id>` in `kube-system`, valid for 15 minutes and labelled
+   `bootstrap.cluster.x-k8s.io/kairosconfig-uid` with the KairosConfig's UID. The
+   non-secret `<id>` is recorded in `KairosConfig.status.bootstrapTokenID`. Each
+   KairosConfig has one token: later renders of its bootstrap data reuse it. The
    secret half never appears in `spec` or `status`. It is present in the
    workload-cluster Secret and in the rendered bootstrap data, and therefore on
    the node, so restrict read access to bootstrap data Secrets as you would for
@@ -120,8 +122,9 @@ bootstrap controller does the following for each Machine:
    that did not complete is not retried on the node: the unit removes
    `/etc/kubernetes/bootstrap-kubelet.conf` (which holds the token) and refuses on
    later boots, so a `MachineHealthCheck` must replace the Machine.
-6. CAPI links the Machine to the Node. The controller stops refreshing the token
-   when the Machine has a `status.nodeRef`.
+6. CAPI links the Machine to the Node. Once the Machine has a `status.nodeRef`,
+   the controller deletes the token Secret and clears
+   `status.bootstrapTokenID`.
 
 ## Prerequisites
 
@@ -280,17 +283,31 @@ to create the `KairosConfig`: check the MachineSet's conditions and events.
 
 ## Token lifetime and failed joins
 
-A token is valid for 15 minutes; this is not configurable in this release. A node
-reads its bootstrap data at first boot, so a token must be valid when the node
-boots. While a Machine has no `status.nodeRef`, the controller checks the token on
-each reconcile. When the token is missing from the workload cluster or past half
-its lifetime, it mints a new one, rewrites the bootstrap data Secret in place, and
-updates `status.bootstrapTokenID`. This helps nodes that boot late, such as
-bare-metal machines with slow provisioning. It does not change a node that has
-already booted.
+A token is valid for 15 minutes; this is not configurable in this release. The
+infrastructure provider copies the bootstrap data into the VM when it creates it,
+and the node does not read the bootstrap data Secret again. So the token a node
+joins with is the one in the bootstrap data at the time its VM was created, and
+the controller keeps that token valid rather than replacing it:
 
-The controller stops refreshing 24 hours after the Machine was created. It then
-sets `BootstrapReady` to `False` (Warning) with reason
+- Every render of a KairosConfig's bootstrap data uses the same token, including
+  the render that adds the providerID once the infrastructure provider publishes
+  it.
+- While the Machine has no `status.nodeRef`, the controller checks the token
+  every five minutes (a third of its lifetime) and moves its expiry to 15 minutes
+  from now. The token's ID and secret do not change.
+- Once the Machine has a `status.nodeRef`, or the KairosConfig is deleted, the
+  controller deletes the token Secret. Revocation on delete is best-effort: if the
+  workload cluster cannot be reached, deletion goes ahead and the token expires on
+  its own within 15 minutes.
+
+The controller mints a replacement token only when the recorded one is gone from
+the workload cluster, for example because someone deleted it. It rewrites the
+bootstrap data Secret, which helps a Machine whose VM has not been created yet. A
+node that already booted with the deleted token cannot join; replace its Machine.
+The controller logs both token IDs when this happens.
+
+The controller stops extending the token 24 hours after the Machine was created.
+It then sets `BootstrapReady` to `False` (Warning) with reason
 `BootstrapTokenRefreshCapExceeded`. It does not delete the Machine.
 
 Configure a `MachineHealthCheck` with `spec.checks.nodeStartupTimeoutSeconds` for
