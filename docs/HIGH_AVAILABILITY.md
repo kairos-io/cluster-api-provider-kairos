@@ -28,6 +28,8 @@ spec:
 
 Where `spec.ha.vip` applies, the controller renders a kube-vip DaemonSet into each control-plane node's bootstrap cloud-config; one Pod holds leader election and advertises the VIP, failing over to a surviving node if the leader is lost.
 
+The kube-vip Pod talks to its own node's API server on `127.0.0.1:6443`, so a member holds the VIP only while its own API server works. A custom API server port, or a bind address that excludes loopback, leaves the VIP down.
+
 Worked samples:
 
 - [`config/samples/capv/kairos_cluster_k0s_ha.yaml`](../config/samples/capv/kairos_cluster_k0s_ha.yaml) / [`kairos_cluster_k3s_ha.yaml`](../config/samples/capv/kairos_cluster_k3s_ha.yaml)
