@@ -39,7 +39,8 @@ import (
 //     (kairosconfig_controller.go reconcileBootstrapData).
 //   - ANY OTHER ERROR IS TERMINAL UNTIL A WATCH FIRES, because Reconcile marks
 //     the conditions and returns ctrl.Result{}, nil. Transient failures (P1:
-//     clustercache, workload API timeouts) must therefore wrap the not-ready type.
+//     workload-cluster connect and API timeouts) must therefore wrap the
+//     not-ready type.
 //   - Error text is user-visible. Neither the material nor req.Config is ever
 //     logged (root rule 2).
 type JoinMaterialSource interface {
@@ -150,7 +151,8 @@ func (s k3sJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (WorkerJ
 //
 // N2 (ADR 0010 P1): a distribution whose row has a nil builtinJoin (kubeadm) MUST
 // have an injected JoinSources entry — main.go wires it with the dependencies only
-// it has (clustercache, the uncached reader, the GroupKind allowlist). If both are
+// it has (the on-demand workload-client factory, the uncached reader, the
+// GroupKind allowlist). If both are
 // absent, this HARD-FAILS with a clear error rather than silently falling back to
 // the DefaultDistribution (k0s) built-in, which would resolve a k0s/k3s token and
 // render the wrong bootstrap data onto a kubeadm node. A nil map or a missing key

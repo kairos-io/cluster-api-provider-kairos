@@ -25,6 +25,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 
 	"fmt"
 	"github.com/go-logr/logr"
@@ -34,6 +37,8 @@ import (
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -44,6 +49,7 @@ import (
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
@@ -217,7 +223,7 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 	src := &kubeadmJoinSource{
 		mgmt:           mgmt,
 		caReader:       caReader,
-		workloadClient: func(_ context.Context, _ client.ObjectKey) (client.Client, error) { return workload, nil },
+		workloadClient: func(_ context.Context, _ client.ObjectKey, _ []byte) (client.Client, error) { return workload, nil },
 		extraKinds:     extraKinds,
 		tokenTTL:       defaultKubeadmTokenTTL,
 		now:            func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
@@ -246,37 +252,92 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 
 func ptrBool(b bool) *bool { return &b }
 
-// TestKubeadmTrustedClusterFilter pins the COARSE connect-level filter: it admits
-// only KubeadmControlPlane and KamajiControlPlane (plus operator-flag kinds) and
-// EXCLUDES KairosControlPlane, so clustercache never dials a k0s/k3s KairosControlPlane
-// cluster. The fine per-request WorkerJoin check still refuses non-kubeadm anyway.
-func TestKubeadmTrustedClusterFilter(t *testing.T) {
-	cp := func(group, kind string) *clusterv1.Cluster {
-		return &clusterv1.Cluster{Spec: clusterv1.ClusterSpec{
-			ControlPlaneRef: clusterv1.ContractVersionedObjectReference{APIGroup: group, Kind: kind, Name: "cp"},
-		}}
+// TestOnDemandWorkloadClient_RefusesUnverifiedKubeconfig pins the property that
+// replaced the clustercache ClusterFilter (kairos-io/kairos#5466): the only thing a
+// workload-cluster connection can be built from is a kubeconfig the trust check
+// returned. There is no resident accessor and no cluster-shaped argument that could
+// make the factory dial on its own, so a caller holding nothing but a cluster name
+// cannot open a connection.
+func TestOnDemandWorkloadClient_RefusesUnverifiedKubeconfig(t *testing.T) {
+	g := NewWithT(t)
+	factory := NewOnDemandWorkloadClient()
+	key := client.ObjectKey{Namespace: "ns", Name: "c"}
+
+	for _, kubeconfig := range [][]byte{nil, {}} {
+		wc, err := factory(context.Background(), key, kubeconfig)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(wc).To(BeNil())
+		g.Expect(err.Error()).To(ContainSubstring("without a verified kubeconfig"))
 	}
-	cases := []struct {
-		name    string
-		cluster *clusterv1.Cluster
-		extra   map[schema.GroupKind]bool
-		want    bool
-	}{
-		{"KubeadmControlPlane admitted", cp(controlPlaneGroup, "KubeadmControlPlane"), nil, true},
-		{"KamajiControlPlane admitted", cp(controlPlaneGroup, "KamajiControlPlane"), nil, true},
-		{"KairosControlPlane excluded from coarse filter", cp(controlPlaneGroup, "KairosControlPlane"), nil, false},
-		{"unknown kind rejected", cp(controlPlaneGroup, "SomethingElse"), nil, false},
-		{"lookalike in another group rejected", cp("evil.example.com", "KubeadmControlPlane"), nil, false},
-		{"operator-flag kind admitted", cp("x.example.com", "FooControlPlane"), map[schema.GroupKind]bool{{Group: "x.example.com", Kind: "FooControlPlane"}: true}, true},
-		{"nil cluster rejected", nil, nil, false},
+
+	// Bytes that are not a kubeconfig fail to parse rather than producing a client
+	// aimed at nothing.
+	wc, err := factory(context.Background(), key, []byte("not a kubeconfig"))
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(wc).To(BeNil())
+}
+
+// TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig proves the factory builds its
+// client from the kubeconfig it was handed, so the address it dials is the one the
+// trust check's anchors pinned, and that the client can address the only workload
+// objects this provider touches (bootstrap-token Secrets).
+func TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	kubeconfig := makeKubeconfig(t, "https://10.0.0.1:6443", ca)
+
+	wc, err := NewOnDemandWorkloadClient()(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, kubeconfig)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(wc).NotTo(BeNil())
+	gvk, err := apiutil.GVKForObject(&corev1.Secret{}, wc.Scheme())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(gvk.Kind).To(Equal("Secret"))
+}
+
+// TestKubeadmTokenNeedsRefresh_ReverifiesTrust pins that the refresh path runs the
+// trust check before it reconnects. It used to lean on the clustercache
+// ClusterFilter, which is gone; a refresh that reconnected on bytes nothing
+// re-verified would be the one path that dials an unchecked address after the
+// kubeconfig Secret has been replaced.
+func TestKubeadmTokenNeedsRefresh_ReverifiesTrust(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	fx := defaultFixture(ca)
+	// Break the owner leg the way a planted replacement Secret would: the
+	// kubeconfig Secret is no longer owned by the resolved control plane.
+	fx.ownerUID = types.UID("someone-else")
+	s, req, _ := buildSource(t, fx, nil)
+
+	var connected bool
+	s.workloadClient = func(_ context.Context, _ client.ObjectKey, _ []byte) (client.Client, error) {
+		connected = true
+		return nil, errors.New("should not be reached")
 	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-			g.Expect(KubeadmTrustedClusterFilter(tc.extra)(tc.cluster)).To(Equal(tc.want))
-		})
+
+	_, err := s.TokenNeedsRefresh(context.Background(), req, "abcdef")
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(connected).To(BeFalse(), "refresh connected to the workload cluster without re-verifying trust")
+}
+
+// TestKubeadmTokenNeedsRefresh_ConnectsOnVerifiedTrust is the other half: when trust
+// still holds, the refresh path does reach the workload cluster, and it is handed
+// the kubeconfig the check verified rather than a cluster name to resolve itself.
+func TestKubeadmTokenNeedsRefresh_ConnectsOnVerifiedTrust(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	s, req, workload := buildSource(t, defaultFixture(ca), nil)
+
+	var got []byte
+	s.workloadClient = func(_ context.Context, _ client.ObjectKey, kubeconfig []byte) (client.Client, error) {
+		got = kubeconfig
+		return workload, nil
 	}
+
+	// No token Secret in the workload cluster: absent means re-mint.
+	refresh, err := s.TokenNeedsRefresh(context.Background(), req, "abcdef")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(refresh).To(BeTrue())
+	g.Expect(got).To(Equal(makeKubeconfig(t, fmt.Sprintf("https://%s:%d", testEndpointHost, testEndpointPort), ca)))
 }
 
 // TestKubeadmWorkerJoin_Accepts covers the three legitimate trust shapes and
@@ -520,7 +581,7 @@ func TestKubeadmWorkerJoin_NotReady(t *testing.T) {
 		{"no control-plane endpoint", func(fx *kubeadmFixture) { fx.endpoint = false }, nil},
 		{"kubeconfig Secret absent", func(fx *kubeadmFixture) { fx.noKubeconfig = true }, nil},
 		{"workload cluster unreachable", nil, func(s *kubeadmJoinSource) {
-			s.workloadClient = func(_ context.Context, _ client.ObjectKey) (client.Client, error) {
+			s.workloadClient = func(_ context.Context, _ client.ObjectKey, _ []byte) (client.Client, error) {
 				return nil, errors.New("dial tcp: timeout")
 			}
 		}},
@@ -688,4 +749,102 @@ func TestKubeadmTokenNeedsRefresh(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(need).To(BeFalse())
 	})
+}
+
+// TestOnDemandWorkloadClient_TimesOut pins that a workload API server which
+// completes the connection and then never answers cannot hold the call open.
+// The KairosConfig controller runs a single worker, so one such cluster would
+// otherwise stall every KairosConfig reconcile in the management cluster, k0s
+// and k3s included. The clustercache client this factory replaced bounded its
+// requests the same way.
+func TestOnDemandWorkloadClient_TimesOut(t *testing.T) {
+	g := NewWithT(t)
+
+	// The handler blocks until the test is over: the server accepts and keeps
+	// the request, which is the shape a hung apiserver presents.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	const timeout = 300 * time.Millisecond
+	wc, err := newOnDemandWorkloadClient(timeout)(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, makeKubeconfig(t, srv.URL, nil))
+	g.Expect(err).NotTo(HaveOccurred())
+
+	// A context with no deadline: only the client's own timeout can end this. The
+	// Get runs in its own goroutine so an unbounded client fails this test in
+	// seconds instead of hanging until the package deadline.
+	done := make(chan error, 1)
+	go func() {
+		done <- wc.Get(context.Background(), client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"}, &corev1.Secret{})
+	}()
+
+	select {
+	case getErr := <-done:
+		g.Expect(getErr).To(HaveOccurred(), "the client returned success from a server that never answers")
+	case <-time.After(10 * timeout):
+		t.Fatal("the request was not bounded by the client timeout")
+	}
+
+	// And the production factory carries a bound rather than none.
+	g.Expect(workloadClientTimeout).To(BeNumerically(">", time.Duration(0)))
+}
+
+// TestOnDemandWorkloadClient_RunsNoDiscovery pins that building the client per
+// join does not pay for discovery per join. The factory runs on every mint and
+// every token refresh, and the only workload kind this provider touches is a
+// core/v1 Secret, so a discovery-backed REST mapper would re-list every group
+// and resource in the workload cluster to re-derive one mapping that cannot
+// change.
+func TestOnDemandWorkloadClient_RunsNoDiscovery(t *testing.T) {
+	g := NewWithT(t)
+
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
+	}))
+	defer srv.Close()
+
+	factory := newOnDemandWorkloadClient(5 * time.Second)
+	key := client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"}
+	// Two clients, as a mint followed by a refresh would build.
+	for i := 0; i < 2; i++ {
+		wc, err := factory(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, makeKubeconfig(t, srv.URL, nil))
+		g.Expect(err).NotTo(HaveOccurred())
+		err = wc.Get(context.Background(), key, &corev1.Secret{})
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "unexpected error from the workload server: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	g.Expect(paths).To(Equal([]string{
+		"/api/v1/namespaces/kube-system/secrets/bootstrap-token-abcdef",
+		"/api/v1/namespaces/kube-system/secrets/bootstrap-token-abcdef",
+	}), "the client made requests other than the Secret GET; discovery is back")
+}
+
+// TestWorkloadRESTMapper_CoversOnlyTheSecret states the mapper's contract: the
+// bootstrap-token Secret maps, and a kind this provider has no business reading
+// in a workload cluster fails here rather than reaching the apiserver.
+func TestWorkloadRESTMapper_CoversOnlyTheSecret(t *testing.T) {
+	g := NewWithT(t)
+	m := workloadRESTMapper()
+
+	mapping, err := m.RESTMapping(schema.GroupKind{Kind: "Secret"}, "v1")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(mapping.Resource.Resource).To(Equal("secrets"))
+	g.Expect(mapping.Scope.Name()).To(Equal(meta.RESTScopeNameNamespace))
+
+	_, err = m.RESTMapping(schema.GroupKind{Kind: "Node"}, "v1")
+	g.Expect(err).To(HaveOccurred())
 }
