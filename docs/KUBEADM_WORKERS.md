@@ -287,6 +287,15 @@ updates `status.bootstrapTokenID`. This helps nodes that boot late, such as
 bare-metal machines with slow provisioning. It does not change a node that has
 already booted.
 
+Minting a token also deletes the tokens it replaces, so a `KairosConfig` has at
+most one usable token at a time instead of one per rotation left to expire. The
+controller finds them by the label
+`bootstrap.cluster.x-k8s.io/kairosconfig-uid`, which it sets on every token it
+mints in `kube-system`. Do not put that label on a Secret of your own: a token
+Secret that carries another `KairosConfig`'s UID is deleted at that config's next
+rotation. Deleting a superseded token is best effort; when the workload cluster
+refuses it, the join still proceeds and the token expires on its own.
+
 The controller stops refreshing 24 hours after the Machine was created. It then
 sets `BootstrapReady` to `False` (Warning) with reason
 `BootstrapTokenRefreshCapExceeded`. It does not delete the Machine.
