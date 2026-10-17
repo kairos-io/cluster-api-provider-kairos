@@ -142,7 +142,7 @@ func TestManagementPushTLSHardening(t *testing.T) {
 			}
 
 			// The token file lives in a private (0700) run dir and is a per-call
-			// mktemp file (0600) removed immediately after the request (PR-4 A7).
+			// mktemp file (0600) removed immediately after the request.
 			if !strings.Contains(result, `chmod 0700 "${KAIROS_MGMT_RUNDIR}"`) {
 				t.Error("the run dir holding the token/body files must be 0700")
 			}

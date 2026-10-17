@@ -18,8 +18,7 @@ package controlplane
 
 // This file implements the control-plane controller's kubeconfig PUBLISH path
 // (ADR 0011, "Control-plane controller (publish path)"). The management side no
-// longer trusts a node-written kubeconfig verbatim (KD-60, the A1/A2 attack
-// class): every byte that reaches the contract Secret `<cluster>-kubeconfig`,
+// longer trusts a node-written kubeconfig verbatim (ADR 0011): every byte that reaches the contract Secret `<cluster>-kubeconfig`,
 // and every workload client we build from it, is S5 output of the pure
 // internal/kubeconfig sanitizer — never the raw node bytes.
 //
@@ -28,8 +27,7 @@ package controlplane
 // check on the contract Secret, adopts a clean legacy contract Secret through
 // the sanitizer, pins the CA on a KCP annotation nodes cannot write, and
 // neutralizes unsafe/oversized/unparseable/CA-mismatched content EMPTY-IN-PLACE
-// (never delete; the KCP manager holds no secrets:delete — maintainer decision,
-// ADR 0011 review record 2026-09-25). The node-side template PATCH to staging
+// (never delete; the KCP manager holds no secrets:delete — see ADR 0011). The node-side template PATCH to staging
 // and the Role migrator that stops nodes writing the contract Secret directly
 // are PR-3; in the PR-2 mixed window nodes still write the contract Secret and
 // the steady-state check adopts/sanitizes it.
@@ -78,7 +76,7 @@ const (
 	// (deleting both this and the pin annotation) and then re-pins. Deleting
 	// KubeconfigCAPinAnnotation directly has the same effect. This is the only
 	// sanctioned way past a NodePushCAMismatch (ADR 0011 step 5, migration
-	// "possible plant: inspect, then re-pin").
+	// "unexpected CA: inspect, then re-pin").
 	KubeconfigRepinAnnotation = "controlplane.cluster.x-k8s.io/kubeconfig-repin"
 
 	// KubeconfigSourceNodePush is the source-annotation value stamped on a
@@ -179,8 +177,8 @@ func (r *KairosControlPlaneReconciler) reconcileContractKubeconfig(ctx context.C
 	adoptable := !ownedByKCP && contractAdoptable(contract, cluster)
 	if !ownedByKCP && !adoptable {
 		// Neither KCP-owned nor adoptable: a leftover from a deleted same-name
-		// cluster, a pre-Cluster plant, a plant carrying a forged controller
-		// ownerRef, or a mislabeled Secret.
+		// cluster, a Secret created before the Cluster, a Secret with a foreign
+		// controller ownerRef, or a mislabeled Secret.
 		//
 		// SF1 (ADR 0011 step 7 ownership-gate, option (b)): the authoritative
 		// direction is Cluster -> KCP (ownerRefs are forgeable; the
@@ -188,8 +186,8 @@ func (r *KairosControlPlaneReconciler) reconcileContractKubeconfig(ctx context.C
 		// cluster), so when Cluster.spec.controlPlaneRef points at this KCP the
 		// KCP is authoritative for that name. Neutralize the Secret in place
 		// (never delete) exactly as for an unsafe owned Secret, then recover from
-		// staging/SSH — this closes the A1/A2 window for a forged-ownerRef or
-		// pre-Cluster plant that would otherwise be left CAPI-core-readable.
+		// staging/SSH, so a Secret this KCP did not write is never left in place
+		// for other consumers.
 		// Reuse WaitingForNodePushReason (no new reason) so SSH-fallback
 		// eligibility (G23) stays intact. Mirrors handleContractRejection.
 		if clusterControlPlaneRefMatches(cluster, kcp) {
@@ -227,10 +225,10 @@ func (r *KairosControlPlaneReconciler) reconcileContractKubeconfig(ctx context.C
 	}
 	pin := effectiveCAPin(kcp)
 	if pin != "" && pin != candPin {
-		// A different CA than the one pinned — a possible plant or split-brain
-		// joiner (A8). Neutralize and refuse to republish until re-pinned.
+		// A different CA than the one pinned — an unexpected CA or a split-brain
+		// joiner. Neutralize and refuse to republish until re-pinned.
 		if err := r.neutralizeContract(ctx, log, kcp, cluster, contract, controlplanev1beta2.NodePushCAMismatchReason,
-			fmt.Sprintf("Contract kubeconfig for %s/%s presents a CA that does not match the pinned fingerprint; emptied. Inspect for a possible plant, then re-pin via the %s annotation.", cluster.Namespace, cluster.Name, KubeconfigRepinAnnotation)); err != nil {
+			fmt.Sprintf("Contract kubeconfig for %s/%s presents a CA that does not match the pinned fingerprint; emptied. Inspect for an unexpected CA, then re-pin via the %s annotation.", cluster.Namespace, cluster.Name, KubeconfigRepinAnnotation)); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -379,8 +377,8 @@ func (r *KairosControlPlaneReconciler) writeContract(ctx context.Context, log lo
 	}
 	contract.Data[bootstrapv1beta2.KubeconfigPushSecretDataKey] = sanitized
 	// The KCP is authoritative for this unique name (guard above) and is the sole
-	// owner of the contract Secret. Drop a foreign/forged controller ownerRef a
-	// plant may carry (SF1) so SetControllerReference — which errors on a
+	// owner of the contract Secret. Drop a foreign controller ownerRef the
+	// Secret may carry (SF1) so SetControllerReference — which errors on a
 	// pre-existing DIFFERENT controller — can take ownership. Non-controller
 	// owners (e.g. the SSH-fallback Cluster owner preserved during adoption) are
 	// kept.
@@ -477,8 +475,8 @@ func (r *KairosControlPlaneReconciler) ensureStagingKubeconfigSecret(ctx context
 	// Existing: require this KCP to be the controller owner (by UID), never label.
 	owner := metav1.GetControllerOfNoCopy(staging)
 	if owner == nil || owner.UID != kcp.UID {
-		// A foreign owner (or none) on the staging name — a node-planted staging
-		// Secret with a forged owner. Refuse to touch it (we do not adopt or
+		// A foreign owner (or none) on the staging name — a staging Secret
+		// with a foreign owner. Refuse to touch it (we do not adopt or
 		// delete) and surface an Event; publishFromStaging separately refuses to
 		// use it as a candidate (its IsControlledBy check fails). We use an Event
 		// rather than the KubeconfigReady condition here so staging-repair
@@ -656,7 +654,7 @@ func contractAdoptable(contract *corev1.Secret, cluster *clusterv1.Cluster) bool
 		return false
 	}
 	// (b) creationTimestamp not earlier than the Cluster's — rejects leftovers
-	// from a deleted same-name cluster and pre-Cluster plants.
+	// from a deleted same-name cluster and Secrets created before the Cluster.
 	if contract.CreationTimestamp.Before(&cluster.CreationTimestamp) {
 		return false
 	}

@@ -565,7 +565,7 @@ see [API_REFERENCE.md — Waiting for the kubeconfig push target](API_REFERENCE.
 ## Node-to-management pushes are now TLS-verified
 
 Every management-API call a node makes as part of node-push — the
-kubeconfig-to-staging PATCH, the join-token PATCH, the etcd-status PATCH, and
+kubeconfig-to-staging PATCH, the etcd-status PATCH, and
 the CAPK k0s VMI SAN-detection GET — now runs `curl --cacert` against the
 management API server's certificate authority, with TLS verification on and
 no insecure fallback anywhere in the templates. The bearer token is also no

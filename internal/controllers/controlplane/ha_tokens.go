@@ -65,9 +65,9 @@ func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context
 	}
 
 	// G10 (ADR 0011): refuse to adopt a same-name Secret this KCP does not
-	// already control. A node with `create` on Secrets could plant
-	// `<cluster>-control-plane-join-token` with a pre-filled token; the old
-	// CreateOrUpdate would keep that planted k3s server token forever (k3s only
+	// already control. A pre-existing
+	// `<cluster>-control-plane-join-token` could carry a pre-filled token; the old
+	// CreateOrUpdate would keep that k3s server token forever (k3s only
 	// generates when empty). Verify ownership by controller-UID first: a foreign
 	// or ownerless existing Secret is refused, not adopted.
 	if err := refuseUnownedHASecret(ctx, r.Client,
@@ -121,7 +121,7 @@ func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context
 // it exists but is NOT already controlled (by controller-owner UID) by the
 // object identified by ownerUID (ADR 0011, closing G10). A NotFound is fine (the
 // caller will Create + own it). An existing Secret with a foreign controller
-// owner, or none, is a planted or stale same-name object we must not adopt: its
+// owner, or none, is an unexpected or stale same-name object we must not adopt: its
 // data (a k3s server token, an etcd-status record) would otherwise be trusted.
 func refuseUnownedHASecret(ctx context.Context, c client.Client, key types.NamespacedName, ownerUID types.UID) error {
 	existing := &corev1.Secret{}
@@ -133,7 +133,7 @@ func refuseUnownedHASecret(ctx context.Context, c client.Client, key types.Names
 	}
 	owner := metav1.GetControllerOfNoCopy(existing)
 	if owner == nil || owner.UID != ownerUID {
-		return fmt.Errorf("HA secret %s/%s already exists but is not controlled by the expected owner (possible plant or stale object); refusing to adopt it", key.Namespace, key.Name)
+		return fmt.Errorf("HA secret %s/%s already exists but is not controlled by the expected owner (unexpected or stale object); refusing to adopt it", key.Namespace, key.Name)
 	}
 	return nil
 }

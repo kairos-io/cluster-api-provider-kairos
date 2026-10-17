@@ -102,8 +102,8 @@ func validWorkloadKubeconfig(t *testing.T) []byte {
 	return out
 }
 
-// unsafeWorkloadKubeconfig builds a kubeconfig carrying a tokenFile (the A1
-// attack shape: client-go reads the file and sends it as the bearer token). The
+// unsafeWorkloadKubeconfig builds a kubeconfig carrying a file-path credential
+// (rejected by the sanitizer). The
 // sanitizer rejects it, so the control-plane controller must neutralize a
 // contract Secret that holds it.
 func unsafeWorkloadKubeconfig(t *testing.T) []byte {
@@ -133,7 +133,7 @@ func unsafeWorkloadKubeconfig(t *testing.T) []byte {
 		CertificateAuthorityData: caPEM,
 	}
 	cfg.AuthInfos["input-admin"] = &clientcmdapi.AuthInfo{
-		TokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
+		TokenFile: "/etc/example/token",
 	}
 	cfg.Contexts["input-ctx"] = &clientcmdapi.Context{Cluster: "input", AuthInfo: "input-admin"}
 	cfg.CurrentContext = "input-ctx"

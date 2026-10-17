@@ -460,7 +460,7 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 		// a token exists.
 		{"kubeconfig with a token file", func(fx *kubeadmFixture) {
 			fx.kubeconfigData = kubeconfigWithUser(t, fx.server, fx.kubeconfigCA, &clientcmdapi.AuthInfo{
-				TokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
+				TokenFile: "/etc/example/token",
 			})
 		}, nil, "refusing to mint a token"},
 		{"kubeconfig with an exec plugin", func(fx *kubeadmFixture) {

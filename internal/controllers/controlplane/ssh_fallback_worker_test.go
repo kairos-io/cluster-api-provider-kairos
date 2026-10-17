@@ -405,7 +405,7 @@ func TestSSHFallbackWorker_Success_WritesSanitizedSecretWithCorrectShape(t *test
 }
 
 // TestSSHFallbackWorker_RejectsUnsafeFetchedKubeconfig proves a malicious or
-// broken on-node kubeconfig (a tokenFile — the A1 shape) fails sanitization and
+// broken on-node kubeconfig (a file-path credential) fails sanitization and
 // is NOT written, rather than being trusted via the SSH path.
 func TestSSHFallbackWorker_RejectsUnsafeFetchedKubeconfig(t *testing.T) {
 	g := NewWithT(t)

@@ -356,8 +356,8 @@ write_files:
       chmod 0700 "${KAIROS_MGMT_RUNDIR}"
       # _mgmt_auth_conf writes a fresh 0600 curl --config file (mktemp) holding the
       # bearer token as a `header` line, echoes its path, and each caller removes it
-      # immediately after the request — so the token file never lingers on tmpfs
-      # (PR-4 review A7). mktemp creates the file 0600 in the 0700 run dir.
+      # immediately after the request — so the token file never lingers on tmpfs.
+      # mktemp creates the file 0600 in the 0700 run dir.
       # SECURITY: the printf'd value is safe ONLY because .Token is a
       # controller-minted TokenRequest JWT (charset [A-Za-z0-9_.-]; no double quote,
       # backslash, or newline). shquote guards the shell layer but does NOT escape

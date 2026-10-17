@@ -164,12 +164,12 @@ func newExpiredKubeconfig(t *testing.T, clusterName, server string) []byte {
 }
 
 // newTokenFileKubeconfig returns RAW (unsanitized) bytes carrying an unsafe
-// tokenFile — the A1 attack shape (client-go reads the file and sends it as the
-// bearer token). Sanitize rejects it as UnsafeIdentity.
+// tokenFile: a kubeconfig with a file-path credential (rejected by the
+// sanitizer as UnsafeIdentity).
 func newTokenFileKubeconfig(t *testing.T) []byte {
 	t.Helper()
 	ca := genCACertPEM(t)
-	return rawKubeconfig(ca, &clientcmdapi.AuthInfo{TokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"})
+	return rawKubeconfig(ca, &clientcmdapi.AuthInfo{TokenFile: "/etc/example/token"})
 }
 
 // TestCAFingerprint verifies the pin is deterministic and CA-dependent.
@@ -524,18 +524,18 @@ func TestReconcileKubeconfig_NotOwnedNotAdoptable_MismatchUntouched(t *testing.T
 	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeFalse())
 }
 
-// TestReconcileKubeconfig_SF1_ForgedOwnerPlantEmptiedAndRepublished: a tokenFile
-// plant carrying a FORGED controller ownerRef (so it is neither KCP-owned nor
-// adoptable) is emptied in place and then republished from clean staging when the
-// Cluster controlPlaneRef points at this KCP. The forged owner is dropped and the
-// KCP takes ownership. No delete.
-func TestReconcileKubeconfig_SF1_ForgedOwnerPlantEmptiedAndRepublished(t *testing.T) {
+// TestReconcileKubeconfig_SF1_ForeignOwnerEmptiedAndRepublished: a Secret with a
+// file-path credential and a foreign controller ownerRef (so it is neither
+// KCP-owned nor adoptable) is emptied in place and then republished from clean
+// staging when the Cluster controlPlaneRef points at this KCP. The foreign owner
+// is dropped and the KCP takes ownership. No delete.
+func TestReconcileKubeconfig_SF1_ForeignOwnerEmptiedAndRepublished(t *testing.T) {
 	g := NewWithT(t)
 	kcp, cluster := publishKCPAndCluster()
-	// A plant with unsafe content (tokenFile — the A1 shape) AND a forged
+	// A Secret with a file-path credential AND a foreign
 	// controller ownerRef that is not this KCP.
 	ctlTrue := true
-	plant := &corev1.Secret{
+	foreign := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "c-kubeconfig", Namespace: "ns",
 			Labels: map[string]string{clusterv1.ClusterNameLabel: "c"},
@@ -543,7 +543,7 @@ func TestReconcileKubeconfig_SF1_ForgedOwnerPlantEmptiedAndRepublished(t *testin
 				APIVersion: controlplanev1beta2.GroupVersion.String(),
 				Kind:       "KairosControlPlane",
 				Name:       "kcp",
-				UID:        types.UID("FORGED-uid"), // not kcp.UID
+				UID:        types.UID("other-uid"), // not kcp.UID
 				Controller: &ctlTrue,
 			}},
 		},
@@ -561,24 +561,24 @@ func TestReconcileKubeconfig_SF1_ForgedOwnerPlantEmptiedAndRepublished(t *testin
 		Data: map[string][]byte{"value": valid},
 	}
 	g.Expect(controllerRefTo(kcp, staging, r0Scheme(t))).To(Succeed())
-	r, nd := buildReconciler(t, kcp, cluster, plant, staging)
+	r, nd := buildReconciler(t, kcp, cluster, foreign, staging)
 
 	ready, err := r.reconcileKubeconfig(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(ready).To(BeTrue(), "SF1: after emptying the forged plant, clean staging republishes")
+	g.Expect(ready).To(BeTrue(), "SF1: after emptying the foreign-owned Secret, clean staging republishes")
 	g.Expect(kubeconfigReason(kcp)).To(Equal(controlplanev1beta2.KubeconfigReadyReason))
 	got := getSecret(t, nd, "ns", "c-kubeconfig")
-	g.Expect(got.Data["value"]).To(Equal(valid), "the forged plant is replaced by clean staging content")
-	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeTrue(), "the KCP takes ownership, dropping the forged owner")
+	g.Expect(got.Data["value"]).To(Equal(valid), "the foreign-owned Secret is replaced by clean staging content")
+	g.Expect(metav1.IsControlledBy(got, kcp)).To(BeTrue(), "the KCP takes ownership, dropping the foreign owner")
 	owner := metav1.GetControllerOfNoCopy(got)
 	g.Expect(owner).NotTo(BeNil())
 	g.Expect(owner.UID).To(Equal(kcp.UID))
 }
 
-// TestReconcileKubeconfig_SF1_PreClusterPlantEmptiedAndRepublished: a clean
+// TestReconcileKubeconfig_SF1_PreClusterSecretEmptiedAndRepublished: a clean
 // Secret with a creationTimestamp before the Cluster (not adoptable by rule b) is
 // emptied and republished from clean staging when authoritative. No delete.
-func TestReconcileKubeconfig_SF1_PreClusterPlantEmptiedAndRepublished(t *testing.T) {
+func TestReconcileKubeconfig_SF1_PreClusterSecretEmptiedAndRepublished(t *testing.T) {
 	g := NewWithT(t)
 	kcp, cluster := publishKCPAndCluster()
 	cluster.CreationTimestamp = metav1.NewTime(time.Now())
@@ -644,10 +644,10 @@ func TestReconcileKubeconfig_PublishesFromStaging(t *testing.T) {
 	g.Expect(got.Annotations[KubeconfigSourceAnnotation]).To(Equal(KubeconfigSourceNodePush))
 }
 
-// TestReconcileKubeconfig_ForgedStagingOwnerRejected: a node-planted staging
-// Secret with a forged (non-KCP) controller owner is never used as a candidate,
+// TestReconcileKubeconfig_ForeignStagingOwnerRejected: a staging
+// Secret with a foreign (non-KCP) controller owner is never used as a candidate,
 // and its content never reaches the contract. No delete.
-func TestReconcileKubeconfig_ForgedStagingOwnerRejected(t *testing.T) {
+func TestReconcileKubeconfig_ForeignStagingOwnerRejected(t *testing.T) {
 	g := NewWithT(t)
 	kcp, cluster := publishKCPAndCluster()
 	valid := newValidKubeconfig(t, cluster.Name, testExpectedServer)
@@ -660,7 +660,7 @@ func TestReconcileKubeconfig_ForgedStagingOwnerRejected(t *testing.T) {
 				APIVersion: controlplanev1beta2.GroupVersion.String(),
 				Kind:       "KairosControlPlane",
 				Name:       "kcp",
-				UID:        types.UID("FORGED-uid"), // not kcp.UID
+				UID:        types.UID("other-uid"), // not kcp.UID
 				Controller: &ctlTrue,
 			}},
 		},
@@ -671,13 +671,13 @@ func TestReconcileKubeconfig_ForgedStagingOwnerRejected(t *testing.T) {
 
 	ready, err := r.reconcileKubeconfig(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(ready).To(BeFalse(), "forged staging must not be published")
+	g.Expect(ready).To(BeFalse(), "foreign-owned staging must not be published")
 
-	// The contract Secret must not have been created from forged staging content.
+	// The contract Secret must not have been created from foreign-owned staging content.
 	contract := &corev1.Secret{}
 	err = nd.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "c-kubeconfig"}, contract)
 	if err == nil {
-		g.Expect(contract.Data["value"]).To(BeEmpty(), "forged staging content must never reach the contract")
+		g.Expect(contract.Data["value"]).To(BeEmpty(), "foreign-owned staging content must never reach the contract")
 	}
 }
 

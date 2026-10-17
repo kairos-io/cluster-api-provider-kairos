@@ -15,10 +15,10 @@ permissions and limitations under the License.
 */
 
 // Package kubeconfig sanitizes a workload kubeconfig pushed by a node before
-// any management-cluster controller trusts it. See ADR 0011
-// (.claude/decisions/0011-c5-node-push-kubeconfig-trust.md), section
-// "Sanitizer (internal/kubeconfig, pure)", for the rule set (S0-S5) and the
-// security analysis this package closes (A1, A2 in that document).
+// any management-cluster controller trusts it. See ADR 0011,
+// section "Sanitizer (internal/kubeconfig, pure)", for the rule set (S0-S5).
+// Only inline credentials and an inline CA are accepted; server and CA are
+// pinned by the caller.
 //
 // This package is pure: no Kubernetes client, no controller-runtime, no I/O
 // beyond parsing bytes already in memory. Every field name, credential shape

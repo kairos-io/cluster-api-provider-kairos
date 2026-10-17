@@ -646,7 +646,7 @@ func (w *SSHFallbackWorker) runRemoteCat(ctx context.Context, log logr.Logger, s
 // payload writes, with the source annotation set to "ssh-fallback" so
 // reconcileKubeconfig can route the Reason.
 //
-// ADR 0011 (C5): the SSH-fetched file (raw admin.conf / k3s.yaml, whose k3s
+// ADR 0011: the SSH-fetched file (raw admin.conf / k3s.yaml, whose k3s
 // server is a loopback address — G9) goes through the SAME trust reduction as a
 // node push: internal/kubeconfig.Sanitize rebuilds it (S5) with the server the
 // controller knows forced in, dropping any file-path credentials, exec plugins

@@ -86,7 +86,7 @@ func TestSanitizingKubeconfigReader_RefusesUnsafeKubeconfig(t *testing.T) {
 	ca := genTestCA(t, "cluster-ca")
 	cases := map[string]func(*clientcmdapi.Config){
 		"token file": func(c *clientcmdapi.Config) {
-			c.AuthInfos["admin"] = &clientcmdapi.AuthInfo{TokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"}
+			c.AuthInfos["admin"] = &clientcmdapi.AuthInfo{TokenFile: "/etc/example/token"}
 		},
 		"exec plugin": func(c *clientcmdapi.Config) {
 			c.AuthInfos["admin"] = &clientcmdapi.AuthInfo{Exec: &clientcmdapi.ExecConfig{Command: "/bin/sh", APIVersion: "client.authentication.k8s.io/v1"}}
@@ -100,7 +100,7 @@ func TestSanitizingKubeconfigReader_RefusesUnsafeKubeconfig(t *testing.T) {
 			c.Clusters["wl"].CertificateAuthority = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 		},
 		"unreferenced user with a token file": func(c *clientcmdapi.Config) {
-			c.AuthInfos["spare"] = &clientcmdapi.AuthInfo{TokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"}
+			c.AuthInfos["spare"] = &clientcmdapi.AuthInfo{TokenFile: "/etc/example/token"}
 		},
 	}
 	for name, mutate := range cases {

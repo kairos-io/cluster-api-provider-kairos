@@ -334,11 +334,11 @@ func TestSanitize_TableDriven(t *testing.T) {
 		{
 			name: "S4 tokenFile is rejected",
 			mutate: func(t *testing.T, cfg *clientcmdapi.Config) {
-				cfg.AuthInfos["source-admin"].TokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+				cfg.AuthInfos["source-admin"].TokenFile = "/etc/example/token"
 			},
 			wantErr:    true,
 			wantReason: kubeconfig.ReasonUnsafeIdentity,
-			forbidden:  []string{"/var/run/secrets/kubernetes.io/serviceaccount/token"},
+			forbidden:  []string{"/etc/example/token"},
 		},
 		{
 			name: "S4 exec is rejected",
@@ -743,7 +743,7 @@ func TestIsFixedPoint(t *testing.T) {
 	// A malicious/unsafe input is never a fixed point: IsFixedPoint must
 	// surface the rejection, not silently report false.
 	cfg := baseConfig(t)
-	cfg.AuthInfos["source-admin"].TokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	cfg.AuthInfos["source-admin"].TokenFile = "/etc/example/token"
 	unsafeRaw := rawOf(t, cfg)
 	if _, err := kubeconfig.IsFixedPoint(unsafeRaw, testClusterName, testExpectedServer); err == nil {
 		t.Fatal("expected IsFixedPoint to return an error for unsafe input")

@@ -59,8 +59,8 @@ func etcdStatusSecretName(clusterName string) string {
 // quorum to guard and no peers to report about).
 func (r *KairosControlPlaneReconciler) ensureEtcdStatusSecret(ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster) error {
 	// G10 (ADR 0011): refuse to adopt a same-name Secret this Cluster does not
-	// already control — a node could plant `<cluster>-etcd-status` with forged
-	// member records the quorum guard reads. Ownership is verified by
+	// already control — a pre-existing `<cluster>-etcd-status` could carry
+	// member records the quorum guard would then read. Ownership is verified by
 	// controller-UID; a foreign or ownerless existing Secret is refused.
 	if err := refuseUnownedHASecret(ctx, r.Client,
 		types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}, cluster.UID); err != nil {

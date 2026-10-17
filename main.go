@@ -382,8 +382,8 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		// manager never dials a k0s/k3s cluster's node-pushed kubeconfig; the FINE,
 		// owner-verified trust check runs per-request in the source.
 		joinSources := map[string]bootstrap.JoinMaterialSource{}
-		// Uncached management reader for the <cluster>-ca cross-check (a planted or
-		// stale cached value must not be trusted).
+		// Uncached management reader for the <cluster>-ca cross-check (a stale or
+		// unexpected cached value must not be trusted).
 		uncachedReader, err := client.New(mgr.GetConfig(), client.Options{
 			Scheme: mgr.GetScheme(),
 			Mapper: mgr.GetRESTMapper(),
@@ -431,7 +431,7 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 			return err
 		}
 
-		// Startup Role migrator (ADR 0011, PR-3 / KD-60): narrow any pre-existing
+		// Startup Role migrator (ADR 0011, PR-3): narrow any pre-existing
 		// node-push Role to the reduced patch-only rule set the instant this manager
 		// takes leadership, so a booted node's stale token loses secrets:create and
 		// the contract-Secret write without waiting for a re-render. Leader-elected,

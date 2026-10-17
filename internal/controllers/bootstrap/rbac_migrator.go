@@ -32,7 +32,7 @@ import (
 )
 
 // NodePushRoleMigrator narrows pre-PR-3 node-push Roles to the reduced rule set at
-// bootstrap-manager startup, so KD-60/A1 closes for already-running clusters the
+// bootstrap-manager startup, so the narrowed rules apply to already-running clusters the
 // instant the new manager takes leadership — without waiting for each cluster to
 // re-render (which the resolver would otherwise do lazily).
 //

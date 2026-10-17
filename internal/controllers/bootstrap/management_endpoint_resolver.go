@@ -117,7 +117,7 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 	// that controls this Machine. The bootstrap manager reads Machines but not
 	// KCPs, so the authoritative check compares the staging Secret's controller
 	// owner UID with the Machine's controller owner UID (both are the KCP). A
-	// forged/absent staging owner, or a missing staging Secret, is not-ready.
+	// foreign or absent staging owner, or a missing staging Secret, is not-ready.
 	stagingName := bootstrapv1beta2.KubeconfigPushSecretName(cluster.Name)
 	if err := r.requireOwnedStaging(ctx, machine, cluster, stagingName); err != nil {
 		return nil, err
@@ -164,12 +164,8 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		},
 	}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, role, func() error {
-		// PR-3 (ADR 0011, KD-60/A1): the node has NO `secrets: create` and NO
-		// `get`/`update`. It may only PATCH two controller-pre-created, named
-		// Secrets. Removing `create` closes KD-60 (a node could otherwise create
-		// `<other>-kubeconfig`/`-ca`/`-etcd`/... for a foreign cluster that an
-		// upstream KCP or CAPI core would then adopt/read, the A3 attack). Every
-		// node-push in the rendered cloud-config is now a strategic-merge PATCH:
+		// PR-3 (ADR 0011): nodes need only PATCH on two named, controller-created
+		// Secrets; no create, get or update. Every node-push in the rendered cloud-config is now a strategic-merge PATCH:
 		//
 		//   secrets:patch (staging kubeconfig) — node-push kubeconfig PATCH of the
 		//                                        `value` key of the controller-owned

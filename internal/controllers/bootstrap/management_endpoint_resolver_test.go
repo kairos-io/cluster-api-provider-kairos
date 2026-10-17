@@ -218,11 +218,11 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	// PR-3 minimization: a k0s control-plane (CAPK) SA gets exactly 2 rules:
 	//   1. secrets/patch on the named staging/etcd-status Secrets
 	//   2. kubevirt.io VMI/get (k0s CAPK control-plane SAN detection only)
-	// The former create rule and the get/update verbs are removed (KD-60/A1).
+	// The former create rule and the get/update verbs are removed.
 	g.Expect(role.Rules).To(HaveLen(2))
 	g.Expect(roleGrantsVMIGet(role)).To(BeTrue(), "k0s control-plane SA must retain virtualmachineinstances:get for SAN detection")
 	g.Expect(roleGrantsServicesGet(role)).To(BeFalse(), "services:get is a dead grant and must be removed (KD-46)")
-	g.Expect(roleGrantsSecretCreate(role)).To(BeFalse(), "PR-3: the node SA must NOT have secrets:create (KD-60/A1)")
+	g.Expect(roleGrantsSecretCreate(role)).To(BeFalse(), "PR-3: the node SA must NOT have secrets:create")
 	// Staging is patch-only; get/update are gone.
 	stagingName := bootstrapv1beta2.KubeconfigPushSecretName("test-cluster")
 	g.Expect(roleGrantsNamedSecret(role, stagingName, "patch")).To(BeTrue(), "node SA must patch the staging Secret")
@@ -450,7 +450,7 @@ func TestResolve_StagingMissing_ReturnsNotReady(t *testing.T) {
 }
 
 // TestResolve_StagingForeignOwner_ReturnsNotReady covers the gate's owner-UID
-// check: a staging Secret owned by a DIFFERENT KCP (forged / another cluster)
+// check: a staging Secret owned by a DIFFERENT KCP (another cluster)
 // fails the gate.
 func TestResolve_StagingForeignOwner_ReturnsNotReady(t *testing.T) {
 	g := NewWithT(t)
@@ -465,7 +465,7 @@ func TestResolve_StagingForeignOwner_ReturnsNotReady(t *testing.T) {
 		APIVersion: controlplanev1beta2.GroupVersion.String(),
 		Kind:       "KairosControlPlane",
 		Name:       "test-cluster-kcp",
-		UID:        types.UID("FORGED-different-uid"),
+		UID:        types.UID("other-kcp-uid"),
 		Controller: &ctlTrue,
 	}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine, foreign).Build()

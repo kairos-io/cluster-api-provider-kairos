@@ -373,7 +373,7 @@ for the full configuration steps.
 
 ### Management API TLS verification and the CA source
 
-The node-to-management push (kubeconfig staging, join-token, etcd-status) is
+The node-to-management push (kubeconfig staging, etcd-status) is
 TLS-verified: nodes run `curl --cacert` against the management API server's CA,
 which the controller renders into each node's cloud-config at
 `/etc/kairos-capi/management-ca.crt`. There is no insecure opt-out; a wrong or

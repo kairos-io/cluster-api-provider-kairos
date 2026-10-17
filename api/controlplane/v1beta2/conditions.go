@@ -162,9 +162,9 @@ const (
 	// NodePushCAMismatchReason is the False reason for KubeconfigReadyCondition
 	// when the certificate authority of a candidate or of the contract Secret
 	// does not match the CA fingerprint pinned on the KairosControlPlane
-	// annotation (ADR 0011 step 5, A8). A mismatch neutralizes the contract
+	// annotation (ADR 0011 step 5). A mismatch neutralizes the contract
 	// Secret (empty-in-place) and refuses to republish until an operator
-	// re-pins via the KCP annotation — a possible plant or a split-brain
+	// re-pins via the KCP annotation — an unexpected CA or a split-brain
 	// joiner, never a silent CA swap. Severity Warning. Deliberately NOT in the
 	// SSH-fallback eligibility set (G23): auto-recovery must not overwrite a CA
 	// the operator has not vetted.
@@ -174,7 +174,7 @@ const (
 	// KubeconfigReadyCondition when the contract Secret exists but is neither
 	// controlled by this KairosControlPlane nor adoptable under the ADR 0011
 	// adoption criteria (a leftover from a deleted same-name cluster, a
-	// pre-Cluster plant, or a mislabeled Secret). The controller does not touch
+	// Secret created before the Cluster, or a mislabeled Secret). The controller does not touch
 	// its content; the message asks the operator to delete it. Severity
 	// Warning.
 	KubeconfigSecretNotOwnedReason = "KubeconfigSecretNotOwned"

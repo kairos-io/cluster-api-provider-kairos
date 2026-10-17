@@ -162,14 +162,14 @@ const workloadRequestTimeout = 10 * time.Second
 // directly (connectForLeave). Every request is bounded by
 // workloadRequestTimeout.
 //
-// ADR 0011 (C5): the rest.Config is built from the S5-rebuilt output of the
+// ADR 0011: the rest.Config is built from the S5-rebuilt output of the
 // contract bytes, NEVER the raw bytes (workloadRESTConfig ->
 // trustedWorkloadKubeconfig). The contract Secret is normally already S5 output
 // (the publish path is its only sanctioned writer), but re-sanitizing here
 // closes the window where something overwrote it between reconciles: nothing
 // client-go would honor as file-path credentials, exec/auth-provider plugins,
-// impersonation or insecure TLS survives Sanitize, so a workload client can
-// never be steered to leak this manager's ServiceAccount token. The server is
+// impersonation or insecure TLS survives Sanitize, so the client uses only the
+// inline credential and CA, the controller-resolved server and the pinned CA. The server is
 // the one the controller resolves itself, not the one in the Secret, and the CA
 // must match the pin on the KairosControlPlane. Any failure returns an error,
 // which the callers treat as fail-safe (the etcd-leave hook stays set, quorum

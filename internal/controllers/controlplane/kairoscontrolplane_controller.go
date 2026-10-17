@@ -456,7 +456,7 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	// ADR 0011 (C5): the management side no longer trusts a node-written
+	// ADR 0011: the management side no longer trusts a node-written
 	// kubeconfig verbatim. reconcileKubeconfig owns the contract Secret
 	// `<cluster>-kubeconfig` and KubeconfigReadyCondition: it validates the
 	// contract against the internal/kubeconfig sanitizer (must be a fixed

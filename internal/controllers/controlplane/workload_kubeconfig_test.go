@@ -79,7 +79,7 @@ func TestWorkloadRESTConfig_RefusesUnsafeKubeconfig(t *testing.T) {
 	for name, mutate := range map[string]func(*clientcmdapi.Cluster, *clientcmdapi.AuthInfo){
 		"tokenFile": func(_ *clientcmdapi.Cluster, u *clientcmdapi.AuthInfo) {
 			u.Token = ""
-			u.TokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+			u.TokenFile = "/etc/example/token"
 		},
 		"exec": func(_ *clientcmdapi.Cluster, u *clientcmdapi.AuthInfo) {
 			u.Exec = &clientcmdapi.ExecConfig{Command: "/bin/sh", APIVersion: "client.authentication.k8s.io/v1"}

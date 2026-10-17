@@ -36,12 +36,12 @@ import (
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/bootstrap"
 )
 
-// TestC5_NodePushRoleRBACProbe proves the PR-3 node Role at the apiserver's own
+// TestNodePushRole_RBACProbe proves the PR-3 node Role at the apiserver's own
 // RBAC layer (envtest runs authorization-mode=RBAC). It runs the production
 // resolver to create the per-cluster SA/Role/RoleBinding, then impersonates the
 // node ServiceAccount and asserts:
 //
-//   - it CANNOT create any Secret (POST) — KD-60/A1 closed;
+//   - it CANNOT create any Secret (POST);
 //   - it CANNOT apply-create a Secret (server-side apply that would create is
 //     re-authorized as `create`, by name — G11);
 //   - it CAN patch the named staging / etcd-status Secrets;
@@ -49,7 +49,7 @@ import (
 //   - it CANNOT patch the join-token Secret (the KCP is its only writer,
 //     ADR 0013);
 //   - it CANNOT patch another cluster's staging Secret.
-func TestC5_NodePushRoleRBACProbe(t *testing.T) {
+func TestNodePushRole_RBACProbe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping envtest in short mode")
 	}
@@ -69,7 +69,7 @@ func TestC5_NodePushRoleRBACProbe(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 
 	const (
-		nsName      = "c5-rbac-ns"
+		nsName      = "kcpub-rbac-ns"
 		clusterName = "c5rbac"
 	)
 	saName := "kairos-kubeconfig-writer-" + clusterName
