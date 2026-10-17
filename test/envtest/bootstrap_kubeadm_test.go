@@ -323,6 +323,44 @@ func TestBootstrapIntegration_KubeadmWorker(t *testing.T) {
 	// The stored token id is the non-secret half (no ".secret").
 	g.Expect(got.Status.BootstrapTokenID).NotTo(ContainSubstring("."))
 
+	// --- Extension: a slow boot keeps the token the node is already holding ---
+	// Wind the minted token's expiry down to a minute out, which is the state a slow
+	// install reaches, and wake the reconcile. The token must be EXTENDED in place:
+	// the infrastructure provider copied the token value into the VM's userdata at
+	// the first render, so a replacement token would never reach the booting node.
+	tokenName := "bootstrap-token-" + got.Status.BootstrapTokenID
+	nearExpiry := time.Now().UTC().Add(1 * time.Minute).Truncate(time.Second)
+	tokenSecret.Data[bootstrapapi.BootstrapTokenExpirationKey] = []byte(nearExpiry.Format(time.RFC3339))
+	g.Expect(workload.Update(ctx, tokenSecret)).To(Succeed())
+
+	// Wake the reconcile. Retry on conflict: the controller patches this object on
+	// its own schedule, so a single Update can lose the race.
+	g.Eventually(func() error {
+		touch := &bootstrapv1beta2.KairosConfig{}
+		if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-ok", Namespace: nsName}, touch); err != nil {
+			return err
+		}
+		if touch.Annotations == nil {
+			touch.Annotations = map[string]string{}
+		}
+		touch.Annotations["test.kairos.io/wake"] = "1"
+		return mgr.GetClient().Update(ctx, touch)
+	}, 20*time.Second, 1*time.Second).Should(Succeed())
+
+	g.Eventually(func() bool {
+		s := &corev1.Secret{}
+		if err := workload.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: tokenName}, s); err != nil {
+			return false
+		}
+		exp, perr := time.Parse(time.RFC3339, string(s.Data[bootstrapapi.BootstrapTokenExpirationKey]))
+		return perr == nil && exp.After(nearExpiry)
+	}, 40*time.Second, 1*time.Second).Should(BeTrue(), "a token close to expiry must have its expiry pushed out")
+
+	after := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-ok", Namespace: nsName}, after)).To(Succeed())
+	g.Expect(after.Status.BootstrapTokenID).To(Equal(got.Status.BootstrapTokenID),
+		"the node is holding this token: extending it must not mint a replacement")
+
 	// --- Refuse case: kubeconfig owner UID does not match the control plane ---
 	setupCluster("wl-bad", false)
 	makeWorker("wl-bad", "worker-bad")

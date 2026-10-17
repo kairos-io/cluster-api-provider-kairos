@@ -34,6 +34,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -561,32 +562,48 @@ func TestKubeadmWorkerJoin_MissingVersionTerminal(t *testing.T) {
 
 // fakeRefresher is a JoinMaterialSource + workerTokenRefresher test double.
 type fakeRefresher struct {
-	need   bool
-	err    error
-	called int
+	remint    bool
+	nextCheck time.Duration
+	err       error
+	ensured   int
+	revoked   int
+	revokeErr error
+	revokedID string
 }
 
 func (f *fakeRefresher) WorkerJoin(context.Context, JoinRequest) (WorkerJoinMaterial, error) {
 	return WorkerJoinMaterial{Kubeadm: &KubeadmJoinMaterial{JoinConfiguration: "x", TokenID: "abcdef"}}, nil
 }
-func (f *fakeRefresher) TokenNeedsRefresh(context.Context, JoinRequest, string) (bool, error) {
-	f.called++
-	return f.need, f.err
+
+func (f *fakeRefresher) EnsureWorkerToken(context.Context, JoinRequest, string) (bool, time.Duration, error) {
+	f.ensured++
+	return f.remint, f.nextCheck, f.err
 }
 
-// TestDecideKubeadmTokenRefresh pins the reconciler's refresh gate: regenerate when
-// the source says so, cap when the Machine is too old, and none when the node has
-// joined or the distribution is not kubeadm (ADR 0010 P1 item 7).
-func TestDecideKubeadmTokenRefresh(t *testing.T) {
+func (f *fakeRefresher) RevokeWorkerToken(_ context.Context, _ JoinRequest, tokenID string) error {
+	f.revoked++
+	f.revokedID = tokenID
+	return f.revokeErr
+}
+
+func (f *fakeRefresher) TokenRecheckInterval() time.Duration { return f.nextCheck }
+
+// TestReconcileKubeadmToken pins the reconciler's token gate: extend (with the
+// source's cadence) while the node is still booting, re-render only when there is
+// nothing left to extend, revoke once the node has registered, cap when the Machine
+// is too old, and do nothing for a non-kubeadm worker (ADR 0010 P1 item 7).
+func TestReconcileKubeadmToken(t *testing.T) {
 	scheme := charScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	kubeadmWorker := func() *bootstrapv1beta2.KairosConfig {
-		return &bootstrapv1beta2.KairosConfig{
+		kc := &bootstrapv1beta2.KairosConfig{
 			ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "default"},
 			Spec:       bootstrapv1beta2.KairosConfigSpec{Distribution: bootstrapv1beta2.DistributionKubeadm, Role: "worker"},
 		}
+		kc.Status.BootstrapTokenID = "abcdef"
+		return kc
 	}
 	youngMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{
 		Name: "w", Namespace: "default", CreationTimestamp: metav1.NewTime(now.Add(-1 * time.Hour))}}
@@ -596,96 +613,245 @@ func TestDecideKubeadmTokenRefresh(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "default", CreationTimestamp: metav1.NewTime(now.Add(-1 * time.Hour))},
 		Status:     clusterv1.MachineStatus{NodeRef: clusterv1.MachineNodeReference{Name: "node-w"}},
 	}
-
-	t.Run("source says refresh -> regenerate", func(t *testing.T) {
-		g := NewWithT(t)
-		ref := &fakeRefresher{need: true}
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
+	reconciler := func(ref JoinMaterialSource) *KairosConfigReconciler {
+		return &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
 			JoinSources: map[string]JoinMaterialSource{bootstrapv1beta2.DistributionKubeadm: ref}}
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kubeadmWorker(), youngMachine, nil)
+	}
+
+	t.Run("still booting -> extend, carrying the source's cadence", func(t *testing.T) {
+		g := NewWithT(t)
+		ref := &fakeRefresher{nextCheck: 5 * time.Minute}
+		d, next, err := reconciler(ref).reconcileKubeadmToken(context.Background(), logr.Discard(), kubeadmWorker(), youngMachine, nil)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(d).To(Equal(kubeadmRefreshExtended))
+		g.Expect(next).To(Equal(5*time.Minute), "the requeue must come from the token's TTL")
+		g.Expect(ref.ensured).To(Equal(1))
+		g.Expect(ref.revoked).To(Equal(0), "a booting node's token must never be revoked")
+	})
+	t.Run("nothing left to extend -> regenerate", func(t *testing.T) {
+		g := NewWithT(t)
+		ref := &fakeRefresher{remint: true}
+		d, next, err := reconciler(ref).reconcileKubeadmToken(context.Background(), logr.Discard(), kubeadmWorker(), youngMachine, nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(d).To(Equal(kubeadmRefreshRegenerate))
-		g.Expect(ref.called).To(Equal(1))
+		g.Expect(next).To(BeZero())
 	})
 	t.Run("machine past cap -> capped, source not consulted", func(t *testing.T) {
 		g := NewWithT(t)
-		ref := &fakeRefresher{need: true}
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
-			JoinSources: map[string]JoinMaterialSource{bootstrapv1beta2.DistributionKubeadm: ref}}
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kubeadmWorker(), oldMachine, nil)
+		ref := &fakeRefresher{}
+		d, _, err := reconciler(ref).reconcileKubeadmToken(context.Background(), logr.Discard(), kubeadmWorker(), oldMachine, nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(d).To(Equal(kubeadmRefreshCapped))
-		g.Expect(ref.called).To(Equal(0), "cap must short-circuit before minting")
+		g.Expect(ref.ensured).To(Equal(0), "the cap must short-circuit before touching the token")
 	})
-	t.Run("node joined -> none", func(t *testing.T) {
+	t.Run("node joined -> revoke and forget the id", func(t *testing.T) {
 		g := NewWithT(t)
-		ref := &fakeRefresher{need: true}
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
-			JoinSources: map[string]JoinMaterialSource{bootstrapv1beta2.DistributionKubeadm: ref}}
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kubeadmWorker(), joinedMachine, nil)
+		ref := &fakeRefresher{}
+		kc := kubeadmWorker()
+		d, _, err := reconciler(ref).reconcileKubeadmToken(context.Background(), logr.Discard(), kc, joinedMachine, nil)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(d).To(Equal(kubeadmRefreshRevoked))
+		g.Expect(ref.revoked).To(Equal(1))
+		g.Expect(ref.revokedID).To(Equal("abcdef"))
+		g.Expect(kc.Status.BootstrapTokenID).To(BeEmpty(), "a revoked token must not be revoked again")
+		g.Expect(ref.ensured).To(Equal(0))
+	})
+	t.Run("node joined with nothing on record -> none", func(t *testing.T) {
+		g := NewWithT(t)
+		ref := &fakeRefresher{}
+		kc := kubeadmWorker()
+		kc.Status.BootstrapTokenID = ""
+		d, _, err := reconciler(ref).reconcileKubeadmToken(context.Background(), logr.Discard(), kc, joinedMachine, nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(d).To(Equal(kubeadmRefreshNone))
-		g.Expect(ref.called).To(Equal(0))
+		g.Expect(ref.revoked).To(Equal(0))
 	})
 	t.Run("k0s worker -> none", func(t *testing.T) {
 		g := NewWithT(t)
 		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now }}
 		kc := kubeadmWorker()
 		kc.Spec.Distribution = bootstrapv1beta2.DistributionK0s
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kc, youngMachine, nil)
+		d, _, err := r.reconcileKubeadmToken(context.Background(), logr.Discard(), kc, youngMachine, nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(d).To(Equal(kubeadmRefreshNone))
 	})
 }
 
-// TestKubeadmTokenNeedsRefresh pins the refresh decision against the workload token
-// Secret: missing -> refresh; past half-TTL -> refresh; fresh -> no refresh.
-func TestKubeadmTokenNeedsRefresh(t *testing.T) {
+// TestKubeadmEnsureWorkerToken pins the extension against the workload token
+// Secret. The behaviour under test is that the token the node is ALREADY HOLDING
+// has its expiry moved: the Secret keeps its name, its ID and its secret half, so
+// a node that boots late still joins with the token baked into its userdata.
+func TestKubeadmEnsureWorkerToken(t *testing.T) {
 	ca := genTestCA(t, "cluster-ca")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	seedToken := func(workload client.Client, id string, exp time.Time) {
+	seedToken := func(workload client.Client, id string, data map[string][]byte) {
 		_ = workload.Create(context.Background(), &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-" + id},
 			Type:       bootstrapapi.SecretTypeBootstrapToken,
-			Data:       map[string][]byte{bootstrapapi.BootstrapTokenExpirationKey: []byte(exp.Format(time.RFC3339))},
+			Data:       data,
 		})
 	}
+	withExpiry := func(exp time.Time) map[string][]byte {
+		return map[string][]byte{
+			bootstrapapi.BootstrapTokenIDKey:         []byte("abcdef"),
+			bootstrapapi.BootstrapTokenSecretKey:     []byte("0123456789abcdef"),
+			bootstrapapi.BootstrapTokenExpirationKey: []byte(exp.Format(time.RFC3339)),
+		}
+	}
+	readToken := func(g *WithT, workload client.Client, id string) *corev1.Secret {
+		s := &corev1.Secret{}
+		g.Expect(workload.Get(context.Background(),
+			client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-" + id}, s)).To(Succeed())
+		return s
+	}
 
-	t.Run("empty token id -> refresh", func(t *testing.T) {
+	t.Run("empty token id -> remint", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, _ := buildSource(t, defaultFixture(ca), nil)
 		src.now = func() time.Time { return now }
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "")
+		remint, next, err := src.EnsureWorkerToken(context.Background(), req, "")
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeTrue())
+		g.Expect(remint).To(BeTrue())
+		g.Expect(next).To(BeZero())
 	})
-	t.Run("token absent in workload -> refresh", func(t *testing.T) {
+	t.Run("token absent in workload -> remint", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, _ := buildSource(t, defaultFixture(ca), nil)
 		src.now = func() time.Time { return now }
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
+		remint, _, err := src.EnsureWorkerToken(context.Background(), req, "abcdef")
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeTrue())
+		g.Expect(remint).To(BeTrue())
 	})
-	t.Run("past half-TTL -> refresh", func(t *testing.T) {
+	t.Run("about to expire -> expiry moved, token value untouched", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, workload := buildSource(t, defaultFixture(ca), nil)
 		src.now = func() time.Time { return now }
-		// TTL 15m; half is 7m30s. Expire in 5m -> past half-TTL.
-		seedToken(workload, "abcdef", now.Add(5*time.Minute))
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
+		// TTL 15m. The node is still booting and its token expires in one minute:
+		// this is the case a slow install dies on today.
+		seedToken(workload, "abcdef", withExpiry(now.Add(1*time.Minute)))
+
+		remint, next, err := src.EnsureWorkerToken(context.Background(), req, "abcdef")
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeTrue())
+		g.Expect(remint).To(BeFalse(), "an extendable token must never be reminted")
+		g.Expect(next).To(Equal(defaultKubeadmTokenTTL / 3))
+
+		s := readToken(g, workload, "abcdef")
+		g.Expect(string(s.Data[bootstrapapi.BootstrapTokenExpirationKey])).
+			To(Equal(now.Add(defaultKubeadmTokenTTL).UTC().Format(time.RFC3339)))
+		g.Expect(string(s.Data[bootstrapapi.BootstrapTokenSecretKey])).To(Equal("0123456789abcdef"),
+			"the node is holding this value; extending must not change it")
+		g.Expect(string(s.Data[bootstrapapi.BootstrapTokenIDKey])).To(Equal("abcdef"))
 	})
-	t.Run("fresh -> no refresh", func(t *testing.T) {
+	t.Run("already good for a full TTL -> left alone", func(t *testing.T) {
 		g := NewWithT(t)
 		src, req, workload := buildSource(t, defaultFixture(ca), nil)
 		src.now = func() time.Time { return now }
-		// Expire in 14m -> well under half consumed.
-		seedToken(workload, "abcdef", now.Add(14*time.Minute))
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
+		far := now.Add(2 * time.Hour)
+		seedToken(workload, "abcdef", withExpiry(far))
+
+		remint, next, err := src.EnsureWorkerToken(context.Background(), req, "abcdef")
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeFalse())
+		g.Expect(remint).To(BeFalse())
+		g.Expect(next).To(Equal(defaultKubeadmTokenTTL / 3))
+		g.Expect(string(readToken(g, workload, "abcdef").Data[bootstrapapi.BootstrapTokenExpirationKey])).
+			To(Equal(far.Format(time.RFC3339)), "an expiry further out than ours must not be pulled in")
 	})
+	t.Run("no expiration key -> treated as due, ours is written", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+		src.now = func() time.Time { return now }
+		seedToken(workload, "abcdef", map[string][]byte{bootstrapapi.BootstrapTokenIDKey: []byte("abcdef")})
+
+		remint, _, err := src.EnsureWorkerToken(context.Background(), req, "abcdef")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(remint).To(BeFalse())
+		g.Expect(string(readToken(g, workload, "abcdef").Data[bootstrapapi.BootstrapTokenExpirationKey])).
+			To(Equal(now.Add(defaultKubeadmTokenTTL).UTC().Format(time.RFC3339)))
+	})
+	t.Run("unparsable expiration -> treated as due, ours is written", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+		src.now = func() time.Time { return now }
+		seedToken(workload, "abcdef", map[string][]byte{
+			bootstrapapi.BootstrapTokenExpirationKey: []byte("not-a-timestamp")})
+
+		remint, _, err := src.EnsureWorkerToken(context.Background(), req, "abcdef")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(remint).To(BeFalse())
+		g.Expect(string(readToken(g, workload, "abcdef").Data[bootstrapapi.BootstrapTokenExpirationKey])).
+			To(Equal(now.Add(defaultKubeadmTokenTTL).UTC().Format(time.RFC3339)))
+	})
+}
+
+// TestKubeadmRevokeWorkerToken pins revocation: the Secret is deleted, an empty ID
+// and an already-absent Secret are both no-ops.
+func TestKubeadmRevokeWorkerToken(t *testing.T) {
+	ca := genTestCA(t, "cluster-ca")
+
+	t.Run("deletes the token secret", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, workload := buildSource(t, defaultFixture(ca), nil)
+		g.Expect(workload.Create(context.Background(), &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"},
+			Type:       bootstrapapi.SecretTypeBootstrapToken,
+		})).To(Succeed())
+
+		g.Expect(src.RevokeWorkerToken(context.Background(), req, "abcdef")).To(Succeed())
+
+		err := workload.Get(context.Background(),
+			client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"}, &corev1.Secret{})
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+	t.Run("empty id and an absent secret are no-ops", func(t *testing.T) {
+		g := NewWithT(t)
+		src, req, _ := buildSource(t, defaultFixture(ca), nil)
+		g.Expect(src.RevokeWorkerToken(context.Background(), req, "")).To(Succeed())
+		g.Expect(src.RevokeWorkerToken(context.Background(), req, "abcdef")).To(Succeed())
+	})
+}
+
+// TestKubeadmWorkerJoin_TokenCarriesOwnerLabel pins the owner label on a minted
+// token: a token whose ID never reaches status is otherwise unattributable.
+func TestKubeadmWorkerJoin_TokenCarriesOwnerLabel(t *testing.T) {
+	g := NewWithT(t)
+	ca := genTestCA(t, "cluster-ca")
+	src, req, workload := buildSource(t, defaultFixture(ca), nil)
+	req.Config.UID = "config-uid-1"
+
+	mat, err := src.WorkerJoin(context.Background(), req)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(mat.Kubeadm).NotTo(BeNil())
+
+	s := &corev1.Secret{}
+	g.Expect(workload.Get(context.Background(), client.ObjectKey{
+		Namespace: metav1.NamespaceSystem,
+		Name:      "bootstrap-token-" + mat.Kubeadm.TokenID,
+	}, s)).To(Succeed())
+	g.Expect(s.Labels).To(HaveKeyWithValue(kubeadmTokenOwnerLabel, "config-uid-1"))
+}
+
+// TestMintBootstrapTokenNilOwner pins the nil-Config guard: WorkerJoin tolerates a
+// nil req.Config everywhere else, so minting must not panic on one either.
+func TestMintBootstrapTokenNilOwner(t *testing.T) {
+	g := NewWithT(t)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	workload := fake.NewClientBuilder().WithScheme(charScheme(t)).Build()
+
+	_, tokenID, err := mintBootstrapToken(context.Background(), workload, defaultKubeadmTokenTTL, now, "")
+	g.Expect(err).NotTo(HaveOccurred())
+
+	s := &corev1.Secret{}
+	g.Expect(workload.Get(context.Background(), client.ObjectKey{
+		Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-" + tokenID}, s)).To(Succeed())
+	g.Expect(s.Labels).To(BeEmpty())
+}
+
+// TestTokenRecheckInterval pins the cadence: a third of the TTL, floored so a very
+// short TTL cannot turn the requeue into a hot loop.
+func TestTokenRecheckInterval(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(tokenRecheckInterval(15 * time.Minute)).To(Equal(5 * time.Minute))
+	g.Expect(tokenRecheckInterval(30 * time.Second)).To(Equal(minTokenRecheckInterval))
+	g.Expect(tokenRecheckInterval(0)).To(Equal(minTokenRecheckInterval))
 }
