@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"time"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,18 +50,27 @@ type JoinMaterialSource interface {
 }
 
 // workerTokenRefresher is an OPTIONAL capability a JoinMaterialSource may implement
-// (found by type assertion, never required). The reconciler consults it while the
-// owning Machine has no nodeRef to decide whether the previously-minted token needs
-// re-minting before it expires (ADR 0010 P1 item 7). kubeadm implements it; k0s/k3s
-// do not — their worker tokens are long-lived or externally managed, so the
-// reconciler simply skips the refresh for them.
+// (found by type assertion, never required). It is the Machine half of CABPK's
+// bootstrap-token model (ADR 0010 P1 item 7): one token per KairosConfig, reused by
+// every render, extended in place while the owning Machine has no nodeRef, and
+// revoked once it has one or the KairosConfig is deleted. kubeadm implements it;
+// k0s/k3s do not — their worker tokens are long-lived or externally managed, so the
+// reconciler simply skips this for them.
+//
+// Every method takes the non-secret token ID persisted in status. A transient
+// workload-cluster error MUST be returned as a bootstrapNotReadyError so the
+// reconciler requeues instead of parking the KairosConfig.
 type workerTokenRefresher interface {
-	// TokenNeedsRefresh reports whether the token identified by tokenID (the
-	// non-secret ID persisted in status) should be re-minted — because it is
-	// missing from the workload cluster, or past half its TTL. A transient
-	// workload-cluster error MUST be returned as a bootstrapNotReadyError so the
-	// reconciler requeues instead of parking the KairosConfig.
-	TokenNeedsRefresh(ctx context.Context, req JoinRequest, tokenID string) (bool, error)
+	// ExtendWorkerToken moves the expiry of token tokenID in place; it never mints.
+	// found is false when the token is gone from the workload cluster, and only
+	// then may the caller re-render (which mints a replacement).
+	ExtendWorkerToken(ctx context.Context, req JoinRequest, tokenID string) (found bool, err error)
+	// RevokeWorkerToken deletes token tokenID from the workload cluster. An
+	// already-absent token is success.
+	RevokeWorkerToken(ctx context.Context, req JoinRequest, tokenID string) error
+	// TokenRecheckInterval is how often the reconciler must come back to extend a
+	// token for a Machine that has not joined yet.
+	TokenRecheckInterval() time.Duration
 }
 
 // JoinRequest is the read-only input to a JoinMaterialSource.
@@ -98,6 +108,11 @@ type KubeadmJoinMaterial struct {
 	// token, written to KairosConfig.status.bootstrapTokenID for audit. Never the
 	// secret half.
 	TokenID string
+	// ReplacedTokenID is the non-secret ID of the token recorded in status that
+	// this render could not reuse because it was gone from the workload cluster,
+	// so TokenID was minted to replace it. Empty when the recorded token was
+	// reused or nothing was recorded. For the reconciler's log only.
+	ReplacedTokenID string
 }
 
 // String redacts the material for %v/%s/%+v. Only the non-secret kubeadm token ID
