@@ -108,7 +108,10 @@ write_files:
     content: |
       [Unit]
       Description=Ensure k0s apiserver SANs include LoadBalancer endpoint
-      After=k0scontroller.service
+      # The script removes the apiserver cert and restarts k0scontroller, which
+      # must not overlap post-bootstrap: the wait for k0scontroller's HA etcd
+      # join, the apply-args join branch and its own edits of k0s.yaml.
+      After=k0scontroller.service kairos-k0s-post-bootstrap.service
       Wants=k0scontroller.service
 
       [Service]
@@ -209,11 +212,12 @@ write_files:
     content: |
       [Unit]
       Description=Kairos k0s post-bootstrap tasks
-      # Skip on Kairos live installer (cdroot present in cmdline) — the
-      # post-bootstrap script would block for 7+ minutes waiting for k0s
-      # node registration that never happens on the installer, holding
-      # up cloud-init's runcmd and preventing kairos-agent from rebooting
-      # into the installed system. (KD-3b lab finding on Hadron.)
+      # Skip on Kairos live installer (cdroot present in cmdline): k0s node
+      # registration never happens there. On a control plane the script still
+      # pushes the kubeconfig, and in an HA cluster the join token and the etcd
+      # status, to the management cluster once its retries run out, and on the
+      # installer those would describe a throwaway cluster. (KD-3b lab finding
+      # on Hadron.)
       ConditionKernelCommandLine=!cdroot
       ConditionPathExists=!/run/cos/recovery_mode
       After=k0scontroller.service
@@ -249,7 +253,13 @@ write_files:
       # the main service file lands on disk during cloud-init early boot;
       # this helper runs once multi-user.target is set up and triggers
       # both enablement and immediate start of the post-bootstrap service.
-      ExecStart=/bin/systemctl enable --now kairos-k0s-post-bootstrap.service
+      # --no-block: the post-bootstrap unit is a oneshot that can retry for
+      # minutes; waiting for it would hold this helper, and runcmd with it.
+      # The lb-sans path starts in this call, after post-bootstrap: systemctl
+      # starts its arguments in order, so its service, ordered after
+      # post-bootstrap, finds the post-bootstrap job already queued and waits
+      # for it. A path listed first, or started on its own, could fire first.
+      ExecStart=/bin/systemctl enable --now --no-block kairos-k0s-post-bootstrap.service kairos-k0s-lb-sans.path
 
       [Install]
       WantedBy=multi-user.target
@@ -621,16 +631,26 @@ write_files:
       written by cluster-api-provider-kairos as the last of its write_files;
       k0s may start once this exists
 stages:
-  boot:
-    - name: "Ensure SSH service is enabled"
-      commands:
-        - systemctl enable --now sshd || systemctl enable --now ssh || true
+  # boot.before finishes before boot starts, and runcmd is part of boot,
+  # so the resolvers are in place before anything runcmd starts.
+  boot.before:
     - name: "Configure DNS resolvers for early boot"
       dns:
         nameservers:
           - 1.1.1.1
           - 8.8.8.8
-        path: "/etc/resolv.conf"
+        # Staged, then renamed over /etc/resolv.conf by the next step. On
+        # systemd-resolved images /etc/resolv.conf is a symlink into a file
+        # resolved regenerates when a DHCP lease brings DNS, and this stage
+        # is not ordered after the first lease. A rename replaces the link.
+        path: "/etc/.kairos-capi-resolv.conf"
+    - name: "Install the DNS resolvers as /etc/resolv.conf"
+      commands:
+        - mv -f /etc/.kairos-capi-resolv.conf /etc/resolv.conf
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
 runcmd:
   # Enable + start the helper service explicitly. `enable --now` both
   # creates the multi-user.target.wants/ symlink for next boot AND starts
@@ -638,6 +658,5 @@ runcmd:
   # stages.initramfs.files to top-level write_files (runcmd is now too
   # late in boot for ln-only symlink creation to be honored by systemd).
   - /bin/systemctl daemon-reload || true
-  - /bin/systemctl enable --now kairos-k0s-post-bootstrap-enable.service || true
-  - /bin/systemctl enable kairos-k0s-lb-sans.path || true
-  - /bin/systemctl start kairos-k0s-lb-sans.path || true
+  # --no-block: waiting for the helper would hold this cloud-config stage.
+  - /bin/systemctl enable --now --no-block kairos-k0s-post-bootstrap-enable.service || true
