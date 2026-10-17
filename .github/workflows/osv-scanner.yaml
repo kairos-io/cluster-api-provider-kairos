@@ -1,8 +1,8 @@
 name: OSV-Scanner
 
 # Dependency vulnerability scan (OpenSSF / CNCF requirement), following the
-# kairos-io org practice: Google's reusable OSV-Scanner workflow, full scan,
-# failing on any known vulnerability. Results land in Security > Code scanning.
+# kairos-io org practice: Google's reusable OSV-Scanner workflow, failing on any
+# known vulnerability. Results land in Security > Code scanning.
 on:
   pull_request:
   push:
@@ -18,27 +18,51 @@ concurrency:
   group: osv-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only by default; only the scan job below is granted what the reusable
-# workflow needs to upload SARIF.
+# Read-only by default; only the scan jobs below are granted what the reusable
+# workflows need to upload SARIF.
 permissions:
   contents: read
 
+# The reusable workflows are SHA-pinned (and SHA-pin their own actions), but their
+# scanner steps pull docker://ghcr.io/google/osv-scanner-action:v2.5.1 by tag.
+# Residual risk accepted for org consistency; release builds do not consume
+# Actions caches (release.yaml), which bounds what a repointed image could reach.
 jobs:
+  # A pull request is scanned against its own base, so the check only goes red
+  # for an advisory the pull request itself introduces. An advisory published
+  # against code that is already on main is in both scans and cancels out.
+  # Keeping the job id and name keeps the check name `osv-scanner / osv-scan`.
   scan:
     name: osv-scanner
+    if: ${{ github.event_name == 'pull_request' }}
     permissions:
       actions: read
       contents: read
       security-events: write
-    # The reusable workflow is SHA-pinned (and SHA-pins its own actions), but its
-    # scanner steps pull docker://ghcr.io/google/osv-scanner-action:v2.5.1 by tag.
-    # Residual risk accepted for org consistency; release builds do not consume
-    # Actions caches (release.yaml), which bounds what a repointed image could reach.
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    with:
+      # Both reusable workflows default scan-args to "-r ./"; this is that plus an
+      # explicit --config, so the ignore in osv-scanner.toml is applied rather
+      # than left to the scanner's config discovery. It is passed to the base
+      # scan and the head scan alike.
+      scan-args: |-
+        --config=./osv-scanner.toml
+        -r
+        ./
+
+  # main, the weekly run and a manual dispatch carry the whole baseline, so an
+  # advisory published against merged code surfaces here rather than on the next
+  # unrelated pull request. The diff scan cannot serve them: it runs
+  # `git checkout $GITHUB_BASE_REF`, which GitHub sets for pull_request only.
+  scan-baseline:
+    name: osv-scanner-baseline
+    if: ${{ github.event_name != 'pull_request' }}
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
     with:
-      # The reusable workflow defaults to "-r ./"; this is that plus an explicit
-      # --config, so the ignore in osv-scanner.toml is applied rather than left
-      # to the scanner's config discovery. Same shape AuroraBoot uses.
       scan-args: |-
         --config=./osv-scanner.toml
         -r
