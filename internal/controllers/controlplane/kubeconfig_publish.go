@@ -777,24 +777,79 @@ func caFingerprint(sanitized []byte) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// serverFromKubeconfig extracts the single cluster server URL from kubeconfig
-// bytes. Used by defaultWorkloadClient to re-sanitize the contract in place
-// (the contract is already S5 output with the correct forced server).
-func serverFromKubeconfig(data []byte) (string, error) {
-	cfg, err := clientcmd.Load(data)
+// trustedWorkloadKubeconfig returns the kubeconfig the KCP may build a
+// workload-cluster client from (ADR 0011 step 12, and the SF2 hardening): the
+// S5 output of the contract Secret `<cluster>-kubeconfig`, rebuilt with
+//
+//   - the server the controller resolves itself (resolveExpectedServer: the
+//     CAPK LB endpoint, else Cluster.spec.controlPlaneEndpoint), never the
+//     server written in the Secret; and
+//   - a CA that matches the fingerprint pinned on the KairosControlPlane that
+//     Cluster.spec.controlPlaneRef names (KubeconfigCAPinAnnotation). The pin is
+//     read from the KCP, which nodes cannot write, never from the Secret.
+//
+// The KCP is looked up through the Cluster's controlPlaneRef (the authoritative
+// Cluster -> KCP direction; ownerRefs are forgeable), so the factory seams that
+// only carry the Cluster need no change. Every failure is an error, never a
+// fallback to the raw bytes: no endpoint yet, no pin yet, a Sanitize rejection,
+// or a CA that does not match the pin. Callers treat the error as fail-safe.
+func (r *KairosControlPlaneReconciler) trustedWorkloadKubeconfig(ctx context.Context, cluster *clusterv1.Cluster) ([]byte, error) {
+	kcp, err := r.controlPlaneForCluster(ctx, cluster)
 	if err != nil {
-		return "", fmt.Errorf("load kubeconfig: %w", err)
+		return nil, err
 	}
-	if len(cfg.Clusters) != 1 {
-		return "", fmt.Errorf("expected exactly one cluster entry, found %d", len(cfg.Clusters))
+	server, ok, err := resolveExpectedServer(ctx, r.Client, kcp, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the control-plane endpoint of cluster %s/%s: %w", cluster.Namespace, cluster.Name, err)
 	}
-	for _, cl := range cfg.Clusters {
-		if cl == nil || cl.Server == "" {
-			return "", fmt.Errorf("cluster entry has no server")
-		}
-		return cl.Server, nil
+	if !ok {
+		return nil, fmt.Errorf("the control-plane endpoint of cluster %s/%s is not known yet", cluster.Namespace, cluster.Name)
 	}
-	return "", fmt.Errorf("no cluster entry")
+
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: contractKubeconfigSecretName(cluster.Name)}
+	if err := r.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("get workload kubeconfig secret %s: %w", key, err)
+	}
+	data := secret.Data[bootstrapv1beta2.KubeconfigPushSecretDataKey]
+	if len(data) == 0 {
+		return nil, fmt.Errorf("workload kubeconfig secret %s has no non-empty 'value' key", key)
+	}
+	sanitized, err := kubeconfig.Sanitize(data, cluster.Name, server)
+	if err != nil {
+		// The error names the failing rule, never a byte of the input.
+		return nil, fmt.Errorf("workload kubeconfig secret %s failed sanitization: %w", key, err)
+	}
+
+	pin := effectiveCAPin(kcp)
+	if pin == "" {
+		return nil, fmt.Errorf("no CA is pinned on KairosControlPlane %s/%s yet; refusing to build a workload client", kcp.Namespace, kcp.Name)
+	}
+	got, err := caFingerprint(sanitized)
+	if err != nil {
+		return nil, err
+	}
+	if got != pin {
+		return nil, fmt.Errorf("workload kubeconfig secret %s presents a CA that does not match the fingerprint pinned on KairosControlPlane %s/%s; refusing to build a workload client", key, kcp.Namespace, kcp.Name)
+	}
+	return sanitized, nil
+}
+
+// controlPlaneForCluster returns the KairosControlPlane that
+// Cluster.spec.controlPlaneRef names, in the Cluster's namespace. A ref to any
+// other kind is an error: the KCP only builds workload clients for clusters it
+// controls.
+func (r *KairosControlPlaneReconciler) controlPlaneForCluster(ctx context.Context, cluster *clusterv1.Cluster) (*controlplanev1beta2.KairosControlPlane, error) {
+	ref := cluster.Spec.ControlPlaneRef
+	if !ref.IsDefined() || ref.Kind != "KairosControlPlane" ||
+		(ref.APIGroup != "" && ref.APIGroup != controlplanev1beta2.GroupVersion.Group) {
+		return nil, fmt.Errorf("cluster %s/%s does not reference a KairosControlPlane; refusing to build a workload client", cluster.Namespace, cluster.Name)
+	}
+	kcp := &controlplanev1beta2.KairosControlPlane{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: ref.Name}, kcp); err != nil {
+		return nil, fmt.Errorf("get KairosControlPlane %s/%s: %w", cluster.Namespace, ref.Name, err)
+	}
+	return kcp, nil
 }
 
 // neutralizesContent reports whether a sanitizer rejection warrants emptying the

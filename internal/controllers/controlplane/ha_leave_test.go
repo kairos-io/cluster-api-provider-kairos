@@ -45,6 +45,7 @@ import (
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 const testClusterName = "c"
@@ -531,15 +532,19 @@ func failConfigMapGets() interceptor.Funcs {
 }
 
 // TestEndpointRESTConfig_BoundsEveryRequest: the endpoint client keeps the
-// kubeconfig's server, CA and credential, and gives up on any request after
-// workloadRequestTimeout instead of waiting on an apiserver that never answers.
+// control-plane endpoint as server, the kubeconfig's CA and credential, and
+// gives up on any request after workloadRequestTimeout instead of waiting on an
+// apiserver that never answers.
 func TestEndpointRESTConfig_BoundsEveryRequest(t *testing.T) {
 	g := NewWithT(t)
 	scheme := haTestScheme(g)
-	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workloadKubeconfigSecret("https://192.0.2.10:6443")).Build()
+	kcp, cluster := k0sKCP(), testCluster()
+	secret := workloadKubeconfigSecret("https://192.0.2.10:6443")
+	pinWorkloadKubeconfig(t, kcp, cluster, secret)
+	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kcp, secret).Build()
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme}
 
-	cfg, err := r.endpointRESTConfig(context.Background(), testCluster())
+	cfg, err := r.endpointRESTConfig(context.Background(), cluster)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(cfg.Timeout).To(Equal(10 * time.Second))
 	g.Expect(cfg.Host).To(Equal("https://192.0.2.10:6443"))
@@ -574,6 +579,37 @@ func mustGenTestCAPEM() []byte {
 		panic(err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// pinWorkloadKubeconfig puts kcp and cluster in the state the publish path
+// leaves once it has accepted the kubeconfig in secret: the Cluster references
+// kcp as its control plane, has a control-plane endpoint (192.0.2.10:6443
+// unless one is already set), and kcp carries the pin of that kubeconfig's CA.
+// The KCP builds workload clients only from a kubeconfig in this state.
+func pinWorkloadKubeconfig(t *testing.T, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, secret *corev1.Secret) {
+	t.Helper()
+	cluster.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: controlplanev1beta2.GroupVersion.Group, Kind: "KairosControlPlane", Name: kcp.Name,
+	}
+	if cluster.Spec.ControlPlaneEndpoint.Host == "" {
+		cluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: "192.0.2.10", Port: 6443}
+	}
+	server, ok, err := resolveExpectedServer(context.Background(), nil, kcp, cluster)
+	if err != nil || !ok {
+		t.Fatalf("resolve expected server: ok=%v err=%v", ok, err)
+	}
+	sanitized, err := kubeconfig.Sanitize(secret.Data["value"], cluster.Name, server)
+	if err != nil {
+		t.Fatalf("sanitize fixture kubeconfig: %v", err)
+	}
+	pin, err := caFingerprint(sanitized)
+	if err != nil {
+		t.Fatalf("fingerprint fixture kubeconfig: %v", err)
+	}
+	if kcp.Annotations == nil {
+		kcp.Annotations = map[string]string{}
+	}
+	kcp.Annotations[KubeconfigCAPinAnnotation] = pin
 }
 
 // workloadKubeconfigSecret is the `<cluster>-kubeconfig` Secret for

@@ -52,9 +52,11 @@ import (
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/k0sjointoken"
 )
 
-// testCAPEM stands in for the cluster CA. The controller treats it as opaque
-// bytes: it copies it from the workload kubeconfig into the join token.
-var testCAPEM = []byte("-----BEGIN CERTIFICATE-----\nZml4dHVyZS1jYQ==\n-----END CERTIFICATE-----\n")
+// testCAPEM is the cluster CA. The controller copies it from the workload
+// kubeconfig into the join token. It must be a real certificate: the KCP reads
+// the CA only from the sanitized kubeconfig, and the sanitizer rejects
+// certificate-authority-data that does not parse.
+var testCAPEM = []byte(testWorkloadCA)
 
 func fixtureCA(*testing.T) []byte { return testCAPEM }
 
@@ -307,6 +309,8 @@ func newPolicyEnv(t *testing.T, o policyOpts) *policyEnv {
 	kcp := k0sKCP()
 	conditions.MarkTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition)
 	cluster := testCluster()
+	kubeconfigSecret := mgmtKubeconfigSecret(t, ca)
+	pinWorkloadKubeconfig(t, kcp, cluster, kubeconfigSecret)
 
 	jt := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: joinTokenSecretName("c"), Namespace: "default", ResourceVersion: "",
@@ -324,7 +328,7 @@ func newPolicyEnv(t *testing.T, o policyOpts) *policyEnv {
 		es.Data[n] = []byte(`{"name":"` + n + `","healthy":true,"voting":true,"members":3,"reportedAt":"t"}`)
 	}
 
-	objs := append([]client.Object{jt, es, mgmtKubeconfigSecret(t, ca)}, o.configs...)
+	objs := append([]client.Object{kcp, jt, es, kubeconfigSecret}, o.configs...)
 	b := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...)
 	if o.mgmtIntercep != nil {
 		b = b.WithInterceptorFuncs(*o.mgmtIntercep)
