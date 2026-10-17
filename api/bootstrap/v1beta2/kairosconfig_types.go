@@ -65,7 +65,34 @@ const (
 	// Secret-watch predicates match it by label (KD-15), never by name suffix.
 	EtcdStatusSecretTypeLabel = "controlplane.cluster.x-k8s.io/secret-type"
 	EtcdStatusSecretTypeValue = "etcd-status"
+
+	// KubeconfigPushSecretSuffix is appended to the cluster name to form the
+	// per-cluster *staging* kubeconfig Secret name (ADR 0011, option B). The
+	// KairosControlPlane pre-creates and owns it; nodes may only PATCH its
+	// `value` key. The controller rebuilds the staged kubeconfig through
+	// internal/kubeconfig (S5), forces the server it already knows, pins the CA,
+	// and is the sole writer of the contract Secret `<cluster>-kubeconfig`. The
+	// suffix is deliberately NOT a CAPI Secret purpose (it can never collide
+	// with `-kubeconfig`, `-ca`, `-etcd`, `-sa`, `-proxy`).
+	KubeconfigPushSecretSuffix = "kubeconfig-push"
+
+	// KubeconfigPushSecretDataKey is the data key the staged kubeconfig lives
+	// under, matching the contract Secret's own `value` key.
+	KubeconfigPushSecretDataKey = "value"
+
+	// KubeconfigPushSecretTypeLabel + Value mark the staging Secret so the
+	// KairosControlPlane's Secret-watch predicate matches it by label (a watch
+	// HINT only — the authoritative lookup is by name plus controller-owner UID,
+	// never by label; ADR 0011 step 1).
+	KubeconfigPushSecretTypeLabel = "controlplane.cluster.x-k8s.io/secret-type"
+	KubeconfigPushSecretTypeValue = "kubeconfig-push"
 )
+
+// KubeconfigPushSecretName returns the per-cluster staging kubeconfig Secret
+// name for the given cluster (ADR 0011, option B).
+func KubeconfigPushSecretName(clusterName string) string {
+	return clusterName + "-" + KubeconfigPushSecretSuffix
+}
 
 // ControlPlaneJoinTokenSecretName returns the per-cluster HA join-token Secret
 // name for the given cluster.

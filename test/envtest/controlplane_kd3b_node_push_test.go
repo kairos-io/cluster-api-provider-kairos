@@ -77,6 +77,10 @@ func TestKD3b_KubeconfigReady_TransitionsOnNodePush(t *testing.T) {
 				Kind:     "KairosControlPlane",
 				Name:     clusterName + "-kcp",
 			},
+			// ADR 0011: the publish path forces the server it knows into the
+			// kubeconfig; without an endpoint it cannot canonicalize, so it stays
+			// in the waiting state. A real (non-CAPK) endpoint is required.
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
 		},
 	}
 	g.Expect(c.Create(ctx, cluster)).To(Succeed())
@@ -162,8 +166,9 @@ func TestKD3b_KubeconfigReady_TransitionsOnNodePush(t *testing.T) {
 	g.Expect(got.Status.LastNodePushObserved).NotTo(BeNil())
 
 	// (2) Simulate the node-side curl push: write the kubeconfig Secret with
-	// the cluster-name label, the node-push annotation, and a non-empty
-	// payload.
+	// the cluster-name label, the node-push annotation, and a REAL kubeconfig
+	// payload (ADR 0011: a synthetic/empty payload is now rejected by the
+	// sanitizer, so the fixture must be a valid admin kubeconfig).
 	pushedSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      clusterName + "-kubeconfig",
@@ -174,13 +179,12 @@ func TestKD3b_KubeconfigReady_TransitionsOnNodePush(t *testing.T) {
 			},
 		},
 		Type: clusterv1.ClusterSecretType,
-		Data: map[string][]byte{
-			"value": []byte("apiVersion: v1\nkind: Config\nclusters: []\ncontexts: []\nusers: []\n"),
-		},
+		Data: map[string][]byte{"value": validWorkloadKubeconfig(t)},
 	}
 	g.Expect(c.Create(ctx, pushedSecret)).To(Succeed())
 
-	// (3) Watch should wake KCP and the condition should flip to True.
+	// (3) Watch should wake KCP and the condition should flip to True once the
+	// controller adopts + rebuilds (S5) the pushed kubeconfig.
 	g.Eventually(func() corev1.ConditionStatus {
 		got := &controlplanev1beta2.KairosControlPlane{}
 		if err := c.Get(ctx, types.NamespacedName{Name: kcp.Name, Namespace: kcp.Namespace}, got); err != nil {
@@ -199,4 +203,14 @@ func TestKD3b_KubeconfigReady_TransitionsOnNodePush(t *testing.T) {
 	g.Expect(got.Status.LastNodePushObserved).To(BeNil(), "Secret-present must clear LastNodePushObserved")
 	g.Expect(got.Status.Initialized).To(BeTrue(),
 		"Initialized must flip to true when the kubeconfig Secret is observed (no NodeRef required)")
+
+	// (4) The controller must have ADOPTED the contract Secret: taken controller
+	// ownership (so it GCs with the KCP), stamped a source, and pinned the CA on
+	// the KCP annotation. The published content is a sanitizer fixed point.
+	adopted := &corev1.Secret{}
+	g.Expect(c.Get(ctx, types.NamespacedName{Name: clusterName + "-kubeconfig", Namespace: ns.Name}, adopted)).To(Succeed())
+	g.Expect(metav1.IsControlledBy(adopted, got)).To(BeTrue(), "the KCP must become the controller owner of the contract Secret")
+	g.Expect(adopted.Data["value"]).NotTo(BeEmpty())
+	g.Expect(got.Annotations["controlplane.cluster.x-k8s.io/kubeconfig-ca-pin"]).NotTo(BeEmpty(),
+		"the first accepted publish must pin the CA on the KCP annotation")
 }

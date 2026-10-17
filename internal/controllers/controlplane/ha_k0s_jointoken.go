@@ -56,7 +56,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/clientcmd"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -311,29 +310,23 @@ func (r *KairosControlPlaneReconciler) workloadClientFor(ctx context.Context, cl
 	return factory(ctx, cluster)
 }
 
-// workloadClusterCA returns the cluster CA from the workload kubeconfig Secret.
-// The KCP's workload client already verifies the apiserver against it, and on
-// k0s it is the same CA `k0s token create` embeds, so joiners verify the :9443
-// join API against it too.
+// workloadClusterCA returns the cluster CA of the workload kubeconfig. The KCP's
+// workload client already verifies the apiserver against it, and on k0s it is
+// the same CA `k0s token create` embeds, so joiners verify the :9443 join API
+// against it too.
+//
+// It comes from workloadRESTConfig, so it is the CA of the sanitized kubeconfig
+// and matches the fingerprint pinned on the KairosControlPlane (ADR 0011): a
+// CA that was swapped into the Secret is never handed to a joiner.
 func (r *KairosControlPlaneReconciler) workloadClusterCA(ctx context.Context, cluster *clusterv1.Cluster) ([]byte, error) {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-kubeconfig", cluster.Name)}
-	if err := r.Get(ctx, key, secret); err != nil {
-		return nil, fmt.Errorf("get workload kubeconfig secret %s: %w", key, err)
-	}
-	cfg, err := clientcmd.Load(secret.Data["value"])
+	restCfg, err := r.workloadRESTConfig(ctx, cluster)
 	if err != nil {
-		return nil, fmt.Errorf("workload kubeconfig secret %s does not parse", key)
+		return nil, err
 	}
-	kctx, ok := cfg.Contexts[cfg.CurrentContext]
-	if !ok || kctx == nil {
-		return nil, fmt.Errorf("workload kubeconfig secret %s has no current context", key)
+	if len(restCfg.CAData) == 0 {
+		return nil, fmt.Errorf("workload kubeconfig for cluster %s/%s carries no cluster CA data", cluster.Namespace, cluster.Name)
 	}
-	cl, ok := cfg.Clusters[kctx.Cluster]
-	if !ok || cl == nil || len(cl.CertificateAuthorityData) == 0 {
-		return nil, fmt.Errorf("workload kubeconfig secret %s carries no cluster CA data", key)
-	}
-	return cl.CertificateAuthorityData, nil
+	return restCfg.CAData, nil
 }
 
 // storedK0sJoinToken is what the management join-token Secret currently holds.

@@ -220,6 +220,22 @@ type ManagementEndpoint struct {
 	// interpolated through text/template — the reporter builds the JSON on-node.
 	// Set for init+join (both distros); empty for single-node and workers.
 	EtcdStatusSecretName string
+	// CABundle is the PEM-encoded certificate-authority bundle the node uses to
+	// verify the management API server's TLS certificate on the node-push channel
+	// (ADR 0011 PR-4). It is the management cluster's own API server CA, taken
+	// from the controller's in-cluster trust root (rest.Config CAData/CAFile) or
+	// an operator override (KAIROS_MANAGEMENT_API_CA_FILE); it is NEVER the tenant
+	// workload cluster's kube-root-ca.crt.
+	//
+	// The CA is a public certificate, not secret material, but it is still
+	// render-safety-sensitive: it is written to a fixed 0644 write_files path
+	// (/etc/kairos-capi/management-ca.crt) and the push curls point --cacert at
+	// that path. It is NEVER inlined into a curl argv. The bytes are validated
+	// and canonically re-encoded (CERTIFICATE blocks only, no PRIVATE KEY) by
+	// SanitizeManagementCABundle before they reach here, and validateTemplateData
+	// re-checks them at render time. Empty means no CA file is rendered and the
+	// push fails closed (there is no -k/--insecure fallback anywhere).
+	CABundle string
 }
 
 // InstallConfig holds installation configuration for the template

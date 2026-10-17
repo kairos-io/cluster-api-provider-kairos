@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 const (
@@ -356,29 +357,10 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 		return zero, fmt.Errorf("the %s Secret carries no certificate-authority-data: refusing to mint a token without a CA pin", kubeconfigKey.Name)
 	}
 
-	// Cross-check against <cluster>-ca if it exists (UNCACHED read, cert only). Do
-	// NOT require the Secret to exist or to be owned: Kamaji's default setup and an
-	// upstream-KCP user-supplied CA legitimately have no CAPI controller owner
-	// (ADR 0010 P1 step 1).
 	caKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + "-ca"}
-	caSecret := &corev1.Secret{}
-	caCrossChecked := false
-	if err := s.caReader.Get(ctx, caKey, caSecret); err == nil {
-		crt, ok := caSecret.Data[clusterCASecretCrtKey]
-		if !ok || len(crt) == 0 {
-			return zero, fmt.Errorf("the %s Secret has no %q: cannot cross-check the CA pin", caKey.Name, clusterCASecretCrtKey)
-		}
-		_, caDER, perr := caCertHashesFromPEM(crt)
-		if perr != nil {
-			return zero, fmt.Errorf("the %s Secret has an unparseable %q: %v", caKey.Name, clusterCASecretCrtKey, perr)
-		}
-		if !derCertSetsEqual(kubeconfigCADER, caDER) {
-			return zero, fmt.Errorf("the kubeconfig CA does not match the %s Secret's %q; inspect the Secret and re-pin if this change is expected",
-				caKey.Name, clusterCASecretCrtKey)
-		}
-		caCrossChecked = true
-	} else if !apierrors.IsNotFound(err) {
-		return zero, newNotReady("WaitingForClusterCA", "waiting to cross-check the %s Secret: %v", caKey.Name, err)
+	caCrossChecked, err := crossCheckClusterCA(ctx, s.caReader, cluster, kubeconfigCADER)
+	if err != nil {
+		return zero, err
 	}
 
 	// Exactly one of the two independent anchors must hold, because the owner
@@ -394,6 +376,16 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 	if !sameServer(server, wantServer) && !caCrossChecked {
 		return zero, fmt.Errorf("the %s Secret's server %q does not equal the Cluster control-plane endpoint %q, and there is no %s Secret to cross-check its CA against: refusing to mint a token",
 			kubeconfigKey.Name, server, wantServer, caKey.Name)
+	}
+
+	// The kubeconfig must also survive the sanitizer (ADR 0011): the workload
+	// client that mints the token is built from its rebuilt (S5) form, never the
+	// raw bytes (SanitizingKubeconfigReader), so a kubeconfig the sanitizer
+	// refuses would never connect. Refuse here, before any token exists, with the
+	// rule that failed (never a byte of the content).
+	if _, err := kubeconfig.Sanitize(kcData, cluster.Name, anchoredServer(server, wantServer)); err != nil {
+		return zero, fmt.Errorf("the %s Secret is not a kubeconfig this controller will connect with: %v; refusing to mint a token",
+			kubeconfigKey.Name, err)
 	}
 
 	return trustedControlPlane{

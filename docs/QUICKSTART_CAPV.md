@@ -482,9 +482,9 @@ If `KairosConfig.status.failureMessage` is set, the issue is transient — it cl
 
 **When to use:** the workload VM has no network route back to the management
 cluster API server (`<mgmt-api-server-host>:6443`). The node-push path —
-where the VM POSTs its kubeconfig to a management cluster Secret — is
-unreachable. Without this fallback, `KubeconfigReadyCondition` stays
-`False(WaitingForNodePush)` indefinitely.
+where the VM PATCHes its kubeconfig into a staging Secret the control plane
+owns in the management cluster — is unreachable. Without this fallback,
+`KubeconfigReadyCondition` stays `False(WaitingForNodePush)` indefinitely.
 
 **When NOT to use:** the default node-push path works in most networks. Do
 not enable SSHFallback unless you have confirmed that the VM cannot reach
@@ -568,6 +568,12 @@ The `KubeconfigReadyCondition` Reason tells you which path is active:
 | `SSHFallbackDialing` | SSH fallback is in progress; wait up to 30 seconds. |
 | `SSHFallbackFailed` | SSH attempt failed. Check Events for the categorized error (host-key mismatch, auth failure, file not found). |
 | `SSHFallbackMisconfigured` | A referenced Secret is missing, empty, or unparseable. Fix the Secret; the controller retries automatically. |
+
+`KubeconfigReadyCondition` can also go `False` for reasons unrelated to
+SSHFallback — a rejected or CA-mismatched kubeconfig, or a Secret the
+controller cannot take ownership of. See
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full reason list, including the `NodePushCAMismatch` re-pin runbook.
 
 For detailed error information when the Reason is `SSHFallbackFailed` or
 `SSHFallbackMisconfigured`:

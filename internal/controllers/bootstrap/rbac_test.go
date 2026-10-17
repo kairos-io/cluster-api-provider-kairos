@@ -75,12 +75,3 @@ func roleAllows(role rbacRole, group, resource, verb string) bool {
 	}
 	return false
 }
-
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}

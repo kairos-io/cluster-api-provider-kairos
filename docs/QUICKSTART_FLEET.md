@@ -107,10 +107,11 @@ metal and pre-provisioned edge nodes that phone home to AuroraBoot.
    control-plane node once it comes up.
 
 5. **Network reachability from the claimed nodes to the management cluster's
-   API server.** Like CAPV/CAPM3, fleet nodes POST their kubeconfig back to a
-   Secret in the management cluster rather than being SSHed into. Set
-   `KAIROS_MANAGEMENT_API_OVERRIDE` on the bootstrap provider to a URL the
-   nodes can reach; without it they are given the in-cluster Service URL. See
+   API server.** Like CAPV/CAPM3, fleet nodes PATCH their kubeconfig into a
+   staging Secret the control plane owns in the management cluster, rather
+   than being SSHed into. Set `KAIROS_MANAGEMENT_API_OVERRIDE` on the bootstrap
+   provider to a URL the nodes can reach; without it they are given the
+   in-cluster Service URL. See
    [INSTALL.md — Set the URL the nodes push to](INSTALL.md#set-the-url-the-nodes-push-to)
    and [Network reachability requirement for non-CAPK infrastructure](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure).
    For air-gapped nodes, the opt-in `SSHFallback` mechanism on
@@ -296,7 +297,12 @@ kubectl --kubeconfig=fleet-demo-kubeconfig.yaml get nodes
 **Node-push behavior:** the control-plane node posts its kubeconfig to a
 Secret in the management cluster at bootstrap time, the same as CAPV/CAPM3.
 If the node has no route to the management cluster's API server, enable
-`SSHFallback` on the `KairosControlPlane` (see Prerequisites above).
+`SSHFallback` on the `KairosControlPlane` (see Prerequisites above). The
+controller validates and canonicalizes whatever it receives before
+publishing it — see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full set of `KubeconfigReady` reasons if the Secret does not appear
+or a kubeconfig you extract looks unexpected.
 
 ### providerID cross-provider contract — verify the match
 
@@ -349,7 +355,7 @@ fleet provider's own roadmap, not something this repo controls.
 | `KairosControlPlane` stuck `Available=False(WaitingForInfrastructureControlPlaneEndpoint)` | `KairosFleetCluster.spec.controlPlaneEndpoint.host` is unset or empty | Fleet does not allocate an endpoint; set it explicitly (Step 4 above). |
 | Node comes back after reboot but the machine never leaves `WaitingForNodeRejoin` | The controller requires the node's heartbeat to be newer than the recorded reboot time | Check that the AuroraBoot node's `lastHeartbeat` is advancing; a node that never phones home after reboot (agent not running, network unreachable) never satisfies the gate. |
 | Workload `Node` has no `providerID`, or it does not match `kairos-fleet://...` | The bootstrap cloud-config's fleet providerID self-discovery path did not run, or ran against the wrong distribution | Confirm the `KairosConfigTemplate` distribution matches your Kairos image, and that the node image runs the Kairos phone-home agent with persisted credentials (see "providerID cross-provider contract" above). |
-| `KubeconfigReadyCondition` stays `False(WaitingForNodePush)` | No network route from the node to the management cluster API server | Run `curl -k https://<mgmt-api-server-host>:6443/api` from the node; if it fails, open the network path or enable `SSHFallback`. |
+| `KubeconfigReadyCondition` stays `False(WaitingForNodePush)` | No network route from the node to the management cluster API server | Run the TLS-verified check from [INSTALL.md](INSTALL.md#management-api-tls-verification-and-the-ca-source) — `curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api` from the node (`curl -k` will not catch a certificate mismatch); if it fails, open the network path or enable `SSHFallback`. |
 
 ---
 
