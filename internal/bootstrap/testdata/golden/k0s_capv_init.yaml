@@ -215,7 +215,9 @@ write_files:
   # concatenated into the YAML. The DaemonSet runs one kube-vip per control-plane
   # Node; the instances leader-elect on the plndr-cp-lock Lease (hence the RBAC)
   # and the leader ARPs the floating control-plane VIP, so VIP ownership fails
-  # over when the leader's Node dies.
+  # over when the leader's Node dies. Each instance elects through its own Node's
+  # apiserver (127.0.0.1:6443), so a member keeps the VIP only while its own
+  # apiserver can write to etcd (ADR 0014).
   - path: /var/lib/k0s/manifests/kube-vip/kube-vip.yaml
     permissions: "0644"
     owner: root
@@ -324,18 +326,15 @@ write_files:
                             value: "1"
                           - name: bgp_enable
                             value: "false"
+                          - name: KUBERNETES_SERVICE_HOST
+                            value: 127.0.0.1
+                          - name: KUBERNETES_SERVICE_PORT
+                            value: "6443"
                         securityContext:
                           capabilities:
                               add:
                                   - NET_ADMIN
                                   - NET_RAW
-                        volumeMounts:
-                          - mountPath: /etc/kubernetes/admin.conf
-                            name: kubeconfig
-                  volumes:
-                      - name: kubeconfig
-                        hostPath:
-                          path: /etc/kubernetes/admin.conf
           updateStrategy:
               type: RollingUpdate
   - path: /usr/local/etc/hostname
@@ -422,34 +421,72 @@ write_files:
       # complement-translate, or it becomes a spurious trailing '-' that no
       # longer matches NodeRef.Name.
       member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
-      # Target the control-plane VIP, NOT this node's local apiserver: `k0s etcd
-      # leave` (below) drops THIS node's local apiserver (it loses its etcd
-      # backend), so a localhost read/ack would fail post-leave and never retry.
-      # The VIP is always fronted by a surviving node, so both the sentinel read
-      # and the `left` ack keep working across the timer's poll cycles until the
-      # ack lands. VIP.Address is render-validated (VIP-INV-3) + shquoted
-      # (VIP-INV-1); it is a --server flag value, never eval'd.
+      # Read and ack through the control-plane VIP, not this node's own apiserver:
+      # `k0s etcd leave` (below) removes THIS node from etcd, after which its local
+      # apiserver has no backend and cannot take the ack. The VIP is not guaranteed
+      # to be off this node at that moment. kube-vip moves it within about 8s once
+      # its holder's apiserver stops writing to etcd (ADR 0014), and a node that
+      # predates that change can keep it longer. So every call is bounded, the ack
+      # is retried inside the run, and a completed leave is never re-run (below).
+      # VIP.Address is render-validated (VIP-INV-3) + shquoted (VIP-INV-1); it is a
+      # --server flag value, never eval'd.
       vip_addr='192.168.1.240'
       srv=(--server="https://${vip_addr}:6443")
       # Read our own leave signal from the workload ConfigMap via the VIP.
-      # Absent ConfigMap/key => empty => no-op exit.
-      val=$(k0s kubectl "${srv[@]}" -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
+      # Absent ConfigMap/key => empty (or an unreachable endpoint) => no-op exit.
+      val=$(k0s kubectl "${srv[@]}" --request-timeout=10s -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
       # Fixed sentinel, string-equality only — never eval'd, never a command arg.
       [ "${val}" = "leave-requested" ] || exit 0
-      echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
-      # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
-      # configured peer address — no ConfigMap/operator-derived value reaches the
-      # command (security constraint: peer-address is never externally supplied).
-      if k0s etcd leave 2>/dev/null; then
-        echo "etcd-leave: left etcd cluster"
+      # Set once `k0s etcd leave` has run to completion. The timer fires every 30s
+      # and the sentinel stays until the controller sees the ack, so without the
+      # marker a run that could not ack would start `k0s etcd leave` again against
+      # an etcd that is already gone, where it blocks. /run is cleared on reboot.
+      leave_marker=/run/kairos-etcd-left
+      if [ -e "${leave_marker}" ]; then
+        echo "etcd-leave: leave already completed for ${member_key}; acking"
       else
-        echo "etcd-leave: k0s etcd leave returned non-zero (already left?); acking anyway"
+        echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
+        # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
+        # configured peer address — no ConfigMap/operator-derived value reaches the
+        # command. It has no deadline of its own, so bound it with timeout(1); an
+        # image without timeout(1) keeps the unbounded call. Its stderr goes to the
+        # journal.
+        rc=0
+        if command -v timeout >/dev/null 2>&1; then
+          timeout 120 k0s etcd leave || rc=$?
+        else
+          k0s etcd leave || rc=$?
+        fi
+        # Anything but a clean exit (a timeout, etcd refusing the removal, a peer
+        # address that cannot be found, a config that fails to load, a missing
+        # binary) leaves the membership unknown, so report nothing: no `left` and no
+        # marker. The next run tries again, and if it keeps failing the controller's
+        # own timeout handles the member.
+        if [ "${rc}" -ne 0 ]; then
+          echo "etcd-leave: k0s etcd leave failed (rc=${rc}); not acking, will retry on the next run" >&2
+          exit 1
+        fi
+        echo "etcd-leave: left etcd cluster"
+        touch "${leave_marker}"
       fi
-      # Ack by patching our own key to `left` via the VIP (the local apiserver is
-      # gone now). Only member_key (locally sanitized) is interpolated; the
-      # read-back value is never reused.
-      k0s kubectl "${srv[@]}" -n kube-system patch configmap kairos-etcd-leave --type merge \
-        -p "{\"data\":{\"${member_key}\":\"left\"}}" 2>/dev/null || true
+      # Ack by patching our own key to `left` via the VIP. Only member_key
+      # (locally sanitized) is interpolated; the read-back value is never reused.
+      # The endpoint can still be fronted by this node for a few seconds, so retry
+      # up to 24 x 5s. TimeoutStartSec on the service bounds the whole run; the
+      # marker above makes the next run resume at this step.
+      for attempt in {1..24}; do
+        if k0s kubectl "${srv[@]}" --request-timeout=10s -n kube-system patch configmap kairos-etcd-leave --type merge \
+          -p "{\"data\":{\"${member_key}\":\"left\"}}" >/dev/null 2>&1; then
+          echo "etcd-leave: acked left for ${member_key}"
+          exit 0
+        fi
+        if [ "${attempt}" -lt 24 ]; then
+          echo "etcd-leave: ack attempt ${attempt}/24 failed; retrying in 5s"
+          sleep 5
+        fi
+      done
+      echo "etcd-leave: could not ack left for ${member_key}; the next run resumes at the ack" >&2
+      exit 1
   - path: /etc/systemd/system/kairos-etcd-leave.service
     permissions: "0644"
     owner: root
@@ -464,6 +501,9 @@ write_files:
 
       [Service]
       Type=oneshot
+      # A oneshot unit has no start timeout by default. The script bounds each call
+      # and retries the ack for about two minutes, so five minutes is a hard stop.
+      TimeoutStartSec=300
       ExecStart=/usr/local/bin/kairos-etcd-leave.sh
   - path: /etc/systemd/system/kairos-etcd-leave.timer
     permissions: "0644"
@@ -712,107 +752,6 @@ write_files:
       }
       if ! push_kubeconfig; then
         echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
-      fi
-      # ADR 0005 (HA) k0s init node: mint the controller-role join token and push
-      # it to the management cluster over the SAME node-push channel as the
-      # kubeconfig (NOT SSH — KD-3b / OQ-2). The k0s controller-join token does
-      # not exist until k0s is up, so the controller cannot pre-generate it (as it
-      # does for k3s); the init node creates it here and PUTs it into the
-      # pre-created, owner-ref'd join-token Secret. Joiners then resolve it via
-      # ControlPlaneJoinTokenSecretRef and the controller's joiner gate opens.
-      #
-      # SECURITY (TOKEN-INV): the token is captured into a shell var and
-      # base64-enveloped into the Secret data — it is NEVER interpolated through
-      # text/template, NEVER echoed, and NEVER logged. All management-endpoint
-      # values are shquote'd (single-quoted POSIX literals; no shell evaluation),
-      # identical to the kubeconfig push above.
-      push_join_token() {
-        if ! command -v curl >/dev/null 2>&1; then
-          echo "WARN: curl not available; cannot push join token"
-          return 1
-        fi
-        if ! command -v base64 >/dev/null 2>&1; then
-          echo "WARN: base64 not available; cannot push join token"
-          return 1
-        fi
-        local jt=""
-        # `k0s token create` needs more than "the apiserver is up" — the bootstrap
-        # token machinery has to be serving too, and that lags k0s start by a few
-        # seconds. This script runs immediately after the kubeconfig push, i.e.
-        # within seconds of k0s starting, so the first attempt loses that race
-        # often enough to matter.
-        #
-        # This token is the ONLY gate on HA formation: initMachineJoinable holds
-        # every joiner until the Secret is non-empty. The unit is a oneshot, so a
-        # single failed attempt used to strand the cluster permanently: the old
-        # code deferred to a next boot that never comes, since nothing reboots
-        # the node. Observed on a bare-metal k0s HA
-        # lab: create returned empty at T+4s, the joiner gate then held for 45
-        # minutes, and the identical command run by hand afterwards succeeded.
-        #
-        # Bounded on the same 300s budget as the node-registration waits above.
-        # Long expiry so the token stays valid across the whole HA join window.
-        for i in {1..60}; do
-          jt=$(k0s token create --role=controller --expiry=24h 2>/dev/null || true)
-          if [ -n "${jt}" ]; then
-            break
-          fi
-          echo "Attempt $i/60: k0s token create not ready yet, retrying in 5 seconds..."
-          sleep 5
-        done
-        if [ -z "${jt}" ]; then
-          echo "WARN: k0s token create still empty after 60 attempts (300s); joiners will block"
-          return 1
-        fi
-        local jt_b64
-        jt_b64=$(printf '%s' "${jt}" | base64 -w 0 2>/dev/null || printf '%s' "${jt}" | base64 | tr -d '\n')
-        # Scrub the plaintext token from the shell as soon as it is enveloped.
-        unset jt
-        local api='https://mgmt.example.com:6443'
-        local ns='default'
-        local jt_name='ha-cluster-control-plane-join-token'
-        local token='mgmt-token'
-        local cluster_name='ha-cluster'
-        # PATCH the pre-existing (controller-created, owner-ref'd) Secret's
-        # data.token via a strategic-merge patch. The Secret already exists and is
-        # owned by the KCP, so we only ever update data — never create — which is
-        # exactly the RBAC the node SA is granted (update/patch on the named
-        # join-token Secret, no create).
-        local patch
-        patch="{\"data\":{\"token\":\"${jt_b64}\"}}"
-        local url="${api}/api/v1/namespaces/${ns}/secrets/${jt_name}"
-        # Same reasoning as the create loop: a transient failure here strands every
-        # joiner just as permanently, so retry rather than give up after one shot.
-        # The 2xx test is a glob, not an arithmetic comparison, so an empty status
-        # from a failed curl cannot abort the loop.
-        local status="" pushed=""
-        for i in {1..30}; do
-          status=$(curl -k -sS -o /tmp/kairos-jointoken-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/strategic-merge-patch+json" \
-            -X PATCH \
-            --data "${patch}" \
-            "${url}" || true)
-          case "${status}" in
-            2[0-9][0-9]) pushed=yes ;;
-          esac
-          if [ -n "${pushed}" ]; then
-            break
-          fi
-          echo "Attempt $i/30: join-token push returned '${status}', retrying in 5 seconds..."
-          sleep 5
-        done
-        # Scrub the enveloped token too.
-        unset jt_b64 patch
-        if [ -n "${pushed}" ]; then
-          echo "Pushed controller-join token to management secret ${ns}/${jt_name}"
-          return 0
-        fi
-        echo "WARN: failed to push controller-join token after 30 attempts (last status '${status}')"
-        return 1
-      }
-      if ! push_join_token; then
-        echo "WARN: controller-join token push failed; joiners will wait until it succeeds"
       fi
       # ADR 0005 §E.1 (HA) etcd-health reporter: every control-plane node (init
       # AND join) reports its own etcd member health into the per-cluster

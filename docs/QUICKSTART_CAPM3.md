@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPM3 (Metal3 / bare metal)
 
-Last verified against: Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, BMO v0.13.0, provider v0.1.3. Verified on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
+Last verified against: provider v0.1.4, 2026-10-16, with Kairos v4.1.2 (Hadron v0.4.0, k0s v1.34.8), CAPI v1.12.2, CAPM3 v1.13.0, and Ironic 38.1: a single-node k0s cluster on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM), with the Machine and Node providerIDs matching. Earlier releases were verified against Kairos v3.6.0+, Kairos Hadron v0.0.4, CAPI v1.13.4, CAPM3 v1.13.0, and BMO v0.13.0, on emulated bare metal (sushy-tools Redfish BMC + libvirt/KVM) and on physical hardware (Hadron whole-disk deploy to bare metal); the same flow applies to physical hardware with a Redfish/IPMI BMC.
 
 This guide walks you through creating a single-node k3s or k0s cluster on Kairos using Cluster API with the Metal3 infrastructure provider (CAPM3). k0s and k3s use the identical flow and differ only in distribution and version fields. For a 3-node HA control plane, see [High-Availability control plane](#high-availability-control-plane) below.
 
@@ -51,8 +51,11 @@ The fix is the same as for standard Kairos: build a fully-installed disk. The su
 
 1. Build the Hadron ISO with `auroraboot`:
    ```bash
-   auroraboot build-iso -n <name> docker:<hadron-image>
+   # Name --output: the next step has to find the ISO, and the auroraboot
+   # default for it is not the same in every release.
+   auroraboot build-iso -n <name> --output . docker:<hadron-image>
    # e.g.: docker:quay.io/kairos/hadron:v0.0.4-standard-amd64-generic-v4.0.3-k3s-v1.35.2-k3s1
+   # writes ./<name>.iso and ./<name>.iso.sha256
    ```
 2. Boot that ISO in QEMU against a blank 20 G raw disk with an install cloud-config (same QEMU procedure described below), allowing Kairos to install and power off.
 3. Verify with `losetup`: the `state` partition (label `state`) must be present alongside `recovery`.
@@ -206,7 +209,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
    kubectl get crd metal3clusters.infrastructure.cluster.x-k8s.io
    ```
 
-5. **Kairos CAPI Provider**: v0.1.0+ installed (see [INSTALL.md](INSTALL.md)).
+5. **Kairos CAPI Provider**: v0.1.3+ installed (see [INSTALL.md](INSTALL.md)). v0.1.3 makes the bootstrap provider wait for the control-plane endpoint before it renders bootstrap data. Earlier releases could render it too early, and a node that has installed from that data does not recover.
 
 6. **Fully-installed Kairos disk image**: See "Building the disk image" above.
 
@@ -221,7 +224,7 @@ The k3s or k0s version is fixed at image-build time. `KairosControlPlane.spec.ve
 Install CAPM3 using `clusterctl` or the upstream manifests. Refer to the [Metal3 documentation](https://book.metal3.io/capm3/introduction) for the current install procedure. The Kairos CAPI provider is installed separately:
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.3/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
 ```
 
 See [INSTALL.md](INSTALL.md) for the full provider install and verification steps.
@@ -347,7 +350,7 @@ kubectl --kubeconfig=kairos-m3-kubeconfig.yaml get nodes
 kubectl --kubeconfig=kairos-m3-kubeconfig.yaml get pods -n kube-system
 ```
 
-**Node-push behavior:** The control-plane node posts its kubeconfig to a Secret in the management cluster at bootstrap time. The node must have network reachability to the management cluster's API server (`<mgmt-api-server-host>:6443`). See [INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) for verification steps.
+**Node-push behavior:** The control-plane node posts its kubeconfig to a Secret in the management cluster at bootstrap time. The node must have network reachability to the management cluster's API server (`<mgmt-api-server-host>:6443`), and the bootstrap provider must be told that URL with `KAIROS_MANAGEMENT_API_OVERRIDE`: without it, nodes are given the in-cluster Service URL, which a bare-metal node cannot reach. See [INSTALL.md](INSTALL.md#set-the-url-the-nodes-push-to) for how to set it, and [Network reachability](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure) for verification steps.
 
 If the node cannot reach the management API server, enable the opt-in [Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback) on the `KairosControlPlane`.
 

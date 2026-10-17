@@ -109,7 +109,7 @@ type etcdMemberStatus struct {
 func (r *KairosControlPlaneReconciler) readEtcdStatus(ctx context.Context, cluster *clusterv1.Cluster) (map[string]etcdMemberStatus, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}
-	if err := r.Client.Get(ctx, key, secret); err != nil {
+	if err := r.Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return map[string]etcdMemberStatus{}, nil
 		}
@@ -157,7 +157,7 @@ func etcdVotingHealthyCount(status map[string]etcdMemberStatus) int {
 //     never the node-reported `members` list length (unvalidated, forgeable).
 func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, target *clusterv1.Machine) (bool, string, error) {
 	// Whole-cluster teardown must never deadlock on quorum (the single bypass).
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kcp.DeletionTimestamp.IsZero() {
 		return true, "", nil
 	}
 	desiredReplicas := int32(1)

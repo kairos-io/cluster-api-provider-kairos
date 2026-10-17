@@ -44,6 +44,15 @@ const (
 	// ControlPlaneJoinTokenSecretDataKey is the data key holding the join token.
 	ControlPlaneJoinTokenSecretDataKey = "token"
 
+	// K0sControllerJoinTokenIDAnnotation carries the bootstrap-token ID of the k0s
+	// controller-join token that the KairosControlPlane minted (ADR 0013). The KCP
+	// sets it on the join-token Secret, in the same write as the token, and on
+	// every join KairosConfig it creates. The bootstrap controller renders a k0s
+	// join only when the two values match, so a joiner never receives a token
+	// other than the one it was created for. The ID is the public half of the
+	// token and is not secret.
+	K0sControllerJoinTokenIDAnnotation = "controlplane.cluster.x-k8s.io/k0s-join-token-id"
+
 	// EtcdStatusSecretSuffix is appended to the cluster name to form the
 	// per-cluster HA etcd-health Secret name (ADR 0005 §E.1). Every control-plane
 	// node PATCHes its own member key over the node-push channel; the controlplane
@@ -173,11 +182,11 @@ type KairosConfigSpec struct {
 	// +kubebuilder:validation:MaxItems=32
 	Files []File `json:"files,omitempty"`
 
-	// PreCommands are commands to run before k0s/k3s installation
+	// PreCommands is reserved and not yet rendered into the cloud-config.
 	// +optional
 	PreCommands []string `json:"preCommands,omitempty"`
 
-	// PostCommands are commands to run after k0s/k3s installation
+	// PostCommands is reserved and not yet rendered into the cloud-config.
 	// +optional
 	PostCommands []string `json:"postCommands,omitempty"`
 

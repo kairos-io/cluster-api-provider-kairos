@@ -42,7 +42,8 @@
 #        before the distribution starts. This is the user's responsibility;
 #        the Kairos CAPI provider does not perform the reload automatically.
 #
-#   Single-node only: multi-node control planes are not yet supported (KD-5).
+#   Single node only: every Machine created from this template renders the
+#   same .network file, so a fixed address can be used by only one node.
 # ============================================================================
 
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2

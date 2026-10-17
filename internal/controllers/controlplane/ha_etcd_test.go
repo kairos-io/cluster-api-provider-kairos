@@ -176,9 +176,10 @@ func TestSetHAConditions_EtcdHealthy(t *testing.T) {
 }
 
 // TestInitMachineJoinable_GatesOnEtcdReport asserts the ADR 0005 §E.1 joiner-gate
-// graduation: with NodeRef + KubeconfigReady + join-token all satisfied, a k0s
-// init is still NOT joinable until it reports a healthy voting etcd member, and
-// becomes joinable once it does.
+// graduation: with NodeRef + KubeconfigReady satisfied, a k0s init is still NOT
+// joinable until it reports a healthy voting etcd member, and becomes joinable
+// once it does. (The gate no longer reads the join token; admitJoiner mints it
+// after the gate opens, ADR 0013.)
 func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 	g := NewWithT(t)
 	scheme := haTestScheme(g)
@@ -192,13 +193,8 @@ func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "default"},
 		Status:     clusterv1.MachineStatus{NodeRef: clusterv1.MachineNodeReference{Name: "cp-0"}},
 	}
-	jt := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: joinTokenSecretName("c"), Namespace: "default"},
-		Data:       map[string][]byte{joinTokenSecretDataKey: []byte("tok")},
-	}
-
 	// No etcd report yet: NOT joinable (k0s strict).
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(jt).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 	joinable, reason, err := r.initMachineJoinable(context.Background(), kcp, cluster, []*clusterv1.Machine{init})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -210,7 +206,7 @@ func TestInitMachineJoinable_GatesOnEtcdReport(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: etcdStatusSecretName("c"), Namespace: "default"},
 		Data:       map[string][]byte{"cp-0": []byte(`{"name":"cp-0","healthy":true,"voting":true,"members":1,"reportedAt":"t"}`)},
 	}
-	c2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(jt, es).Build()
+	c2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(es).Build()
 	r2 := &KairosControlPlaneReconciler{Client: c2, Scheme: scheme}
 	joinable, _, err = r2.initMachineJoinable(context.Background(), kcp, cluster, []*clusterv1.Machine{init})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -301,10 +297,6 @@ func TestInitMachineJoinable_SequencesJoiners(t *testing.T) {
 	healthy := func(node string) string {
 		return `{"name":"` + node + `","healthy":true,"voting":true,"members":1,"reportedAt":"t"}`
 	}
-	jt := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: joinTokenSecretName("c"), Namespace: "default"},
-		Data:       map[string][]byte{joinTokenSecretDataKey: []byte("tok")},
-	}
 	// etcdStatus always carries a healthy init; only the joiners vary.
 	esWith := func(extra map[string]string) *corev1.Secret {
 		data := map[string][]byte{"cp-0": []byte(healthy("cp-0"))}
@@ -387,7 +379,7 @@ func TestInitMachineJoinable_SequencesJoiners(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(jt, esWith(tc.etcdExtra)).Build()
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(esWith(tc.etcdExtra)).Build()
 			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 			joinable, reason, err := r.initMachineJoinable(context.Background(), mkKCP(tc.distribution), cluster, tc.machines)

@@ -140,22 +140,28 @@ func (*kairosControlPlaneValidator) ValidateDelete(_ context.Context, r *KairosC
 
 // validateWithWarnings runs validate() and also collects non-blocking warnings.
 func (r *KairosControlPlane) validateWithWarnings() (admission.Warnings, error) {
-	var warnings admission.Warnings
+	return warnVIPOnSingleReplica(&r.Spec, "spec"), r.validate()
+}
 
-	// Warn (but do not reject) when a VIP block is set on a single-node
-	// control plane. The VIP configuration will be silently ignored by the
-	// controller until replicas is increased to 3 or 5, so surfacing this as a
-	// warning lets operators catch configuration drift early.
-	if r.Spec.HA != nil && r.Spec.HA.VIP != nil &&
-		r.Spec.Replicas != nil && *r.Spec.Replicas == 1 {
-		warnings = append(warnings,
-			"spec.ha.vip is set but spec.replicas is 1: kube-vip is not "+
-				"rendered for single-node control planes. Remove spec.ha.vip "+
-				"or set spec.replicas to 3 or 5.",
-		)
+// warnVIPOnSingleReplica warns, without rejecting, when a VIP block is set on a
+// single-node control plane. The VIP configuration is silently ignored by the
+// controller until replicas is increased to 3 or 5, so surfacing it as a
+// warning lets operators catch configuration drift early.
+//
+// base is the field path of the spec being validated: "spec" on a
+// KairosControlPlane and "spec.template.spec" on a KairosControlPlaneTemplate.
+// Both validators call this, for the same reason they share the validate()
+// rules: a configuration that warns on the controlled type has to warn on the
+// template too, or staging it hides the warning until a cluster is created.
+func warnVIPOnSingleReplica(s *KairosControlPlaneSpec, base string) admission.Warnings {
+	if s.HA == nil || s.HA.VIP == nil || s.Replicas == nil || *s.Replicas != 1 {
+		return nil
 	}
-
-	return warnings, r.validate()
+	return admission.Warnings{
+		base + ".ha.vip is set but " + base + ".replicas is 1: kube-vip is not " +
+			"rendered for single-node control planes. Remove " + base + ".ha.vip " +
+			"or set " + base + ".replicas to 3 or 5.",
+	}
 }
 
 // validate performs validation on the KairosControlPlane spec.

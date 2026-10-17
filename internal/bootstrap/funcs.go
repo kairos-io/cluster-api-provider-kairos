@@ -57,6 +57,15 @@ func newFuncMap() template.FuncMap {
 // versions). Bump deliberately in a reviewed change.
 const kubeVIPImage = "ghcr.io/kube-vip/kube-vip:v0.8.7"
 
+// kubeVIPLocalAPIHost and kubeVIPLocalAPIPort are the apiserver address every
+// kube-vip instance elects through: its own Node's apiserver on the loopback
+// (ADR 0014 § PR-A). Both k0s and k3s listen on 6443 on all addresses and carry
+// 127.0.0.1 in the serving certificate's SANs.
+const (
+	kubeVIPLocalAPIHost = "127.0.0.1"
+	kubeVIPLocalAPIPort = "6443"
+)
+
 // kubeVIPManifest renders the kube-vip manifest set for the supplied VIP config
 // as a multi-document marshaled YAML string.
 //
@@ -92,7 +101,7 @@ func kubeVIPManifest(v *VIPConfig) (string, error) {
 	if mode == "" {
 		mode = "ARP" // empty Mode defaults to ARP (matches the CRD default).
 	}
-	container, volume := kubeVIPContainer(v, mode)
+	container := kubeVIPContainer(v, mode)
 
 	const (
 		saName  = "kube-vip"
@@ -152,7 +161,8 @@ func kubeVIPManifest(v *VIPConfig) (string, error) {
 	// node-role.kubernetes.io/control-plane is the cross-distro union (k3s
 	// servers carry it; k0s controllers carry it once they run with
 	// --enable-worker), and the tolerations clear the control-plane NoSchedule
-	// taint so it lands on the CP Nodes while general workloads stay off.
+	// taint so it lands on the CP Nodes while general workloads stay off. Each
+	// instance elects through its own Node's apiserver (see kubeVIPContainer).
 	ds := kvDaemonSet{
 		APIVersion: "apps/v1",
 		Kind:       "DaemonSet",
@@ -170,7 +180,6 @@ func kubeVIPManifest(v *VIPConfig) (string, error) {
 						{Key: "node-role.kubernetes.io/master", Operator: "Exists", Effect: "NoSchedule"},
 					},
 					Containers: []kvContainer{container},
-					Volumes:    []kvVolume{volume},
 				},
 			},
 			UpdateStrategy: kvDaemonSetUpdateStrategy{Type: "RollingUpdate"},
@@ -191,18 +200,37 @@ func kubeVIPManifest(v *VIPConfig) (string, error) {
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
-// kubeVIPContainer builds the kube-vip control-plane container and its
-// admin.conf host-path volume from the VIP config. Extracted so the container
-// envelope (env, capabilities, image, mount) has a single definition; it is
-// byte-identical to the pre-DaemonSet Pod container (ADR 0005 § D.1 keeps the
-// container spec unchanged — only the enclosing workload kind changed).
+// kubeVIPContainer builds the kube-vip control-plane container from the VIP
+// config. Extracted so the container envelope (env, capabilities, image) has a
+// single definition.
+//
+// LOCAL ELECTION (ADR 0014 § PR-A): the container elects through the
+// apiserver of the Node it runs on. kube-vip picks its client in this order
+// (v0.8.7 pkg/manager/manager.go): a regular file at /etc/kubernetes/admin.conf,
+// then $HOME/.kube/config, then the in-cluster config. This DaemonSet has no
+// kubeconfig file in the container, so it uses the in-cluster config, which
+// targets KUBERNETES_SERVICE_HOST/PORT. Left alone those point at the
+// `kubernetes` Service ClusterIP, and kube-proxy may pin the connection to a
+// peer's apiserver, so the Lease keeps being renewed while this Node's own
+// apiserver cannot write to etcd and the VIP stays on a broken member. Pointing
+// both variables at the loopback makes a member hold the VIP only while its own
+// apiserver works. A variable declared in the container spec takes precedence
+// over the one the kubelet injects, and the Pod is hostNetwork, so 127.0.0.1 is
+// the Node's loopback. The serving certificates of both k0s and k3s carry
+// 127.0.0.1 as a SAN and the ServiceAccount CA is the cluster CA, so TLS
+// verification holds.
+//
+// Do not mount /etc/kubernetes/admin.conf into the container. A regular file at
+// that path switches kube-vip to its admin.conf branch, where the two variables
+// above are ignored. These hosts have no such file, so the old hostPath mount
+// only made the kubelet create an empty directory there.
 //
 // The arp-vs-bgp toggle is a pair of string booleans; everything else is passed
 // verbatim as scalars marshaled by yaml.v3. We deliberately keep this to the
 // documented control-plane VIP envelope (ADR 0005 §C: "not operator-injectable
 // beyond the bounded VIP block") — no operator field becomes an arbitrary
-// kube-vip flag.
-func kubeVIPContainer(v *VIPConfig, mode string) (kvContainer, kvVolume) {
+// kube-vip flag. The two apiserver variables are static strings.
+func kubeVIPContainer(v *VIPConfig, mode string) kvContainer {
 	arpEnabled := "true"
 	bgpEnabled := "false"
 	if mode == "BGP" {
@@ -221,8 +249,10 @@ func kubeVIPContainer(v *VIPConfig, mode string) (kvContainer, kvVolume) {
 		{Name: "vip_renewdeadline", Value: "3"},
 		{Name: "vip_retryperiod", Value: "1"},
 		{Name: "bgp_enable", Value: bgpEnabled},
+		{Name: "KUBERNETES_SERVICE_HOST", Value: kubeVIPLocalAPIHost},
+		{Name: "KUBERNETES_SERVICE_PORT", Value: kubeVIPLocalAPIPort},
 	}
-	container := kvContainer{
+	return kvContainer{
 		Name:            "kube-vip",
 		Image:           kubeVIPImage,
 		ImagePullPolicy: "IfNotPresent",
@@ -233,18 +263,7 @@ func kubeVIPContainer(v *VIPConfig, mode string) (kvContainer, kvVolume) {
 				Add: []string{"NET_ADMIN", "NET_RAW"},
 			},
 		},
-		VolumeMounts: []kvVolumeMount{{
-			MountPath: "/etc/kubernetes/admin.conf",
-			Name:      "kubeconfig",
-		}},
 	}
-	volume := kvVolume{
-		Name: "kubeconfig",
-		HostPath: kvHostPath{
-			Path: "/etc/kubernetes/admin.conf",
-		},
-	}
-	return container, volume
 }
 
 // kube-vip manifest types. These are a minimal, purpose-built schema (not the
@@ -333,7 +352,6 @@ type kvPodSpec struct {
 	NodeSelector       map[string]string `yaml:"nodeSelector,omitempty"`
 	Tolerations        []kvToleration    `yaml:"tolerations,omitempty"`
 	Containers         []kvContainer     `yaml:"containers"`
-	Volumes            []kvVolume        `yaml:"volumes"`
 }
 
 type kvToleration struct {
@@ -349,7 +367,6 @@ type kvContainer struct {
 	Args            []string          `yaml:"args"`
 	Env             []kvEnvVar        `yaml:"env"`
 	SecurityContext kvSecurityContext `yaml:"securityContext"`
-	VolumeMounts    []kvVolumeMount   `yaml:"volumeMounts"`
 }
 
 type kvEnvVar struct {
@@ -363,20 +380,6 @@ type kvSecurityContext struct {
 
 type kvCapabilities struct {
 	Add []string `yaml:"add"`
-}
-
-type kvVolumeMount struct {
-	MountPath string `yaml:"mountPath"`
-	Name      string `yaml:"name"`
-}
-
-type kvVolume struct {
-	Name     string     `yaml:"name"`
-	HostPath kvHostPath `yaml:"hostPath"`
-}
-
-type kvHostPath struct {
-	Path string `yaml:"path"`
 }
 
 // quote marshals a scalar as a single YAML node and returns it without the

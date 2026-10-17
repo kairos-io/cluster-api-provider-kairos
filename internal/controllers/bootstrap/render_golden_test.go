@@ -90,7 +90,6 @@ var updateControllerGolden = flag.Bool("update", false, "regenerate controller g
 //	JoinToken                         | k3s_cp_init_*, *_cp_join_* (resolved from SecretRef)
 //	VIP                               | *_capv_cp_init_* / *_capv_cp_join_* (spec.controlPlaneVIP)
 //	ManagementEndpoint                | *_cp_* with a resolver (init/join/single capk+capv)
-//	  .JoinTokenSecretName            | k0s_cp_init_* (k0s init push block)
 //	  .EtcdStatusSecretName           | *_cp_init_*, *_cp_join_* (HA reporter)
 //	  .ControlPlaneEndpointHost       | *_cp_* (stamped from cluster)
 // ---------------------------------------------------------------------------
