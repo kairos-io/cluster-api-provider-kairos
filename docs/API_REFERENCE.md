@@ -51,7 +51,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `caCertSecretRef` | `ObjectReference` | No | — | Reserved; not implemented. The reference is accepted and stored, but no controller reads the Secret and its contents reach no node. Setting it produces an admission warning. Use `files` to place a CA certificate on the node. See kairos-io/kairos#4937. |
 | `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. |
 | `hostnamePrefix` | `string` | No | `"metal-"` | Prefix for the auto-generated hostname. The final hostname is `{hostnamePrefix}{4-char-machine-id}`. |
-| `dnsServers` | `[]string` | No | — | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). |
+| `dnsServers` | `[]string` | No | — | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). They are written as a regular `/etc/resolv.conf` for the rest of the boot. On images with systemd-resolved this replaces its symlink, so DHCP-provided servers and search domains no longer reach the host resolver. |
 | `podCIDR` | `string` | No | — | Pod network CIDR for k0s. Uses k0s defaults when unset. |
 | `serviceCIDR` | `string` | No | — | Service network CIDR for k0s. Uses k0s defaults when unset. |
 | `primaryIP` | `string` | No | — | Overrides the detected node IP used for TLS certificate SANs and endpoint configuration (sets `KAIROS_PRIMARY_IP`). Useful in KubeVirt environments where the detected IP is a pod network address rather than the VM's accessible address. |

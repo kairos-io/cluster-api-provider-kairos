@@ -357,6 +357,10 @@ type KairosConfigSpec struct {
 
 	// DNSServers configures DNS resolvers for early boot
 	// This helps pulling CNI images before cluster DNS is ready.
+	// They are written as a regular /etc/resolv.conf for the rest of the boot.
+	// On images with systemd-resolved this replaces its symlink, so
+	// DHCP-provided servers and search domains no longer reach the host
+	// resolver.
 	// +optional
 	DNSServers []string `json:"dnsServers,omitempty"`
 

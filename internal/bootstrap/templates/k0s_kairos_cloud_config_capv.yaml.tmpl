@@ -468,7 +468,8 @@ write_files:
       # KubeletConfiguration drop-in merged via --config-dir before the kubelet
       # registers the Node. Written with printf (not an interpolated heredoc); the
       # only substituted value is the UUID validated above.
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nproviderID: kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/10-provider-id.conf"
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nproviderID: kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/10-provider-id.conf.tmp.$$"
+      mv -f "${DROPIN_DIR}/10-provider-id.conf.tmp.$$" "${DROPIN_DIR}/10-provider-id.conf"
       echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
   {{- end }}
   {{- /*
@@ -1342,12 +1343,32 @@ MANIFEST_EOF
       written by cluster-api-provider-kairos as the last of its write_files;
       k0s may start once this exists
 stages:
+  {{- if .DNSServers }}
+  # boot.before finishes before boot starts, and runcmd is part of boot,
+  # so the resolvers are in place before anything runcmd starts.
+  boot.before:
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+        {{- range .DNSServers }}
+          - {{ . | quote }}
+        {{- end }}
+        # Staged, then renamed over /etc/resolv.conf by the next step. On
+        # systemd-resolved images /etc/resolv.conf is a symlink into a file
+        # resolved regenerates when a DHCP lease brings DNS, and this stage
+        # is not ordered after the first lease. A rename replaces the link.
+        path: "/etc/.kairos-capi-resolv.conf"
+    - name: "Install the DNS resolvers as /etc/resolv.conf"
+      commands:
+        - mv -f /etc/.kairos-capi-resolv.conf /etc/resolv.conf
+  {{- end }}
   boot:
     {{- if and .IsFleet (not .ProviderID) (ne .Role "control-plane") }}
-    # Fleet worker: also run the providerID drop-in writer as an early boot stage
-    # (belt-and-suspenders alongside the k0sworker.service ExecStartPre), so the
-    # KubeletConfiguration drop-in is present before the kubelet registers. The
-    # script is idempotent and fails closed on a missing/malformed node_id.
+    # Fleet worker: also run the providerID drop-in writer as a boot stage step,
+    # as a backstop. The k0sworker.service ExecStartPre is what puts the
+    # KubeletConfiguration drop-in in place before the kubelet registers; this
+    # step can run at the same time, which is why the script renames the file
+    # into place. It is idempotent and fails closed on a missing/malformed node_id.
     - name: "Discover providerID for k0s worker (fleet self-discovery)"
       commands:
         - /usr/local/bin/kairos-k0s-fleet-provider-id.sh || true
@@ -1355,15 +1376,6 @@ stages:
     - name: "Ensure SSH service is enabled"
       commands:
         - systemctl enable --now sshd || systemctl enable --now ssh || true
-    {{- if .DNSServers }}
-    - name: "Configure DNS resolvers for early boot"
-      dns:
-        nameservers:
-        {{- range .DNSServers }}
-          - {{ . | quote }}
-        {{- end }}
-        path: "/etc/resolv.conf"
-    {{- end }}
 
 {{- /*
   Post-bootstrap service enablement: kairos-k0s-post-bootstrap.service is

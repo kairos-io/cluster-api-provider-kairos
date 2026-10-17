@@ -225,12 +225,12 @@ write_files:
     content: |
       [Unit]
       Description=Kairos k3s post-bootstrap tasks
-      # Skip on Kairos live installer (cdroot present in cmdline) — the
-      # post-bootstrap script would block for 7+ minutes waiting for k3s
-      # node registration that never happens on the installer (overlayfs
-      # snapshotter cannot nest on the live tmpfs overlay), holding up
-      # cloud-init's runcmd and preventing kairos-agent from rebooting
-      # into the installed system. (KD-3b lab finding on Hadron.)
+      # Skip on Kairos live installer (cdroot present in cmdline): k3s node
+      # registration never happens there (overlayfs snapshotter cannot nest
+      # on the live tmpfs overlay). The script would still run to its end: it
+      # writes the bootstrap-success sentinel, and on an HA control plane it
+      # reports a healthy etcd member under the installer's hostname, both for
+      # a node that does not exist. (KD-3b lab finding on Hadron.)
       ConditionKernelCommandLine=!cdroot
       After=k3s.service
       Wants=k3s.service
@@ -478,6 +478,22 @@ write_files:
     permissions: "0644"
     owner: root:root
 stages:
+  # boot.before finishes before boot starts, and runcmd is part of boot,
+  # so the resolvers are in place before anything runcmd starts.
+  boot.before:
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+        # Staged, then renamed over /etc/resolv.conf by the next step. On
+        # systemd-resolved images /etc/resolv.conf is a symlink into a file
+        # resolved regenerates when a DHCP lease brings DNS, and this stage
+        # is not ordered after the first lease. A rename replaces the link.
+        path: "/etc/.kairos-capi-resolv.conf"
+    - name: "Install the DNS resolvers as /etc/resolv.conf"
+      commands:
+        - mv -f /etc/.kairos-capi-resolv.conf /etc/resolv.conf
   boot:
     - name: "Ensure SSH service is enabled"
       commands:
@@ -486,12 +502,6 @@ stages:
       commands:
         - mkdir -p /etc/rancher/k3s
         - mkdir -p /etc/rancher/k3s/config.yaml.d
-    - name: "Configure DNS resolvers for early boot"
-      dns:
-        nameservers:
-          - 1.1.1.1
-          - 8.8.8.8
-        path: "/etc/resolv.conf"
 
 runcmd:
   # `enable --now`: create the multi-user.target.wants/ symlink AND start
@@ -499,5 +509,7 @@ runcmd:
   # service would only auto-start on the NEXT boot — too late for the
   # KD-3b push pattern, which needs to fire on the first installed-system
   # boot. Same fix the k0s templates use via the helper service.
+  # --no-block: the unit is a oneshot that can retry for minutes, and
+  # waiting for it holds this cloud-config stage.
   - /bin/systemctl daemon-reload || true
-  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true
+  - /bin/systemctl enable --now --no-block kairos-k3s-post-bootstrap.service || true
