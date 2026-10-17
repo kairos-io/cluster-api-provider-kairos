@@ -225,7 +225,7 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// has already finalized the object via a bare r.Update; otherwise the
 	// deferred Patch should flush observedGeneration/conditions on the
 	// non-terminal drain-requeue path.
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kcp.DeletionTimestamp.IsZero() {
 		// A paused Cluster holds deletion too, as it does for upstream
 		// KubeadmControlPlane. Deleting the control plane marks every
 		// control-plane Machine for deletion and strips their etcd-leave hooks,
@@ -1780,44 +1780,6 @@ func (r *KairosControlPlaneReconciler) getControlPlaneLBEndpoint(ctx context.Con
 	}
 
 	return host, port, nil
-}
-
-// updateKubeconfigServerToNodeIP replaces 127.0.0.1/localhost in kubeconfig server with the node IP.
-// k3s default kubeconfig uses https://127.0.0.1:6443 which is not reachable from the management cluster.
-func updateKubeconfigServerToNodeIP(kubeconfig []byte, nodeIP string, port int32) ([]byte, error) {
-	if nodeIP == "" || port == 0 {
-		return kubeconfig, nil
-	}
-	config, err := clientcmd.Load(kubeconfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
-	}
-	desired := fmt.Sprintf("https://%s:%d", nodeIP, port)
-	changed := false
-	for _, cluster := range config.Clusters {
-		if cluster == nil {
-			continue
-		}
-		parsed, err := url.Parse(cluster.Server)
-		if err != nil {
-			cluster.Server = desired
-			changed = true
-			continue
-		}
-		// Replace 127.0.0.1 or localhost with node IP
-		if parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "localhost" {
-			cluster.Server = desired
-			changed = true
-		}
-	}
-	if !changed {
-		return kubeconfig, nil
-	}
-	out, err := clientcmd.Write(*config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize kubeconfig: %w", err)
-	}
-	return out, nil
 }
 
 // ensureKubeconfigServer updates the kubeconfig secret server to match the given endpoint.

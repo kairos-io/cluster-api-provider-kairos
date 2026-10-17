@@ -1254,7 +1254,7 @@ func TestHA_NoRenderRunsK0sTokenCreate(t *testing.T) {
 	}
 	var cases []renderCase
 	for _, tc := range goldenCases() {
-		cases = append(cases, renderCase{tc.name, tc.render, tc.data})
+		cases = append(cases, renderCase(tc))
 	}
 	for _, kv := range []bool{false, true} {
 		for _, role := range []string{"init", "join", "single", ""} {

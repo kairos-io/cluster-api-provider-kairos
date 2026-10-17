@@ -190,7 +190,7 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// has just issued a bare r.Update for the terminal finalizer-remove
 	// step -- the deferred Patch must be skipped to avoid racing the
 	// apiserver removing the object.
-	if !kairosConfig.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kairosConfig.DeletionTimestamp.IsZero() {
 		res, skipPatch, derr := r.reconcileDelete(ctx, log, kairosConfig)
 		if skipPatch {
 			patchOnExit = false
@@ -938,11 +938,12 @@ func sanitizeCapkUserdata(content string) (string, bool) {
 				updated = append(updated, line)
 				continue
 			}
-			if trimmed == "groups: users, admin" {
+			switch trimmed {
+			case "groups: users, admin":
 				indent := len(line) - len(strings.TrimLeft(line, " "))
 				line = strings.Repeat(" ", indent) + "groups: [users, admin]"
 				changed = true
-			} else if trimmed == "groups:" {
+			case "groups:":
 				groupsIndent = len(line) - len(strings.TrimLeft(line, " "))
 				line = strings.Repeat(" ", groupsIndent) + "groups: [users, admin]"
 				expectGroupsList = true

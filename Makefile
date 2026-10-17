@@ -220,14 +220,14 @@ $(LOCALBIN):
 ## Tool Binaries
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 # Pinned because `make release-manifests` renders the release artifacts with it. v5.8.3 requires
 # go >= 1.27 and broke the v0.1.4 release job (GOTOOLCHAIN=local, go.mod Go). v5.8.1 rendered v0.1.3.
 KUSTOMIZE_VERSION ?= v5.8.1
-GOLANGCI_LINT_VERSION ?= v1.60.0
+GOLANGCI_LINT_VERSION ?= v2.14.0
 # Pinned so `make test-envtest` is reproducible (rule 4: no unpinned @latest / floating envtest assets).
 # ENVTEST_K8S_VERSION is the Kubernetes API-server/etcd binary version the controllers are tested
 # against; 1.36 is the top of Cluster API v1.13's supported management-cluster band. Bump deliberately.
@@ -256,8 +256,13 @@ $(KUSTOMIZE): $(LOCALBIN)
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
-	test -s $(LOCALBIN)/golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(LOCALBIN) $(GOLANGCI_LINT_VERSION)
+# The install script is taken from the same tag as the binary: the one on the
+# abandoned master branch fails the checksum check for v2.12.2 and later.
+$(GOLANGCI_LINT): | $(LOCALBIN)
+	rm -rf $@.tmp
+	curl --fail --silent --show-error --location https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh | sh -s -- -b $@.tmp $(GOLANGCI_LINT_VERSION)
+	mv $@.tmp/golangci-lint $@
+	rmdir $@.tmp
 
 .PHONY: tidy
 tidy: ## Run go mod tidy

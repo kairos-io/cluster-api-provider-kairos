@@ -52,7 +52,7 @@ func nodeDrainTimeoutSeconds(d *metav1.Duration) *int32 {
 		return nil
 	}
 
-	seconds := int64(d.Duration.Seconds())
+	seconds := int64(d.Seconds())
 	switch {
 	case seconds < 0:
 		seconds = 0
