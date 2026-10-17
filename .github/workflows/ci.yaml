@@ -84,6 +84,11 @@ jobs:
       with:
         go-version: '1.26.4'
 
+    # kubeadm --dry-run creates /etc/kubernetes/tmp on the host whatever the
+    # test root is, and the runner user cannot create /etc/kubernetes itself.
+    - name: Make /etc/kubernetes writable for kubeadm --dry-run
+      run: sudo install -d -o "$(id -un)" /etc/kubernetes
+
     - name: Run the kubeadm worker join against a real kubeadm
       run: make test-kubeadm KUBEADM_VERSION=${{ matrix.kubeadm-version }}
 
