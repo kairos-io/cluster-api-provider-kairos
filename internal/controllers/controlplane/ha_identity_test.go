@@ -259,6 +259,61 @@ func TestReconcileWorkloadIdentity_DisagreementAtPinFreezes(t *testing.T) {
 	g.Expect(ev[0]).To(ContainSubstring("10.0.0.11=" + uidB))
 }
 
+// TestReconcileWorkloadIdentity_MalformedAnswerNeverBecomesThePin: an answer
+// that is not UID-shaped is still an answer. It is never pinned, even when
+// every path returns it, and it freezes the control plane with a sanitized
+// value: nothing a workload apiserver returns reaches the annotation, the log
+// or the event verbatim.
+func TestReconcileWorkloadIdentity_MalformedAnswerNeverBecomesThePin(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		uid  string
+	}{
+		{"very long", strings.Repeat("a", 4096)},
+		{"newline", "11111111-1111\nWarning forged-line"},
+		{"control characters", "\x1b[31m" + uidA + "\x00"},
+		{"separator", uidA + "; pinned " + uidB},
+	} {
+		t.Run(tc.name+", one path", func(t *testing.T) {
+			g := NewWithT(t)
+			f := newIdentityFixture(g, nil)
+			f.members.clients["10.0.0.11"] = workloadWithUID(f.scheme, tc.uid)
+
+			gate := f.reconcile()
+
+			g.Expect(gate.frozen).To(BeTrue())
+			stored := f.stored()
+			g.Expect(stored.Annotations).ToNot(HaveKey(WorkloadClusterUIDAnnotation))
+			g.Expect(stored.Annotations[WorkloadClusterIdentityMismatchAnnotation]).To(
+				MatchRegexp(`^<malformed> via 10\.0\.0\.11 at \S+; pinned <none>$`))
+			ev := strings.Join(f.events(), "\n")
+			g.Expect(ev).To(ContainSubstring("Warning WorkloadClusterIdentityChanged"))
+			g.Expect(ev).To(ContainSubstring("10.0.0.11=<malformed>"))
+			g.Expect(ev).ToNot(ContainSubstring(tc.uid))
+		})
+
+		t.Run(tc.name+", every path agrees", func(t *testing.T) {
+			g := NewWithT(t)
+			f := newIdentityFixture(g, nil)
+			f.endpoint = workloadWithUID(f.scheme, tc.uid)
+			for ip := range f.members.clients {
+				f.members.clients[ip] = workloadWithUID(f.scheme, tc.uid)
+			}
+
+			gate := f.reconcile()
+
+			g.Expect(gate.frozen).To(BeTrue(), "agreement on a malformed UID must not pin it")
+			stored := f.stored()
+			g.Expect(stored.Annotations).ToNot(HaveKey(WorkloadClusterUIDAnnotation))
+			g.Expect(stored.Annotations[WorkloadClusterIdentityMismatchAnnotation]).To(HavePrefix("<malformed> via "))
+			for _, e := range f.events() {
+				g.Expect(e).ToNot(ContainSubstring("WorkloadClusterIdentityPinned"))
+				g.Expect(e).ToNot(ContainSubstring(tc.uid))
+			}
+		})
+	}
+}
+
 func TestReconcileWorkloadIdentity_HoldsWhenNothingAnswers(t *testing.T) {
 	g := NewWithT(t)
 	f := newIdentityFixture(g, nil)

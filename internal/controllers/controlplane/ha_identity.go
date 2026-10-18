@@ -270,6 +270,18 @@ func (r *KairosControlPlaneReconciler) pinWorkloadIdentity(ctx context.Context, 
 		return identityGate{hold: "no workload apiserver answered the cluster identity read: " + strings.Join(failures, "; ")}, nil
 	}
 
+	// Only a UID-shaped answer may become the pin. An answer that is not
+	// UID-shaped is still an answer: it comes from an apiserver trusted by the
+	// cluster CA that does not report a real kube-system UID, so it freezes the
+	// control plane rather than being dropped, which would let a hostile path
+	// hide. tripIdentityFreeze sanitizes it before it reaches the annotation,
+	// the log or the event.
+	for _, o := range answered {
+		if !uidShape.MatchString(o.uid) {
+			return frozenGate(kcp, r.tripIdentityFreeze(ctx, log, kcp, o.uid, o.via, "", describeObservations(answered))), nil
+		}
+	}
+
 	first := answered[0]
 	for _, o := range answered[1:] {
 		if o.uid == first.uid {
@@ -289,10 +301,10 @@ func (r *KairosControlPlaneReconciler) pinWorkloadIdentity(ctx context.Context, 
 	for _, o := range answered {
 		vias = append(vias, o.via)
 	}
-	log.Info("Pinned the workload cluster identity", "uid", first.uid, "via", vias)
+	log.Info("Pinned the workload cluster identity", "uid", displayUID(first.uid), "via", vias)
 	if r.Recorder != nil {
 		r.Recorder.Eventf(kcp, corev1.EventTypeNormal, "WorkloadClusterIdentityPinned",
-			"Pinned the workload cluster identity (kube-system UID %s), read through %s", first.uid, strings.Join(vias, ", "))
+			"Pinned the workload cluster identity (kube-system UID %s), read through %s", displayUID(first.uid), strings.Join(vias, ", "))
 	}
 	return identityGate{}, nil
 }
@@ -353,7 +365,11 @@ func (r *KairosControlPlaneReconciler) observeWorkloadIdentity(ctx context.Conte
 
 // readWorkloadIdentity returns the UID of the kube-system Namespace as wc
 // sees it. The read is bounded by timeout. A Namespace without a UID is an
-// error, never an identity.
+// error, never an identity. Any other UID is returned as read, even one that
+// is not UID-shaped: it is an answer, and every caller treats an answer that
+// does not equal the pin as a mismatch. Callers must pass it through
+// displayUID before it reaches an annotation, a log line or an event; only a
+// UID-shaped answer may become the pin (pinWorkloadIdentity).
 func readWorkloadIdentity(ctx context.Context, wc client.Client, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
