@@ -49,16 +49,23 @@ func (r *KairosControlPlaneReconciler) leaveNodeName(ctx context.Context, m *clu
 // KairosConfig is gone, or that has none, renders its own name. Any other
 // read error is returned: the caller must not guess a name.
 func (r *KairosControlPlaneReconciler) renderedNodeName(ctx context.Context, m *clusterv1.Machine) (string, error) {
+	h, err := r.renderedHostname(ctx, m)
+	return strings.ToLower(h), err
+}
+
+// renderedHostname is the hostname the renderer gives m's node, as written
+// (not lowercased): spec.hostname of its KairosConfig, else the Machine name.
+func (r *KairosControlPlaneReconciler) renderedHostname(ctx context.Context, m *clusterv1.Machine) (string, error) {
 	ref := m.Spec.Bootstrap.ConfigRef
 	if ref.Name == "" || ref.Kind != "KairosConfig" || ref.APIGroup != bootstrapv1beta2.GroupVersion.Group {
-		return strings.ToLower(m.Name), nil
+		return m.Name, nil
 	}
 	kc := &bootstrapv1beta2.KairosConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: m.Namespace, Name: ref.Name}, kc); err != nil {
 		if apierrors.IsNotFound(err) {
-			return strings.ToLower(m.Name), nil
+			return m.Name, nil
 		}
 		return "", fmt.Errorf("read KairosConfig %s/%s of Machine %s for its node name: %w", m.Namespace, ref.Name, m.Name, err)
 	}
-	return strings.ToLower(bootstrapv1beta2.RenderedHostname(&kc.Spec, m.Name)), nil
+	return bootstrapv1beta2.RenderedHostname(&kc.Spec, m.Name), nil
 }

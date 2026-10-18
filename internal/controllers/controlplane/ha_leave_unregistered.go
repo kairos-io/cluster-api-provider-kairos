@@ -44,6 +44,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
 )
 
@@ -94,6 +95,23 @@ func leaveUnreachableExpired(m *clusterv1.Machine) bool {
 //   - Otherwise it may be a live member: record its member ID, so a later
 //     delegation acts on this member only, and proceed.
 func (r *KairosControlPlaneReconciler) inspectUnregisteredLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, target *clusterv1.Machine, nodeName string, conn leaveConn) (proceed, done bool, err error) {
+	// The lookup is only evidence when the rendered hostname is exactly the
+	// name the node goes by. One that is not a lowercase DNS-1123 label, or
+	// carries "{{" that Kairos expands at boot, may name another member on the
+	// node (an old KairosConfig the webhook check predates). Then "not found"
+	// proves nothing: hold for the bound, with no read and no write.
+	raw, err := r.renderedHostname(ctx, target)
+	if err != nil {
+		return false, false, err
+	}
+	if !bootstrapv1beta2.ValidNodeHostname(raw) {
+		log.Info("etcd-leave: the Machine has no NodeRef and its rendered hostname cannot be matched to an EtcdMember; holding until the bound",
+			"machine", target.Name, "reasons", bootstrapv1beta2.NodeHostnameErrors(raw))
+		done, err := r.leaveUnreachable(ctx, log, kcp, target, nodeName, "its rendered hostname is not a lowercase DNS-1123 label",
+			fmt.Errorf("rendered hostname of Machine %s is not a lowercase DNS-1123 label", target.Name))
+		return false, done, err
+	}
+
 	member := &unstructured.Unstructured{}
 	member.SetGroupVersionKind(etcdMemberGVK)
 	if gerr := conn.client.Get(ctx, client.ObjectKey{Name: nodeName}, member); gerr != nil {

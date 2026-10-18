@@ -94,6 +94,45 @@ func TestUnregisteredLeave_NoEtcdMemberReleasesTheHook(t *testing.T) {
 	}
 }
 
+// TestUnregisteredLeave_UnmatchableHostnameIsNoEvidence: a KairosConfig
+// admitted before the hostname check may render a hostname the node does not
+// go by in etcd: one with template markup Kairos expands at boot, or one that
+// is not a lowercase DNS-1123 label. "No EtcdMember of that name" then proves
+// nothing, so the hook is kept (nothing read, nothing written) and released
+// only after leaveUnreachableBound, with a warning.
+func TestUnregisteredLeave_UnmatchableHostnameIsNoEvidence(t *testing.T) {
+	for _, hostname := range []string{"metal-{{ trunc 4 .MachineID }}", "CP.Example.Com"} {
+		t.Run(hostname+": kept within the bound", func(t *testing.T) {
+			g := NewWithT(t)
+			target := withKairosConfigRef(unregisteredLeaver(nil, "10.0.0.10"), "cp-0")
+			f := newLeaveFixtureFor(g, target, nil, nil)
+			g.Expect(f.mgmt.Create(context.Background(), kairosConfigWithHostname("cp-0", hostname))).To(Succeed())
+
+			done, err := f.reconcile()
+
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(done).To(BeFalse(), "a missing EtcdMember under this name is not evidence")
+			got := getMachine(g, f.mgmt, "cp-0")
+			g.Expect(hasEtcdLeaveHook(got)).To(BeTrue())
+			g.Expect(got.Annotations).To(HaveKey(etcdLeaveUnreachableSinceAnnotation))
+			g.Expect(got.Annotations).ToNot(HaveKey(etcdLeaveRequestedAtAnnotation))
+		})
+		t.Run(hostname+": released with a warning past the bound", func(t *testing.T) {
+			g := NewWithT(t)
+			target := withKairosConfigRef(unregisteredLeaver(map[string]string{etcdLeaveUnreachableSinceAnnotation: ago(leaveUnreachableBound + time.Minute)}, "10.0.0.10"), "cp-0")
+			f := newLeaveFixtureFor(g, target, nil, nil)
+			g.Expect(f.mgmt.Create(context.Background(), kairosConfigWithHostname("cp-0", hostname))).To(Succeed())
+
+			done, err := f.reconcile()
+
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(done).To(BeTrue())
+			assertHookGone(g, f.mgmt, "cp-0")
+			g.Expect(f.events()).To(ConsistOf(And(ContainSubstring("Warning EtcdMemberLeaveTimedOut"), ContainSubstring("not a lowercase DNS-1123 label"))))
+		})
+	}
+}
+
 // TestUnregisteredLeave_MemberPresentGetsTheHandshake is the incident case:
 // a joiner joined etcd but never got a NodeRef. Its EtcdMember is found under
 // its rendered name, so the KCP requests the leave, records the member ID,
