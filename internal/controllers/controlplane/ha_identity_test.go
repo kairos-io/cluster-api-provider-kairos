@@ -622,15 +622,17 @@ func TestPatchKCPAnnotations_KeepsTheComputedStatus(t *testing.T) {
 func TestMarkWorkloadIdentityConditions(t *testing.T) {
 	g := NewWithT(t)
 	kcp := vipKCP()
+	conditions.MarkTrue(kcp, clusterv1.ReadyCondition)
 	conditions.MarkTrue(kcp, controlplanev1beta2.EtcdHealthyCondition)
 	conditions.MarkTrue(kcp, controlplanev1beta2.AvailableCondition)
 
 	markWorkloadIdentityConditions(kcp)
 	g.Expect(conditions.IsTrue(kcp, controlplanev1beta2.EtcdHealthyCondition)).To(BeTrue(), "no freeze: untouched")
+	g.Expect(conditions.IsTrue(kcp, clusterv1.ReadyCondition)).To(BeTrue(), "no freeze: untouched")
 
 	kcp.Annotations = map[string]string{WorkloadClusterIdentityMismatchAnnotation: uidB + " via endpoint at 2026-10-18T00:00:00Z; pinned " + uidA}
 	markWorkloadIdentityConditions(kcp)
-	for _, ct := range []clusterv1.ConditionType{controlplanev1beta2.EtcdHealthyCondition, controlplanev1beta2.AvailableCondition} {
+	for _, ct := range []clusterv1.ConditionType{clusterv1.ReadyCondition, controlplanev1beta2.EtcdHealthyCondition, controlplanev1beta2.AvailableCondition} {
 		c := conditions.Get(kcp, ct)
 		g.Expect(c).ToNot(BeNil())
 		g.Expect(c.Status).To(Equal(corev1.ConditionFalse))

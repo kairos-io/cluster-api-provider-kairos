@@ -123,7 +123,7 @@ Why it exists: on k0s, a joining member whose join failed half-way can start a n
 
 While frozen:
 
-- `EtcdHealthy` and `Available` are `False` (Error) with reason `WorkloadClusterIdentityChanged`, and a Warning event `WorkloadClusterIdentityChanged` names the pinned UID, the UID read, and where it was read from;
+- `Ready`, `Available` and `EtcdHealthy` are `False` (Error) with reason `WorkloadClusterIdentityChanged`, and a Warning event `WorkloadClusterIdentityChanged` names the pinned UID, the UID read, and where it was read from;
 - the controller creates and deletes no control-plane Machine and removes no etcd-leave hook, so a k0s Machine deleted by you or a MachineHealthCheck stays at its pre-terminate hook, its VM and etcd data intact;
 - the controller writes nothing to the workload cluster (no etcd-leave request, no join token);
 - deleting the whole cluster still works.

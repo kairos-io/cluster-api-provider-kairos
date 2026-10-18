@@ -234,7 +234,7 @@ func TestHA_WorkloadIdentityChange_FreezesMembership(t *testing.T) {
 	))
 	g.Eventually(func(g Gomega) {
 		got := getKCP(NewWithT(t), ctx, c, nsName, kcpName)
-		for _, ct := range []string{controlplanev1beta2.EtcdHealthyCondition, controlplanev1beta2.AvailableCondition} {
+		for _, ct := range []string{string(clusterv1.ReadyCondition), controlplanev1beta2.EtcdHealthyCondition, controlplanev1beta2.AvailableCondition} {
 			cond := kcpCondition(got, ct)
 			g.Expect(cond).ToNot(BeNil(), ct)
 			g.Expect(cond.Status).To(Equal(corev1.ConditionFalse), ct)

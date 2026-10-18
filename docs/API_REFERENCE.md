@@ -449,7 +449,7 @@ Cross-field validation (enforced by the validating webhook, not expressible as k
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
 | `updatedReplicas` | `int32` | Number of Machines running the desired version. |
 | `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). `EtcdHealthy` and `Available` are `False` with reason `WorkloadClusterIdentityChanged` while control-plane membership changes are frozen; see [Workload cluster identity](#workload-cluster-identity). |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). `Ready`, `Available` and `EtcdHealthy` are `False` with reason `WorkloadClusterIdentityChanged` while control-plane membership changes are frozen; see [Workload cluster identity](#workload-cluster-identity). |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
@@ -513,7 +513,7 @@ Surfaced on `KairosControlPlane.status.conditions` for HA control planes only (`
 | `False` (Info) | `EtcdQuorumDegraded` | Quorum still holds, but fewer than all desired members are healthy and voting. |
 | `False` (Warning) | `EtcdQuorumAtRisk` | The healthy+voting member count is at or below the `(N/2)+1` quorum minimum — one more member loss breaks quorum. Also covers the bring-up window before any member has reported. |
 | `False` (Info) | `WaitingForEtcdMember` | The init node has not yet reported a healthy voting etcd member. |
-| `False` (Error) | `WorkloadClusterIdentityChanged` | A workload API server answered with a different cluster identity than the one pinned on this `KairosControlPlane`. Control-plane membership changes are frozen until an operator re-pins. `Available` carries the same reason. This overrides every other `EtcdHealthy` state, and is also set on a control plane that has been scaled down to one replica after it was pinned. See [Workload cluster identity](#workload-cluster-identity). |
+| `False` (Error) | `WorkloadClusterIdentityChanged` | A workload API server answered with a different cluster identity than the one pinned on this `KairosControlPlane`. Control-plane membership changes are frozen until an operator re-pins. `Ready` and `Available` carry the same reason. This overrides every other `EtcdHealthy` state, and is also set on a control plane that has been scaled down to one replica after it was pinned. See [Workload cluster identity](#workload-cluster-identity). |
 
 The condition is derived from a per-cluster, node-reported etcd-status Secret (see [Security Considerations](#security-considerations) for the trust model of this signal). The controller uses this condition, together with the desired replica count, to refuse control-plane Machine deletions that would drop etcd below the quorum minimum — this quorum-safety decision is made independently of, and before, any single node's self-reported signal.
 
@@ -547,7 +547,7 @@ An API server whose identity cannot be read is treated as not answering: the act
 
 - creates and deletes no control-plane Machine, and removes no etcd-leave hook, so a Machine deleted by an operator or a MachineHealthCheck stays at its pre-terminate hook (k0s); k3s Machines carry no hook, so the controller cannot hold their deletion;
 - writes nothing to the workload cluster: no etcd-leave request, no join token;
-- sets `EtcdHealthy` and `Available` to `False` (Error) with reason `WorkloadClusterIdentityChanged`, and emits a Warning event `WorkloadClusterIdentityChanged` that names the pinned UID, the UID it read, and the address it read it through;
+- sets `Ready`, `Available` and `EtcdHealthy` to `False` (Error) with reason `WorkloadClusterIdentityChanged`, and emits a Warning event `WorkloadClusterIdentityChanged` that names the pinned UID, the UID it read, and the address it read it through;
 - requeues every 60 seconds.
 
 Deleting the whole cluster is not affected: control-plane deletion strips the etcd-leave hooks and deletes the Machines whatever the identity.

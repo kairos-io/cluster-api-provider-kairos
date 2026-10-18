@@ -534,8 +534,8 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// warning, and etcd health.
 	r.setHAConditions(ctx, kcp, cluster, endpointReady)
 
-	// ADR 0015 PR-2: while the workload identity is frozen, EtcdHealthy and
-	// Available are False whatever the nodes report. Runs last so no condition
+	// ADR 0015 PR-2: while the workload identity is frozen, Ready, Available
+	// and EtcdHealthy are False whatever the nodes report. Runs last so no condition
 	// above can report the control plane healthy while the KCP may be looking at
 	// a different cluster.
 	markWorkloadIdentityConditions(kcp)

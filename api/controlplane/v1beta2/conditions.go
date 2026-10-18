@@ -98,7 +98,7 @@ const (
 	EtcdQuorumAtRiskReason = "EtcdQuorumAtRisk"
 
 	// WorkloadClusterIdentityChangedReason is the False(Error) reason on
-	// EtcdHealthyCondition and AvailableCondition while the control plane is
+	// Ready, EtcdHealthyCondition and AvailableCondition while the control plane is
 	// frozen because a workload apiserver answered with a kube-system Namespace
 	// UID other than the one pinned on the KairosControlPlane (ADR 0015 PR-2).
 	// It means the controller reached a different cluster that shares the CA,

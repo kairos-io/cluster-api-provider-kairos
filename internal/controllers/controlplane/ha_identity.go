@@ -542,19 +542,24 @@ func (r *KairosControlPlaneReconciler) patchKCPAnnotations(ctx context.Context, 
 	return nil
 }
 
-// markWorkloadIdentityConditions sets EtcdHealthy and Available to
+// markWorkloadIdentityConditions sets Ready, Available and EtcdHealthy to
 // False(Error, WorkloadClusterIdentityChanged) while the freeze is in place.
 // It runs after every other condition is computed, so nothing reports the
-// control plane healthy while it may be looking at the wrong cluster.
+// control plane healthy while it may be looking at the wrong cluster: on
+// 2026-10-17 every condition read True while the original cluster was
+// destroyed (ADR 0015 OQ-4).
 func markWorkloadIdentityConditions(kcp *controlplanev1beta2.KairosControlPlane) {
 	msg, frozen := workloadIdentityFrozen(kcp)
 	if !frozen {
 		return
 	}
-	conditions.MarkFalse(kcp, controlplanev1beta2.EtcdHealthyCondition,
-		controlplanev1beta2.WorkloadClusterIdentityChangedReason, clusterv1.ConditionSeverityError, "%s", msg)
-	conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition,
-		controlplanev1beta2.WorkloadClusterIdentityChangedReason, clusterv1.ConditionSeverityError, "%s", msg)
+	for _, ct := range []clusterv1.ConditionType{
+		clusterv1.ReadyCondition,
+		controlplanev1beta2.AvailableCondition,
+		controlplanev1beta2.EtcdHealthyCondition,
+	} {
+		conditions.MarkFalse(kcp, ct, controlplanev1beta2.WorkloadClusterIdentityChangedReason, clusterv1.ConditionSeverityError, "%s", msg)
+	}
 }
 
 // identityCheckKey keys the recheck rate limit. The UID alone is enough in a
