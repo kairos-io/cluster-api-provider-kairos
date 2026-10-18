@@ -173,7 +173,10 @@ func (r *KairosControlPlaneReconciler) reconcileOrphanEtcdMembers(ctx context.Co
 	if !r.orphanCheckDue(kcp) {
 		return ctrl.Result{}, false, nil
 	}
-	r.markOrphanChecked(kcp)
+	// removeOneOrphan marks the check done itself, once it has an answer to
+	// act on: a pass that stops early (a member not reported healthy yet, no
+	// verified apiserver, a failed list) retries on the next reconcile instead
+	// of waiting out etcdOrphanCheckInterval.
 	return r.removeOneOrphan(ctx, log, kcp, cluster, all, desiredReplicas)
 }
 
@@ -319,11 +322,18 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(etcdMemberGVK.GroupVersion().WithKind(etcdMemberGVK.Kind + "List"))
 	if err := conn.client.List(ctx, list); err != nil {
-		if !meta.IsNoMatchError(err) {
+		if meta.IsNoMatchError(err) {
+			// A definite answer: this cluster has no EtcdMember API.
+			r.markOrphanChecked(kcp)
+		} else {
 			log.V(1).Info("Not checking for orphan etcd members: the EtcdMembers could not be listed", "via", conn.via, "reason", err.Error())
 		}
 		return ctrl.Result{}, false, nil
 	}
+	// The members are listed: from here on every outcome (nothing to do,
+	// blocked, or a removal started) is an evaluation, and the next one waits
+	// for etcdOrphanCheckInterval.
+	r.markOrphanChecked(kcp)
 
 	expected, err := r.expectedEtcdMembers(ctx, machines)
 	if err != nil {

@@ -646,6 +646,36 @@ func TestOrphanEtcdMembers_RecordOutlivesAScaleToOne(t *testing.T) {
 	g.Expect(f.stored().Annotations).ToNot(HaveKey(etcdOrphanLeaveAnnotation))
 }
 
+// TestOrphanEtcdMembers_FailedPassKeepsTheSlot: a pass that stops before it
+// has listed the members (here, no verified apiserver answers, then a member
+// not yet reported healthy) does not use up the once-a-minute check, so the
+// next reconcile tries again and removes the orphan. Before, the slot was
+// taken first, and a passing failure delayed the cleanup by a full interval.
+func TestOrphanEtcdMembers_FailedPassKeepsTheSlot(t *testing.T) {
+	g := NewWithT(t)
+	f := newOrphanFixture(g, nil, withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+	pass := func() bool {
+		_, hold, err := f.r.reconcileOrphanEtcdMembers(context.Background(), log.Log, f.kcp, haCluster(), f.machines, 3)
+		g.Expect(err).ToNot(HaveOccurred())
+		return hold
+	}
+
+	members := f.r.MemberClientFactory
+	f.r.MemberClientFactory = (&fakeMembers{}).factory
+	g.Expect(pass()).To(BeFalse())
+	g.Expect(f.r.orphanCheckDue(f.kcp)).To(BeTrue(), "no answer: the slot is kept")
+
+	f.r.MemberClientFactory = members
+	g.Expect(f.mgmt.Update(context.Background(), etcdStatusSecretForMembersRV(g, f.mgmt, "cp-0", "cp-1"))).To(Succeed())
+	g.Expect(pass()).To(BeFalse())
+	g.Expect(f.r.orphanCheckDue(f.kcp)).To(BeTrue(), "a member not reported healthy yet: the slot is kept")
+
+	g.Expect(f.mgmt.Update(context.Background(), etcdStatusSecretForMembersRV(g, f.mgmt, "cp-0", "cp-1", "cp-2"))).To(Succeed())
+	g.Expect(pass()).To(BeTrue(), "the next reconcile acts at once")
+	g.Expect(f.leaveSet("kcp-old")).To(BeTrue())
+	g.Expect(f.r.orphanCheckDue(f.kcp)).To(BeFalse(), "an evaluated pass takes the slot")
+}
+
 // TestReconcileMachines_OrphanRemovalHoldsMembershipChanges: while an orphan
 // etcd-member removal is in progress, reconcileMachines changes no other
 // membership (here, a k0s scale-down delete); once it is done, it does.
