@@ -538,7 +538,7 @@ A `KairosControlPlane` with more than one replica records which workload cluster
 - before a joiner is admitted, on the same connection the k0s join token is issued through (k3s: through the endpoint);
 - before a k0s join token is extended or deleted;
 - before the controller deletes a control-plane Machine, for a rollout or a scale-down;
-- on every connection the k0s etcd-leave handshake uses;
+- on every connection the k0s etcd-leave handshake and the orphan etcd-member cleanup use; these two paths use no connection at all until a pin exists;
 - and through every reachable path at most once a minute, even with nothing to do.
 
 An API server whose identity cannot be read is treated as not answering: the action waits and is retried.
@@ -576,6 +576,18 @@ Deleting the whole cluster is not affected: control-plane deletion strips the et
   ```
 
 Write access to the `KairosControlPlane` is required for all three, the same access that can scale the control plane.
+
+### k0s etcd leave and orphan members
+
+On k0s HA control planes the controller removes a deleted control-plane Machine's etcd member before it lets the deletion proceed, including for a Machine that never got a Node, and it removes etcd members no control-plane Machine accounts for. The rules are in [High availability: etcd health and quorum-safe replacement](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement). The controller keeps its state in these annotations; none is meant to be set by hand.
+
+| Annotation | On | Purpose |
+|---|---|---|
+| `controlplane.cluster.x-k8s.io/etcd-leave-requested-at` | Machine | When the leave was first requested (RFC3339). Starts the ~5-minute wait for the node's own ack. |
+| `controlplane.cluster.x-k8s.io/etcd-member-leave-requested-at` | Machine | When the leave was handed to k0s. Starts the ~10-minute wait for k0s. |
+| `controlplane.cluster.x-k8s.io/etcd-member-leave-member-id` | Machine | The etcd member ID first seen for the leaving node. k0s's `EtcdMember` is acted on only while it carries this ID. |
+| `controlplane.cluster.x-k8s.io/etcd-leave-unreachable-since` | Machine | The first time, before any leave request, that no verified workload API server answered. After ~15 minutes the deletion proceeds with `EtcdMemberLeaveTimedOut`. |
+| `controlplane.cluster.x-k8s.io/etcd-orphan-member-leave` | KairosControlPlane | The orphan etcd member being removed: `<EtcdMember name> <member ID> <RFC3339>`. While set, no other orphan is removed and no control-plane Machine is created or deleted. |
 
 ### Template ownership
 
