@@ -201,6 +201,14 @@ type leaveConn struct {
 // ConfigMap counts as an answer. When there is no candidate, or none
 // answers, it tries the endpoint client. It returns an error only when
 // nothing answered, and that error names every apiserver it tried.
+//
+// Every answer must come from the pinned workload cluster (ADR 0015 PR-2):
+// an apiserver whose identity read fails counts as not answering, and one
+// that serves another cluster freezes the control plane, and connectForLeave
+// returns its errWorkloadIdentityChanged error at once. In the 2026-10-17
+// split, the KCP read "no EtcdMember" from the new cluster and released the
+// old members' hooks; a verified connection is what makes such an absence
+// mean something.
 func (r *KairosControlPlaneReconciler) connectForLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (leaveConn, error) {
 	factory := r.MemberClientFactory
 	if factory == nil {
@@ -208,19 +216,38 @@ func (r *KairosControlPlaneReconciler) connectForLeave(ctx context.Context, log 
 	}
 	var errs []error
 	for _, ip := range leaveCandidateIPs(machines, target, leaveExcludedHosts(kcp, cluster)...) {
-		conn, err := readLeaveThrough(ctx, ip, func() (client.Client, error) { return factory(ctx, cluster, ip) })
+		conn, err := r.verifiedLeaveConn(ctx, log, kcp, ip, func() (client.Client, error) { return factory(ctx, cluster, ip) })
 		if err == nil {
 			return conn, nil
+		}
+		if errors.Is(err, errWorkloadIdentityChanged) {
+			return leaveConn{}, err
 		}
 		log.V(1).Info("etcd-leave: member did not answer; trying the next", "machine", target.Name, "member", ip, "reason", err.Error())
 		errs = append(errs, fmt.Errorf("member %s: %w", ip, err))
 	}
-	conn, err := readLeaveThrough(ctx, leaveViaEndpoint, func() (client.Client, error) { return r.workloadClientFor(ctx, cluster) })
+	conn, err := r.verifiedLeaveConn(ctx, log, kcp, leaveViaEndpoint, func() (client.Client, error) { return r.workloadClientFor(ctx, cluster) })
 	if err == nil {
 		return conn, nil
 	}
+	if errors.Is(err, errWorkloadIdentityChanged) {
+		return leaveConn{}, err
+	}
 	errs = append(errs, fmt.Errorf("%s: %w", leaveViaEndpoint, err))
 	return leaveConn{}, errors.Join(errs...)
+}
+
+// verifiedLeaveConn is readLeaveThrough followed by the identity check on the
+// same client.
+func (r *KairosControlPlaneReconciler) verifiedLeaveConn(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, via string, build func() (client.Client, error)) (leaveConn, error) {
+	conn, err := readLeaveThrough(ctx, via, build)
+	if err != nil {
+		return leaveConn{}, err
+	}
+	if err := r.verifyWorkloadIdentity(ctx, log, kcp, conn.client, via); err != nil {
+		return leaveConn{}, err
+	}
+	return conn, nil
 }
 
 // readLeaveThrough builds a client with build and reads the leave ConfigMap

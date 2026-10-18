@@ -534,6 +534,12 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// warning, and etcd health.
 	r.setHAConditions(ctx, kcp, cluster, endpointReady)
 
+	// ADR 0015 PR-2: while the workload identity is frozen, EtcdHealthy and
+	// Available are False whatever the nodes report. Runs last so no condition
+	// above can report the control plane healthy while the KCP may be looking at
+	// a different cluster.
+	markWorkloadIdentityConditions(kcp)
+
 	// Failure fields were cleared above immediately after reconcileMachines
 	// returned nil (KD-14, maintainer-confirmed decision #3). The previous
 	// `if ReadyReplicas > 0` gate at this location is intentionally removed.
@@ -686,6 +692,28 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		return ctrl.Result{}, err
 	}
 
+	// ADR 0015 PR-2: before any membership action, make sure the KCP is acting
+	// on the workload cluster it pinned. This pins the kube-system UID on first
+	// contact (and on the first reconcile after an upgrade), rechecks it at most
+	// once a minute, and holds every membership action below (etcd-leave hook
+	// removal, the join-token lifetime, joiner admission, create and delete)
+	// while the identity is frozen, or while a pin is due but could not be
+	// taken. Like the preflight checks of the upstream kubeadm control plane, a
+	// hold returns a requeue, not an error, so status is still refreshed.
+	// Whole-cluster teardown never reaches this (reconcileDelete).
+	identity, err := r.reconcileWorkloadIdentity(ctx, log, kcp, cluster, machines, desiredReplicas)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile the workload cluster identity: %w", err)
+	}
+	if identity.frozen {
+		log.Info("Control-plane membership changes are frozen: the workload cluster identity changed", "detail", identity.hold)
+		return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+	}
+	if identity.hold != "" {
+		log.Info("Holding control-plane membership changes until the workload cluster identity is pinned", "reason", identity.hold)
+		return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
+	}
+
 	// HA (ADR 0005 §E.3): before any scale/rollout math, progress the etcd-leave
 	// pre-terminate handshake for every owned control-plane Machine that is
 	// terminating and still carries our hook. This single sweep covers the
@@ -701,6 +729,10 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 			continue
 		}
 		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, machines, m)
+		if errors.Is(err, errWorkloadIdentityChanged) {
+			log.Info("Holding the etcd leave: the workload cluster identity changed", "machine", m.Name, "reason", err.Error())
+			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+		}
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile etcd member leave for %s: %w", m.Name, err)
 		}
@@ -730,6 +762,11 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		// fails the reconcile and never gates the scale or rollout logic below.
 		if distributionOf(kcp) == "k0s" && conditions.IsTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition) {
 			k0sJoinerPending = r.reconcileK0sJoinTokenLifetime(ctx, log, kcp, cluster, machines)
+		}
+		// The join-token lifetime checks the identity on its own client; a
+		// mismatch found there freezes the control plane here too.
+		if _, frozen := workloadIdentityFrozen(kcp); frozen {
+			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
 		}
 	}
 
@@ -770,6 +807,10 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		var joinTokenID string
 		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
 			admission, err := r.admitJoiner(ctx, log, kcp, cluster, machines)
+			if errors.Is(err, errWorkloadIdentityChanged) {
+				log.Info("Holding back join machine: the workload cluster identity changed", "reason", err.Error())
+				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
@@ -781,6 +822,9 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		}
 
 		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
+			if errors.Is(err, errWorkloadIdentityChanged) {
+				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine: %w", err)
 		}
 		// Only create one per reconcile to avoid over-scaling
@@ -799,12 +843,20 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 				log.Info("Holding back control-plane scale-down — etcd quorum would break", "machine", target.Name, "reason", reason)
 				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 			}
+			// ADR 0015 PR-2: never delete a member on the word of a cluster the
+			// KCP did not pin.
+			if res, proceed := r.identityPreflight(ctx, log, kcp, cluster, "control-plane scale-down"); !proceed {
+				return res, nil
+			}
 			// k3s embedded etcd has no supported member-remove (KD-5d); warn that
 			// the member will linger. For k0s the sweep above drives a clean
 			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
 			r.warnIfK3sEtcdLimitation(kcp, target)
 			log.Info("Scaling down control plane machine", "machine", target.Name)
-			if err := r.Delete(ctx, target); err != nil {
+			if err := r.deleteControlPlaneMachine(ctx, kcp, target); err != nil {
+				if errors.Is(err, errWorkloadIdentityChanged) {
+					return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+				}
 				return ctrl.Result{}, fmt.Errorf("failed to delete control plane machine: %w", err)
 			}
 		}
@@ -847,12 +899,23 @@ type joinAdmission struct {
 // read-only join gate (initMachineJoinable) and, once that opens on k0s, makes
 // sure the KCP holds a controller-join token for the joiner (ADR 0013). The
 // token step replaced the gate's old "the init node pushed a token" clause.
+//
+// Admission also requires the pinned workload identity (ADR 0015 PR-2): on k0s
+// the token mint checks it on the client it mints through; on k3s, which mints
+// nothing, it is checked through the endpoint here. A mismatch returns an
+// errWorkloadIdentityChanged error; a failed check holds the joiner.
 func (r *KairosControlPlaneReconciler) admitJoiner(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) (joinAdmission, error) {
 	joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
 	if err != nil || !joinable {
 		return joinAdmission{reason: reason}, err
 	}
 	if distributionOf(kcp) != "k0s" {
+		if err := r.verifyIdentityViaEndpoint(ctx, log, kcp, cluster); err != nil {
+			if errors.Is(err, errWorkloadIdentityChanged) {
+				return joinAdmission{}, err
+			}
+			return joinAdmission{reason: err.Error()}, nil
+		}
 		return joinAdmission{admitted: true}, nil
 	}
 	id, reason, err := r.ensureK0sControllerJoinToken(ctx, log, kcp, cluster, machines)
@@ -970,7 +1033,14 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 // token ID admitJoiner returned for a k0s join, stamped on the KairosConfig so
 // the bootstrap controller renders exactly that token (ADR 0013); it is empty
 // for every other role and for k3s.
+//
+// It refuses while the workload identity is frozen (ADR 0015 PR-2): every
+// control-plane create goes through here, so the freeze holds even for a
+// caller that did not check it.
 func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) error {
+	if err := errIfIdentityFrozen(kcp, "create a control-plane Machine"); err != nil {
+		return err
+	}
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
 	// Create KairosConfig
@@ -1244,6 +1314,19 @@ func (r *KairosControlPlaneReconciler) selectMachineForDeletion(machines []*clus
 	}
 	// Delete the newest machine for scale down to reduce churn on older nodes
 	return machines[len(machines)-1]
+}
+
+// deleteControlPlaneMachine is the KCP-initiated delete of one control-plane
+// Machine (rollout replacement and scale-down). It refuses while the workload
+// identity is frozen (ADR 0015 PR-2). Callers verify the identity first with
+// identityPreflight; this check keeps the freeze in force even for a caller
+// that did not. Whole-cluster teardown deletes through drainOwnedMachines and
+// is not affected.
+func (r *KairosControlPlaneReconciler) deleteControlPlaneMachine(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) error {
+	if err := errIfIdentityFrozen(kcp, "delete control-plane Machine "+target.Name); err != nil {
+		return err
+	}
+	return r.Delete(ctx, target)
 }
 
 // setHAConditions surfaces the two HA-specific conditions (ADR 0005 Phase 3) on
@@ -1756,6 +1839,8 @@ func (r *KairosControlPlaneReconciler) reconcileDelete(ctx context.Context, log 
 	// Reconcile does not race apiserver GC once the last finalizer drops.
 	// (KD-4, per maintainer-confirmed plan.)
 	controllerutil.RemoveFinalizer(kcp, controlplanev1beta2.KairosControlPlaneFinalizer)
+	// Drop the in-memory identity recheck entry (ADR 0015 PR-2) with the KCP.
+	r.forgetIdentityCheck(kcp)
 	if err := r.Update(ctx, kcp); err != nil {
 		if apierrors.IsNotFound(err) {
 			// Object already gone -- nothing to do.

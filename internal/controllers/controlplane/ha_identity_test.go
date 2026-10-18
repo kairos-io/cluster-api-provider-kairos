@@ -50,6 +50,17 @@ func workloadWithUID(scheme *runtime.Scheme, uid string, objs ...client.Object) 
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{ns}, objs...)...).Build()
 }
 
+// withPinnedWorkload pins kcp to uidA, as a KCP running this code has done on
+// its first reconcile, and returns a workload factory whose cluster has that
+// identity. Tests of the membership logic use it so the identity gate passes.
+func withPinnedWorkload(scheme *runtime.Scheme, kcp *controlplanev1beta2.KairosControlPlane, objs ...client.Object) func(context.Context, *clusterv1.Cluster) (client.Client, error) {
+	if kcp.Annotations == nil {
+		kcp.Annotations = map[string]string{}
+	}
+	kcp.Annotations[WorkloadClusterUIDAnnotation] = uidA
+	return staticWorkloadClient(workloadWithUID(scheme, uidA, objs...))
+}
+
 // identityFixture is an HA k0s control plane with KubeconfigReady True, a
 // management client holding the KCP, a workload endpoint and two staying
 // members reachable directly.

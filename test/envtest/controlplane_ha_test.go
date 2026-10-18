@@ -31,6 +31,7 @@ import (
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/controlplane"
 )
 
 // haFixture creates a Cluster + KCP (replicas=3) in a fresh namespace and waits
@@ -440,6 +441,34 @@ func getKCP(g *WithT, ctx context.Context, c client.Client, ns, name string) *co
 	kcp := &controlplanev1beta2.KairosControlPlane{}
 	g.Expect(c.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, kcp)).To(Succeed())
 	return kcp
+}
+
+// envtestKubeSystemUID returns the UID of kube-system in the envtest
+// apiserver, which plays the workload cluster in these tests.
+func envtestKubeSystemUID(t *testing.T, ctx context.Context, wc client.Client) string {
+	t.Helper()
+	ns := &corev1.Namespace{}
+	NewWithT(t).Expect(wc.Get(ctx, types.NamespacedName{Name: metav1.NamespaceSystem}, ns)).To(Succeed())
+	return string(ns.UID)
+}
+
+// pinEnvtestWorkloadIdentity records the workload identity pin (ADR 0015
+// PR-2) on the KCP, as the KCP does at first contact, for tests whose
+// cluster is already past that point.
+func pinEnvtestWorkloadIdentity(t *testing.T, ctx context.Context, c, wc client.Client, ns, name string) {
+	t.Helper()
+	uid := envtestKubeSystemUID(t, ctx, wc)
+	NewWithT(t).Eventually(func() error {
+		kcp := &controlplanev1beta2.KairosControlPlane{}
+		if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, kcp); err != nil {
+			return err
+		}
+		if kcp.Annotations == nil {
+			kcp.Annotations = map[string]string{}
+		}
+		kcp.Annotations[controlplane.WorkloadClusterUIDAnnotation] = uid
+		return c.Update(ctx, kcp)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 }
 
 func touchKCP(g *WithT, ctx context.Context, c client.Client, ns, name string) {

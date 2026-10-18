@@ -174,7 +174,7 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 
 	if etcdMemberJoinedStatus(member) == k0sEtcdMemberNotJoined {
 		log.Info("etcd-leave: k0s reports the member is not in etcd; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
-		return true, r.removeEtcdLeaveHook(ctx, target)
+		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 	if etcdMemberLeaveCapped(target) {
 		return true, r.abandonMemberLeave(ctx, log, kcp, target, fmt.Sprintf("k0s did not report its member gone within %s", etcdMemberLeaveCap))
@@ -194,7 +194,7 @@ func (r *KairosControlPlaneReconciler) abandonMemberLeave(ctx context.Context, l
 		r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
 			"Control-plane node %q did not leave etcd within %s and %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout, why)
 	}
-	return r.removeEtcdLeaveHook(ctx, target)
+	return r.removeEtcdLeaveHook(ctx, kcp, target)
 }
 
 // etcdMemberLeaveCapped reports whether the KCP first tried to hand the leave
