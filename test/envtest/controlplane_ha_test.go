@@ -249,6 +249,11 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 		return cfg.Spec.ControlPlaneRole, nil
 	}, 30*time.Second, 500*time.Millisecond).Should(Equal(bootstrapv1beta2.ControlPlaneRoleJoin),
 		"join config must be created once the init machine is joinable")
+
+	// ADR 0015 PR-2: the joiner was admitted only after the KCP pinned the
+	// identity of the workload cluster it admitted it into.
+	g.Expect(getKCP(g, ctx, c, nsName, kcpName).Annotations).To(HaveKeyWithValue(
+		controlplane.WorkloadClusterUIDAnnotation, envtestKubeSystemUID(t, ctx, envtestWorkloadClient(t, cfg))))
 }
 
 // TestHA_JoinTokenWatch_ReReconcilesJoinConfig asserts BLOCKER-2: writing the
