@@ -80,6 +80,20 @@ const (
 	// member may be orphaned, and lets the delete proceed (quorum was already
 	// proven safe by canRemoveMember before the delete).
 	memberLeaveTimeout = 5 * time.Minute
+
+	// etcdLeaveUnreachableSinceAnnotation records (RFC3339) the first pass,
+	// before any leave was requested, on which no verified workload apiserver
+	// answered (ADR 0015 PR-3). It anchors leaveUnreachableBound. It is a
+	// separate stamp from etcdLeaveRequestedAtAnnotation so that the first
+	// request still force-writes the sentinel (clearing a stale `left`) when
+	// the workload cluster answers again.
+	etcdLeaveUnreachableSinceAnnotation = "controlplane.cluster.x-k8s.io/etcd-leave-unreachable-since"
+
+	// leaveUnreachableBound bounds how long a hook is kept, before any leave
+	// was requested, while no verified workload apiserver answers: the same
+	// ~15 minutes a requested leave gets (memberLeaveTimeout, then
+	// etcdMemberLeaveCap). Before ADR 0015 this phase had no bound (GT-15).
+	leaveUnreachableBound = memberLeaveTimeout + etcdMemberLeaveCap
 )
 
 // etcdLeaveHookAnnotation is the full pre-terminate hook annotation key
@@ -246,53 +260,67 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // The workload-cluster traffic goes through one member that is staying, not
 // through the control-plane endpoint (connectForLeave, ADR 0014).
 //
-// State machine:
-//  1. NodeRef == nil → the Machine never registered a Node: no member key to
-//     signal and no live node to run the leave. Remove the hook, done. (We key
-//     ONLY on NodeRef, never Machine phase: by the time the sweep runs the
-//     Machine is already `Deleting`, so a phase check would fire for every
-//     target and skip the leave for healthy members too.)
-//  2. Non-k0s carrying the hook (should never happen) → remove hook, done.
-//     Then, until a leave has been requested, wait (done=false, no workload
-//     traffic) while CAPI is still draining the Node or detaching its
-//     volumes (machineAtPreTerminate).
-//  3. Node acked `left` in the workload ConfigMap → remove hook, done.
-//  4. Already-requested AND member gone from etcd-status → remove hook, done.
-//  5. Already-requested AND past memberLeaveTimeout → delegateMemberLeave:
-//     set spec.leave on the member's k0s EtcdMember and remove the hook once
-//     k0s reports Joined=False. Without that API or object, or after
-//     etcdMemberLeaveCap, remove the hook with a warning (the member may be
-//     orphaned).
-//  6. Otherwise → write the leave-requested sentinel, stamp the first-request
-//     timestamp, requeue (done=false).
+// The member is named by leaveNodeName: the Node name, or, for a Machine
+// without a NodeRef, the hostname the renderer gave its node. A Machine
+// without a NodeRef may still hold an etcd member: k0s joins etcd before the
+// Node registers, and the Machine gets its NodeRef later still. Releasing
+// such a Machine without a leave orphaned its member on 2026-10-17, and the
+// next join under the same name split the cluster (ADR 0015 PR-3).
 //
-// Identity (ADR 0015 PR-2): every connection connectForLeave returns serves
-// the pinned cluster. One that does not freezes the control plane, and while
-// frozen nothing here writes to the workload cluster or removes the hook.
+// State machine:
+//  1. Non-k0s carrying the hook (should never happen) → remove hook, done.
+//  2. Until a leave has been requested, wait (done=false, no workload
+//     traffic) while CAPI is still draining the Node or detaching its
+//     volumes (machineAtPreTerminate). Without a NodeRef CAPI goes there at
+//     once.
+//  3. Until a leave has been requested, nothing answering (or no pinned
+//     identity to verify an answer against) keeps the hook, from the first
+//     such pass for at most leaveUnreachableBound (etcd-leave-unreachable-
+//     since); then the hook is removed with a warning.
+//  4. Without a NodeRef, before the first request: inspect the EtcdMember of
+//     that name (inspectUnregisteredLeave). None in the pinned cluster, or
+//     one k0s reports Joined=False → remove hook, done. One whose peer
+//     address another Machine reports, or a name another Machine also
+//     renders → remove hook with a warning, nothing written. Otherwise the
+//     handshake below, with its member ID recorded.
+//  5. First request: write the leave-requested sentinel, stamp the
+//     first-request timestamp, requeue (done=false).
+//  6. Node acked `left` in the workload ConfigMap → remove hook, done.
+//  7. With a NodeRef only: member gone from etcd-status → remove hook, done.
+//     (A node that never registered may never have reported, so its absence
+//     there means nothing.)
+//  8. Past memberLeaveTimeout → delegateMemberLeave: set spec.leave on the
+//     member's k0s EtcdMember and remove the hook once k0s reports
+//     Joined=False. Without that API or object, or after etcdMemberLeaveCap,
+//     remove the hook with a warning (the member may be orphaned).
+//  9. Otherwise → keep the sentinel, requeue.
+//
+// Identity (ADR 0015 PR-2, PR-3): every connection connectForLeave returns
+// serves the pinned cluster, and with no pin it returns none. One that serves
+// another cluster freezes the control plane, and while frozen nothing here
+// writes to the workload cluster or removes the hook. So every "gone" this
+// concludes (no EtcdMember, Joined=False, an ack) was read from the pinned
+// cluster.
 //
 // SECURITY / fail-safe (ADR 0005 §E.5): a workload-client BUILD error or a
 // ConfigMap READ error, on every apiserver connectForLeave tries, or a failed
 // write, returns the error with the hook STILL SET — the delete stays blocked
-// and quorum is preserved. The one exception is the timeout of step 5, which
-// is bounded whether or not the workload cluster answers: before, a failed
-// read returned ahead of it, so a leave whose reads kept failing was never
-// bounded.
+// and quorum is preserved. Every such wait is bounded: by
+// leaveUnreachableBound before the first request (step 3) and by
+// memberLeaveTimeout plus etcdMemberLeaveCap after it (step 8), so neither an
+// unreachable node nor an unreachable workload cluster wedges deletion.
 func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (bool, error) {
 	// (0) ADR 0015 PR-2: a frozen control plane neither writes to the workload
 	// cluster nor removes the hook.
 	if err := errIfIdentityFrozen(kcp, "progress the etcd leave of Machine "+target.Name); err != nil {
 		return false, err
 	}
-	// (1) Never-registered node: nothing to leave, nothing alive to run it.
-	if !target.Status.NodeRef.IsDefined() {
-		log.Info("etcd-leave: target has no NodeRef; removing hook without leave handshake", "machine", target.Name)
-		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
-	}
-	// (2) Defensive: only k0s stamps the hook.
+	// (1) Defensive: only k0s stamps the hook.
 	if distributionOf(kcp) != "k0s" {
 		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 
+	registered := target.Status.NodeRef.IsDefined()
 	nodeName, err := r.leaveNodeName(ctx, target)
 	if err != nil {
 		return false, err
@@ -312,8 +340,8 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	}
 
 	// Find a workload apiserver that answers, and read the leave ConfigMap
-	// through it. Nothing answering is fail-safe: hook retained, except that
-	// the timeout backstop below is still evaluated once a leave was requested.
+	// through it. Nothing answering is fail-safe: hook retained, and bounded
+	// (leaveUnreachable before the first request, the timeout after it).
 	conn, connErr := r.connectForLeave(ctx, log, kcp, cluster, machines, target)
 	// An apiserver that serves another cluster froze the control plane
 	// (connectForLeave verifies the identity of every connection). Its
@@ -334,7 +362,12 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// requested==true. Terminal checks are deliberately NOT evaluated on this pass.
 	if !requested {
 		if connErr != nil {
-			return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)
+			return r.leaveUnreachable(ctx, log, kcp, target, nodeName, "no workload apiserver answered", connErr)
+		}
+		if !registered {
+			if proceed, done, err := r.inspectUnregisteredLeave(ctx, log, kcp, machines, target, nodeName, conn); !proceed {
+				return done, err
+			}
 		}
 		if err := r.ensureLeaveRequested(ctx, conn.client, leaveConfigMapKey, nodeName, true /*force*/); err != nil {
 			return false, err
@@ -358,10 +391,14 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 		}
 		// Member gone from node-reported etcd-status → treat as left. Best-effort: a
 		// read error leaves the member "present" so we keep waiting, never skip.
-		if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
-			if _, present := status[nodeName]; !present {
-				log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
-				return true, r.removeEtcdLeaveHook(ctx, kcp, target)
+		// Only for a registered node: one without a NodeRef may never have
+		// reported, so its absence says nothing about etcd.
+		if registered {
+			if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
+				if _, present := status[nodeName]; !present {
+					log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
+					return true, r.removeEtcdLeaveHook(ctx, kcp, target)
+				}
 			}
 		}
 	}

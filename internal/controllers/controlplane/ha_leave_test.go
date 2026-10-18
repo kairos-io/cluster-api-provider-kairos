@@ -175,29 +175,6 @@ func etcdStatusSecretForMembers(members ...string) *corev1.Secret {
 	}
 }
 
-// TestReconcileMemberLeave_NoNodeRefFastPath: a Machine that never registered a
-// Node has no member to leave — hook removed, done, and NO workload client built.
-func TestReconcileMemberLeave_NoNodeRefFastPath(t *testing.T) {
-	g := NewWithT(t)
-	scheme := haTestScheme(g)
-	target := hookedMachine("cp-0", "", nil)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target).Build()
-
-	factoryCalled := false
-	r := &KairosControlPlaneReconciler{
-		Client: c, Scheme: scheme,
-		WorkloadClientFactory: func(context.Context, *clusterv1.Cluster) (client.Client, error) {
-			factoryCalled = true
-			return nil, nil
-		},
-	}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(done).To(BeTrue())
-	g.Expect(factoryCalled).To(BeFalse(), "no NodeRef must not reach the workload cluster")
-	assertHookGone(g, c, "cp-0")
-}
-
 // TestReconcileMemberLeave_NonK0sRemovesHook: defensive — a non-k0s Machine that
 // somehow carries the hook is unblocked without a k0s-specific leave.
 func TestReconcileMemberLeave_NonK0sRemovesHook(t *testing.T) {
