@@ -170,6 +170,15 @@ func TestParseOrphanLeave(t *testing.T) {
 		_, ok := parseOrphanLeave(bad)
 		g.Expect(ok).To(BeFalse(), "%q must not parse", bad)
 	}
+
+	// A time in the future would stretch the cap and the hold: beyond the
+	// clock-skew allowance it is rejected.
+	soon := orphanLeave{name: "kcp-7", memberID: testMemberID, at: time.Now().Add(time.Minute)}
+	_, ok = parseOrphanLeave(soon.String())
+	g.Expect(ok).To(BeTrue(), "within the skew")
+	later := orphanLeave{name: "kcp-7", memberID: testMemberID, at: time.Now().Add(orphanLeaveClockSkew + time.Minute)}
+	_, ok = parseOrphanLeave(later.String())
+	g.Expect(ok).To(BeFalse(), "beyond the skew")
 }
 
 // TestOrphanEtcdMembers_RemovedOneAtATime: two members have no Machine. The
@@ -314,10 +323,20 @@ func TestOrphanEtcdMembers_BlockedOutsideASteadyState(t *testing.T) {
 		{"scaling up", func(f *orphanFixture) { f.machines = f.machines[:2] }},
 		{"rolling out", func(f *orphanFixture) { f.machines[1].Spec.Version = "v1.33.0+k0s.0" }},
 		{"a Machine is being deleted", func(f *orphanFixture) {
-			now := metav1.Now()
-			f.machines[2].DeletionTimestamp = &now
+			stored := getMachine(f.g, f.mgmt, "cp-2")
+			stored.Finalizers = []string{"test.kairos.io/hold"}
+			f.g.Expect(f.mgmt.Update(context.Background(), stored)).To(Succeed())
+			f.g.Expect(f.mgmt.Delete(context.Background(), stored)).To(Succeed())
+			f.machines[2] = getMachine(f.g, f.mgmt, "cp-2")
 		}},
-		{"a joiner has no NodeRef", func(f *orphanFixture) { noNodeRef(f.machines[2]) }},
+		{"a joiner has no NodeRef", func(f *orphanFixture) {
+			stored := noNodeRef(getMachine(f.g, f.mgmt, "cp-2"))
+			f.g.Expect(f.mgmt.Update(context.Background(), stored)).To(Succeed())
+			f.machines[2] = stored
+		}},
+		{"a control-plane Machine of another owner has no NodeRef", func(f *orphanFixture) {
+			f.g.Expect(f.mgmt.Create(context.Background(), noNodeRef(orphanMachine("foreign-cp", "10.0.0.30")))).To(Succeed())
+		}},
 		{"a joiner has not reported healthy and voting", func(f *orphanFixture) {
 			g := f.g
 			g.Expect(f.mgmt.Update(context.Background(), etcdStatusSecretForMembersRV(g, f.mgmt, "cp-0", "cp-1"))).To(Succeed())
@@ -550,6 +569,83 @@ func TestOrphanEtcdMembers_RateLimited(t *testing.T) {
 	g.Expect(f.members.dialed).To(HaveLen(dialed), "no second check within the interval")
 }
 
+// TestOrphanEtcdMembers_DriftedMemberNameBlocksRemoval is the security
+// review's must-fix: three Machines and three members, but cp-2's member goes
+// by another name, and (as on CAPK) its peer address is on a network no
+// Machine reports. That member is cp-2's live voter, not an orphan. Every
+// Machine must be paired with a distinct member before anything is removed,
+// so nothing is written and a Warning says why.
+func TestOrphanEtcdMembers_DriftedMemberNameBlocksRemoval(t *testing.T) {
+	g := NewWithT(t)
+	f := newOrphanFixture(g, nil,
+		k0sEtcdMember("cp-0", "10.0.0.10", false, "True"),
+		k0sEtcdMember("cp-1", "10.0.0.11", false, "True"),
+		k0sEtcdMember("cp-2-renamed", "192.168.50.12:2380", false, "True"),
+	)
+
+	_, hold, err := f.reconcile()
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(hold).To(BeFalse())
+	g.Expect(f.leaveSet("cp-2-renamed")).To(BeFalse(), "a live voter must never be asked to leave")
+	g.Expect(f.stored().Annotations).ToNot(HaveKey(etcdOrphanLeaveAnnotation))
+	g.Expect(f.events()).To(ConsistOf(And(ContainSubstring("Warning EtcdOrphanMemberRemovalBlocked"), ContainSubstring("naming does not match"), ContainSubstring("cp-2"))))
+}
+
+// TestOrphanEtcdMembers_PeerAddressPairsARenamedMember: a member whose name
+// drifted but whose peer address its Machine reports is paired with that
+// Machine; a real orphan next to it is still removed.
+func TestOrphanEtcdMembers_PeerAddressPairsARenamedMember(t *testing.T) {
+	g := NewWithT(t)
+	f := newOrphanFixture(g, nil,
+		k0sEtcdMember("cp-0", "10.0.0.10", false, "True"),
+		k0sEtcdMember("cp-1", "10.0.0.11", false, "True"),
+		k0sEtcdMember("cp-2-renamed", "10.0.0.12:2380", false, "True"),
+		k0sEtcdMemberWithID("ghost", "10.0.0.9", "a1", false, "True"),
+	)
+
+	_, hold, err := f.reconcile()
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(hold).To(BeTrue())
+	g.Expect(f.leaveSet("ghost")).To(BeTrue())
+	g.Expect(f.leaveSet("cp-2-renamed")).To(BeFalse())
+}
+
+func TestUnmatchedMachines(t *testing.T) {
+	g := NewWithT(t)
+	machines := []*clusterv1.Machine{nodeMachine("cp-0", false, "10.0.0.10"), nodeMachine("cp-1", false, "10.0.0.11")}
+	// One member cannot stand for two Machines: cp-1 reports cp-0's address,
+	// but cp-0 already took that member by name.
+	machines[1].Status.Addresses = append(machines[1].Status.Addresses, clusterv1.MachineAddress{Address: "10.0.0.10"})
+	g.Expect(unmatchedMachines(machines, []*unstructured.Unstructured{k0sEtcdMember("cp-0", "10.0.0.10", false, "True")})).To(Equal([]string{"cp-1"}))
+	g.Expect(unmatchedMachines(machines, []*unstructured.Unstructured{
+		k0sEtcdMember("cp-0", "10.0.0.10", false, "True"), k0sEtcdMember("x", "10.0.0.11:2380", false, "True"),
+	})).To(BeEmpty())
+}
+
+// TestOrphanEtcdMembers_RecordOutlivesAScaleToOne: a removal recorded before
+// the control plane was scaled to one replica is still followed, and still
+// holds every other membership change, until it ends.
+func TestOrphanEtcdMembers_RecordOutlivesAScaleToOne(t *testing.T) {
+	g := NewWithT(t)
+	rec := orphanLeave{name: "kcp-old", memberID: testMemberID, at: time.Now().Add(-time.Minute)}
+	f := newOrphanFixture(g, map[string]string{etcdOrphanLeaveAnnotation: rec.String()},
+		withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+
+	_, hold, err := f.r.reconcileOrphanEtcdMembers(context.Background(), log.Log, f.kcp, haCluster(), f.machines, 1)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(hold).To(BeTrue(), "the scale-down waits for the removal in progress")
+	g.Expect(f.leaveSet("kcp-old")).To(BeTrue(), "the recorded removal is still driven")
+
+	f.setJoined("kcp-old", "False")
+	_, hold, err = f.r.reconcileOrphanEtcdMembers(context.Background(), log.Log, f.kcp, haCluster(), f.machines, 1)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(hold).To(BeFalse())
+	g.Expect(f.stored().Annotations).ToNot(HaveKey(etcdOrphanLeaveAnnotation))
+}
+
 // TestReconcileMachines_OrphanRemovalHoldsMembershipChanges: while an orphan
 // etcd-member removal is in progress, reconcileMachines changes no other
 // membership (here, a k0s scale-down delete); once it is done, it does.
@@ -581,4 +677,29 @@ func TestReconcileMachines_OrphanRemovalHoldsMembershipChanges(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(run.storedAnnotations()).ToNot(HaveKey(etcdOrphanLeaveAnnotation))
 	g.Expect(sc.acted(g, run.c)).To(BeTrue(), "the scale-down resumes in the same pass")
+}
+
+// TestReconcileMachines_OrphanRecordHoldsAScaleToOne: the hold does not
+// depend on the control plane still being HA. Scaled to one replica with a
+// removal recorded, reconcileMachines deletes nothing until it ends.
+func TestReconcileMachines_OrphanRecordHoldsAScaleToOne(t *testing.T) {
+	g := NewWithT(t)
+	sc := membershipScenarios[1] // scale-down delete of test-kcp-3
+	rec := orphanLeave{name: "kcp-old", memberID: testMemberID, at: time.Now().Add(-time.Minute)}
+	run := newMembershipRun(g, sc, map[string]string{
+		WorkloadClusterUIDAnnotation: uidA,
+		etcdOrphanLeaveAnnotation:    rec.String(),
+	}, uidA)
+	run.kcp.Spec.Distribution = "k0s"
+	one := int32(1)
+	run.kcp.Spec.Replicas = &one
+	run.workload = workloadWithUID(run.r.Scheme, uidA, k0sEtcdMember("kcp-old", "10.0.0.7", true, "True"))
+	run.r.MemberClientFactory = (&fakeMembers{}).factory
+
+	requeue, err := run.reconcile()
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(requeue).To(Equal(joinerGateRequeueAfter))
+	g.Expect(sc.acted(g, run.c)).To(BeFalse(), "no delete while an orphan removal is in progress, even at one replica")
+	g.Expect(run.storedAnnotations()).To(HaveKey(etcdOrphanLeaveAnnotation))
 }

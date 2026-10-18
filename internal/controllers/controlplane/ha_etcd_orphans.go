@@ -87,6 +87,10 @@ const (
 	// etcdOrphanCheckInterval bounds how often the KCP lists the EtcdMembers
 	// when no orphan removal is in progress.
 	etcdOrphanCheckInterval = time.Minute
+
+	// orphanLeaveClockSkew is how far in the future a recorded removal time
+	// may be and still be accepted.
+	orphanLeaveClockSkew = 5 * time.Minute
 )
 
 // orphanLeave is a parsed etcdOrphanLeaveAnnotation.
@@ -115,6 +119,11 @@ func parseOrphanLeave(v string) (orphanLeave, bool) {
 	if err != nil {
 		return orphanLeave{}, false
 	}
+	// A record from the future would stretch etcdMemberLeaveCap, and with it
+	// the hold on every membership change, past its bound.
+	if at.After(time.Now().Add(orphanLeaveClockSkew)) {
+		return orphanLeave{}, false
+	}
 	return orphanLeave{name: parts[0], memberID: id, at: at}, true
 }
 
@@ -126,28 +135,38 @@ func validEtcdMemberName(name string) bool {
 }
 
 // reconcileOrphanEtcdMembers removes, one at a time, k0s etcd members that no
-// control-plane Machine accounts for. It runs on every reconcile of a k0s HA
-// control plane after the etcd-leave sweep and before any scale or rollout
-// decision. hold=true means a removal is in progress and the caller returns
-// res; err is an errWorkloadIdentityChanged error when a connection serves
-// another cluster, or a management-cluster error.
+// control-plane Machine accounts for. It runs on every reconcile, after the
+// etcd-leave sweep and before any scale or rollout decision. machines are the
+// KCP's own control-plane Machines. hold=true means a removal is in progress
+// and the caller returns res; err is an errWorkloadIdentityChanged error when
+// a connection serves another cluster, or a management-cluster error.
+//
+// A removal already recorded is followed to its end, and holds every other
+// membership change, whatever the distribution and replica count are now: a
+// scale to one replica in the middle of it must not let a delete run while
+// k0s is still removing a member. New removals start only on k0s HA.
 func (r *KairosControlPlaneReconciler) reconcileOrphanEtcdMembers(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, desiredReplicas int32) (res ctrl.Result, hold bool, err error) {
-	if distributionOf(kcp) != "k0s" || desiredReplicas <= 1 {
+	raw, recorded := kcp.Annotations[etcdOrphanLeaveAnnotation]
+	if !recorded && (distributionOf(kcp) != "k0s" || desiredReplicas <= 1) {
 		return ctrl.Result{}, false, nil
 	}
 	if err := errIfIdentityFrozen(kcp, "remove an orphan etcd member"); err != nil {
 		return ctrl.Result{}, false, err
 	}
-	if raw, ok := kcp.Annotations[etcdOrphanLeaveAnnotation]; ok {
+	all, err := r.clusterControlPlaneMachines(ctx, kcp, cluster)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if recorded {
 		rec, valid := parseOrphanLeave(raw)
 		if !valid {
 			log.Info("Removing an unparsable orphan etcd-member record", "annotation", etcdOrphanLeaveAnnotation)
 			return ctrl.Result{}, false, r.patchKCPAnnotations(ctx, kcp, nil, etcdOrphanLeaveAnnotation)
 		}
-		return r.progressOrphanLeave(ctx, log, kcp, cluster, machines, rec)
+		return r.progressOrphanLeave(ctx, log, kcp, cluster, all, rec)
 	}
 
-	if why := orphanCleanupBlocked(kcp, machines, desiredReplicas); why != "" {
+	if why := orphanCleanupBlocked(kcp, machines, all, desiredReplicas); why != "" {
 		log.V(4).Info("Not checking for orphan etcd members", "reason", why)
 		return ctrl.Result{}, false, nil
 	}
@@ -155,33 +174,126 @@ func (r *KairosControlPlaneReconciler) reconcileOrphanEtcdMembers(ctx context.Co
 		return ctrl.Result{}, false, nil
 	}
 	r.markOrphanChecked(kcp)
-	return r.removeOneOrphan(ctx, log, kcp, cluster, machines, desiredReplicas)
+	return r.removeOneOrphan(ctx, log, kcp, cluster, all, desiredReplicas)
 }
 
 // orphanCleanupBlocked returns why the control plane is not in the steady
-// state orphan cleanup needs, or "" when it is.
-func orphanCleanupBlocked(kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, desiredReplicas int32) string {
+// state orphan cleanup needs, or "" when it is. owned are the KCP's
+// control-plane Machines, all those of the cluster whoever owns them: a
+// Machine of any owner that is being deleted or has no Node yet may be the
+// one a member that looks orphaned belongs to.
+func orphanCleanupBlocked(kcp *controlplanev1beta2.KairosControlPlane, owned, all []*clusterv1.Machine, desiredReplicas int32) string {
 	if !kcp.DeletionTimestamp.IsZero() {
 		return "the control plane is being deleted"
 	}
-	if int32(len(machines)) != desiredReplicas {
-		return fmt.Sprintf("scaling: %d of %d control-plane Machines", len(machines), desiredReplicas)
+	if int32(len(owned)) != desiredReplicas {
+		return fmt.Sprintf("scaling: %d of %d control-plane Machines", len(owned), desiredReplicas)
 	}
-	for _, m := range machines {
+	for _, m := range owned {
+		if m.Spec.Version == "" || m.Spec.Version != kcp.Spec.Version {
+			return fmt.Sprintf("rolling out: Machine %s does not run %s", m.Name, kcp.Spec.Version)
+		}
+	}
+	for _, m := range all {
 		switch {
 		case !m.DeletionTimestamp.IsZero():
 			return fmt.Sprintf("Machine %s is being deleted", m.Name)
 		case !m.Status.NodeRef.IsDefined():
 			return fmt.Sprintf("Machine %s has not registered a Node", m.Name)
-		case m.Spec.Version == "" || m.Spec.Version != kcp.Spec.Version:
-			return fmt.Sprintf("rolling out: Machine %s does not run %s", m.Name, kcp.Spec.Version)
 		}
 	}
 	return ""
 }
 
+// clusterControlPlaneMachines lists every control-plane Machine of cluster,
+// whoever owns it.
+func (r *KairosControlPlaneReconciler) clusterControlPlaneMachines(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) ([]*clusterv1.Machine, error) {
+	list := &clusterv1.MachineList{}
+	selector := labels.SelectorFromSet(map[string]string{
+		clusterv1.ClusterNameLabel:         cluster.Name,
+		clusterv1.MachineControlPlaneLabel: "",
+	})
+	if err := r.List(ctx, list, client.InNamespace(kcp.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, fmt.Errorf("list control-plane Machines: %w", err)
+	}
+	out := make([]*clusterv1.Machine, 0, len(list.Items))
+	for i := range list.Items {
+		out = append(out, &list.Items[i])
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// unmatchedMachines returns the Machines no joined EtcdMember can be paired
+// with, each pairing using a distinct member: first by Node name, then, for
+// the Machines left, by a peer address the Machine reports.
+//
+// Orphan cleanup proceeds only when it returns none. A member whose name has
+// drifted from its Node name (and whose peer address no Machine reports, as
+// on CAPK) would otherwise look like an orphan, and the quorum check, built
+// from the same name match, would count one healthy member too few and still
+// pass: the KCP would remove a live voter.
+func unmatchedMachines(machines []*clusterv1.Machine, joined []*unstructured.Unstructured) []string {
+	used := map[string]bool{}
+	matched := map[string]bool{}
+	byName := map[string]*unstructured.Unstructured{}
+	for _, member := range joined {
+		byName[member.GetName()] = member
+	}
+	for _, m := range machines {
+		if !m.Status.NodeRef.IsDefined() {
+			continue
+		}
+		if member, ok := byName[m.Status.NodeRef.Name]; ok && !used[member.GetName()] {
+			used[member.GetName()] = true
+			matched[m.Name] = true
+		}
+	}
+	var out []string
+	for _, m := range machines {
+		if matched[m.Name] {
+			continue
+		}
+		addrs := map[string]bool{}
+		for _, a := range m.Status.Addresses {
+			if ip := net.ParseIP(a.Address); ip != nil {
+				addrs[ip.String()] = true
+			}
+		}
+		found := false
+		for _, member := range joined {
+			if used[member.GetName()] {
+				continue
+			}
+			if ip := etcdMemberPeerIP(member); ip != "" && addrs[ip] {
+				used[member.GetName()] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, m.Name)
+		}
+	}
+	return out
+}
+
+// etcdMemberPeerIP returns the IP of the EtcdMember's status.peerAddress in
+// canonical form, or "" when it has none.
+func etcdMemberPeerIP(member *unstructured.Unstructured) string {
+	peer, _, _ := unstructured.NestedString(member.Object, "status", "peerAddress")
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		peer = host
+	}
+	if ip := net.ParseIP(peer); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
 // removeOneOrphan finds the orphan etcd members and, when it is safe, asks
-// k0s to remove the first of them.
+// k0s to remove the first of them. machines are every control-plane Machine
+// of the cluster.
 func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, desiredReplicas int32) (ctrl.Result, bool, error) {
 	// Every member must report healthy and voting: a joiner that has not
 	// finished is pending, and its member may look like an orphan.
@@ -213,7 +325,7 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 		return ctrl.Result{}, false, nil
 	}
 
-	expected, err := r.expectedEtcdMembers(ctx, kcp, cluster)
+	expected, err := r.expectedEtcdMembers(ctx, machines)
 	if err != nil {
 		return ctrl.Result{}, false, err
 	}
@@ -229,6 +341,17 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 		}
 	}
 	if len(orphans) == 0 {
+		return ctrl.Result{}, false, nil
+	}
+	// Every Machine must own a distinct joined member before any member can
+	// be called an orphan (unmatchedMachines).
+	if unmatched := unmatchedMachines(machines, joined); len(unmatched) > 0 {
+		log.Info("Not removing orphan etcd members: some Machines have no EtcdMember by Node name or peer address", "machines", unmatched)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdOrphanMemberRemovalBlocked",
+				"etcd member naming does not match the control-plane Machines: no EtcdMember matches Machine(s) %s by Node name or peer address, so no member is removed; compare `k0s etcd member-list` with the Machines",
+				strings.Join(unmatched, ", "))
+		}
 		return ctrl.Result{}, false, nil
 	}
 	sort.Slice(orphans, func(i, j int) bool { return orphans[i].GetName() < orphans[j].GetName() })
@@ -353,7 +476,7 @@ func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, 
 		return finish(corev1.EventTypeNormal, "EtcdOrphanMemberRemoved",
 			"k0s removed etcd member %q (ID %s), which had no control-plane Machine", rec.name, rec.memberID)
 	}
-	expected, err := r.expectedEtcdMembers(ctx, kcp, cluster)
+	expected, err := r.expectedEtcdMembers(ctx, machines)
 	if err != nil {
 		return ctrl.Result{}, false, err
 	}
@@ -403,31 +526,19 @@ func (e expectedMembers) has(member *unstructured.Unstructured) bool {
 	if e.names[member.GetName()] {
 		return true
 	}
-	peer, _, _ := unstructured.NestedString(member.Object, "status", "peerAddress")
-	if host, _, err := net.SplitHostPort(peer); err == nil {
-		peer = host
-	}
-	if ip := net.ParseIP(peer); ip != nil {
-		return e.addrs[ip.String()]
+	if ip := etcdMemberPeerIP(member); ip != "" {
+		return e.addrs[ip]
 	}
 	return false
 }
 
-// expectedEtcdMembers collects the node names and addresses of every
-// control-plane Machine of cluster, whoever owns it: a Machine this KCP does
-// not own still has a member that must not be removed.
-func (r *KairosControlPlaneReconciler) expectedEtcdMembers(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (expectedMembers, error) {
-	list := &clusterv1.MachineList{}
-	selector := labels.SelectorFromSet(map[string]string{
-		clusterv1.ClusterNameLabel:         cluster.Name,
-		clusterv1.MachineControlPlaneLabel: "",
-	})
-	if err := r.List(ctx, list, client.InNamespace(kcp.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return expectedMembers{}, fmt.Errorf("list control-plane Machines: %w", err)
-	}
+// expectedEtcdMembers collects the node names and addresses of machines,
+// which are every control-plane Machine of the cluster, whoever owns it
+// (clusterControlPlaneMachines): a Machine this KCP does not own still has a
+// member that must not be removed.
+func (r *KairosControlPlaneReconciler) expectedEtcdMembers(ctx context.Context, machines []*clusterv1.Machine) (expectedMembers, error) {
 	e := expectedMembers{names: map[string]bool{}, addrs: map[string]bool{}}
-	for i := range list.Items {
-		m := &list.Items[i]
+	for _, m := range machines {
 		rendered, err := r.renderedNodeName(ctx, m)
 		if err != nil {
 			return expectedMembers{}, err

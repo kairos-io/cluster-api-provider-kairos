@@ -773,23 +773,25 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		if _, frozen := workloadIdentityFrozen(kcp); frozen {
 			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
 		}
+	}
 
-		// ADR 0015 PR-3: remove, one at a time and only when quorum allows, k0s
-		// etcd members that no control-plane Machine accounts for, as upstream's
-		// kubeadm control plane does in reconcileEtcdMembers. A removal in
-		// progress holds every scale and rollout step below, so membership never
-		// changes twice at once.
-		res, hold, err := r.reconcileOrphanEtcdMembers(ctx, log, kcp, cluster, machines, desiredReplicas)
-		if errors.Is(err, errWorkloadIdentityChanged) {
-			log.Info("Holding orphan etcd member cleanup: the workload cluster identity changed", "reason", err.Error())
-			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
-		}
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to reconcile orphan etcd members: %w", err)
-		}
-		if hold {
-			return res, nil
-		}
+	// ADR 0015 PR-3: remove, one at a time and only when quorum allows, k0s
+	// etcd members that no control-plane Machine accounts for, as upstream's
+	// kubeadm control plane does in reconcileEtcdMembers. A removal in
+	// progress holds every scale and rollout step below, so membership never
+	// changes twice at once. It runs whatever the replica count: a removal
+	// recorded before a scale to one replica is still followed to its end and
+	// still holds; new removals start only on k0s HA.
+	res, hold, err := r.reconcileOrphanEtcdMembers(ctx, log, kcp, cluster, machines, desiredReplicas)
+	if errors.Is(err, errWorkloadIdentityChanged) {
+		log.Info("Holding orphan etcd member cleanup: the workload cluster identity changed", "reason", err.Error())
+		return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile orphan etcd members: %w", err)
+	}
+	if hold {
+		return res, nil
 	}
 
 	maxSurge := int32(1)
