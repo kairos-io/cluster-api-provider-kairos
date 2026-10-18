@@ -16,6 +16,37 @@ permissions and limitations under the License.
 
 package v1beta2
 
+import (
+	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
+)
+
+// NodeHostnameErrors returns why h cannot be a control-plane node hostname,
+// or nil when it can. A valid hostname is a lowercase DNS-1123 label (at most
+// 63 characters of [a-z0-9-], starting and ending alphanumeric) with no
+// template markup.
+//
+// The KairosControlPlane controller finds a node's k0s EtcdMember, and its
+// etcd-leave key, by the rendered hostname (ADR 0015 PR-3). k0s lowercases
+// the hostname into the EtcdMember name, the node-side responder keys on the
+// hostname as the kernel has it, and Kairos expands "{{ ... }}" in a hostname
+// at boot. A hostname outside this shape can therefore name a different
+// member on the node than the controller looks up.
+func NodeHostnameErrors(h string) []string {
+	var errs []string
+	if strings.Contains(h, "{{") {
+		errs = append(errs, "must not contain template markup ('{{')")
+	}
+	errs = append(errs, validation.IsDNS1123Label(h)...)
+	return errs
+}
+
+// ValidNodeHostname reports whether h passes NodeHostnameErrors.
+func ValidNodeHostname(h string) bool {
+	return len(NodeHostnameErrors(h)) == 0
+}
+
 // RenderedHostname returns the hostname the bootstrap renderer gives the node
 // of a Machine named machineName: spec.hostname when it is set, else the
 // Machine name. The renderer and the KairosControlPlane controller both use
