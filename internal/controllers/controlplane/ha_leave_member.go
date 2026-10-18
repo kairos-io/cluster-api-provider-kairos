@@ -209,7 +209,17 @@ type leaveConn struct {
 // split, the KCP read "no EtcdMember" from the new cluster and released the
 // old members' hooks; a verified connection is what makes such an absence
 // mean something.
+//
+// With no pin there is nothing to verify against, so no apiserver is tried
+// and the error wraps errWorkloadIdentityNotPinned (ADR 0015 PR-3): the
+// caller treats it as nothing answering, which is bounded.
 func (r *KairosControlPlaneReconciler) connectForLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (leaveConn, error) {
+	if err := errIfIdentityFrozen(kcp, "use the workload cluster"); err != nil {
+		return leaveConn{}, err
+	}
+	if kcp.Annotations[WorkloadClusterUIDAnnotation] == "" {
+		return leaveConn{}, fmt.Errorf("no apiserver tried: %w", errWorkloadIdentityNotPinned)
+	}
 	factory := r.MemberClientFactory
 	if factory == nil {
 		factory = r.defaultMemberClient
@@ -244,7 +254,7 @@ func (r *KairosControlPlaneReconciler) verifiedLeaveConn(ctx context.Context, lo
 	if err != nil {
 		return leaveConn{}, err
 	}
-	if err := r.verifyWorkloadIdentity(ctx, log, kcp, conn.client, via); err != nil {
+	if err := r.verifyPinnedWorkloadIdentity(ctx, log, kcp, conn.client, via); err != nil {
 		return leaveConn{}, err
 	}
 	return conn, nil
