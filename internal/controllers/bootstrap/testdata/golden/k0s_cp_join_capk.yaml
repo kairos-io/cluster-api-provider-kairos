@@ -352,25 +352,35 @@ write_files:
         }'
       }
 
-      # True when the live k0scontroller was started with --token-file. A bare
-      # k0s (started before its arguments existed) is a one-member cluster of its
-      # own that kairos-k0s-apply-args.sh is about to wipe and restart; seeing one
-      # member there proves nothing about a join.
-      live_has_token() {
+      # A bare k0s (started before its arguments existed) is a one-member cluster
+      # of its own that kairos-k0s-apply-args.sh is about to wipe and restart;
+      # seeing one member there proves nothing about a join. So a one-member
+      # result only counts when the SAME k0scontroller process, read before the
+      # member list, is still the main PID afterwards and was started with
+      # --token-file.
+      main_pid() {
         local pid
         pid="$(systemctl show -p MainPID --value k0scontroller.service 2>/dev/null || echo 0)"
-        if [ -z "${pid}" ] || [ "${pid}" = "0" ] || [ ! -r "/proc/${pid}/cmdline" ]; then
-          return 1
+        if [ -z "${pid}" ] || [ "${pid}" = "0" ]; then
+          echo 0
+        else
+          echo "${pid}"
         fi
-        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q -- '--token-file'
+      }
+      pid_has_token() {
+        [ -r "/proc/$1/cmdline" ] || return 1
+        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q -- '--token-file'
       }
 
       n=""
       for attempt in {1..120}; do
+        pid_before="$(main_pid)"
         if n="$(count_members)" && [ -n "${n}" ] && [ "${n}" -ge 1 ]; then
-          # One member only counts as "bootstrapped its own cluster" when the
-          # live process was started with the token; otherwise keep polling.
-          if [ "${n}" -ge 2 ] || live_has_token; then
+          if [ "${n}" -ge 2 ]; then
+            break
+          fi
+          pid_after="$(main_pid)"
+          if [ "${pid_before}" != "0" ] && [ "${pid_before}" = "${pid_after}" ] && pid_has_token "${pid_after}"; then
             break
           fi
         fi
@@ -783,7 +793,10 @@ write_files:
         # before anything reads k0s state. Bounded; the join confirmation also
         # checks the live argv, which covers the setsid fallback.
         for i in {1..60}; do
-          systemctl is-active --quiet kairos-k0s-apply-args 2>/dev/null || break
+          case "$(systemctl is-active kairos-k0s-apply-args 2>/dev/null)" in
+            active|activating|reloading) ;;
+            *) break ;;
+          esac
           sleep 5
         done
         for i in {1..60}; do

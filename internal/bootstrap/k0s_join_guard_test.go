@@ -110,8 +110,9 @@ func TestK0sJoinGuard_RenderShape(t *testing.T) {
 			if call < 0 {
 				t.Fatalf("post-bootstrap does not run the join confirmation:\n%s", s.postBootstrap)
 			}
-			active := strings.Index(s.postBootstrap, "systemctl is-active --quiet kairos-k0s-apply-args")
-			if status := strings.Index(s.postBootstrap, "k0s status >/dev/null"); active < 0 || active > status {
+			active := strings.Index(s.postBootstrap, "systemctl is-active kairos-k0s-apply-args")
+			if status := strings.Index(s.postBootstrap, "k0s status >/dev/null"); active < 0 || active > status ||
+				!strings.Contains(s.postBootstrap, "active|activating|reloading)") {
 				t.Errorf("post-bootstrap must wait for a detached apply-args before the k0s status loop")
 			}
 			if wait := strings.Index(s.postBootstrap, "k0s status >/dev/null"); wait < 0 || wait > call {
@@ -225,11 +226,12 @@ type joinEnv struct {
 }
 
 type joinRun struct {
-	members  string // stdout of the stubbed `k0s etcd member-list` ("" with memberRC != 0: it fails)
-	memberRC int
-	rmFails  bool
-	bare     bool // the live k0scontroller has no --token-file in its argv
-	mvFails  bool // writing a marker (mv) fails
+	members    string // stdout of the stubbed `k0s etcd member-list` ("" with memberRC != 0: it fails)
+	memberRC   int
+	rmFails    bool
+	bare       bool // the live k0scontroller has no --token-file in its argv
+	mvFails    bool // writing a marker (mv) fails
+	pidChanges bool // MainPID differs between the reads around member-list
 }
 
 type joinResult struct {
@@ -328,24 +330,41 @@ func (e *joinEnv) run(t *testing.T, bashPath, script string, run joinRun, replac
 	if run.mvFails {
 		extra["mv"] = "#!/bin/bash\necho \"mv $*\" >> \"${STUB_LOG}\"\nexit 1\n"
 	}
-	if fromProc := `"/proc/${pid}/cmdline"`; strings.Contains(script, fromProc) {
-		// The confirmation reads the live k0scontroller's argv.
-		procDir := filepath.Join(e.dir, "proc", "4242")
-		if err := os.MkdirAll(procDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if fromProc := `"/proc/$1/cmdline"`; strings.Contains(script, fromProc) {
+		// The confirmation reads the live k0scontroller's argv. Two PIDs exist so
+		// a test can make MainPID change between its two reads.
 		cmdline := "/usr/bin/k0s\x00controller\x00--token-file=/etc/k0s/controller-token\x00"
 		if run.bare {
 			cmdline = "/usr/bin/k0s\x00controller\x00"
 		}
-		if err := os.WriteFile(filepath.Join(procDir, "cmdline"), []byte(cmdline), 0o644); err != nil {
-			t.Fatal(err)
+		for _, pid := range []string{"4242", "4243"} {
+			procDir := filepath.Join(e.dir, "proc", pid)
+			if err := os.MkdirAll(procDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(procDir, "cmdline"), []byte(cmdline), 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
-		extra["systemctl"] = `#!/bin/bash
+		pidStub := `#!/bin/bash
 echo "systemctl $*" >> "${STUB_LOG}"
 case "$*" in *"-p MainPID"*) echo 4242 ;; esac
 `
-		script = strings.ReplaceAll(script, fromProc, `"`+filepath.Join(e.dir, "proc")+`/${pid}/cmdline"`)
+		if run.pidChanges {
+			// MainPID alternates between two PIDs on every read.
+			pidStub = `#!/bin/bash
+echo "systemctl $*" >> "${STUB_LOG}"
+case "$*" in
+  *"-p MainPID"*)
+    n=$(cat "${STUB_STATE}/pidreads" 2>/dev/null || echo 0)
+    echo $((n+1)) > "${STUB_STATE}/pidreads"
+    echo $((4242 + n % 2))
+    ;;
+esac
+`
+		}
+		extra["systemctl"] = pidStub
+		script = strings.ReplaceAll(script, fromProc, `"`+filepath.Join(e.dir, "proc")+`/$1/cmdline"`)
 	}
 	e.stubs(t, extra)
 	p := filepath.Join(e.dir, "script.sh")
@@ -358,6 +377,7 @@ case "$*" in *"-p MainPID"*) echo 4242 ;; esac
 		"STUB_LOG="+e.log,
 		"STUB_MEMBERS="+run.members,
 		"STUB_MEMBER_RC="+string(rune('0'+run.memberRC)),
+		"STUB_STATE="+e.dir,
 	)
 	out, err := cmd.CombinedOutput()
 	res := joinResult{output: string(out)}
@@ -452,6 +472,8 @@ func TestK0sJoinGuard_Confirmation(t *testing.T) {
 		{"2 members confirm", nil, joinRun{members: two}, 0, true, false, false, 1},
 		{"3 pretty-printed members confirm", nil, joinRun{members: three}, 0, true, false, false, 1},
 		{"1 member stops and refuses", nil, joinRun{members: `{"members":{"cp-1":"https://10.0.0.2:2380"}}`}, 1, false, true, true, 1},
+		{"1 member but MainPID changed between the reads is inconclusive", nil, joinRun{members: `{"members":{"cp-1":"https://10.0.0.2:2380"}}`, pidChanges: true}, 1, false, false, false, 120},
+		{"2 members confirm even when MainPID changes", nil, joinRun{members: two, pidChanges: true}, 0, true, false, false, 1},
 		// A bare k0s (started before its arguments existed) is a one-member cluster
 		// that apply-args is about to wipe: it must neither refuse nor stop k0s.
 		{"bare argv with 1 member is inconclusive, not a refusal", nil, joinRun{members: `{"members":{"cp-1":"https://10.0.0.2:2380"}}`, bare: true}, 1, false, false, false, 120},
