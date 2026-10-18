@@ -245,6 +245,137 @@ write_files:
     group: root
     content: |
       k0s-controller-join-token
+  # ADR 0015 PR-1: a join node fails closed. k0s decides "already joined" from
+  # etcd's db file (etcd/member/snap/db), which etcd creates BEFORE it has
+  # validated the cluster it is joining. A join whose etcd fails in between
+  # therefore leaves a db with no WAL, and the next start skips the join and
+  # bootstraps a NEW cluster that shares the CA. This guard runs inside the
+  # k0scontroller unit as an ExecStartPre (the mechanism of the address
+  # resolver; NOT a separate unit ordered ahead of k0s, which is the ADR 0004
+  # deadlock). It is static: no template input reaches it.
+  - path: /usr/local/bin/kairos-k0s-join-guard.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+      K0S_DIR=/var/lib/k0s
+      confirmed="${K0S_DIR}/.kairos-join-confirmed"
+      refused="${K0S_DIR}/.kairos-join-refused"
+      member="${K0S_DIR}/etcd/member"
+
+      # A confirmed member is never touched or refused again.
+      if [ -e "${confirmed}" ]; then
+        exit 0
+      fi
+
+      if [ -e "${refused}" ]; then
+        echo "kairos-join-guard: refusing to start k0scontroller: this node bootstrapped a cluster of its own instead of joining one. Replace the Machine (delete it); do not start k0s on this node." >&2
+        exit 1
+      fi
+
+      # etcd's own "have a WAL" test: the wal dir holds at least one *.wal file.
+      if [ -e "${member}/snap/db" ]; then
+        have_wal=0
+        for f in "${member}"/wal/*.wal; do
+          if [ -e "${f}" ]; then
+            have_wal=1
+            break
+          fi
+        done
+        if [ "${have_wal}" = "0" ]; then
+          echo "kairos-join-guard: etcd db without a WAL: the previous join did not finish; clearing ${member} so k0s joins again"
+          if ! rm -rf -- "${member}"; then
+            echo "kairos-join-guard: could not clear ${member}; refusing to start k0s on it" >&2
+            exit 1
+          fi
+        fi
+      fi
+      exit 0
+  - path: /etc/systemd/system/k0scontroller.service.d/zz-capi-join-guard.conf
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      ExecStartPre=/usr/local/bin/kairos-k0s-join-guard.sh
+  # ADR 0015 PR-1: confirm the join after k0s has started. A joined node sees
+  # itself plus the member that served the join (>= 2 members); only a node that
+  # bootstrapped its own cluster sees exactly one. Run as the first step of
+  # kairos-k0s-post-bootstrap.sh, before the providerID or any report.
+  - path: /usr/local/bin/kairos-k0s-join-confirm.sh
+    permissions: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      set -u
+      K0S_DIR=/var/lib/k0s
+      confirmed="${K0S_DIR}/.kairos-join-confirmed"
+      refused="${K0S_DIR}/.kairos-join-refused"
+
+      if [ -e "${confirmed}" ]; then
+        exit 0
+      fi
+      if [ -e "${refused}" ]; then
+        echo "kairos-join-guard: REFUSED earlier: this node serves a cluster of its own; not proceeding" >&2
+        exit 1
+      fi
+
+      write_marker() {
+        local target="$1" text="$2" tmp="$1.tmp.$$"
+        if printf '%s\n' "${text}" > "${tmp}" && mv -f "${tmp}" "${target}"; then
+          return 0
+        fi
+        rm -f "${tmp}"
+        return 1
+      }
+
+      # Entries of "members" in `k0s etcd member-list` ({"members":{"<name>":"<url>"}}).
+      # Prints the count, or fails when the output is not a member list.
+      count_members() {
+        local out body
+        out="$(if command -v timeout >/dev/null 2>&1; then timeout 10 k0s etcd member-list; else k0s etcd member-list; fi 2>/dev/null)" || return 1
+        out="$(printf '%s' "${out}" | tr -d ' \t\r\n')"
+        case "${out}" in
+          *'"members":{'*) ;;
+          *) return 1 ;;
+        esac
+        body="$(printf '%s' "${out}" | sed -n 's/.*"members":{\(.*\)}.*/\1/p')"
+        if [ -z "${body}" ]; then
+          echo 0
+          return 0
+        fi
+        printf '%s' "${body}" | grep -o '":"' | wc -l | tr -d ' '
+      }
+
+      n=""
+      for attempt in {1..120}; do
+        if n="$(count_members)" && [ -n "${n}" ] && [ "${n}" -ge 1 ]; then
+          break
+        fi
+        n=""
+        sleep 5
+      done
+
+      if [ -z "${n}" ]; then
+        echo "kairos-join-guard: could not read the etcd member list within 10 minutes; join not confirmed, no providerID set" >&2
+        exit 1
+      fi
+      if [ "${n}" -ge 2 ]; then
+        write_marker "${confirmed}" "members=${n} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" ||
+          echo "kairos-join-guard: could not write the confirmed marker; it is retried on the next boot" >&2
+        echo "kairos-join-guard: join confirmed (${n} etcd members)"
+        exit 0
+      fi
+
+      # Exactly one member: this node is serving a cluster of its own.
+      write_marker "${refused}" "members=${n} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" ||
+        echo "kairos-join-guard: could not write the refusal marker" >&2
+      systemctl --no-block stop k0scontroller.service || true
+      echo "kairos-join-guard: REFUSED: etcd lists only this node (${n} member); stopped k0scontroller, no providerID set. Replace the Machine." >&2
+      exit 1
   # ADR 0005 § D.1 (HA) kube-vip DaemonSet + RBAC (CAPV/CAPM3 only; CAPK uses its
   # built-in LoadBalancer Service per OQ-5 and never reaches this block).
   # k0s applies manifests under /var/lib/k0s/manifests/<dir>/ via its
@@ -620,13 +751,23 @@ write_files:
       # bin/ holds the extracted k0s binaries and manifests/ holds the kube-vip
       # manifest that write_files put there; neither identifies a cluster, and
       # removing them would be destructive for no reason.
+      #
+      # ADR 0015 PR-1: never once the join is confirmed. A confirmed member holds
+      # real cluster state, whatever its live argv looks like. The marker files
+      # themselves are kept so the fail-closed guard still sees them.
       case "${r}" in
         *--token-file*) ;;
         *)
-          echo "  join controller self-initialised without its token; discarding that state"
-          systemctl stop "${UNIT}" || true
-          find /var/lib/k0s -mindepth 1 -maxdepth 1 \
-            ! -name bin ! -name manifests -exec rm -rf {} + 2>/dev/null || true
+          if [ -e /var/lib/k0s/.kairos-join-confirmed ]; then
+            echo "  join already confirmed; not discarding state"
+          else
+            echo "  join controller self-initialised without its token; discarding that state"
+            systemctl stop "${UNIT}" || true
+            find /var/lib/k0s -mindepth 1 -maxdepth 1 \
+              ! -name bin ! -name manifests \
+              ! -name .kairos-join-confirmed ! -name .kairos-join-refused \
+              -exec rm -rf {} + 2>/dev/null || true
+          fi
           ;;
       esac
       systemctl restart "${UNIT}" || true
@@ -658,6 +799,10 @@ write_files:
           sleep 5
         done
       fi
+      # ADR 0015 PR-1: confirm this node JOINED a cluster before anything else.
+      # A node that bootstrapped its own cluster is stopped and refused, and never
+      # gets a providerID. Fails the unit (set -e); a reboot retries.
+      /usr/local/bin/kairos-k0s-join-confirm.sh
       # Enforce hostname from cloud-config on immutable rootfs
       if [ -f /usr/local/etc/hostname ]; then
         /usr/bin/hostnamectl set-hostname "$(cat /usr/local/etc/hostname)"
