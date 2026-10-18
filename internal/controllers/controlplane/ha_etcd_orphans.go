@@ -163,7 +163,7 @@ func (r *KairosControlPlaneReconciler) reconcileOrphanEtcdMembers(ctx context.Co
 			log.Info("Removing an unparsable orphan etcd-member record", "annotation", etcdOrphanLeaveAnnotation)
 			return ctrl.Result{}, false, r.patchKCPAnnotations(ctx, kcp, nil, etcdOrphanLeaveAnnotation)
 		}
-		return r.progressOrphanLeave(ctx, log, kcp, cluster, all, rec)
+		return r.progressOrphanLeave(ctx, log, kcp, cluster, all, desiredReplicas, rec)
 	}
 
 	if why := orphanCleanupBlocked(kcp, machines, all, desiredReplicas); why != "" {
@@ -353,17 +353,6 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 	if len(orphans) == 0 {
 		return ctrl.Result{}, false, nil
 	}
-	// Every Machine must own a distinct joined member before any member can
-	// be called an orphan (unmatchedMachines).
-	if unmatched := unmatchedMachines(machines, joined); len(unmatched) > 0 {
-		log.Info("Not removing orphan etcd members: some Machines have no EtcdMember by Node name or peer address", "machines", unmatched)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdOrphanMemberRemovalBlocked",
-				"etcd member naming does not match the control-plane Machines: no EtcdMember matches Machine(s) %s by Node name or peer address, so no member is removed; compare `k0s etcd member-list` with the Machines",
-				strings.Join(unmatched, ", "))
-		}
-		return ctrl.Result{}, false, nil
-	}
 	sort.Slice(orphans, func(i, j int) bool { return orphans[i].GetName() < orphans[j].GetName() })
 
 	var target *unstructured.Unstructured
@@ -388,21 +377,7 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 		return ctrl.Result{}, false, nil
 	}
 
-	// Quorum: what is left must still be a healthy majority, of the members
-	// left and of the desired replicas.
-	healthy := healthyVotingMembers(joined, target, machines, status)
-	left := len(joined) - 1
-	need := left/2 + 1
-	if q := int(desiredReplicas/2 + 1); q > need {
-		need = q
-	}
-	if healthy < need {
-		log.Info("Not removing an orphan etcd member: quorum would not hold", "member", target.GetName(), "healthyLeft", healthy, "need", need)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdOrphanMemberRemovalBlocked",
-				"etcd member %q has no control-plane Machine, but removing it would leave %d healthy voting members of %d, below the %d needed; remove it by hand once the cluster is healthy",
-				target.GetName(), healthy, left, need)
-		}
+	if r.orphanRemovalBlocked(log, kcp, machines, joined, target, status, desiredReplicas) {
 		return ctrl.Result{}, false, nil
 	}
 
@@ -436,7 +411,7 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 // the member gone, the EtcdMember describes another member, or
 // etcdMemberLeaveCap passes. It holds every other membership change while it
 // runs.
-func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, rec orphanLeave) (ctrl.Result, bool, error) {
+func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, desiredReplicas int32, rec orphanLeave) (ctrl.Result, bool, error) {
 	wait := ctrl.Result{RequeueAfter: joinerGateRequeueAfter}
 	finish := func(eventType, reason, msg string, args ...interface{}) (ctrl.Result, bool, error) {
 		if err := r.patchKCPAnnotations(ctx, kcp, nil, etcdOrphanLeaveAnnotation); err != nil {
@@ -505,6 +480,25 @@ func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, 
 			"etcd member %q now has a control-plane Machine; took back the request to remove it", rec.name)
 	}
 	if leave, _, _ := unstructured.NestedBool(member.Object, "spec", "leave"); !leave {
+		// The record exists but spec.leave was never written (a crash between
+		// the two writes, or a failed patch): the cluster may have changed
+		// since the record. Check again, as for a first request, before this
+		// first write.
+		joined, lerr := listJoinedEtcdMembers(ctx, conn.client)
+		status, serr := r.readEtcdStatus(ctx, cluster)
+		switch {
+		case lerr != nil || serr != nil:
+			if capped {
+				return timedOut()
+			}
+			log.Info("Waiting to request the recorded orphan etcd member removal: cannot re-check its safety", "member", rec.name)
+			return wait, true, nil
+		case r.orphanRemovalBlocked(log, kcp, machines, joined, member, status, desiredReplicas):
+			if capped {
+				return timedOut()
+			}
+			return wait, true, nil
+		}
 		if err := setEtcdMemberLeave(ctx, conn.client, member, true); err != nil {
 			log.Info("Could not set spec.leave on the orphan etcd member; retrying", "member", rec.name, "reason", err.Error())
 		}
@@ -514,6 +508,61 @@ func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, 
 	}
 	log.Info("Waiting for k0s to remove the orphan etcd member", "member", rec.name, "memberID", rec.memberID, "via", conn.via)
 	return wait, true, nil
+}
+
+// orphanRemovalBlocked reports whether removing target from joined is unsafe
+// now, and if so emits EtcdOrphanMemberRemovalBlocked saying why. Both the
+// first request and a recorded removal about to write its first spec.leave
+// run it.
+//
+//   - Every control-plane Machine must own a distinct joined member
+//     (unmatchedMachines); otherwise a member whose name drifted could be a
+//     live voter.
+//   - Quorum: the healthy voting members left must be a majority of the
+//     members left and of the desired replicas.
+func (r *KairosControlPlaneReconciler) orphanRemovalBlocked(log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, joined []*unstructured.Unstructured, target *unstructured.Unstructured, status map[string]etcdMemberStatus, desiredReplicas int32) bool {
+	if unmatched := unmatchedMachines(machines, joined); len(unmatched) > 0 {
+		log.Info("Not removing orphan etcd members: some Machines have no EtcdMember by Node name or peer address", "machines", unmatched)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdOrphanMemberRemovalBlocked",
+				"etcd member naming does not match the control-plane Machines: no EtcdMember matches Machine(s) %s by Node name or peer address, so no member is removed; compare `k0s etcd member-list` with the Machines",
+				strings.Join(unmatched, ", "))
+		}
+		return true
+	}
+	healthy := healthyVotingMembers(joined, target, machines, status)
+	left := len(joined) - 1
+	need := left/2 + 1
+	if q := int(desiredReplicas/2 + 1); q > need {
+		need = q
+	}
+	if healthy < need {
+		log.Info("Not removing an orphan etcd member: quorum would not hold", "member", target.GetName(), "healthyLeft", healthy, "need", need)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdOrphanMemberRemovalBlocked",
+				"etcd member %q has no control-plane Machine, but removing it would leave %d healthy voting members of %d, below the %d needed; remove it by hand once the cluster is healthy",
+				target.GetName(), healthy, left, need)
+		}
+		return true
+	}
+	return false
+}
+
+// listJoinedEtcdMembers lists the EtcdMembers through wc and returns those k0s
+// does not report Joined=False.
+func listJoinedEtcdMembers(ctx context.Context, wc client.Client) ([]*unstructured.Unstructured, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(etcdMemberGVK.GroupVersion().WithKind(etcdMemberGVK.Kind + "List"))
+	if err := wc.List(ctx, list); err != nil {
+		return nil, err
+	}
+	var joined []*unstructured.Unstructured
+	for i := range list.Items {
+		if etcdMemberJoinedStatus(&list.Items[i]) != k0sEtcdMemberNotJoined {
+			joined = append(joined, &list.Items[i])
+		}
+	}
+	return joined, nil
 }
 
 // setEtcdMemberLeave sets spec.leave on member to leave with a merge patch

@@ -711,6 +711,61 @@ func TestOrphanEtcdMembers_RecordConflictKeepsTheSlot(t *testing.T) {
 	g.Expect(f.stored().Annotations).To(HaveKey(etcdOrphanLeaveAnnotation))
 }
 
+// TestOrphanEtcdMembers_RecordedRemovalRechecksBeforeTheFirstWrite: a record
+// whose spec.leave was never written (the KCP crashed between the two writes)
+// is re-checked before that first write. If quorum, or the pairing of every
+// Machine with its own member, no longer allows the removal, nothing is
+// written: the removal holds with EtcdOrphanMemberRemovalBlocked, and the cap
+// still ends it.
+func TestOrphanEtcdMembers_RecordedRemovalRechecksBeforeTheFirstWrite(t *testing.T) {
+	recent := orphanLeave{name: "kcp-old", memberID: testMemberID, at: time.Now().Add(-time.Minute)}
+	t.Run("quorum no longer holds: no write, held", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newOrphanFixture(g, map[string]string{etcdOrphanLeaveAnnotation: recent.String()},
+			withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+		// Two members stopped reporting healthy since the record was written.
+		g.Expect(f.mgmt.Update(context.Background(), etcdStatusSecretForMembersRV(g, f.mgmt, "cp-0"))).To(Succeed())
+
+		_, hold, err := f.reconcile()
+
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(hold).To(BeTrue(), "still holds every other membership change")
+		g.Expect(f.leaveSet("kcp-old")).To(BeFalse(), "no spec.leave without quorum")
+		g.Expect(f.stored().Annotations).To(HaveKey(etcdOrphanLeaveAnnotation))
+		g.Expect(f.events()).To(ConsistOf(And(ContainSubstring("Warning EtcdOrphanMemberRemovalBlocked"), ContainSubstring("healthy voting members"))))
+	})
+	t.Run("a Machine lost its member pairing: no write, held", func(t *testing.T) {
+		g := NewWithT(t)
+		f := newOrphanFixture(g, map[string]string{etcdOrphanLeaveAnnotation: recent.String()},
+			k0sEtcdMember("cp-0", "10.0.0.10", false, "True"),
+			k0sEtcdMember("cp-1", "10.0.0.11", false, "True"),
+			k0sEtcdMember("cp-2-renamed", "192.168.50.12:2380", false, "True"),
+			k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))
+
+		_, hold, err := f.reconcile()
+
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(hold).To(BeTrue())
+		g.Expect(f.leaveSet("kcp-old")).To(BeFalse())
+		g.Expect(f.events()).To(ConsistOf(ContainSubstring("naming does not match")))
+	})
+	t.Run("still blocked past the cap: cleared with a warning, no write", func(t *testing.T) {
+		g := NewWithT(t)
+		old := orphanLeave{name: "kcp-old", memberID: testMemberID, at: time.Now().Add(-etcdMemberLeaveCap - time.Minute)}
+		f := newOrphanFixture(g, map[string]string{etcdOrphanLeaveAnnotation: old.String()},
+			withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+		g.Expect(f.mgmt.Update(context.Background(), etcdStatusSecretForMembersRV(g, f.mgmt, "cp-0"))).To(Succeed())
+
+		_, hold, err := f.reconcile()
+
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(hold).To(BeFalse())
+		g.Expect(f.leaveSet("kcp-old")).To(BeFalse())
+		g.Expect(f.stored().Annotations).ToNot(HaveKey(etcdOrphanLeaveAnnotation))
+		g.Expect(f.events()).To(ContainElement(ContainSubstring("Warning EtcdOrphanMemberRemovalTimedOut")))
+	})
+}
+
 // TestReconcileMachines_OrphanRemovalHoldsMembershipChanges: while an orphan
 // etcd-member removal is in progress, reconcileMachines changes no other
 // membership (here, a k0s scale-down delete); once it is done, it does.
