@@ -580,7 +580,7 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	//
 	// Naming (KD-48): the bootstrap Secret is named deterministically after the
 	// KairosConfig — which our KCP names identically to the owning Machine
-	// (fmt.Sprintf("%s-%d", kcp.Name, index)). This mirrors CABPK, where the
+	// (<kcp>-<random suffix>, ADR 0015 PR-4). This mirrors CABPK, where the
 	// KubeadmConfig's data Secret is named after the config, and is REQUIRED for
 	// correctness with infrastructure providers that derive the userData Secret
 	// name from the Machine name rather than from Machine.spec.bootstrap.dataSecretName.

@@ -353,10 +353,13 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 
 	// (3) First entry for THIS eviction cycle (no timestamp stamped yet). FORCE the
 	// leave-requested sentinel, overwriting any STALE `left` a prior eviction of a
-	// same-named Machine left behind: Machine indices/names are reused, and the
-	// workload ConfigMap key == the Node name, so a previous cycle's ack can linger
-	// and would otherwise short-circuit this eviction into removing the hook
-	// without the (new) member ever leaving etcd → orphan. The force-write MUST
+	// same-named node left behind. The workload ConfigMap key == the Node name, so
+	// a previous cycle's ack can linger and would otherwise short-circuit this
+	// eviction into removing the hook without the (new) member ever leaving etcd
+	// → orphan. New Machines no longer reuse names (ADR 0015 PR-4), but the force
+	// stays: index-named Machines from before that change may already carry a
+	// reused name with a stale ack, and a KairosConfig `hostname` can give
+	// several Machines over time the same Node name. The force-write MUST
 	// precede the timestamp stamp, so a stamp failure re-forces (clears the stale
 	// ack) next reconcile rather than leaving a stale `left` visible once
 	// requested==true. Terminal checks are deliberately NOT evaluated on this pass.
@@ -445,7 +448,7 @@ func leaveTimedOut(m *clusterv1.Machine) bool {
 // clobbers an existing `left` ack (a racy reconcile within a cycle must not
 // un-ack a node that already left). When force is true (the first entry of an
 // eviction cycle) it overwrites any value, including a STALE `left` left behind
-// by a prior eviction of a same-named Machine.
+// by a prior eviction of a node of the same name.
 func (r *KairosControlPlaneReconciler) ensureLeaveRequested(ctx context.Context, wc client.Client, cmKey types.NamespacedName, nodeName string, force bool) error {
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmKey.Name, Namespace: cmKey.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, wc, cm, func() error {

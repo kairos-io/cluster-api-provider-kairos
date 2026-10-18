@@ -1,8 +1,14 @@
 #!/bin/bash
 # Inspect cloud-config from KairosConfig secret
-# Usage: ./hack/inspect-cloud-config.sh [kairosconfig-name] [namespace]
+# Usage: ./hack/inspect-cloud-config.sh <kairosconfig-name> [namespace]
 
-KAIROS_CONFIG_NAME=${1:-kairos-control-plane-0}
+if [ -z "$1" ]; then
+    echo "Usage: $0 <kairosconfig-name> [namespace]" >&2
+    echo "Control-plane KairosConfigs are named after their Machine: <kcp-name>-<5 random characters>." >&2
+    echo "List them with: kubectl get kairosconfigs -n <namespace>" >&2
+    exit 1
+fi
+KAIROS_CONFIG_NAME=$1
 NAMESPACE=${2:-default}
 
 echo "=== Finding KairosConfig: $KAIROS_CONFIG_NAME ==="
