@@ -293,7 +293,10 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 
-	nodeName := target.Status.NodeRef.Name
+	nodeName, err := r.leaveNodeName(ctx, target)
+	if err != nil {
+		return false, err
+	}
 	_, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]
 
 	// (2b) Not before CAPI has finished with the Node. The drain and the volume
@@ -368,7 +371,7 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// stuck node must not wedge deletion, and neither must an unreachable
 	// workload cluster.
 	if leaveTimedOut(target) {
-		return r.delegateMemberLeave(ctx, log, kcp, machines, target, conn, connErr)
+		return r.delegateMemberLeave(ctx, log, kcp, machines, target, nodeName, conn, connErr)
 	}
 	if connErr != nil {
 		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)

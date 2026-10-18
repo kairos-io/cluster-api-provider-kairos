@@ -167,11 +167,13 @@ func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log log
 		hostnamePrefix = "metal-"
 	}
 
-	// Prefer explicit hostname, otherwise use Machine name.
-	hostname := kairosConfig.Spec.Hostname
-	if hostname == "" && machine != nil {
-		hostname = machine.Name
+	// Prefer explicit hostname, otherwise use Machine name. The KCP looks the
+	// node up by the same name (bootstrapv1beta2.RenderedHostname, ADR 0015).
+	machineName := ""
+	if machine != nil {
+		machineName = machine.Name
 	}
+	hostname := bootstrapv1beta2.RenderedHostname(&kairosConfig.Spec, machineName)
 
 	// Set install configuration (with defaults).
 	var installConfig *bootstrap.InstallConfig
