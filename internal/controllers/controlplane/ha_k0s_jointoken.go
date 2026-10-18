@@ -484,6 +484,26 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 		}
 		return "", fmt.Sprintf("issuing a k0s join token failed: %v", err), nil
 	}
+	// ADR 0015 PR-2: narrow the verify-then-act window. The identity was read
+	// before the mint; read it again on the same client now the token exists.
+	// If the cluster changed in between, delete the token (best effort; it
+	// also lapses with its TTL) and freeze, so no joiner is ever created with
+	// it. The management Secret keeps the encoded token, but no KairosConfig is
+	// stamped with its ID, and after an operator clears the freeze the next
+	// admission re-checks it against the pinned cluster before reusing it.
+	//
+	// This narrows the window but cannot close it: through the VIP, each
+	// request may reach a different apiserver, so the mint itself may land in
+	// a cluster that neither read saw. The node-side join check (ADR 0015
+	// PR-1: a joiner that sees itself as the only etcd member refuses to
+	// serve) is the backstop for that residue.
+	if verr := r.verifyWorkloadIdentity(ctx, log, kcp, wc, leaveViaEndpoint); verr != nil {
+		if errors.Is(verr, errWorkloadIdentityChanged) {
+			deleteK0sJoinToken(ctx, log, wc, id)
+			return "", "", verr
+		}
+		return "", fmt.Sprintf("cannot re-verify the workload cluster identity after issuing a k0s join token: %v", verr), nil
+	}
 	for _, old := range stored.supersededIDs() {
 		if old != id {
 			deleteSupersededK0sJoinToken(ctx, log, wc, old)

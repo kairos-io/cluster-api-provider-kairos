@@ -36,6 +36,7 @@ import (
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -494,6 +495,43 @@ func TestEnsureK0sJoinToken_IdentityGatesTheMint(t *testing.T) {
 		g.Expect(e.factoryCalls).To(BeZero())
 		g.Expect(e.workloadTokenIDs()).To(BeEmpty())
 	})
+}
+
+// TestEnsureK0sJoinToken_ReverifiesAfterTheMint: the cluster switches
+// between the identity read before the mint and the one after it. The token
+// is deleted, the control plane freezes, and no token ID is returned, so no
+// joiner is ever created with it.
+func TestEnsureK0sJoinToken_ReverifiesAfterTheMint(t *testing.T) {
+	g := NewWithT(t)
+	e := newPolicyEnv(t, policyOpts{liveAddrs: []string{"10.0.0.20"}, workload: []client.Object{kubeSystem(uidA)}})
+	pinPolicyEnv(t, e, map[string]string{WorkloadClusterUIDAnnotation: uidA})
+	// The first kube-system read (before the mint) sees the pinned cluster;
+	// every later read sees another one.
+	var reads int
+	switching := interceptor.NewClient(e.wc.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if ns, ok := obj.(*corev1.Namespace); ok && ns.Name == metav1.NamespaceSystem {
+				reads++
+				if reads > 1 {
+					ns.UID = types.UID(uidB)
+				}
+			}
+			return nil
+		},
+	})
+	e.r.WorkloadClientFactory = staticWorkloadClient(switching)
+
+	id, _, err := e.ensure()
+
+	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeTrue())
+	g.Expect(id).To(BeEmpty())
+	g.Expect(reads).To(Equal(2), "read once before and once after the mint")
+	g.Expect(e.workloadTokenIDs()).To(BeEmpty(), "the token minted across the switch is deleted")
+	_, frozen := workloadIdentityFrozen(e.kcp)
+	g.Expect(frozen).To(BeTrue())
 }
 
 func TestK0sJoinTokenLifetime_IdentityGatesTheExtension(t *testing.T) {
