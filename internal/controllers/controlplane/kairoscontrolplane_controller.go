@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -72,6 +73,11 @@ type KairosControlPlaneReconciler struct {
 	// control-plane endpoint (ADR 0014). nil → defaultMemberClient; tests
 	// inject a fake.
 	MemberClientFactory func(ctx context.Context, cluster *clusterv1.Cluster, ip string) (client.Client, error)
+
+	// identityMu guards identityCheckedAt, the in-memory rate limit of the
+	// periodic workload-identity recheck (ADR 0015 PR-2, ha_identity.go).
+	identityMu        sync.Mutex
+	identityCheckedAt map[string]time.Time
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
