@@ -314,6 +314,25 @@ func TestReconcileWorkloadIdentity_MalformedAnswerNeverBecomesThePin(t *testing.
 	}
 }
 
+// TestReconcileWorkloadIdentity_VanishedMarkerRechecksAtOnce: when an
+// operator removes the mismatch marker, the next reconcile rechecks every
+// path at once, not up to a minute later.
+func TestReconcileWorkloadIdentity_VanishedMarkerRechecksAtOnce(t *testing.T) {
+	g := NewWithT(t)
+	f := newIdentityFixture(g, map[string]string{WorkloadClusterUIDAnnotation: uidA})
+	g.Expect(f.reconcile()).To(Equal(identityGate{}))
+	g.Expect(f.endpointCalls).To(Equal(1))
+
+	// The freeze lands within the interval (here: recorded by another check).
+	f.operatorAnnotates(map[string]string{WorkloadClusterIdentityMismatchAnnotation: frozenAgainst(uidA)})
+	g.Expect(f.reconcile().frozen).To(BeTrue())
+
+	f.endpoint = workloadWithUID(f.scheme, uidB)
+	f.operatorAnnotates(nil, WorkloadClusterIdentityMismatchAnnotation)
+	g.Expect(f.reconcile().frozen).To(BeTrue(), "the cluster still differs: frozen again at once")
+	g.Expect(f.endpointCalls).To(Equal(2), "the recheck ran on the first reconcile after the marker went")
+}
+
 func TestReconcileWorkloadIdentity_HoldsWhenNothingAnswers(t *testing.T) {
 	g := NewWithT(t)
 	f := newIdentityFixture(g, nil)

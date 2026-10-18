@@ -218,6 +218,10 @@ func (r *KairosControlPlaneReconciler) reconcileWorkloadIdentity(ctx context.Con
 		return identityGate{}, err
 	}
 	if msg, frozen := workloadIdentityFrozen(kcp); frozen {
+		// Keep the next full recheck due, so that the reconcile which sees the
+		// marker gone (an operator removed it) rechecks every path at once
+		// instead of up to workloadIdentityRecheckInterval later.
+		r.forgetIdentityCheck(kcp)
 		return identityGate{frozen: true, hold: msg}, nil
 	}
 	if !identityApplies(kcp, machines, desiredReplicas) {
@@ -466,6 +470,7 @@ func (r *KairosControlPlaneReconciler) tripIdentityFreeze(ctx context.Context, l
 	if err := r.patchKCPAnnotations(ctx, kcp, map[string]string{WorkloadClusterIdentityMismatchAnnotation: value}); err != nil {
 		return errors.Join(changed, fmt.Errorf("record the identity mismatch on the KairosControlPlane: %w", err))
 	}
+	r.forgetIdentityCheck(kcp)
 	log.Info("Workload cluster identity changed; freezing control-plane membership changes",
 		"pinned", displayUID(pin), "observed", displayUID(uid), "via", via)
 	if r.Recorder != nil {
