@@ -409,8 +409,13 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 	// Record first, so a crash after the patch is still tracked.
 	rec := orphanLeave{name: target.GetName(), memberID: targetID, at: time.Now()}
 	if err := r.patchKCPAnnotations(ctx, kcp, map[string]string{etcdOrphanLeaveAnnotation: rec.String()}); err != nil {
+		// Nothing was asked of k0s. Give the check slot back, so the next
+		// reconcile (on a fresh KCP) tries again at once instead of after
+		// etcdOrphanCheckInterval with no record to follow.
+		r.forgetOrphanCheck(kcp)
 		if apierrors.IsConflict(err) {
-			return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, true, nil
+			log.Info("The KairosControlPlane changed while the orphan etcd member removal was being recorded; retrying", "member", rec.name)
+			return ctrl.Result{RequeueAfter: time.Second}, true, nil
 		}
 		return ctrl.Result{}, false, fmt.Errorf("record the orphan etcd member removal: %w", err)
 	}
@@ -597,6 +602,13 @@ func (r *KairosControlPlaneReconciler) orphanCheckDue(kcp *controlplanev1beta2.K
 	defer r.orphanMu.Unlock()
 	at, ok := r.orphanCheckedAt[identityCheckKey(kcp)]
 	return !ok || time.Since(at) >= etcdOrphanCheckInterval
+}
+
+// forgetOrphanCheck makes the next reconcile of kcp run an orphan check.
+func (r *KairosControlPlaneReconciler) forgetOrphanCheck(kcp *controlplanev1beta2.KairosControlPlane) {
+	r.orphanMu.Lock()
+	defer r.orphanMu.Unlock()
+	delete(r.orphanCheckedAt, identityCheckKey(kcp))
 }
 
 // markOrphanChecked records an orphan check of kcp now.

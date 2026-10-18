@@ -24,6 +24,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -674,6 +675,40 @@ func TestOrphanEtcdMembers_FailedPassKeepsTheSlot(t *testing.T) {
 	g.Expect(pass()).To(BeTrue(), "the next reconcile acts at once")
 	g.Expect(f.leaveSet("kcp-old")).To(BeTrue())
 	g.Expect(f.r.orphanCheckDue(f.kcp)).To(BeFalse(), "an evaluated pass takes the slot")
+}
+
+// TestOrphanEtcdMembers_RecordConflictKeepsTheSlot: when the record cannot be
+// written because the KairosControlPlane changed (a routine conflict with
+// the status update), nothing is asked of k0s, and the slot is given back, so
+// the next reconcile records and requests the removal at once. Before, the
+// slot stayed taken with no record, and the cleanup waited a full interval:
+// the cause of TestHA_K0sOrphanEtcdMemberIsRemoved's flake.
+func TestOrphanEtcdMembers_RecordConflictKeepsTheSlot(t *testing.T) {
+	g := NewWithT(t)
+	f := newOrphanFixture(g, nil, withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+	conflicts := 1
+	f.r.Client = interceptor.NewClient(f.mgmt.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*controlplanev1beta2.KairosControlPlane); ok && conflicts > 0 {
+				conflicts--
+				return apierrors.NewConflict(controlplanev1beta2.GroupVersion.WithResource("kairoscontrolplanes").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	pass := func() bool {
+		_, hold, err := f.r.reconcileOrphanEtcdMembers(context.Background(), log.Log, f.kcp, haCluster(), f.machines, 3)
+		g.Expect(err).ToNot(HaveOccurred())
+		return hold
+	}
+
+	g.Expect(pass()).To(BeTrue(), "this pass holds")
+	g.Expect(f.leaveSet("kcp-old")).To(BeFalse(), "nothing is asked of k0s without a record")
+	g.Expect(f.r.orphanCheckDue(f.kcp)).To(BeTrue(), "the slot is given back")
+
+	g.Expect(pass()).To(BeTrue())
+	g.Expect(f.leaveSet("kcp-old")).To(BeTrue(), "the next reconcile acts at once")
+	g.Expect(f.stored().Annotations).To(HaveKey(etcdOrphanLeaveAnnotation))
 }
 
 // TestReconcileMachines_OrphanRemovalHoldsMembershipChanges: while an orphan
