@@ -1,7 +1,6 @@
 # Kubeadm Workers
 
-Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: not
-yet released. It is not in v0.1.4, and is planned for v0.2.0.
+Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: v0.2.0.
 
 Verification status, by control plane:
 
@@ -11,9 +10,11 @@ Verification status, by control plane:
   `spec.serverAddress`, and a bring-your-own CA with `advertiseAddress` and no
   `serverAddress`. Workers joined and became Ready in all three. Contributed by
   @patrostkowski.
-- **Upstream `KubeadmControlPlane`**: unit and envtest tests only. Not yet
-  validated against a live cluster. See also the namespace requirement below,
-  which applies specifically to this case.
+- **Upstream `KubeadmControlPlane`**: validated on a live management cluster
+  with KubeVirt workers and real Kairos images: the worker joined and became
+  Ready, the trust checks passed and refused as expected, DNS worked, and a
+  worker frozen past the bootstrap token's TTL still joined. See also the
+  namespace requirement below, which applies specifically to this case.
 
 Setting `spec.distribution: kubeadm` on a `KairosConfig` or
 `KairosConfigTemplate` bootstraps a Kairos **worker** node that joins a control
@@ -32,7 +33,7 @@ background discussion is in
 | --- | --- |
 | Kairos workers created by a `MachineDeployment` | Supported. |
 | Control planes of kind `KamajiControlPlane` | Supported. Validated on a live cluster; see the verification status above. |
-| Control planes of kind `KubeadmControlPlane` | Designed for, not yet validated live, and it **must** have its own namespace; see [the namespace requirement](#required-keep-upstream-kubeadmcontrolplane-clusters-in-their-own-namespace). |
+| Control planes of kind `KubeadmControlPlane` | Supported. Validated on a live cluster, and it **must** have its own namespace; see [the namespace requirement](#required-keep-upstream-kubeadmcontrolplane-clusters-in-their-own-namespace). |
 | Control planes of any other kind | Need an operator flag; see [Allowing other control-plane kinds](#allowing-other-control-plane-kinds). |
 | A kubeadm control plane run by this provider (`KairosControlPlane` with `distribution: kubeadm`) | Not supported. Refused; see [KairosControlPlane refuses kubeadm](#kairoscontrolplane-refuses-kubeadm). |
 | `MachinePool` workers | Not supported. Refused. |
@@ -44,8 +45,8 @@ background discussion is in
 
 **Do not put a cluster whose control plane is an upstream `KubeadmControlPlane`
 in the same namespace as a k0s or k3s Kairos cluster.** Give it a namespace of
-its own. This is a condition of using the kubeadm worker path at all while it is
-a preview, not a recommendation.
+its own. This is a condition of using the kubeadm worker path with an upstream
+`KubeadmControlPlane`, not a recommendation.
 
 The reason is how upstream `KubeadmControlPlane` obtains its PKI: it **adopts**
 a pre-existing `<cluster>-ca` or `<cluster>-kubeconfig` Secret rather than
