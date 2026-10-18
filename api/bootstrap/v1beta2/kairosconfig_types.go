@@ -635,12 +635,14 @@ type KairosConfigStatus struct {
 	FailureMessage string `json:"failureMessage,omitempty"`
 
 	// BootstrapTokenID is the non-secret ID half (the "[a-z0-9]{6}" prefix) of the
-	// kubeadm bootstrap token this KairosConfig most recently minted in the workload
-	// cluster. It lets operators correlate the token Secret in the workload cluster's
-	// kube-system namespace with this KairosConfig and audit its refresh, without
-	// exposing the secret half, which lives only in the bootstrap-data Secret and is
-	// never placed in spec or status. Empty for k0s and k3s, and for a kubeadm worker
-	// that has not yet minted a token.
+	// kubeadm bootstrap token this KairosConfig uses in the workload cluster. Every
+	// render of the KairosConfig reuses this token, and the controller extends its
+	// expiry while the Machine has no nodeRef. It is revoked and cleared once the
+	// Machine has a nodeRef, or when the KairosConfig is deleted. It lets operators
+	// correlate the token Secret in the workload cluster's kube-system namespace with
+	// this KairosConfig without exposing the secret half, which lives only in the
+	// bootstrap-data Secret and is never placed in spec or status. Empty for k0s and
+	// k3s, for a kubeadm worker that has not yet minted a token, and after revocation.
 	// +optional
 	BootstrapTokenID string `json:"bootstrapTokenID,omitempty"`
 }
