@@ -161,6 +161,19 @@ const workloadRequestTimeout = 10 * time.Second
 // the k0s join-token path, and the etcd-leave handshake when no member answers
 // directly (connectForLeave). Every request is bounded by
 // workloadRequestTimeout.
+//
+// ADR 0011: the rest.Config is built from the S5-rebuilt output of the
+// contract bytes, NEVER the raw bytes (workloadRESTConfig ->
+// trustedWorkloadKubeconfig). The contract Secret is normally already S5 output
+// (the publish path is its only sanctioned writer), but re-sanitizing here
+// closes the window where something overwrote it between reconciles: nothing
+// client-go would honor as file-path credentials, exec/auth-provider plugins,
+// impersonation or insecure TLS survives Sanitize, so the client uses only the
+// inline credential and CA, the controller-resolved server and the pinned CA. The server is
+// the one the controller resolves itself, not the one in the Secret, and the CA
+// must match the pin on the KairosControlPlane. Any failure returns an error,
+// which the callers treat as fail-safe (the etcd-leave hook stays set, quorum
+// preserved; no join token is minted).
 func (r *KairosControlPlaneReconciler) defaultWorkloadClient(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error) {
 	restCfg, err := r.endpointRESTConfig(ctx, cluster)
 	if err != nil {
@@ -185,21 +198,22 @@ func (r *KairosControlPlaneReconciler) endpointRESTConfig(ctx context.Context, c
 	return restCfg, nil
 }
 
-// workloadRESTConfig parses the `<cluster>-kubeconfig` Secret into a fresh
-// rest.Config: the endpoint as server, the cluster CA, and the credential.
+// workloadRESTConfig builds a fresh rest.Config for the workload cluster: the
+// server the controller itself resolves, the cluster CA pinned on the
+// KairosControlPlane, and the inline credential. It is the ONLY place the KCP
+// turns the `<cluster>-kubeconfig` Secret into a rest.Config; the endpoint
+// client (defaultWorkloadClient), every etcd-leave member client
+// (defaultMemberClient) and the k0s join-token CA (workloadClusterCA) all
+// derive from it. The bytes it parses are trustedWorkloadKubeconfig's S5
+// output, never the Secret's raw value.
 func (r *KairosControlPlaneReconciler) workloadRESTConfig(ctx context.Context, cluster *clusterv1.Cluster) (*rest.Config, error) {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: cluster.Namespace, Name: fmt.Sprintf("%s-kubeconfig", cluster.Name)}
-	if err := r.Get(ctx, key, secret); err != nil {
-		return nil, fmt.Errorf("get workload kubeconfig secret %s: %w", key, err)
-	}
-	data, ok := secret.Data["value"]
-	if !ok || len(data) == 0 {
-		return nil, fmt.Errorf("workload kubeconfig secret %s has no non-empty 'value' key", key)
-	}
-	restCfg, err := clientcmd.RESTConfigFromKubeConfig(data)
+	sanitized, err := r.trustedWorkloadKubeconfig(ctx, cluster)
 	if err != nil {
-		return nil, fmt.Errorf("parse workload kubeconfig %s: %w", key, err)
+		return nil, err
+	}
+	restCfg, err := clientcmd.RESTConfigFromKubeConfig(sanitized)
+	if err != nil {
+		return nil, fmt.Errorf("parse sanitized workload kubeconfig for cluster %s/%s: %w", cluster.Namespace, cluster.Name, err)
 	}
 	return restCfg, nil
 }

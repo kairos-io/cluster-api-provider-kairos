@@ -525,6 +525,37 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 			log.Info("Waiting for join token secret before generating cloud-config")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		if errors.Is(err, ErrKubeconfigPushTargetNotReady) {
+			// PR-3 resolver gate (ADR 0011): the control plane has not yet
+			// pre-created and taken ownership of the staging kubeconfig Secret the
+			// node is allowed to PATCH. Requeue rather than hand out a push token
+			// with no valid target.
+			log.Info("Waiting for the control plane to pre-create the staging kubeconfig Secret before generating cloud-config")
+			if kairosConfig.Status.FailureReason == "" {
+				conditions.MarkFalse(kairosConfig,
+					bootstrapv1beta2.BootstrapReadyCondition,
+					bootstrapv1beta2.WaitingForKubeconfigPushTargetReason,
+					clusterv1.ConditionSeverityInfo,
+					"Waiting for the control plane to pre-create the staging kubeconfig Secret")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if errors.Is(err, ErrManagementCAUnavailable) {
+			// PR-4 (ADR 0011): the node-push channel is TLS-verified against the
+			// management API CA with no insecure fallback, so a control-plane node
+			// cannot be handed a push token until a CA is available. The manager
+			// normally fails fast at startup; a hit here means the resolver was
+			// wired without a CA. Requeue and surface the reason.
+			log.Info("Waiting for the management API CA before generating cloud-config (node-push TLS has no insecure fallback)")
+			if kairosConfig.Status.FailureReason == "" {
+				conditions.MarkFalse(kairosConfig,
+					bootstrapv1beta2.BootstrapReadyCondition,
+					bootstrapv1beta2.ManagementCAUnavailableReason,
+					clusterv1.ConditionSeverityWarning,
+					"Waiting for the management API CA to verify the node-push channel")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 		// Typed not-ready signal from a JoinMaterialSource (ADR 0010 P1 item 6):
 		// transient workload-cluster/clustercache/API conditions on the kubeadm
 		// path. Requeue and leave conditions alone — do NOT park the KairosConfig.

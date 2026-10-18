@@ -562,7 +562,7 @@ Reprovision with a fully-installed Hadron disk. See the "Hadron images: addition
 
 The node k3s/k0s is running but the kubeconfig has not reached the management cluster. Causes:
 
-1. **No network route from the node to the management cluster API server**: run `curl -k https://<mgmt-api-server-host>:6443/api` from the node. If it fails, either open the network path or enable [SSHFallback](#air-gapped-fallback-sshfallback).
+1. **No network route from the node to the management cluster API server**: run the TLS-verified reachability check from [INSTALL.md](INSTALL.md#management-api-tls-verification-and-the-ca-source) — `curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api` from the node (`curl -k` will not catch a certificate mismatch). If it fails, either open the network path or enable [SSHFallback](#air-gapped-fallback-sshfallback).
 2. **bootstrap-Secret naming**: if `BareMetalHost.spec.userData` references a Secret that does not exist, upgrade the provider to v0.1.0-alpha.2+. The deterministic bootstrap-Secret naming fix shipped in alpha.2 and is required for unattended Metal3 provisioning.
 
 ### Bootstrap issues
@@ -611,7 +611,7 @@ If the node's IP changes after provisioning (DHCP lease reassignment), the `cont
 
 ## Air-gapped fallback (SSHFallback)
 
-**When to use:** the bare-metal node has no network route to the management cluster API server (`<mgmt-api-server-host>:6443`). The node-push path — where the node POSTs its kubeconfig to a management cluster Secret — is unreachable. Without this fallback, `KubeconfigReadyCondition` stays `False(WaitingForNodePush)` indefinitely.
+**When to use:** the bare-metal node has no network route to the management cluster API server (`<mgmt-api-server-host>:6443`). The node-push path — where the node PATCHes its kubeconfig into a staging Secret the control plane owns in the management cluster — is unreachable. Without this fallback, `KubeconfigReadyCondition` stays `False(WaitingForNodePush)` indefinitely.
 
 **When NOT to use:** the default node-push path works in most networks. Do not enable SSHFallback unless you have confirmed the node cannot reach the management API server. The fallback is an escape hatch, not a replacement for node-push.
 
@@ -671,6 +671,12 @@ The `KubeconfigReadyCondition` Reason tells you which path is active:
 | `SSHFallbackDialing` | SSH fallback is in progress; wait up to 30 seconds. |
 | `SSHFallbackFailed` | SSH attempt failed. Check Events for the categorized error. |
 | `SSHFallbackMisconfigured` | A referenced Secret is missing, empty, or unparseable. Fix the Secret; the controller retries automatically. |
+
+`KubeconfigReadyCondition` can also go `False` for reasons unrelated to
+SSHFallback — a rejected or CA-mismatched kubeconfig, or a Secret the
+controller cannot take ownership of. See
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full reason list, including the `NodePushCAMismatch` re-pin runbook.
 
 ---
 

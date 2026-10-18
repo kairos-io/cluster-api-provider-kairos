@@ -24,8 +24,11 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -59,6 +62,17 @@ func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context
 	distribution := kcp.Spec.Distribution
 	if distribution == "" {
 		distribution = "k0s"
+	}
+
+	// G10 (ADR 0011): refuse to adopt a same-name Secret this KCP does not
+	// already control. A pre-existing
+	// `<cluster>-control-plane-join-token` could carry a pre-filled token; the old
+	// CreateOrUpdate would keep that k3s server token forever (k3s only
+	// generates when empty). Verify ownership by controller-UID first: a foreign
+	// or ownerless existing Secret is refused, not adopted.
+	if err := refuseUnownedHASecret(ctx, r.Client,
+		types.NamespacedName{Name: joinTokenSecretName(cluster.Name), Namespace: cluster.Namespace}, kcp.UID); err != nil {
+		return err
 	}
 
 	secret := &corev1.Secret{
@@ -100,6 +114,27 @@ func (r *KairosControlPlaneReconciler) ensureJoinTokenSecret(ctx context.Context
 	// Log the Secret identity only — never its contents.
 	log.V(4).Info("Ensured HA join-token secret",
 		"secret", joinTokenSecretName(cluster.Name), "namespace", cluster.Namespace, "distribution", distribution)
+	return nil
+}
+
+// refuseUnownedHASecret gets the Secret named by key and returns an error when
+// it exists but is NOT already controlled (by controller-owner UID) by the
+// object identified by ownerUID (ADR 0011, closing G10). A NotFound is fine (the
+// caller will Create + own it). An existing Secret with a foreign controller
+// owner, or none, is an unexpected or stale same-name object we must not adopt: its
+// data (a k3s server token, an etcd-status record) would otherwise be trusted.
+func refuseUnownedHASecret(ctx context.Context, c client.Client, key types.NamespacedName, ownerUID types.UID) error {
+	existing := &corev1.Secret{}
+	if err := c.Get(ctx, key, existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("verify ownership of HA secret %s/%s: %w", key.Namespace, key.Name, err)
+	}
+	owner := metav1.GetControllerOfNoCopy(existing)
+	if owner == nil || owner.UID != ownerUID {
+		return fmt.Errorf("HA secret %s/%s already exists but is not controlled by the expected owner (unexpected or stale object); refusing to adopt it", key.Namespace, key.Name)
+	}
 	return nil
 }
 

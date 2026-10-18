@@ -483,3 +483,110 @@ annotation on each `MutatingWebhookConfiguration` /
 There is no post-install CA-injection step on any install path (`clusterctl`
 or flat manifest). If you have automation that runs the old script, remove
 that step.
+
+---
+
+## Kubeconfig Secrets are adopted and canonicalized
+
+The control-plane controller now rebuilds the content of every
+`<cluster>-kubeconfig` Secret it manages into a single canonical form before
+publishing it, rather than keeping whatever was last written to it. See
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the reasons this surfaces on `KairosControlPlane.status.conditions` and
+the two annotations that control the certificate-authority pin.
+
+**Adoption.** A pre-existing `<cluster>-kubeconfig` Secret that is not yet
+controlled by the `KairosControlPlane` is adopted automatically the first
+time the controller observes it, provided it was created no earlier than the
+`Cluster` object and carries the `cluster.x-k8s.io/cluster-name` label.
+Adoption rewrites the Secret's content into the canonical form described
+below and sets the `KairosControlPlane` as its controller; a Secret that
+cannot be adopted is left untouched and reported as
+`KubeconfigSecretNotOwned`, naming the object to delete so the controller can
+publish its own.
+
+**Context and user names change.** The canonical form always names its
+`context` and `user` entries `<cluster>-admin@<cluster>` and
+`<cluster>-admin`, regardless of what a node originally wrote. This is
+visible in `clusterctl get kubeconfig <cluster>` and in any kubeconfig
+extracted with:
+
+```bash
+kubectl get secret <cluster>-kubeconfig -n <cluster-namespace> \
+  -o jsonpath='{.data.value}' | base64 -d
+```
+
+`kubectl --kubeconfig=<file> get nodes` and similar commands are unaffected —
+they select whichever context the file marks `current-context`, and the
+sanitizer sets that correctly. Automation that instead greps or hardcodes a
+specific context/user name from a previously-fetched kubeconfig should expect
+the new name after this Secret is next rewritten.
+
+---
+
+## Node-push RBAC narrows to patch-only, and the push target moves to a staging Secret
+
+Control-plane nodes now publish their kubeconfig by PATCHing only the `value`
+key of a controller-owned staging Secret, `<cluster>-kubeconfig-push`, instead
+of writing the contract Secret `<cluster>-kubeconfig` directly. The control
+plane is the contract Secret's sole writer; see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition).
+Operators do not create or edit the staging Secret.
+
+Matching this, the per-cluster node ServiceAccount's Role is narrowed to
+`patch` on two named Secrets (the staging kubeconfig and the HA etcd-status
+Secret) with no `create`, `get`, or `update` verb. The HA join-token Secret is
+written only by the control plane, so nodes have no access to it.
+
+**On upgrade, a startup migrator narrows any existing per-cluster node-push
+Role to this reduced rule set automatically**, the moment the new controller
+manager takes leadership. It only ever removes permissions from a Role it
+recognizes as its own (by owner and name) — it never widens a rule, and it
+never fails manager startup. No operator action is required.
+
+**A control-plane node whose bootstrap data was rendered before the upgrade**
+still runs its old push script, which targets the contract Secret directly
+with the old verbs. Once the migrator has run, that request is rejected with
+HTTP 403. This is expected, not an error: the push is a best-effort, one-shot
+step that logs a warning and does not block or retry bootstrap, and the
+contract Secret's correctness does not depend on that push succeeding. The
+warning clears the next time the affected control-plane Machine is replaced
+or rolled, which re-renders its bootstrap data with the current, patch-only
+push script.
+
+**A control-plane `KairosConfig`'s bootstrap rendering now also waits** for
+the `KairosControlPlane` to create and own the staging Secret before handing
+a node a push token, reported as `BootstrapReady=False(WaitingForKubeconfigPushTarget)`
+at severity `Info`. This clears on its own, typically within one reconcile;
+see [API_REFERENCE.md — Waiting for the kubeconfig push target](API_REFERENCE.md#waiting-for-the-kubeconfig-push-target).
+
+---
+
+## Node-to-management pushes are now TLS-verified
+
+Every management-API call a node makes as part of node-push — the
+kubeconfig-to-staging PATCH, the etcd-status PATCH, and
+the CAPK k0s VMI SAN-detection GET — now runs `curl --cacert` against the
+management API server's certificate authority, with TLS verification on and
+no insecure fallback anywhere in the templates. The bearer token is also no
+longer readable from curl's argv or a world-readable script: it is written to
+a 0600 curl config file inside a 0700 directory, and the post-bootstrap
+scripts that carry it are now `0700` rather than `0755`. None of this needs
+any operator action to keep working — it is the same push, verified.
+
+**The CA a node verifies against comes from the controller, not the node.**
+By default the controller renders its own in-cluster trust root — the
+management API server's CA, resolved once at manager startup. **If the
+management endpoint's serving certificate is not signed by that CA** — for
+example, when `KAIROS_MANAGEMENT_API_OVERRIDE` points at a load balancer or
+proxy with its own certificate — the node-push fails its TLS check. Set
+`KAIROS_MANAGEMENT_API_CA_FILE` on the controller Deployment to the correct
+CA (a PEM file path or an inline PEM) and restart the manager. See
+[INSTALL.md — Management API TLS verification and the CA source](INSTALL.md#management-api-tls-verification-and-the-ca-source).
+
+**The manager now fails fast at startup** if node-push is enabled (a
+management URL is configured) and no CA can be resolved from either source —
+it does not start with an unverifiable push configured. If a control-plane
+`KairosConfig` instead reports `BootstrapReady=False(ManagementCAUnavailable)`
+on an already-running manager, see
+[API_REFERENCE.md — Management API CA unavailable](API_REFERENCE.md#management-api-ca-unavailable).

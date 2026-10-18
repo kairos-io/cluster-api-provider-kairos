@@ -155,7 +155,7 @@ func tokenFromLegacyRef(ctx context.Context, c client.Reader, namespace string, 
 // as before.
 //
 // The control-plane join stays outside the JoinMaterialSource seam: it is
-// coupled to the C5 node-push rework (M2). applyControlPlaneRenderData calls this
+// coupled to the kubeconfig publish rework (M2). applyControlPlaneRenderData calls this
 // directly.
 func (r *KairosConfigReconciler) resolveControlPlaneJoinToken(ctx context.Context, kc *bootstrapv1beta2.KairosConfig, _ *clusterv1.Cluster) (string, error) {
 	distribution := bootstrapv1beta2.EffectiveDistribution(kc.Spec.Distribution)

@@ -118,3 +118,35 @@ func TestValidate_NilManagementEndpointSkipsNestedCheck(t *testing.T) {
 		t.Fatalf("render with nil ManagementEndpoint should not error: %v", err)
 	}
 }
+
+// TestValidate_KubeadmPatchesDirectory asserts the renderer refuses a kubeadm
+// patches directory it cannot safely place a file in and create on the node.
+func TestValidate_KubeadmPatchesDirectory(t *testing.T) {
+	cases := []struct {
+		dir     string
+		wantErr bool
+	}{
+		{"/etc/kubernetes/kairos-patches", false},
+		{"", true},
+		{"etc/kubernetes/patches", true},
+		{"/etc/kubernetes/../patches", true},
+		{"/etc/kubernetes/patches/", true},
+		{"/etc/kubernetes/pat\nches", true},
+		{"/etc/kubernetes/pat\rches", true},
+		{"/etc/kubernetes/pat\x00ches", true},
+		{"/", true},
+		{"/etc/kubernetes", true},
+		{"/tmp/patches", true},
+	}
+	for _, tc := range cases {
+		d := dispatchKubeadmWorkerData(false)
+		d.Kubeadm.PatchesDirectory = tc.dir
+		err := validateTemplateData(&d)
+		if tc.wantErr && (err == nil || !strings.Contains(err.Error(), "kubeadm.patchesDirectory")) {
+			t.Errorf("dir %q: want a kubeadm.patchesDirectory error, got %v", tc.dir, err)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("dir %q: want no error, got %v", tc.dir, err)
+		}
+	}
+}

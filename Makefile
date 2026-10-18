@@ -236,6 +236,25 @@ GOLANGCI_LINT_VERSION ?= v2.14.0
 # skew (one minor), NOT a mismatch to "fix" by bumping go.mod: MVS would revert it to CAPI's requirement.
 SETUP_ENVTEST_VERSION ?= v0.24.1
 ENVTEST_K8S_VERSION ?= 1.36.2
+# kubeadm used by `make test-kubeadm`; the JoinConfiguration API version the
+# controller renders follows it.
+KUBEADM_VERSION ?= v$(ENVTEST_K8S_VERSION)
+KUBEADM ?= $(LOCALBIN)/kubeadm-$(KUBEADM_VERSION)
+
+.PHONY: test-kubeadm
+test-kubeadm: $(KUBEADM) ## Run the rendered kubeadm worker join against a real kubeadm (Linux only).
+	KUBEADM_BIN=$(KUBEADM) go test ./internal/controllers/bootstrap/ -run TestKubeadmJoinCommand -count=1 -v
+
+$(KUBEADM): hack/kubeadm.sha256 | $(LOCALBIN)
+	@[ "$$(uname -s)" = Linux ] || { echo "test-kubeadm needs Linux: kubeadm is released for Linux only"; exit 1; }
+	@arch=$$(go env GOARCH); \
+	sum=$$(awk -v v=$(KUBEADM_VERSION) -v a=$$arch '$$1 == v && $$2 == a { print $$3 }' hack/kubeadm.sha256); \
+	[ -n "$$sum" ] || { echo "no sha256 pinned for kubeadm $(KUBEADM_VERSION) $$arch in hack/kubeadm.sha256"; exit 1; }; \
+	curl --fail --silent --show-error --location --output $@.tmp https://dl.k8s.io/release/$(KUBEADM_VERSION)/bin/linux/$$arch/kubeadm; \
+	echo "$$sum  $@.tmp" | sha256sum --check --quiet
+	chmod +x $@.tmp
+	mv $@.tmp $@
+
 # The CAPI CRDs the envtest suite installs have to come from the release the module
 # is built against, so the version is read from go.mod instead of written out a
 # second time. Renovate automerges a patch bump of sigs.k8s.io/cluster-api once the

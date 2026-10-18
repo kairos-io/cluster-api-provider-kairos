@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 const (
@@ -246,7 +247,7 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 		return WorkerJoinMaterial{}, err
 	}
 
-	joinCfgYAML, err := s.renderJoinConfiguration(req, trusted, token)
+	joinCfgYAML, patchesDir, err := s.renderJoinConfiguration(req, trusted, token)
 	if err != nil {
 		// A render failure is terminal: it is a bad spec or version, not transient.
 		return WorkerJoinMaterial{}, err
@@ -255,6 +256,7 @@ func (s *kubeadmJoinSource) WorkerJoin(ctx context.Context, req JoinRequest) (Wo
 	mat := &KubeadmJoinMaterial{
 		JoinConfiguration: joinCfgYAML,
 		KubernetesVersion: req.Machine.Spec.Version,
+		PatchesDirectory:  patchesDir,
 		TokenID:           tokenID,
 	}
 	if storedID != "" && storedID != tokenID {
@@ -471,29 +473,10 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 		return zero, fmt.Errorf("the %s Secret carries no certificate-authority-data: refusing to mint a token without a CA pin", kubeconfigKey.Name)
 	}
 
-	// Cross-check against <cluster>-ca if it exists (UNCACHED read, cert only). Do
-	// NOT require the Secret to exist or to be owned: Kamaji's default setup and an
-	// upstream-KCP user-supplied CA legitimately have no CAPI controller owner
-	// (ADR 0010 P1 step 1).
 	caKey := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name + "-ca"}
-	caSecret := &corev1.Secret{}
-	caCrossChecked := false
-	if err := s.caReader.Get(ctx, caKey, caSecret); err == nil {
-		crt, ok := caSecret.Data[clusterCASecretCrtKey]
-		if !ok || len(crt) == 0 {
-			return zero, fmt.Errorf("the %s Secret has no %q: cannot cross-check the CA pin", caKey.Name, clusterCASecretCrtKey)
-		}
-		_, caDER, perr := caCertHashesFromPEM(crt)
-		if perr != nil {
-			return zero, fmt.Errorf("the %s Secret has an unparseable %q: %v", caKey.Name, clusterCASecretCrtKey, perr)
-		}
-		if !derCertSetsEqual(kubeconfigCADER, caDER) {
-			return zero, fmt.Errorf("the kubeconfig CA does not match the %s Secret's %q; inspect the Secret and re-pin if this change is expected",
-				caKey.Name, clusterCASecretCrtKey)
-		}
-		caCrossChecked = true
-	} else if !apierrors.IsNotFound(err) {
-		return zero, newNotReady("WaitingForClusterCA", "waiting to cross-check the %s Secret: %v", caKey.Name, err)
+	caCrossChecked, err := crossCheckClusterCA(ctx, s.caReader, cluster, kubeconfigCADER)
+	if err != nil {
+		return zero, err
 	}
 
 	// Exactly one of the two independent anchors must hold, because the owner
@@ -511,6 +494,16 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			kubeconfigKey.Name, server, wantServer, caKey.Name)
 	}
 
+	// The kubeconfig must also survive the sanitizer (ADR 0011): the workload
+	// client that mints the token is built from its rebuilt (S5) form, never the
+	// raw bytes (SanitizingKubeconfigReader), so a kubeconfig the sanitizer
+	// refuses would never connect. Refuse here, before any token exists, with the
+	// rule that failed (never a byte of the content).
+	if _, err := kubeconfig.Sanitize(kcData, cluster.Name, anchoredServer(server, wantServer)); err != nil {
+		return zero, fmt.Errorf("the %s Secret is not a kubeconfig this controller will connect with: %v; refusing to mint a token",
+			kubeconfigKey.Name, err)
+	}
+
 	return trustedControlPlane{
 		clusterKey:   client.ObjectKey{Namespace: cluster.Namespace, Name: cluster.Name},
 		endpointHost: cluster.Spec.ControlPlaneEndpoint.Host,
@@ -521,9 +514,9 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 
 // renderJoinConfiguration overlays the controller-owned fields onto the user's
 // JoinConfiguration (if any) and marshals it with the CAPI version-aware
-// marshaller. The minted token lands in discovery.bootstrapToken.token; it is
-// never logged.
-func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted trustedControlPlane, token string) (string, error) {
+// marshaller, returning it with the kubeadm patches directory it names. The
+// minted token lands in discovery.bootstrapToken.token; it is never logged.
+func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted trustedControlPlane, token string) (joinConfig, patchesDir string, err error) {
 	var jc kubeadmv1.JoinConfiguration
 	if req.Config != nil && req.Config.Spec.Kubeadm != nil && req.Config.Spec.Kubeadm.JoinConfiguration != nil {
 		jc = *req.Config.Spec.Kubeadm.JoinConfiguration.DeepCopy()
@@ -543,7 +536,7 @@ func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted tru
 	}
 	endpoint, err := kubeadmJoinEndpoint(serverAddress, trusted)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Bootstrap-token discovery: the minted token, the endpoint, and the CA pin.
@@ -563,16 +556,21 @@ func (s *kubeadmJoinSource) renderJoinConfiguration(req JoinRequest, trusted tru
 	// too, but KairosConfigTemplate has no webhook registered, so without this the
 	// only gate would be admission on the KairosConfig CAPI core derives from it.
 	jc.ControlPlane = nil
+	// kubeadm refuses --patches next to --config, so the directory the
+	// providerID patch lands in is carried by the configuration itself.
+	if jc.Patches.Directory == "" {
+		jc.Patches.Directory = defaultKubeadmPatchesDir
+	}
 
 	version, err := semver.ParseTolerant(req.Machine.Spec.Version)
 	if err != nil {
-		return "", fmt.Errorf("invalid Machine.spec.version %q: %w", req.Machine.Spec.Version, err)
+		return "", "", fmt.Errorf("invalid Machine.spec.version %q: %w", req.Machine.Spec.Version, err)
 	}
 	out, err := kubeadmtypes.MarshalJoinConfigurationForVersion(&jc, version)
 	if err != nil {
-		return "", fmt.Errorf("marshal kubeadm JoinConfiguration: %w", err)
+		return "", "", fmt.Errorf("marshal kubeadm JoinConfiguration: %w", err)
 	}
-	return out, nil
+	return out, jc.Patches.Directory, nil
 }
 
 func (s *kubeadmJoinSource) ttl() time.Duration {

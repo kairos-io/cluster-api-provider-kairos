@@ -96,6 +96,22 @@ func makeKubeconfig(t *testing.T, server string, caPEM []byte) []byte {
 	return data
 }
 
+// kubeconfigWithUser builds a kubeconfig like makeKubeconfig, with the given
+// user entry.
+func kubeconfigWithUser(t *testing.T, server string, caPEM []byte, user *clientcmdapi.AuthInfo) []byte {
+	t.Helper()
+	cfg := clientcmdapi.NewConfig()
+	cfg.Clusters["wl"] = &clientcmdapi.Cluster{Server: server, CertificateAuthorityData: caPEM}
+	cfg.Contexts["wl"] = &clientcmdapi.Context{Cluster: "wl", AuthInfo: "admin"}
+	cfg.AuthInfos["admin"] = user
+	cfg.CurrentContext = "wl"
+	data, err := runtime.Encode(clientcmdlatest.Codec, cfg)
+	if err != nil {
+		t.Fatalf("encode kubeconfig: %v", err)
+	}
+	return data
+}
+
 func kubeadmTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -129,6 +145,9 @@ type kubeadmFixture struct {
 	endpointHost string // overrides testEndpointHost when set
 	endpointPort int32  // overrides testEndpointPort when non-zero
 	noController bool   // the kubeconfig ownerRef exists but is not a controller ref
+	// kubeconfigData, when set, is stored as the kubeconfig Secret's value
+	// instead of makeKubeconfig(server, kubeconfigCA).
+	kubeconfigData []byte
 }
 
 // defaultFixture is a passing KubeadmControlPlane fixture.
@@ -197,6 +216,9 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 				}},
 			},
 			Data: map[string][]byte{workloadKubeconfigSecretKey: makeKubeconfig(t, fx.server, fx.kubeconfigCA)},
+		}
+		if fx.kubeconfigData != nil {
+			kc.Data[workloadKubeconfigSecretKey] = fx.kubeconfigData
 		}
 		objs = append(objs, kc)
 	}
@@ -432,6 +454,19 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 		{"CA cross-check mismatch", func(fx *kubeadmFixture) { fx.clusterCA = otherCA }, nil, "does not match"},
 		{"lookalike kind in another group", func(fx *kubeadmFixture) { fx.cpGroup = "evil.example.com" }, nil, "not on the kubeadm trust allowlist"},
 		{"k0s KairosControlPlane", func(fx *kubeadmFixture) { fx.cpKind = "KairosControlPlane"; fx.cpDist = "k0s" }, nil, "not kubeadm"},
+		// The kubeconfig passes both anchors but names a credential file: the
+		// workload client is built from the sanitized form only, so refuse before
+		// a token exists.
+		{"kubeconfig with a token file", func(fx *kubeadmFixture) {
+			fx.kubeconfigData = kubeconfigWithUser(t, fx.server, fx.kubeconfigCA, &clientcmdapi.AuthInfo{
+				TokenFile: "/etc/example/token",
+			})
+		}, nil, "refusing to mint a token"},
+		{"kubeconfig with an exec plugin", func(fx *kubeadmFixture) {
+			fx.kubeconfigData = kubeconfigWithUser(t, fx.server, fx.kubeconfigCA, &clientcmdapi.AuthInfo{
+				Exec: &clientcmdapi.ExecConfig{Command: "/bin/sh", APIVersion: "client.authentication.k8s.io/v1"},
+			})
+		}, nil, "refusing to mint a token"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -439,12 +474,15 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 			g := NewWithT(t)
 			fx := defaultFixture(ca)
 			tc.mutate(&fx)
-			src, req, _ := buildSource(t, fx, tc.extra)
+			src, req, workload := buildSource(t, fx, tc.extra)
 			_, err := src.WorkerJoin(context.Background(), req)
 			g.Expect(err).To(HaveOccurred())
 			g.Expect(err.Error()).To(ContainSubstring(tc.wantSub))
 			var nr *bootstrapNotReadyError
 			g.Expect(errors.As(err, &nr)).To(BeFalse(), "refusal must be terminal, not not-ready")
+			minted := &corev1.SecretList{}
+			g.Expect(workload.List(context.Background(), minted)).To(Succeed())
+			g.Expect(minted.Items).To(BeEmpty(), "a refused trust check must not mint a token")
 		})
 	}
 }

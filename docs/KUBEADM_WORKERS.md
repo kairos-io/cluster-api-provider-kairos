@@ -95,6 +95,17 @@ bootstrap controller does the following for each Machine:
      kubeconfig `server`.
    - If a `<cluster>-ca` Secret exists, its `tls.crt` equals the kubeconfig's
      CA. A missing `<cluster>-ca` is allowed.
+   - The kubeconfig is self-contained: exactly one cluster, user and context;
+     the CA as `certificate-authority-data`; and the credential inline, as
+     `client-certificate-data` plus `client-key-data`, or as `token`. Fields
+     that point outside the kubeconfig are refused, in every entry: file paths
+     (`certificate-authority`, `client-certificate`, `client-key`,
+     `tokenFile`), `exec` and `auth-provider` plugins, `proxy-url`,
+     `tls-server-name`, `insecure-skip-tls-verify`, impersonation, and
+     basic-auth. The kubeconfigs `KubeadmControlPlane` and Kamaji publish meet
+     this. The controller connects to the workload cluster only with a
+     kubeconfig it has rebuilt from these fields, never with the Secret as
+     stored.
    - Under Kamaji, do not expect to control `<cluster>-ca` yourself. Kamaji
      honours a bring-your-own CA only as a pre-created `<tcp>-ca` holding a
      valid `ca.crt`/`ca.key` pair; a CAPI-style `<cluster>-ca` carrying only
@@ -236,8 +247,10 @@ field is optional. The controller sets or overwrites these:
   `spec.network.advertiseAddress`. The address must be covered by the API
   server certificate's SANs. The CA hash pins discovery either way.
 - `discovery.file`: cleared.
-- A kubelet `providerID` patch, applied through `kubeadm join --patches`, when the
-  infrastructure provider's providerID is known at render time.
+- `patches.directory`: `/etc/kubernetes/kairos-patches`, unless you set another one. It must be an absolute, clean path under `/etc/kubernetes/`: no `.` or `..` segments, no repeated or trailing slashes, no newline, CR or NUL. kubeadm applies every patch in it as root, and only root can write under `/etc/kubernetes/`. `/etc/kubernetes/manifests` and directories under it are refused: that is the kubelet's static pod directory. The node creates the directory before the join.
+- A kubelet `providerID` patch, `kubeletconfiguration0+merge.yaml` in that directory, when the infrastructure provider's providerID is known at render time.
+
+To patch the kubelet configuration kubeadm downloads from the cluster, for example to set `clusterDNS` or resource reservations, write a `kubeletconfiguration<suffix>+merge.yaml` file into the patches directory with `spec.files`. kubeadm applies patch files in alphanumeric order of their names. Do not use the name `kubeletconfiguration0+merge.yaml`: the providerID patch takes it.
 
 Everything else, such as `nodeRegistration.kubeletExtraArgs`, passes through.
 Do not set `joinConfiguration.controlPlane`: control-plane joins are not
@@ -322,7 +335,8 @@ another control-plane kind, the operator sets
 operator-level setting; there is no per-Cluster field. The operator must also grant
 the bootstrap manager read access to the added kind. See
 [Optional manager flags](INSTALL.md#optional-manager-flags) for the format, the
-RBAC requirement, and how to set it.
+RBAC requirement, and how to set it. The added kind's `<cluster>-kubeconfig`
+must be self-contained, as described in [How it works](#how-it-works).
 
 ## KairosControlPlane refuses kubeadm
 
@@ -362,6 +376,7 @@ kubectl get kairosconfig <name> -o jsonpath='{.status.failureMessage}'
 | `is not on the kubeadm trust allowlist` | The control-plane kind is not `KubeadmControlPlane` or `KamajiControlPlane`. Use a supported kind or have the operator set `--kubeadm-extra-controlplane-kinds`. |
 | `kubeconfig CA does not match` | The CA in `<cluster>-kubeconfig` differs from `<cluster>-ca` `tls.crt`. Resolve which CA is correct before retrying. |
 | `carries no certificate-authority-data` | The kubeconfig has no CA to pin. Fix the control plane's kubeconfig Secret. |
+| `is not a kubeconfig this controller will connect with` | The kubeconfig is not self-contained: it has more than one cluster, user or context, or a field that points outside it (a file path, an `exec` or `auth-provider` plugin, a proxy, skipped TLS verification). The message names the rule. This usually means a control-plane kind added with `--kubeadm-extra-controlplane-kinds` publishes a kubeconfig in a different shape; it must publish an inline credential and CA. |
 | `does not support MachinePool` | Use a `MachineDeployment`. |
 | `requires Machine.spec.version` | Set `spec.template.spec.version` on the MachineDeployment. |
 | `not kubeadm: a kubeadm worker cannot join a k0s/k3s control plane` | The Cluster's control plane is a k0s or k3s `KairosControlPlane`. Use k0s or k3s workers. |

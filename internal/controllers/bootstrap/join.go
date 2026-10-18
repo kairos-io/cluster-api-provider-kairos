@@ -29,8 +29,8 @@ import (
 
 // JoinMaterialSource resolves what one distribution needs to join a WORKER to an
 // existing cluster (a token today; in P1 also a CA pin and a join configuration).
-// The control-plane join stays outside this seam — it is coupled to the C5
-// node-push rework (M2). Contract:
+// The control-plane join stays outside this seam — it is coupled to the kubeconfig
+// publish rework (M2). Contract:
 //
 //   - It may read the management cluster, and a workload cluster if it was built
 //     with a client for one. It MUST NOT mutate req.Config; the reconciler owns
@@ -104,6 +104,8 @@ type KubeadmJoinMaterial struct {
 	JoinConfiguration string
 	// KubernetesVersion is the exact version the node must run (Machine.spec.version).
 	KubernetesVersion string
+	// PatchesDirectory is the kubeadm patches directory named in JoinConfiguration.
+	PatchesDirectory string
 	// TokenID is the non-secret ID half ("[a-z0-9]{6}") of the minted bootstrap
 	// token, written to KairosConfig.status.bootstrapTokenID for audit. Never the
 	// secret half.

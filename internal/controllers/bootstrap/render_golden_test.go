@@ -107,7 +107,7 @@ const (
 // rule 5) so the goldens are reproducible.
 type goldenResolver struct{ endpoint *ManagementEndpoint }
 
-func (g *goldenResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
+func (g *goldenResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Machine, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
 	return g.endpoint, nil
 }
 

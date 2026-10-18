@@ -288,6 +288,10 @@ Also check controller logs:
 ```bash
 kubectl logs -n kairos-capi-system deployment/kairos-capi-controller-manager
 ```
+The `KubeconfigReady` condition's Reason narrows down the cause — see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full reason list (rejected content, a certificate-authority mismatch, or a
+Secret the controller cannot take ownership of) and what to do about each.
 
 **3-node k0s control plane never converges**: if `KairosControlPlane` reports `Available=True` but the workload API server is unreachable, the Kairos image is likely missing the k0s start gate. See [k0s HA: the image start gate](#k0s-ha-the-image-start-gate) for the diagnosis and the image-side fix.
 
