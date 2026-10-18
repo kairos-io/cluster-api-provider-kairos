@@ -236,6 +236,12 @@ func etcdMemberPeerOwner(member *unstructured.Unstructured, machines []*clusterv
 // hexadecimal etcd member ID.
 func etcdMemberID(member *unstructured.Unstructured) (string, bool) {
 	raw, _, _ := unstructured.NestedString(member.Object, "status", "memberID")
+	return canonicalMemberID(raw)
+}
+
+// canonicalMemberID returns raw as a canonical etcd member ID (lowercase
+// hex), and false when it is empty, zero or not hexadecimal.
+func canonicalMemberID(raw string) (string, bool) {
 	if raw == "" {
 		return "", false
 	}

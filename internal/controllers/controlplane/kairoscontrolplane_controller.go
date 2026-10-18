@@ -78,6 +78,11 @@ type KairosControlPlaneReconciler struct {
 	// periodic workload-identity recheck (ADR 0015 PR-2, ha_identity.go).
 	identityMu        sync.Mutex
 	identityCheckedAt map[string]time.Time
+
+	// orphanMu guards orphanCheckedAt, the in-memory rate limit of the orphan
+	// etcd-member check (ADR 0015 PR-3, ha_etcd_orphans.go).
+	orphanMu        sync.Mutex
+	orphanCheckedAt map[string]time.Time
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
@@ -767,6 +772,23 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		// mismatch found there freezes the control plane here too.
 		if _, frozen := workloadIdentityFrozen(kcp); frozen {
 			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+		}
+
+		// ADR 0015 PR-3: remove, one at a time and only when quorum allows, k0s
+		// etcd members that no control-plane Machine accounts for, as upstream's
+		// kubeadm control plane does in reconcileEtcdMembers. A removal in
+		// progress holds every scale and rollout step below, so membership never
+		// changes twice at once.
+		res, hold, err := r.reconcileOrphanEtcdMembers(ctx, log, kcp, cluster, machines, desiredReplicas)
+		if errors.Is(err, errWorkloadIdentityChanged) {
+			log.Info("Holding orphan etcd member cleanup: the workload cluster identity changed", "reason", err.Error())
+			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+		}
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile orphan etcd members: %w", err)
+		}
+		if hold {
+			return res, nil
 		}
 	}
 
