@@ -165,4 +165,17 @@ The freeze is sticky on purpose: it never clears by itself, because the two clus
 
 ### Before upgrading an existing HA cluster
 
-The controller pins an existing cluster on its first reconcile after the upgrade, from whatever answers then. It refuses to pin, and freezes, if the endpoint and the members disagree, but it cannot detect a split that every path reports the same way. Before upgrading, run step 2 of the runbook above and check that every member answers with the same UID.
+Left alone, the controller pins an existing cluster on its first reconcile after the upgrade, from whatever answers then. It refuses to pin, and freezes, if the endpoint and the members disagree, but it cannot detect a split that every path reports the same way. Close that gap by setting the pin yourself before you upgrade:
+
+1. Run step 2 of the runbook above and check that every control-plane member answers with the same UID.
+2. Set that UID as the pin. A pin that is already set is never replaced by first-use pinning, so the controller checks against your value from its first reconcile:
+   ```bash
+   kubectl annotate kairoscontrolplane <name> -n <namespace> \
+     controlplane.cluster.x-k8s.io/workload-cluster-uid=<verified-uid>
+   ```
+
+**CAPK:** Machines usually report pod IPs, which are not in the API server certificate, so the controller's reads through member addresses do not answer and its first-use pin rests on the control-plane endpoint alone. Pre-seeding the pin matters most there. A split that appears later is still caught by the per-connection checks and the once-a-minute recheck.
+
+### When the controller cannot pin
+
+Once an HA control plane has a registered member, the controller takes no membership action until the identity is pinned. If no path answers the identity read, or `KubeconfigReady` stays `False`, that hold has no time limit: no joiner is admitted, no control-plane Machine is deleted, and a Machine being deleted stays at its etcd-leave hook, because the bounded etcd-leave timeout is suspended too. The controller logs `Holding control-plane membership changes until the workload cluster identity is pinned` with the reason. The way out is to verify the UID through every member (step 2 of the runbook) and set the pin annotation by hand, as above.
