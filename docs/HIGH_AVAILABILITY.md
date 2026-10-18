@@ -114,3 +114,16 @@ On k0s, the departing node runs `k0s etcd leave` before the Machine is deleted; 
 A k0s node that never acks its leave within ~5 minutes is deleted anyway (the delete was already proven quorum-safe); watch for `EtcdMemberLeaveTimedOut` and remove the member manually if it fires.
 
 **KD-51:** etcd health/leave signals are node-self-reported over vanilla RBAC, so a compromised control-plane node can forge them. Not a privilege escalation (a compromised node already has cluster-admin-equivalent access) and it cannot force an unsafe deletion — quorum-safety is decided independently of any node signal. A forged signal can only self-downgrade the clean-leave/health guarantee.
+
+## A refused k0s joiner (ADR 0015)
+
+A k0s control-plane joiner checks that it really joined a cluster. If the live `k0scontroller` was started with its join token but `k0s etcd member-list` shows only the joiner itself, the node has bootstrapped a cluster of its own (it shares the CA, so TLS cannot tell). It then stops k0s, never sets its providerID, and refuses every later start.
+
+**Recognise it:**
+- The Machine never gets a NodeRef, and the rollout or scale-up stalls on it.
+- On the node, `/var/lib/k0s/.kairos-join-refused` exists, `systemctl status k0scontroller` shows the start refused, and the journal has `kairos-join-guard: REFUSED`.
+- A joiner whose confirmation passed has `/var/lib/k0s/.kairos-join-confirmed` instead.
+
+**Fix:** delete the Machine. Do not remove the marker or start k0s by hand on that node; the replacement joins as a fresh VM. If the failed join left an unstarted etcd member behind, the replacement may stall with `Peer URLs already exists`: remove that member on a surviving control-plane node with `k0s etcd leave --peer-address <ip>` (the empty-name entry in `k0s etcd member-list`).
+
+**Do not** delete or replace all of the older control-plane members while a joiner is still unconfirmed (no `.kairos-join-confirmed`). Until it is confirmed you cannot tell whether it joined the real cluster.

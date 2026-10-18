@@ -110,6 +110,10 @@ func TestK0sJoinGuard_RenderShape(t *testing.T) {
 			if call < 0 {
 				t.Fatalf("post-bootstrap does not run the join confirmation:\n%s", s.postBootstrap)
 			}
+			active := strings.Index(s.postBootstrap, "systemctl is-active --quiet kairos-k0s-apply-args")
+			if status := strings.Index(s.postBootstrap, "k0s status >/dev/null"); active < 0 || active > status {
+				t.Errorf("post-bootstrap must wait for a detached apply-args before the k0s status loop")
+			}
 			if wait := strings.Index(s.postBootstrap, "k0s status >/dev/null"); wait < 0 || wait > call {
 				t.Errorf("join confirmation must follow the k0s status wait")
 			}
@@ -224,6 +228,8 @@ type joinRun struct {
 	members  string // stdout of the stubbed `k0s etcd member-list` ("" with memberRC != 0: it fails)
 	memberRC int
 	rmFails  bool
+	bare     bool // the live k0scontroller has no --token-file in its argv
+	mvFails  bool // writing a marker (mv) fails
 }
 
 type joinResult struct {
@@ -318,6 +324,28 @@ func (e *joinEnv) run(t *testing.T, bashPath, script string, run joinRun, replac
 	extra := map[string]string{}
 	if run.rmFails {
 		extra["rm"] = "#!/bin/bash\necho \"rm $*\" >> \"${STUB_LOG}\"\nexit 1\n"
+	}
+	if run.mvFails {
+		extra["mv"] = "#!/bin/bash\necho \"mv $*\" >> \"${STUB_LOG}\"\nexit 1\n"
+	}
+	if fromProc := `"/proc/${pid}/cmdline"`; strings.Contains(script, fromProc) {
+		// The confirmation reads the live k0scontroller's argv.
+		procDir := filepath.Join(e.dir, "proc", "4242")
+		if err := os.MkdirAll(procDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmdline := "/usr/bin/k0s\x00controller\x00--token-file=/etc/k0s/controller-token\x00"
+		if run.bare {
+			cmdline = "/usr/bin/k0s\x00controller\x00"
+		}
+		if err := os.WriteFile(filepath.Join(procDir, "cmdline"), []byte(cmdline), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		extra["systemctl"] = `#!/bin/bash
+echo "systemctl $*" >> "${STUB_LOG}"
+case "$*" in *"-p MainPID"*) echo 4242 ;; esac
+`
+		script = strings.ReplaceAll(script, fromProc, `"`+filepath.Join(e.dir, "proc")+`/${pid}/cmdline"`)
 	}
 	e.stubs(t, extra)
 	p := filepath.Join(e.dir, "script.sh")
@@ -424,6 +452,15 @@ func TestK0sJoinGuard_Confirmation(t *testing.T) {
 		{"2 members confirm", nil, joinRun{members: two}, 0, true, false, false, 1},
 		{"3 pretty-printed members confirm", nil, joinRun{members: three}, 0, true, false, false, 1},
 		{"1 member stops and refuses", nil, joinRun{members: `{"members":{"cp-1":"https://10.0.0.2:2380"}}`}, 1, false, true, true, 1},
+		// A bare k0s (started before its arguments existed) is a one-member cluster
+		// that apply-args is about to wipe: it must neither refuse nor stop k0s.
+		{"bare argv with 1 member is inconclusive, not a refusal", nil, joinRun{members: `{"members":{"cp-1":"https://10.0.0.2:2380"}}`, bare: true}, 1, false, false, false, 120},
+		{"bare argv with 2 members still confirms", nil, joinRun{members: two, bare: true}, 0, true, false, false, 1},
+		{"a failed confirmed-marker write fails the run", nil, joinRun{members: two, mvFails: true}, 1, false, false, false, 1},
+		{"a failed refusal-marker write still stops k0s and fails", nil, joinRun{members: `{"members":{"cp-1":"https://10.0.0.2:2380"}}`, mvFails: true}, 1, false, false, true, 1},
+		// GT-10 shape pin: only the keys of the members object count.
+		{"nested member values count once", nil, joinRun{members: `{"members":{"cp-1":{"peer":"https://a:2380","x":"y"}}}`}, 1, false, true, true, 1},
+		{"a sibling object never adds members", nil, joinRun{members: `{"members":{"cp-1":"https://a:2380"},"other":{"b":"c","d":"e"}}`}, 1, false, true, true, 1},
 		{"member-list failing for the whole window writes nothing", nil, joinRun{members: "", memberRC: 1}, 1, false, false, false, 120},
 		{"garbage output for the whole window writes nothing", nil, joinRun{members: "not json"}, 1, false, false, false, 120},
 		{"empty members for the whole window writes nothing", nil, joinRun{members: `{"members":{}}`}, 1, false, false, false, 120},
