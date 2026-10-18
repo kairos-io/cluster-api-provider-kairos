@@ -28,8 +28,8 @@ import (
 
 // JoinMaterialSource resolves what one distribution needs to join a WORKER to an
 // existing cluster (a token today; in P1 also a CA pin and a join configuration).
-// The control-plane join stays outside this seam — it is coupled to the C5
-// node-push rework (M2). Contract:
+// The control-plane join stays outside this seam — it is coupled to the kubeconfig
+// publish rework (M2). Contract:
 //
 //   - It may read the management cluster, and a workload cluster if it was built
 //     with a client for one. It MUST NOT mutate req.Config; the reconciler owns

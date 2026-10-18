@@ -85,9 +85,24 @@ func rolloutEtcdStatus(cluster *clusterv1.Cluster, machines ...*clusterv1.Machin
 		b, _ := json.Marshal(etcdMemberStatus{Name: node, Healthy: true, Voting: true, Members: len(machines)})
 		data[node] = b
 	}
+	// Owner-ref to the Cluster (Controller=true), matching how
+	// ensureEtcdStatusSecret creates it: reconcileMachines now refuses to adopt a
+	// same-name etcd-status Secret that this Cluster does not already control
+	// (ADR 0011, closing G10), so the fixture must present the real ownership.
+	ctlTrue := true
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace},
-		Data:       data,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      etcdStatusSecretName(cluster.Name),
+			Namespace: cluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "Cluster",
+				Name:       cluster.Name,
+				UID:        cluster.UID,
+				Controller: &ctlTrue,
+			}},
+		},
+		Data: data,
 	}
 }
 

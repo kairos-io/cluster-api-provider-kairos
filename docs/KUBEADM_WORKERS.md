@@ -95,6 +95,17 @@ bootstrap controller does the following for each Machine:
      kubeconfig `server`.
    - If a `<cluster>-ca` Secret exists, its `tls.crt` equals the kubeconfig's
      CA. A missing `<cluster>-ca` is allowed.
+   - The kubeconfig is self-contained: exactly one cluster, user and context;
+     the CA as `certificate-authority-data`; and the credential inline, as
+     `client-certificate-data` plus `client-key-data`, or as `token`. Fields
+     that point outside the kubeconfig are refused, in every entry: file paths
+     (`certificate-authority`, `client-certificate`, `client-key`,
+     `tokenFile`), `exec` and `auth-provider` plugins, `proxy-url`,
+     `tls-server-name`, `insecure-skip-tls-verify`, impersonation, and
+     basic-auth. The kubeconfigs `KubeadmControlPlane` and Kamaji publish meet
+     this. The controller connects to the workload cluster only with a
+     kubeconfig it has rebuilt from these fields, never with the Secret as
+     stored.
    - Under Kamaji, do not expect to control `<cluster>-ca` yourself. Kamaji
      honours a bring-your-own CA only as a pre-created `<tcp>-ca` holding a
      valid `ca.crt`/`ca.key` pair; a CAPI-style `<cluster>-ca` carrying only
@@ -307,7 +318,8 @@ another control-plane kind, the operator sets
 operator-level setting; there is no per-Cluster field. The operator must also grant
 the bootstrap manager read access to the added kind. See
 [Optional manager flags](INSTALL.md#optional-manager-flags) for the format, the
-RBAC requirement, and how to set it.
+RBAC requirement, and how to set it. The added kind's `<cluster>-kubeconfig`
+must be self-contained, as described in [How it works](#how-it-works).
 
 ## KairosControlPlane refuses kubeadm
 
@@ -347,6 +359,7 @@ kubectl get kairosconfig <name> -o jsonpath='{.status.failureMessage}'
 | `is not on the kubeadm trust allowlist` | The control-plane kind is not `KubeadmControlPlane` or `KamajiControlPlane`. Use a supported kind or have the operator set `--kubeadm-extra-controlplane-kinds`. |
 | `kubeconfig CA does not match` | The CA in `<cluster>-kubeconfig` differs from `<cluster>-ca` `tls.crt`. Resolve which CA is correct before retrying. |
 | `carries no certificate-authority-data` | The kubeconfig has no CA to pin. Fix the control plane's kubeconfig Secret. |
+| `is not a kubeconfig this controller will connect with` | The kubeconfig is not self-contained: it has more than one cluster, user or context, or a field that points outside it (a file path, an `exec` or `auth-provider` plugin, a proxy, skipped TLS verification). The message names the rule. This usually means a control-plane kind added with `--kubeadm-extra-controlplane-kinds` publishes a kubeconfig in a different shape; it must publish an inline credential and CA. |
 | `does not support MachinePool` | Use a `MachineDeployment`. |
 | `requires Machine.spec.version` | Set `spec.template.spec.version` on the MachineDeployment. |
 | `not kubeadm: a kubeadm worker cannot join a k0s/k3s control plane` | The Cluster's control plane is a k0s or k3s `KairosControlPlane`. Use k0s or k3s workers. |
