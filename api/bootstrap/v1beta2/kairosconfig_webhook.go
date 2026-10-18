@@ -108,10 +108,15 @@ func (*kairosConfigValidator) ValidateUpdate(_ context.Context, old, r *KairosCo
 	return r.warnings(), r.validateWith(hostErrs)
 }
 
-// validateHostname checks spec.hostname with NodeHostnameErrors. An empty
-// hostname is valid: the node is then named after its Machine.
+// validateHostname checks spec.hostname with NodeHostnameErrors, on
+// control-plane configs only (spec.role, which the KairosControlPlane always
+// sets to control-plane). Only control-plane nodes are matched to a k0s etcd
+// member by their hostname; a worker's hostname is never used that way, and
+// rejecting uppercase or FQDN worker hostnames would break MachineDeployment
+// scale-ups from existing worker templates. An empty hostname is valid: the
+// node is then named after its Machine.
 func (r *KairosConfig) validateHostname() field.ErrorList {
-	if r.Spec.Hostname == "" {
+	if r.Spec.Hostname == "" || r.Spec.Role != "control-plane" {
 		return nil
 	}
 	var errs field.ErrorList

@@ -38,6 +38,35 @@ func TestNodeHostnameErrors(t *testing.T) {
 	}
 }
 
+// TestKairosConfig_Webhook_HostnameIsControlPlaneOnly: the hostname rule
+// applies to control-plane configs only. A worker's hostname is never matched
+// to an etcd member, and existing worker templates with uppercase or FQDN
+// hostnames must keep scaling.
+func TestKairosConfig_Webhook_HostnameIsControlPlaneOnly(t *testing.T) {
+	v := &kairosConfigValidator{}
+	ctx := context.Background()
+	for _, h := range []string{"Worker-01", "worker-01.example.com", "metal-{{ trunc 4 .MachineID }}"} {
+		worker := newValidKairosConfig()
+		worker.Spec.Role = "worker"
+		worker.Spec.WorkerToken = "token"
+		worker.Spec.Hostname = h
+		if _, err := v.ValidateCreate(ctx, worker); err != nil {
+			t.Errorf("worker with hostname %q must be admitted: %v", h, err)
+		}
+		changed := worker.DeepCopy()
+		changed.Spec.Hostname = h + "x"
+		if _, err := v.ValidateUpdate(ctx, worker, changed); err != nil {
+			t.Errorf("worker hostname change to %q must be admitted: %v", changed.Spec.Hostname, err)
+		}
+
+		cp := newValidKairosConfig()
+		cp.Spec.Hostname = h
+		if _, err := v.ValidateCreate(ctx, cp); err == nil || !strings.Contains(err.Error(), "spec.hostname") {
+			t.Errorf("control-plane config with hostname %q must be rejected, got %v", h, err)
+		}
+	}
+}
+
 // TestKairosConfig_Webhook_Hostname: spec.hostname must be a lowercase
 // DNS-1123 label with no template markup on create, and on an update that
 // changes it. An update that leaves an older, now-invalid hostname alone is
