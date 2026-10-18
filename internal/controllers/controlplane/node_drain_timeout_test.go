@@ -105,12 +105,13 @@ func TestCreateControlPlaneMachine_PropagatesNodeDrainTimeout(t *testing.T) {
 		WithObjects(drainTimeoutInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, cluster, 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, cluster,
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	g.Expect(err).NotTo(HaveOccurred())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),
-		types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, machine)).To(Succeed())
+		types.NamespacedName{Name: created.Name, Namespace: "default"}, machine)).To(Succeed())
 
 	g.Expect(machine.Spec.Deletion.NodeDrainTimeoutSeconds).NotTo(BeNil())
 	g.Expect(*machine.Spec.Deletion.NodeDrainTimeoutSeconds).To(Equal(int32(420)))
@@ -131,12 +132,13 @@ func TestCreateControlPlaneMachine_NoNodeDrainTimeoutLeavesFieldUnset(t *testing
 		WithObjects(drainTimeoutInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, cluster, 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, cluster,
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	g.Expect(err).NotTo(HaveOccurred())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),
-		types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, machine)).To(Succeed())
+		types.NamespacedName{Name: created.Name, Namespace: "default"}, machine)).To(Succeed())
 
 	g.Expect(machine.Spec.Deletion.NodeDrainTimeoutSeconds).To(BeNil())
 }

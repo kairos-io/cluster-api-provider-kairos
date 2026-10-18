@@ -107,7 +107,7 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 			}
 			joinTokenID = admission.k0sJoinTokenID
 		}
-		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
+		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, role, joinTokenID); err != nil {
 			if errors.Is(err, errWorkloadIdentityChanged) {
 				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
 			}

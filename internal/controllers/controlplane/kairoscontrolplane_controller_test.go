@@ -118,12 +118,11 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 		Scheme: scheme,
 	}
 
-	err := reconciler.createControlPlaneMachine(
+	created, err := reconciler.createControlPlaneMachine(
 		context.Background(),
 		log.Log,
 		kcp,
 		cluster,
-		0,
 		bootstrapv1beta2.ControlPlaneRoleSingle,
 		"",
 	)
@@ -133,7 +132,7 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 	// Verify KairosConfig was created with SingleNode = true
 	kairosConfig := &bootstrapv1beta2.KairosConfig{}
 	err = client.Get(context.Background(), types.NamespacedName{
-		Name:      "test-kcp-0",
+		Name:      created.Name,
 		Namespace: "default",
 	}, kairosConfig)
 
@@ -220,12 +219,11 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 		Scheme: scheme,
 	}
 
-	err := reconciler.createControlPlaneMachine(
+	created, err := reconciler.createControlPlaneMachine(
 		context.Background(),
 		log.Log,
 		kcp,
 		cluster,
-		0,
 		bootstrapv1beta2.ControlPlaneRoleInit,
 		"",
 	)
@@ -235,7 +233,7 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 	// Verify KairosConfig was created with SingleNode = false
 	kairosConfig := &bootstrapv1beta2.KairosConfig{}
 	err = client.Get(context.Background(), types.NamespacedName{
-		Name:      "test-kcp-0",
+		Name:      created.Name,
 		Namespace: "default",
 	}, kairosConfig)
 

@@ -21,9 +21,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -58,11 +56,15 @@ func TestControlPlaneTemplateHostname(t *testing.T) {
 			r.reportControlPlaneTemplateHostname(context.Background(), log.Log, kcp)
 			g.Expect(rec.Events).To(Receive(ContainSubstring("Warning " + invalidControlPlaneHostnameReason)))
 
-			err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0, bootstrapv1beta2.ControlPlaneRoleSingle, "")
+			created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 			g.Expect(err).To(MatchError(ContainSubstring("lowercase DNS-1123 label")))
-			g.Expect(r.Get(context.Background(), types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, &bootstrapv1beta2.KairosConfig{})).ToNot(Succeed(),
-				"no KairosConfig is created from the template")
-			g.Expect(r.Get(context.Background(), types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, &clusterv1.Machine{})).ToNot(Succeed())
+			g.Expect(created).To(BeNil())
+			// Names are random (ADR 0015 PR-4): check that nothing at all was
+			// created, not that one name is absent.
+			configs, infra, machines := objectNames(g, r.Client)
+			g.Expect(configs).To(BeEmpty(), "no KairosConfig is created from the template")
+			g.Expect(infra).To(BeEmpty())
+			g.Expect(machines).To(BeEmpty())
 		})
 	}
 	for _, h := range []string{"", "cp-host"} {
