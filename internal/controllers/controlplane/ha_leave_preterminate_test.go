@@ -26,7 +26,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // TestReconcileMemberLeave_WaitsForCAPIToFinishWithTheNode: while CAPI is
@@ -62,7 +61,7 @@ func TestReconcileMemberLeave_WaitsForCAPIToFinishWithTheNode(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			f := newLeaveFixtureFor(g, tc.stage(leavingMachine("cp-0", nil, "10.0.0.10")), nil, nil)
-			workload := fake.NewClientBuilder().WithScheme(f.scheme).Build() // no leave ConfigMap yet
+			workload := pinnedWorkloadBuilder(f.scheme).Build() // no leave ConfigMap yet
 			members := &fakeMembers{clients: map[string]client.Client{"10.0.0.11": workload}}
 			endpointCalls := 0
 			f.r.MemberClientFactory = members.factory

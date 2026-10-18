@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -125,6 +126,29 @@ func k0sKCP() *controlplanev1beta2.KairosControlPlane {
 	}
 }
 
+// pinned returns kcp with the workload identity pinned to uidA, as a KCP
+// running ADR 0015 has done at its first contact. Every etcd-leave connection
+// must serve the pinned cluster (verifyPinnedWorkloadIdentity), so the leave
+// tests run against a pinned control plane and a workload built by
+// pinnedWorkloadBuilder.
+func pinned(kcp *controlplanev1beta2.KairosControlPlane) *controlplanev1beta2.KairosControlPlane {
+	if kcp.Annotations == nil {
+		kcp.Annotations = map[string]string{}
+	}
+	kcp.Annotations[WorkloadClusterUIDAnnotation] = uidA
+	return kcp
+}
+
+func pinnedK0sKCP() *controlplanev1beta2.KairosControlPlane { return pinned(k0sKCP()) }
+
+func pinnedVIPKCP() *controlplanev1beta2.KairosControlPlane { return pinned(vipKCP()) }
+
+// pinnedWorkloadBuilder is a fake workload cluster with the pinned identity:
+// its kube-system Namespace has UID uidA.
+func pinnedWorkloadBuilder(scheme *runtime.Scheme) *fake.ClientBuilder {
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(kubeSystem(uidA))
+}
+
 func testCluster() *clusterv1.Cluster {
 	return &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: "default"}}
 }
@@ -167,7 +191,7 @@ func TestReconcileMemberLeave_NoNodeRefFastPath(t *testing.T) {
 			return nil, nil
 		},
 	}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeTrue())
 	g.Expect(factoryCalled).To(BeFalse(), "no NodeRef must not reach the workload cluster")
@@ -207,13 +231,13 @@ func TestReconcileMemberLeave_WritesRequestThenWaits(t *testing.T) {
 	scheme := haTestScheme(g)
 	target := hookedMachine("cp-0", "cp-0", nil)
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).Build() // no ConfigMap yet
+	wc := pinnedWorkloadBuilder(scheme).Build() // no ConfigMap yet
 
 	r := &KairosControlPlaneReconciler{
 		Client: mgmt, Scheme: scheme,
 		WorkloadClientFactory: staticWorkloadClient(wc),
 	}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeFalse(), "must wait for the node to ack")
 
@@ -238,10 +262,10 @@ func TestReconcileMemberLeave_AckRemovesHook(t *testing.T) {
 	scheme := haTestScheme(g)
 	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339)})
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeftValue})).Build()
+	wc := pinnedWorkloadBuilder(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeftValue})).Build()
 
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeTrue())
 	assertHookGone(g, mgmt, "cp-0")
@@ -256,10 +280,10 @@ func TestReconcileMemberLeave_AbsentFromEtcdStatusRemovesHook(t *testing.T) {
 	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339)})
 	// etcd-status no longer lists cp-0.
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).Build()
+	wc := pinnedWorkloadBuilder(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).Build()
 
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeTrue())
 	assertHookGone(g, mgmt, "cp-0")
@@ -277,11 +301,11 @@ func TestReconcileMemberLeave_TimeoutRemovesHook(t *testing.T) {
 	// Member still present in etcd-status (so the cross-check does NOT short-circuit)
 	// and no `left` ack — only the timeout can fire.
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).Build()
+	wc := pinnedWorkloadBuilder(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).Build()
 
 	rec := record.NewFakeRecorder(4)
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: rec, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeTrue())
 	assertHookGone(g, mgmt, "cp-0")
@@ -303,7 +327,7 @@ func TestReconcileMemberLeave_ClientBuildErrorRetainsHook(t *testing.T) {
 			return nil, context.DeadlineExceeded
 		},
 	}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	got := &clusterv1.Machine{}
@@ -413,10 +437,10 @@ func TestReconcileMemberLeave_StaleLeftDoesNotShortCircuit(t *testing.T) {
 	target := hookedMachine("cp-0", "cp-0", nil)
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
 	// Workload ConfigMap carries a STALE `left` for cp-0 from a prior cycle.
-	wc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeftValue})).Build()
+	wc := pinnedWorkloadBuilder(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeftValue})).Build()
 
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeFalse(), "stale `left` must not complete the leave; a real leave must be requested")
 
@@ -440,11 +464,11 @@ func TestReconcileMemberLeave_ReadErrorBeforeTimeoutRetainsHook(t *testing.T) {
 	scheme := haTestScheme(g)
 	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339)})
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
+	wc := pinnedWorkloadBuilder(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
 
 	rec := record.NewFakeRecorder(4)
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: rec, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	got := &clusterv1.Machine{}
@@ -475,11 +499,11 @@ func TestReconcileMemberLeave_ReadErrorPastTimeoutReachesBackstop(t *testing.T) 
 			scheme := haTestScheme(g)
 			target := hookedMachine("cp-0", "cp-0", tc.annotations)
 			mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-			wc := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
+			wc := pinnedWorkloadBuilder(scheme).WithInterceptorFuncs(failConfigMapGets()).Build()
 
 			rec := record.NewFakeRecorder(4)
 			r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: rec, WorkloadClientFactory: staticWorkloadClient(wc)}
-			done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+			done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 			got := &clusterv1.Machine{}
 			g.Expect(mgmt.Get(context.Background(), types.NamespacedName{Name: "cp-0", Namespace: "default"}, got)).To(Succeed())
 			if tc.wantDone {
@@ -506,10 +530,10 @@ func TestReconcileMemberLeave_WaitingReassertsMissingRequest(t *testing.T) {
 	scheme := haTestScheme(g)
 	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339)})
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	wc := fake.NewClientBuilder().WithScheme(scheme).Build() // the ConfigMap is gone
+	wc := pinnedWorkloadBuilder(scheme).Build() // the ConfigMap is gone
 
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	cm := &corev1.ConfigMap{}
