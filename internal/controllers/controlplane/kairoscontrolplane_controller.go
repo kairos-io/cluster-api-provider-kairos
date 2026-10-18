@@ -682,6 +682,11 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	log.Info("Reconciling control plane machines", "desired", desiredReplicas, "current", currentReplicas)
 
+	// ADR 0015 PR-3: say at once, not at the next scale-up, when the
+	// referenced KairosConfigTemplate's hostname cannot be used for
+	// control-plane nodes. createControlPlaneMachine refuses such a template.
+	r.reportControlPlaneTemplateHostname(ctx, log, kcp)
+
 	// Carry the current machineTemplate.nodeDrainTimeout onto the Machines that
 	// already exist. This runs before the etcd-leave sweep below so a Machine
 	// that is terminating right now picks up an edited deadline.
@@ -1064,6 +1069,13 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) error {
 	if err := errIfIdentityFrozen(kcp, "create a control-plane Machine"); err != nil {
 		return err
+	}
+	// ADR 0015 PR-3: never stamp a control-plane config from a template whose
+	// hostname control-plane nodes cannot use; fail before anything exists.
+	if problem, err := r.controlPlaneTemplateHostnameProblem(ctx, kcp); err != nil {
+		return err
+	} else if problem != "" {
+		return errors.New(problem)
 	}
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
