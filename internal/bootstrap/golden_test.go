@@ -84,10 +84,11 @@ func goldenCases() []goldenCase {
 		d.ManagementEndpoint = &ManagementEndpoint{
 			APIServer:                 "https://mgmt.example.com:6443",
 			Token:                     "mgmt-token",
-			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretName:      "cluster-kubeconfig-push",
 			KubeconfigSecretNamespace: "default",
 			ClusterName:               "ha-cluster",
 			ControlPlaneEndpointHost:  host,
+			CABundle:                  goldenManagementCA,
 		}
 		return d
 	}
@@ -100,7 +101,7 @@ func goldenCases() []goldenCase {
 		{"k3s_capk_single", RenderK3sCloudConfig, base(bootstrapv1beta2.ControlPlaneRoleSingle, true, true, false)},
 
 		// --- init (HA first node, CAPV: kube-vip + etcd-health reporter rendered) ---
-		{"k0s_capv_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinTokenSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-control-plane-join-token"), "ha-cluster-etcd-status")},
+		{"k0s_capv_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-etcd-status")},
 		{"k3s_capv_init", RenderK3sCloudConfig, withEtcdStatusSecretName(withEndpoint(withVIP(base(bootstrapv1beta2.ControlPlaneRoleInit, false, false, false)), "192.168.1.240"), "ha-cluster-etcd-status")},
 
 		// --- join (HA subsequent node, CAPV: kube-vip + etcd-health reporter rendered) ---
@@ -112,7 +113,7 @@ func goldenCases() []goldenCase {
 		// snapshots exercise the etcd-health reporter block (ADR 0005 §E.1 port to
 		// CAPK); k0s additionally carries the etcd-leave responder (ADR 0005 §E.3),
 		// gated only on IsHAControlPlane, acking via ControlPlaneLBEndpoint (no VIP).
-		{"k0s_capk_init", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinTokenSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-control-plane-join-token"), "ha-cluster-etcd-status")},
+		{"k0s_capk_init", RenderK0sCloudConfig, withEtcdStatusSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-etcd-status")},
 		{"k3s_capk_init", RenderK3sCloudConfig, withEtcdStatusSecretName(capkHA(base(bootstrapv1beta2.ControlPlaneRoleInit, false, true, false)), "ha-cluster-etcd-status")},
 		{"k0s_capk_join", RenderK0sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
 		{"k3s_capk_join", RenderK3sCloudConfig, withEtcdStatusSecretName(withJoinToken(capkHA(base(bootstrapv1beta2.ControlPlaneRoleJoin, false, true, false))), "ha-cluster-etcd-status")},
@@ -121,15 +122,6 @@ func goldenCases() []goldenCase {
 
 func withJoinToken(d TemplateData) TemplateData {
 	d.JoinToken = "K10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa::server:bbbbbbbbbbbbbbbbbbbbbbbb"
-	return d
-}
-
-// withJoinTokenSecretName stamps the k0s HA init-node push-block gate
-// (ManagementEndpoint.JoinTokenSecretName). Only the k0s init render mints
-// `k0s token create` and pushes the token; this makes the golden snapshot
-// exercise that highest-blast-radius block. Requires ManagementEndpoint set.
-func withJoinTokenSecretName(d TemplateData, name string) TemplateData {
-	d.ManagementEndpoint.JoinTokenSecretName = name
 	return d
 }
 
@@ -161,12 +153,30 @@ func capkHA(d TemplateData) TemplateData {
 	d.ManagementEndpoint = &ManagementEndpoint{
 		APIServer:                 "https://mgmt.example.com:6443",
 		Token:                     "mgmt-token",
-		KubeconfigSecretName:      "cluster-kubeconfig",
+		KubeconfigSecretName:      "cluster-kubeconfig-push",
 		KubeconfigSecretNamespace: "default",
 		ClusterName:               "ha-cluster",
+		CABundle:                  goldenManagementCA,
 	}
 	return d
 }
+
+// goldenManagementCA is a fixed, valid CA-certificate PEM used by the HA golden
+// fixtures so the ADR 0011 PR-4 management-CA write_files block renders
+// deterministically. It is a self-signed test CA (no private key ships in the
+// golden output — only the certificate).
+const goldenManagementCA = `-----BEGIN CERTIFICATE-----
+MIIBlzCCAT2gAwIBAgIUdeNhGQtfDB6MzsuCfT7yp/3ejvQwCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVa2Fpcm9zLWdvbGRlbi10ZXN0LWNhMCAXDTI2MDkzMDEwNTg1
+NFoYDzIxMjYwOTA2MTA1ODU0WjAgMR4wHAYDVQQDDBVrYWlyb3MtZ29sZGVuLXRl
+c3QtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQPBiI+dbJqCIS60D7lz31x
+BOC2BhG1YRKWXAjxR+QZHB8xXeD7sQWMRWQmeeHLBxMPy8iEwOXKQ6LFmOq6XtWI
+o1MwUTAdBgNVHQ4EFgQUt9qwjQz9hwGB5A4wl4fgHwoVDT4wHwYDVR0jBBgwFoAU
+t9qwjQz9hwGB5A4wl4fgHwoVDT4wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD
+AgNIADBFAiEAoZbZfZMI9EwRVOlFjYNl4RBCCLCa84UpLykKiU/wY1ECICm9LUxU
+grfraH74VERMr+gdq7NCdTm4KotBdpRo64GX
+-----END CERTIFICATE-----
+`
 
 func goldenPath(name string) string {
 	return filepath.Join("testdata", "golden", name+".yaml")

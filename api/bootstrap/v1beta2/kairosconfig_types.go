@@ -44,6 +44,15 @@ const (
 	// ControlPlaneJoinTokenSecretDataKey is the data key holding the join token.
 	ControlPlaneJoinTokenSecretDataKey = "token"
 
+	// K0sControllerJoinTokenIDAnnotation carries the bootstrap-token ID of the k0s
+	// controller-join token that the KairosControlPlane minted (ADR 0013). The KCP
+	// sets it on the join-token Secret, in the same write as the token, and on
+	// every join KairosConfig it creates. The bootstrap controller renders a k0s
+	// join only when the two values match, so a joiner never receives a token
+	// other than the one it was created for. The ID is the public half of the
+	// token and is not secret.
+	K0sControllerJoinTokenIDAnnotation = "controlplane.cluster.x-k8s.io/k0s-join-token-id"
+
 	// EtcdStatusSecretSuffix is appended to the cluster name to form the
 	// per-cluster HA etcd-health Secret name (ADR 0005 §E.1). Every control-plane
 	// node PATCHes its own member key over the node-push channel; the controlplane
@@ -56,7 +65,34 @@ const (
 	// Secret-watch predicates match it by label (KD-15), never by name suffix.
 	EtcdStatusSecretTypeLabel = "controlplane.cluster.x-k8s.io/secret-type"
 	EtcdStatusSecretTypeValue = "etcd-status"
+
+	// KubeconfigPushSecretSuffix is appended to the cluster name to form the
+	// per-cluster *staging* kubeconfig Secret name (ADR 0011, option B). The
+	// KairosControlPlane pre-creates and owns it; nodes may only PATCH its
+	// `value` key. The controller rebuilds the staged kubeconfig through
+	// internal/kubeconfig (S5), forces the server it already knows, pins the CA,
+	// and is the sole writer of the contract Secret `<cluster>-kubeconfig`. The
+	// suffix is deliberately NOT a CAPI Secret purpose (it can never collide
+	// with `-kubeconfig`, `-ca`, `-etcd`, `-sa`, `-proxy`).
+	KubeconfigPushSecretSuffix = "kubeconfig-push"
+
+	// KubeconfigPushSecretDataKey is the data key the staged kubeconfig lives
+	// under, matching the contract Secret's own `value` key.
+	KubeconfigPushSecretDataKey = "value"
+
+	// KubeconfigPushSecretTypeLabel + Value mark the staging Secret so the
+	// KairosControlPlane's Secret-watch predicate matches it by label (a watch
+	// HINT only — the authoritative lookup is by name plus controller-owner UID,
+	// never by label; ADR 0011 step 1).
+	KubeconfigPushSecretTypeLabel = "controlplane.cluster.x-k8s.io/secret-type"
+	KubeconfigPushSecretTypeValue = "kubeconfig-push"
 )
+
+// KubeconfigPushSecretName returns the per-cluster staging kubeconfig Secret
+// name for the given cluster (ADR 0011, option B).
+func KubeconfigPushSecretName(clusterName string) string {
+	return clusterName + "-" + KubeconfigPushSecretSuffix
+}
 
 // ControlPlaneJoinTokenSecretName returns the per-cluster HA join-token Secret
 // name for the given cluster.
@@ -173,11 +209,11 @@ type KairosConfigSpec struct {
 	// +kubebuilder:validation:MaxItems=32
 	Files []File `json:"files,omitempty"`
 
-	// PreCommands are commands to run before k0s/k3s installation
+	// PreCommands is reserved and not yet rendered into the cloud-config.
 	// +optional
 	PreCommands []string `json:"preCommands,omitempty"`
 
-	// PostCommands are commands to run after k0s/k3s installation
+	// PostCommands is reserved and not yet rendered into the cloud-config.
 	// +optional
 	PostCommands []string `json:"postCommands,omitempty"`
 
@@ -599,12 +635,14 @@ type KairosConfigStatus struct {
 	FailureMessage string `json:"failureMessage,omitempty"`
 
 	// BootstrapTokenID is the non-secret ID half (the "[a-z0-9]{6}" prefix) of the
-	// kubeadm bootstrap token this KairosConfig most recently minted in the workload
-	// cluster. It lets operators correlate the token Secret in the workload cluster's
-	// kube-system namespace with this KairosConfig and audit its refresh, without
-	// exposing the secret half, which lives only in the bootstrap-data Secret and is
-	// never placed in spec or status. Empty for k0s and k3s, and for a kubeadm worker
-	// that has not yet minted a token.
+	// kubeadm bootstrap token this KairosConfig uses in the workload cluster. Every
+	// render of the KairosConfig reuses this token, and the controller extends its
+	// expiry while the Machine has no nodeRef. It is revoked and cleared once the
+	// Machine has a nodeRef, or when the KairosConfig is deleted. It lets operators
+	// correlate the token Secret in the workload cluster's kube-system namespace with
+	// this KairosConfig without exposing the secret half, which lives only in the
+	// bootstrap-data Secret and is never placed in spec or status. Empty for k0s and
+	// k3s, for a kubeadm worker that has not yet minted a token, and after revocation.
 	// +optional
 	BootstrapTokenID string `json:"bootstrapTokenID,omitempty"`
 }

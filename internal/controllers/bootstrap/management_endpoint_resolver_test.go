@@ -33,8 +33,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
+
+// testKCPUID is the shared controller-owner UID for the fixture's Machine and
+// its staging kubeconfig Secret. The PR-3 resolver gate (ADR 0011) passes only
+// when the staging Secret's controller-owner UID equals the Machine's — both the
+// KCP — so the two fixtures below stamp this same UID.
+const testKCPUID = types.UID("00000000-0000-0000-0000-0000000000cp")
 
 // fakeSubResourceClient is the minimum surface tests need to drive
 // kubeVirtTokenResolver — just the Create path against the "token"
@@ -89,11 +97,60 @@ func newResolverScheme(t *testing.T) *runtime.Scheme {
 	g.Expect(rbacv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(authenticationv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(controlplanev1beta2.AddToScheme(scheme)).To(Succeed())
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 	return scheme
 }
 
-func newResolverFixture(scheme *runtime.Scheme, sub *fakeSubResourceClient, mgmtAPI string, seed ...client.Object) (*kubeVirtTokenResolver, *bootstrapv1beta2.KairosConfig, *clusterv1.Cluster) {
+// resolverMachine is a control-plane Machine controlled by a KairosControlPlane
+// (UID testKCPUID) — the shape the resolver gate keys on.
+func resolverMachine(clusterName, ns string) *clusterv1.Machine {
+	ctlTrue := true
+	return &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName + "-cp-0",
+			Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       clusterName + "-kcp",
+				UID:        testKCPUID,
+				Controller: &ctlTrue,
+			}},
+		},
+	}
+}
+
+// ownedStagingSecret is the per-cluster staging kubeconfig Secret controller-owned
+// by the same KCP (UID testKCPUID). Seeding it lets the resolver gate pass.
+func ownedStagingSecret(clusterName, ns string) *corev1.Secret {
+	ctlTrue := true
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      bootstrapv1beta2.KubeconfigPushSecretName(clusterName),
+			Namespace: ns,
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:                     clusterName,
+				bootstrapv1beta2.KubeconfigPushSecretTypeLabel: bootstrapv1beta2.KubeconfigPushSecretTypeValue,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlplanev1beta2.GroupVersion.String(),
+				Kind:       "KairosControlPlane",
+				Name:       clusterName + "-kcp",
+				UID:        testKCPUID,
+				Controller: &ctlTrue,
+			}},
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+}
+
+// newResolverFixture builds a resolver over a fake client seeded with a
+// KairosConfig, a Cluster named "test-cluster", a KCP-controlled control-plane
+// Machine, and (by default) the KCP-owned staging Secret so the PR-3 resolver
+// gate passes. Additional seed objects can be appended; pass a staging Secret in
+// seed to override the default owned one for gate-failure cases.
+func newResolverFixture(scheme *runtime.Scheme, sub *fakeSubResourceClient, mgmtAPI string, seed ...client.Object) (*kubeVirtTokenResolver, *bootstrapv1beta2.KairosConfig, *clusterv1.Machine, *clusterv1.Cluster) {
 	kc := &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-config",
@@ -107,38 +164,49 @@ func newResolverFixture(scheme *runtime.Scheme, sub *fakeSubResourceClient, mgmt
 			Namespace: "default",
 		},
 	}
-	objects := append([]client.Object{kc, cluster}, seed...)
+	machine := resolverMachine("test-cluster", "default")
+	objects := append([]client.Object{kc, cluster, machine, ownedStagingSecret("test-cluster", "default")}, seed...)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	r := &kubeVirtTokenResolver{
 		Client:              c,
 		SubResource:         func(string) client.SubResourceClient { return sub },
 		Scheme:              scheme,
 		ManagementAPIServer: mgmtAPI,
+		ManagementCABundle:  testManagementCABundle,
 	}
-	return r, kc, cluster
+	return r, kc, machine, cluster
 }
 
-// TestResolve_HappyPath_ReturnsFullEndpoint exercises the success path: an
-// empty management cluster receives the SA/Role/RoleBinding upserts, the
-// fake TokenRequest returns a token, and the resolver assembles the
-// ManagementEndpoint with all four fields populated.
+// testManagementCABundle is a non-empty stand-in for the management API CA
+// (ADR 0011 PR-4). The resolver only checks that a CA is present (len > 0); PEM
+// validation lives in bootstrap.SanitizeManagementCABundle, exercised in that
+// package's tests, so the exact bytes here do not matter to the resolver.
+var testManagementCABundle = []byte("-----BEGIN CERTIFICATE-----\ntest-management-ca\n-----END CERTIFICATE-----\n")
+
+// TestResolve_HappyPath_ReturnsFullEndpoint exercises the success path: the
+// SA/Role/RoleBinding upserts, the fake TokenRequest returns a token, and the
+// resolver assembles the ManagementEndpoint pointing at the STAGING Secret.
 func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "tok-abc"}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 	// k0s control-plane is the config shape that exercises every rule the
 	// resolver can grant (incl. the conditional VMI/get for SAN detection).
 	kc.Spec.Role = "control-plane"
 	kc.Spec.Distribution = "k0s"
 
-	got, err := r.Resolve(context.Background(), kc, cluster)
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(got).NotTo(BeNil())
 	g.Expect(got.Token).To(Equal("tok-abc"))
 	g.Expect(got.APIServer).To(Equal("https://mgmt:6443"))
-	g.Expect(got.KubeconfigSecretName).To(Equal("test-cluster-kubeconfig"))
+	// PR-3: the node's push target is the STAGING Secret, never the contract one.
+	g.Expect(got.KubeconfigSecretName).To(Equal("test-cluster-kubeconfig-push"))
 	g.Expect(got.KubeconfigSecretNamespace).To(Equal("default"))
+	// PR-4: the resolved endpoint carries the management API CA the node verifies
+	// the push channel against.
+	g.Expect(got.CABundle).To(Equal(testManagementCABundle))
 
 	// SA/Role/RoleBinding were created with the cluster-name label.
 	saName := kubeconfigWriterName("test-cluster")
@@ -147,15 +215,21 @@ func TestResolve_HappyPath_ReturnsFullEndpoint(t *testing.T) {
 	g.Expect(sa.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, "test-cluster"))
 	role := &rbacv1.Role{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
-	// KD-46 minimization: a k0s control-plane (CAPK) SA gets exactly 3 rules:
-	//   1. secrets/create (no resourceNames — K8s RBAC silent-fail workaround)
-	//   2. secrets/get,update,patch on the named kubeconfig Secret
-	//   3. kubevirt.io VMI/get (k0s CAPK control-plane SAN detection only)
-	// services/get was removed (dead grant — no template reads Services
-	// with the node SA token).
-	g.Expect(role.Rules).To(HaveLen(3))
+	// PR-3 minimization: a k0s control-plane (CAPK) SA gets exactly 2 rules:
+	//   1. secrets/patch on the named staging/etcd-status Secrets
+	//   2. kubevirt.io VMI/get (k0s CAPK control-plane SAN detection only)
+	// The former create rule and the get/update verbs are removed.
+	g.Expect(role.Rules).To(HaveLen(2))
 	g.Expect(roleGrantsVMIGet(role)).To(BeTrue(), "k0s control-plane SA must retain virtualmachineinstances:get for SAN detection")
 	g.Expect(roleGrantsServicesGet(role)).To(BeFalse(), "services:get is a dead grant and must be removed (KD-46)")
+	g.Expect(roleGrantsSecretCreate(role)).To(BeFalse(), "PR-3: the node SA must NOT have secrets:create")
+	// Staging is patch-only; get/update are gone.
+	stagingName := bootstrapv1beta2.KubeconfigPushSecretName("test-cluster")
+	g.Expect(roleGrantsNamedSecret(role, stagingName, "patch")).To(BeTrue(), "node SA must patch the staging Secret")
+	g.Expect(roleGrantsNamedSecret(role, stagingName, "get")).To(BeFalse(), "PR-3: node SA must NOT get the staging Secret")
+	g.Expect(roleGrantsNamedSecret(role, stagingName, "update")).To(BeFalse(), "PR-3: node SA must NOT update the staging Secret")
+	// The contract Secret is never in the Role's resourceNames.
+	g.Expect(roleGrantsNamedSecret(role, "test-cluster-kubeconfig", "patch")).To(BeFalse(), "PR-3: node SA must NOT touch the contract Secret")
 	rb := &rbacv1.RoleBinding{}
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, rb)).To(Succeed())
 	g.Expect(rb.RoleRef.Name).To(Equal(saName))
@@ -203,10 +277,43 @@ func roleGrantsServicesGet(role *rbacv1.Role) bool {
 	return false
 }
 
+// roleGrantsSecretCreate reports whether the Role grants create on core Secrets
+// via any rule — used to assert the PR-3 removal of the node create grant.
+func roleGrantsSecretCreate(role *rbacv1.Role) bool {
+	for _, rule := range role.Rules {
+		coreGroup := false
+		for _, g := range rule.APIGroups {
+			if g == "" || g == "*" {
+				coreGroup = true
+				break
+			}
+		}
+		if !coreGroup {
+			continue
+		}
+		hasSecret := false
+		for _, res := range rule.Resources {
+			if res == "secrets" || res == "*" {
+				hasSecret = true
+				break
+			}
+		}
+		if !hasSecret {
+			continue
+		}
+		for _, v := range rule.Verbs {
+			if v == "create" || v == "*" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane verifies the
 // KD-46 conditional grant: only a k0s control-plane config receives
 // virtualmachineinstances:get. k3s control-planes and all workers get the
-// minimal 2-rule Secret-only Role.
+// minimal single-rule patch-only Secret Role.
 func TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -215,11 +322,11 @@ func TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane(t *testing.T) {
 		wantVMIGet   bool
 		wantRuleLen  int
 	}{
-		{"k0s-control-plane-gets-vmi", "control-plane", "k0s", true, 3},
-		{"k0s-empty-distribution-defaults-k0s", "control-plane", "", true, 3},
-		{"k3s-control-plane-no-vmi", "control-plane", "k3s", false, 2},
-		{"k0s-worker-no-vmi", "worker", "k0s", false, 2},
-		{"k3s-worker-no-vmi", "worker", "k3s", false, 2},
+		{"k0s-control-plane-gets-vmi", "control-plane", "k0s", true, 2},
+		{"k0s-empty-distribution-defaults-k0s", "control-plane", "", true, 2},
+		{"k3s-control-plane-no-vmi", "control-plane", "k3s", false, 1},
+		{"k0s-worker-no-vmi", "worker", "k0s", false, 1},
+		{"k3s-worker-no-vmi", "worker", "k3s", false, 1},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -227,11 +334,11 @@ func TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane(t *testing.T) {
 			g := NewWithT(t)
 			scheme := newResolverScheme(t)
 			sub := &fakeSubResourceClient{token: "tok"}
-			r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+			r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 			kc.Spec.Role = tc.role
 			kc.Spec.Distribution = tc.distribution
 
-			_, err := r.Resolve(context.Background(), kc, cluster)
+			_, err := r.Resolve(context.Background(), kc, machine, cluster)
 			g.Expect(err).NotTo(HaveOccurred())
 
 			role := &rbacv1.Role{}
@@ -239,8 +346,9 @@ func TestResolve_RBACMinimization_VMIGetScopedToK0sControlPlane(t *testing.T) {
 			g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
 			g.Expect(role.Rules).To(HaveLen(tc.wantRuleLen))
 			g.Expect(roleGrantsVMIGet(role)).To(Equal(tc.wantVMIGet))
-			// services:get must never appear regardless of config shape.
+			// services:get and secrets:create must never appear regardless of shape.
 			g.Expect(roleGrantsServicesGet(role)).To(BeFalse())
+			g.Expect(roleGrantsSecretCreate(role)).To(BeFalse())
 		})
 	}
 }
@@ -252,42 +360,40 @@ func TestResolve_SubResourceError_ReturnsError(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{err: errors.New("boom")}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 
-	got, err := r.Resolve(context.Background(), kc, cluster)
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("failed to create serviceaccount token"))
 	g.Expect(got).To(BeNil())
 }
 
 // TestResolve_EmptyToken_ReturnsError asserts that a successful TokenRequest
-// with an empty .Status.Token (which the apiserver can legitimately return
-// under some auth-plugin misconfigurations) is detected and returned as an
-// error rather than silently producing a useless ManagementEndpoint.
+// with an empty .Status.Token is detected and returned as an error rather than
+// silently producing a useless ManagementEndpoint.
 func TestResolve_EmptyToken_ReturnsError(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: ""}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 
-	got, err := r.Resolve(context.Background(), kc, cluster)
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("empty token"))
 	g.Expect(got).To(BeNil())
 }
 
 // TestResolve_EmptyManagementAPIServer_ReturnsNilNil verifies the documented
-// "disabled" signal: when ManagementAPIServer is empty (envtest, `go run`
-// outside a cluster), the resolver returns (nil, nil) and skips all
-// SA/Role/RoleBinding/TokenRequest work. This contract lets the reconciler
-// continue rendering without the in-node push block.
+// "disabled" signal: when ManagementAPIServer is empty the resolver returns
+// (nil, nil) and skips all SA/Role/RoleBinding/TokenRequest work — before the
+// staging gate is even consulted.
 func TestResolve_EmptyManagementAPIServer_ReturnsNilNil(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "ignored"}
-	r, kc, cluster := newResolverFixture(scheme, sub, "")
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "")
 
-	got, err := r.Resolve(context.Background(), kc, cluster)
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(got).To(BeNil())
 	g.Expect(sub.createCalls).To(Equal(0))
@@ -298,60 +404,123 @@ func TestResolve_EmptyManagementAPIServer_ReturnsNilNil(t *testing.T) {
 	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 }
 
+// TestResolve_NoCA_ReturnsCAUnavailable covers the PR-4 fail-closed gate: when
+// push is enabled (a management URL is set) but no CA was resolved, the resolver
+// returns ErrManagementCAUnavailable BEFORE minting a token or touching the
+// staging Secret, so the node is never handed a push it cannot verify.
+func TestResolve_NoCA_ReturnsCAUnavailable(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r.ManagementCABundle = nil // push enabled, but no CA available
+
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
+	g.Expect(errors.Is(err, ErrManagementCAUnavailable)).To(BeTrue())
+	g.Expect(got).To(BeNil())
+	g.Expect(sub.createCalls).To(Equal(0), "no token minted when the CA is unavailable")
+	saName := kubeconfigWriterName("test-cluster")
+	sa := &corev1.ServiceAccount{}
+	g.Expect(apierrors.IsNotFound(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, sa))).To(BeTrue(),
+		"no SA created when the CA is unavailable")
+}
+
+// TestResolve_StagingMissing_ReturnsNotReady covers the PR-3 resolver gate: when
+// the staging Secret does not exist, Resolve returns ErrKubeconfigPushTargetNotReady
+// and mints NO token / creates NO SA (the gate runs before that work).
+func TestResolve_StagingMissing_ReturnsNotReady(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	kc := &bootstrapv1beta2.KairosConfig{ObjectMeta: metav1.ObjectMeta{Name: "test-config", Namespace: "default"}}
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"}}
+	machine := resolverMachine("test-cluster", "default")
+	// No staging Secret seeded.
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine).Build()
+	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443", ManagementCABundle: testManagementCABundle}
+
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
+	g.Expect(errors.Is(err, ErrKubeconfigPushTargetNotReady)).To(BeTrue())
+	g.Expect(got).To(BeNil())
+	g.Expect(sub.createCalls).To(Equal(0), "no token minted when the gate fails")
+	saName := kubeconfigWriterName("test-cluster")
+	sa := &corev1.ServiceAccount{}
+	g.Expect(apierrors.IsNotFound(c.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, sa))).To(BeTrue(),
+		"no SA created when the gate fails")
+}
+
+// TestResolve_StagingForeignOwner_ReturnsNotReady covers the gate's owner-UID
+// check: a staging Secret owned by a DIFFERENT KCP (another cluster)
+// fails the gate.
+func TestResolve_StagingForeignOwner_ReturnsNotReady(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newResolverScheme(t)
+	sub := &fakeSubResourceClient{token: "tok"}
+	kc := &bootstrapv1beta2.KairosConfig{ObjectMeta: metav1.ObjectMeta{Name: "test-config", Namespace: "default"}}
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"}}
+	machine := resolverMachine("test-cluster", "default")
+	foreign := ownedStagingSecret("test-cluster", "default")
+	ctlTrue := true
+	foreign.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: controlplanev1beta2.GroupVersion.String(),
+		Kind:       "KairosControlPlane",
+		Name:       "test-cluster-kcp",
+		UID:        types.UID("other-kcp-uid"),
+		Controller: &ctlTrue,
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine, foreign).Build()
+	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443", ManagementCABundle: testManagementCABundle}
+
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
+	g.Expect(errors.Is(err, ErrKubeconfigPushTargetNotReady)).To(BeTrue())
+	g.Expect(got).To(BeNil())
+	g.Expect(sub.createCalls).To(Equal(0))
+}
+
 // TestResolve_Idempotent_TwoCallsNoConflict asserts that calling Resolve
 // twice in a row against the same fixture does not error on the second call.
-// The first call creates the SA/Role/RoleBinding; the second goes through
-// controllerutil.CreateOrUpdate's update path. This is the property the
-// legacy ensureKubeconfigPushConfig depended on (Reconcile re-renders on
-// every Generation bump and we cannot afford a second-call conflict).
 func TestResolve_Idempotent_TwoCallsNoConflict(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "tok-abc"}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 
-	first, err := r.Resolve(context.Background(), kc, cluster)
+	first, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(first).NotTo(BeNil())
 
-	second, err := r.Resolve(context.Background(), kc, cluster)
+	second, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(second).NotTo(BeNil())
 	g.Expect(second.Token).To(Equal("tok-abc"))
 	// Both calls produced a TokenRequest — no in-resolver caching today.
-	// (KD-33b will add caching; this assertion is the regression guard for
-	// the "remove caching by accident" reverse direction.)
 	g.Expect(sub.createCalls).To(Equal(2))
 }
 
 // TestResolve_HappyPath_CAPVCluster asserts the resolver returns the same
-// ManagementEndpoint shape regardless of the underlying infrastructure
-// provider — for KD-3b, the resolver is called for CAPV control planes too
-// (gate broadened from CAPK-only). The test deliberately constructs no CAPK
-// or CAPV-specific objects: the resolver is infra-agnostic on its happy path
-// (the per-infra differentiation lives in supportsManagementEndpoint, not
-// here). What this test asserts is that nothing in the resolver implicitly
-// depends on a KubeVirt-only object existing.
+// ManagementEndpoint shape regardless of the underlying infrastructure provider,
+// pointing at that cluster's staging Secret.
 func TestResolve_HappyPath_CAPVCluster(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "tok-capv"}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
-	cluster.Name = "capv-cluster" // override the default name to make assertions sharper
+	kc := &bootstrapv1beta2.KairosConfig{ObjectMeta: metav1.ObjectMeta{Name: "test-config", Namespace: "default"}}
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "capv-cluster", Namespace: "default"}}
+	machine := resolverMachine("capv-cluster", "default")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kc, cluster, machine, ownedStagingSecret("capv-cluster", "default")).Build()
+	r := &kubeVirtTokenResolver{Client: c, SubResource: func(string) client.SubResourceClient { return sub }, Scheme: scheme, ManagementAPIServer: "https://mgmt:6443", ManagementCABundle: testManagementCABundle}
 
-	got, err := r.Resolve(context.Background(), kc, cluster)
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(got).NotTo(BeNil())
 	g.Expect(got.Token).To(Equal("tok-capv"))
-	g.Expect(got.KubeconfigSecretName).To(Equal("capv-cluster-kubeconfig"))
+	g.Expect(got.KubeconfigSecretName).To(Equal("capv-cluster-kubeconfig-push"))
 	g.Expect(got.KubeconfigSecretNamespace).To(Equal("default"))
 	g.Expect(got.APIServer).To(Equal("https://mgmt:6443"))
 }
 
 // TestResolve_PreExistingServiceAccount_StillSucceeds covers the case where
-// a previous reconcile (or another controller) already created the SA, but
-// not the Role or RoleBinding. The CreateOrUpdate path must adopt the
-// existing SA (setting our owner-ref + label on update) rather than fail.
+// a previous reconcile already created the SA, but not the Role or RoleBinding.
 func TestResolve_PreExistingServiceAccount_StillSucceeds(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
@@ -360,14 +529,12 @@ func TestResolve_PreExistingServiceAccount_StillSucceeds(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      saName,
 			Namespace: "default",
-			// No labels, no owner-ref — the resolver must add them via the
-			// CreateOrUpdate mutate function.
 		},
 	}
 	sub := &fakeSubResourceClient{token: "tok-xyz"}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443", preExisting)
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443", preExisting)
 
-	got, err := r.Resolve(context.Background(), kc, cluster)
+	got, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(got).NotTo(BeNil())
 	g.Expect(got.Token).To(Equal("tok-xyz"))
@@ -379,29 +546,19 @@ func TestResolve_PreExistingServiceAccount_StillSucceeds(t *testing.T) {
 }
 
 // TestResolve_MultipleConfigsSameCluster_OwnedByCluster is the regression guard
-// for the Phase-4 multi-node bring-up blocker (ADR 0005 § D.2). The per-cluster
-// SA/Role/RoleBinding are a single object set shared by every control-plane
-// Machine's KairosConfig. When they were controller-owned by the per-Machine
-// KairosConfig, the first config (the init node) became the sole controller
-// owner and every subsequent config's Resolve failed with a
-// controllerutil.AlreadyOwnedError ("already owned by another controller"), so
-// joiners never rendered bootstrap and the cluster stalled at one node. Owning
-// by the Cluster makes Resolve idempotent across configs.
-//
-// The test drives two DISTINCT KairosConfigs (different name + UID) in the same
-// cluster: both must succeed and the three shared objects must be
-// controller-owned by the Cluster. It fails against the pre-fix kc-owned code
-// (the second Resolve returns AlreadyOwnedError on the ServiceAccount).
+// for the Phase-4 multi-node bring-up blocker (ADR 0005 § D.2): the per-cluster
+// SA/Role/RoleBinding are Cluster-owned, so two distinct KairosConfigs in the
+// same cluster both resolve without an AlreadyOwnedError.
 func TestResolve_MultipleConfigsSameCluster_OwnedByCluster(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "tok"}
-	r, kc1, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r, kc1, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 	kc1.Spec.Role = "control-plane"
 	kc1.Spec.Distribution = "k3s"
 
 	// Init node.
-	_, err := r.Resolve(context.Background(), kc1, cluster)
+	_, err := r.Resolve(context.Background(), kc1, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	// A second, distinct KairosConfig in the SAME cluster (a joiner). Different
@@ -414,11 +571,10 @@ func TestResolve_MultipleConfigsSameCluster_OwnedByCluster(t *testing.T) {
 		},
 		Spec: bootstrapv1beta2.KairosConfigSpec{Role: "control-plane", Distribution: "k3s"},
 	}
-	_, err = r.Resolve(context.Background(), kc2, cluster)
+	_, err = r.Resolve(context.Background(), kc2, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred(), "a second KairosConfig in the same cluster must not conflict on the shared RBAC objects")
 
-	// All three shared objects must be controller-owned by the Cluster, not by
-	// either KairosConfig.
+	// All three shared objects must be controller-owned by the Cluster.
 	saName := kubeconfigWriterName("test-cluster")
 	nn := types.NamespacedName{Name: saName, Namespace: "default"}
 	sa := &corev1.ServiceAccount{}
@@ -437,18 +593,18 @@ func TestResolve_MultipleConfigsSameCluster_OwnedByCluster(t *testing.T) {
 }
 
 // TestResolve_GrantsEtcdStatusSecret asserts the node SA's Role is granted
-// get/update/patch (and NOT create) on the per-cluster etcd-status Secret
-// (ADR 0005 §E.1), on the same resourceNames-scoped rule as the kubeconfig +
-// join-token Secrets — a bounded named-Secret widening, no new rule.
+// patch (and NOT create/get/update) on the per-cluster etcd-status Secret
+// (ADR 0005 §E.1), on the same resourceNames-scoped patch rule as the staging
+// kubeconfig Secret. The join-token Secret is granted nothing (ADR 0013).
 func TestResolve_GrantsEtcdStatusSecret(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newResolverScheme(t)
 	sub := &fakeSubResourceClient{token: "tok"}
-	r, kc, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
+	r, kc, machine, cluster := newResolverFixture(scheme, sub, "https://mgmt:6443")
 	kc.Spec.Role = "control-plane"
 	kc.Spec.Distribution = "k0s"
 
-	_, err := r.Resolve(context.Background(), kc, cluster)
+	_, err := r.Resolve(context.Background(), kc, machine, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	role := &rbacv1.Role{}
@@ -456,16 +612,76 @@ func TestResolve_GrantsEtcdStatusSecret(t *testing.T) {
 	g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: saName, Namespace: "default"}, role)).To(Succeed())
 
 	etcdName := bootstrapv1beta2.EtcdStatusSecretName("test-cluster")
-	g.Expect(roleGrantsNamedSecret(role, etcdName, "get")).To(BeTrue(), "node SA must get the etcd-status Secret")
-	g.Expect(roleGrantsNamedSecret(role, etcdName, "update")).To(BeTrue(), "node SA must update the etcd-status Secret")
 	g.Expect(roleGrantsNamedSecret(role, etcdName, "patch")).To(BeTrue(), "node SA must patch the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "get")).To(BeFalse(), "PR-3: node SA must NOT get the etcd-status Secret")
+	g.Expect(roleGrantsNamedSecret(role, etcdName, "update")).To(BeFalse(), "PR-3: node SA must NOT update the etcd-status Secret")
 	g.Expect(roleGrantsNamedSecret(role, etcdName, "create")).To(BeFalse(), "node SA must NOT create the etcd-status Secret (controller pre-creates it)")
+
+	joinTokenName := bootstrapv1beta2.ControlPlaneJoinTokenSecretName("test-cluster")
+	g.Expect(roleGrantsNamedSecret(role, joinTokenName, "patch")).To(BeFalse(), "ADR 0013: the KCP is the join-token Secret's only writer")
+	g.Expect(roleGrantsNamedSecret(role, joinTokenName, "get")).To(BeFalse())
+}
+
+// TestResolve_NoJoinTokenSecretGrant pins ADR 0013: the KairosControlPlane is
+// the only writer of the k0s join-token Secret, so the per-cluster node
+// ServiceAccount's Role grants nothing on it, for any role or distribution. A
+// Role created by an older release, which did grant it, is narrowed by the
+// next Resolve. The node keeps only patch on the staging kubeconfig and
+// etcd-status Secrets, and loses every grant on the contract kubeconfig.
+func TestResolve_NoJoinTokenSecretGrant(t *testing.T) {
+	joinToken := bootstrapv1beta2.ControlPlaneJoinTokenSecretName("test-cluster")
+	etcdStatus := bootstrapv1beta2.EtcdStatusSecretName("test-cluster")
+	kubeconfig := "test-cluster-kubeconfig"
+	staging := bootstrapv1beta2.KubeconfigPushSecretName("test-cluster")
+
+	for _, tc := range []struct{ name, role, distribution string }{
+		{"k0s control plane", "control-plane", "k0s"},
+		{"k3s control plane", "control-plane", "k3s"},
+		{"k0s worker", "worker", "k0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := newResolverScheme(t)
+			// The Role an older release created: the join-token Secret in the
+			// named get/update/patch rule.
+			stale := &rbacv1.Role{
+				ObjectMeta: metav1.ObjectMeta{Name: kubeconfigWriterName("test-cluster"), Namespace: "default"},
+				Rules: []rbacv1.PolicyRule{
+					{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"create"}},
+					{APIGroups: []string{""}, Resources: []string{"secrets"},
+						ResourceNames: []string{kubeconfig, joinToken, etcdStatus}, Verbs: []string{"get", "update", "patch"}},
+				},
+			}
+			r, kc, machine, cluster := newResolverFixture(scheme, &fakeSubResourceClient{token: "tok"}, "https://mgmt:6443", stale)
+			kc.Spec.Role = tc.role
+			kc.Spec.Distribution = tc.distribution
+
+			_, err := r.Resolve(context.Background(), kc, machine, cluster)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			role := &rbacv1.Role{}
+			g.Expect(r.Client.Get(context.Background(), types.NamespacedName{Name: kubeconfigWriterName("test-cluster"), Namespace: "default"}, role)).To(Succeed())
+			for _, verb := range []string{"get", "list", "watch", "create", "update", "patch", "delete"} {
+				g.Expect(roleGrantsNamedSecret(role, joinToken, verb)).To(BeFalse(), "node SA must not %s the join-token Secret", verb)
+			}
+			for _, rule := range role.Rules {
+				g.Expect(rule.ResourceNames).ToNot(ContainElement(joinToken))
+			}
+			g.Expect(roleGrantsNamedSecret(role, staging, "patch")).To(BeTrue(), "staging kubeconfig push grant")
+			g.Expect(roleGrantsNamedSecret(role, etcdStatus, "patch")).To(BeTrue(), "etcd-status grant kept")
+			for _, verb := range []string{"get", "update", "create"} {
+				g.Expect(roleGrantsNamedSecret(role, staging, verb)).To(BeFalse(), "staging: no %s", verb)
+				g.Expect(roleGrantsNamedSecret(role, etcdStatus, verb)).To(BeFalse(), "etcd-status: no %s", verb)
+			}
+			for _, verb := range []string{"get", "update", "patch", "create"} {
+				g.Expect(roleGrantsNamedSecret(role, kubeconfig, verb)).To(BeFalse(), "contract kubeconfig: no %s", verb)
+			}
+		})
+	}
 }
 
 // roleGrantsNamedSecret reports whether the Role grants the given verb on the
-// named core Secret via a resourceNames-scoped rule (the create rule carries no
-// resourceNames, so a create check only matches a named-create rule — which we
-// assert is absent).
+// named core Secret via a resourceNames-scoped rule.
 func roleGrantsNamedSecret(role *rbacv1.Role, name, verb string) bool {
 	for _, rule := range role.Rules {
 		coreGroup := false

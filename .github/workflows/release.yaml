@@ -28,9 +28,11 @@ jobs:
   # to main, the Monday cron), and that workflow is the only whole-tree scan in
   # the repository. Without this job a release cut between two Mondays can
   # publish while an advisory is already open against an unchanged dependency,
-  # with nothing red anywhere. Same scanner version, same SHA pin and same
-  # --config as osv-scanner.yaml, so the ignore list in osv-scanner.toml cannot
-  # fork between the two.
+  # with nothing red anywhere. Same scanner version and same --config as
+  # osv-scanner.yaml, so the ignore list in osv-scanner.toml cannot fork between
+  # the two. The two pins are different SHAs of google/osv-scanner-action for
+  # the same release: osv-scanner.yaml pins the reusable workflow, this job pins
+  # the action that workflow itself calls. Bump them together.
   #
   # The scan reads the tagged tree, not main: the release is what ships, and
   # everything else about this workflow is already resolved at the tag. The
@@ -38,13 +40,10 @@ jobs:
   # so a change to osv-scanner.toml is a change that wants review on its own.
   #
   # This calls the scanner action directly instead of reusing
-  # osv-scanner-reusable.yml, because that workflow is built to report, not to
-  # gate: it runs the scanner step under `continue-on-error: true` and hands the
-  # results file to osv-reporter, which treats a missing file as "no
-  # vulnerabilities" and exits 0. An osv.dev outage, a network failure or a
-  # malformed osv-scanner.toml would therefore leave this gate green and let the
-  # tag through. Invoked directly and without continue-on-error, a finding and a
-  # scanner error both fail the job.
+  # osv-scanner-reusable.yml. Invoked directly and without continue-on-error, a
+  # finding and a scanner error both fail the job, so an osv.dev outage, a
+  # network failure or a malformed osv-scanner.toml cannot let a tag through on
+  # a green gate.
   #
   # No SARIF upload, so no security-events: write. osv-scanner.yaml owns the
   # Security > Code scanning view, keyed on main; a second analysis keyed on
@@ -61,7 +60,7 @@ jobs:
           persist-credentials: false
 
       - name: Scan for known vulnerabilities
-        uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
         with:
           scan-args: |-
             --config=./osv-scanner.toml
@@ -76,10 +75,10 @@ jobs:
       IMG_REGISTRY: ghcr.io/kairos-io/cluster-api-provider-kairos
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.4'
           # A release must build from the tagged tree alone. setup-go restores
@@ -98,13 +97,13 @@ jobs:
           fi
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -151,7 +150,7 @@ jobs:
           grep -REn "CERT_NAMESPACE|CERT_NAME[^=]|SERVICE_NAME[^S]|SERVICE_NAMESPACE" dist/*.yaml || echo "(none)"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}

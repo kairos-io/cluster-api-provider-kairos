@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	bootstraputil "k8s.io/cluster-bootstrap/token/util"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
@@ -48,6 +49,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/bootstrap"
@@ -58,8 +60,8 @@ const controlPlaneLBServiceSuffix = "control-plane-lb"
 var errLBEndpointNotReady = errors.New("control plane load balancer endpoint not ready")
 
 // errTokenNotReady signals that a referenced join-token Secret does not exist
-// yet (the controller has not generated it, or the init node has not pushed it
-// over the node-push channel). reconcileBootstrapData maps it to a timed
+// yet, or does not yet hold the token this KairosConfig was issued (the
+// controller has not written it). reconcileBootstrapData maps it to a timed
 // requeue rather than a hard failure. (Formerly errK3sTokenNotReady; generalized
 // for the Phase-3 control-plane-join token path — ADR 0005.)
 var errTokenNotReady = errors.New("join token secret not ready")
@@ -190,7 +192,7 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// has just issued a bare r.Update for the terminal finalizer-remove
 	// step -- the deferred Patch must be skipped to avoid racing the
 	// apiserver removing the object.
-	if !kairosConfig.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kairosConfig.DeletionTimestamp.IsZero() {
 		res, skipPatch, derr := r.reconcileDelete(ctx, log, kairosConfig)
 		if skipPatch {
 			patchOnExit = false
@@ -325,7 +327,12 @@ func (r *KairosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	kairosConfig.Status.FailureReason = ""
 	kairosConfig.Status.FailureMessage = ""
 
-	return ctrl.Result{}, nil
+	// A kubeadm worker's bootstrap token is extended on its own clock until the
+	// node joins, and revoked once it has. That is a scheduled revisit of a
+	// KairosConfig whose bootstrap data is done, so it is requested here, after the
+	// conditions above, rather than as a reconcileBootstrapData requeue, which
+	// means "not done yet" and would skip them.
+	return ctrl.Result{RequeueAfter: r.kubeadmTokenRecheck(kairosConfig, machine)}, nil
 }
 
 func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (ctrl.Result, error) {
@@ -447,23 +454,26 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 				}
 			}
 
-			// kubeadm worker bootstrap-token refresh (ADR 0010 P1 item 7), outside the
-			// render-once short-circuit below: while the Machine has no nodeRef, keep
-			// the token fresh by regenerating the bootstrap data before it expires.
-			switch decision, derr := r.decideKubeadmTokenRefresh(ctx, log, kairosConfig, machine, cluster); {
+			// kubeadm worker bootstrap-token lifecycle (ADR 0010 P1 item 7), outside
+			// the render-once short-circuit below: while the Machine has no nodeRef
+			// the recorded token is extended in place (the VM already holds it), and
+			// once it has one the token is revoked. Reconcile requeues on the token's
+			// clock (kubeadmTokenRecheck). A regeneration triggered above, such as the
+			// providerID one, reuses the same token in WorkerJoin.
+			switch decision, derr := r.reconcileKubeadmWorkerToken(ctx, log, kairosConfig, machine, cluster, secret); {
 			case derr != nil:
 				var notReady *bootstrapNotReadyError
 				if errors.As(derr, &notReady) {
-					log.Info("Waiting to check the kubeadm bootstrap token", "reason", notReady.Reason())
+					log.Info("Waiting to reconcile the kubeadm bootstrap token", "reason", notReady.Reason())
 					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 				}
-				return ctrl.Result{}, fmt.Errorf("kubeadm bootstrap token refresh check: %w", derr)
+				return ctrl.Result{}, fmt.Errorf("kubeadm bootstrap token reconcile: %w", derr)
 			case decision == kubeadmRefreshRegenerate:
-				log.Info("kubeadm bootstrap token is due for refresh; regenerating bootstrap data",
+				log.Info("No kubeadm bootstrap token to extend; regenerating bootstrap data",
 					"secret", *kairosConfig.Status.DataSecretName)
 				needsRegeneration = true
 			case decision == kubeadmRefreshCapped:
-				const msg = "kubeadm bootstrap token refresh cap exceeded: the node has not registered in time; " +
+				const msg = "kubeadm bootstrap token refresh cap exceeded: the node has not registered in time, and the token is no longer extended; " +
 					"a MachineHealthCheck (nodeStartupTimeout) is expected to replace this Machine"
 				log.Info(msg, "secret", *kairosConfig.Status.DataSecretName)
 				conditions.MarkFalse(kairosConfig, bootstrapv1beta2.BootstrapReadyCondition,
@@ -513,6 +523,37 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 		}
 		if errors.Is(err, errTokenNotReady) {
 			log.Info("Waiting for join token secret before generating cloud-config")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if errors.Is(err, ErrKubeconfigPushTargetNotReady) {
+			// PR-3 resolver gate (ADR 0011): the control plane has not yet
+			// pre-created and taken ownership of the staging kubeconfig Secret the
+			// node is allowed to PATCH. Requeue rather than hand out a push token
+			// with no valid target.
+			log.Info("Waiting for the control plane to pre-create the staging kubeconfig Secret before generating cloud-config")
+			if kairosConfig.Status.FailureReason == "" {
+				conditions.MarkFalse(kairosConfig,
+					bootstrapv1beta2.BootstrapReadyCondition,
+					bootstrapv1beta2.WaitingForKubeconfigPushTargetReason,
+					clusterv1.ConditionSeverityInfo,
+					"Waiting for the control plane to pre-create the staging kubeconfig Secret")
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if errors.Is(err, ErrManagementCAUnavailable) {
+			// PR-4 (ADR 0011): the node-push channel is TLS-verified against the
+			// management API CA with no insecure fallback, so a control-plane node
+			// cannot be handed a push token until a CA is available. The manager
+			// normally fails fast at startup; a hit here means the resolver was
+			// wired without a CA. Requeue and surface the reason.
+			log.Info("Waiting for the management API CA before generating cloud-config (node-push TLS has no insecure fallback)")
+			if kairosConfig.Status.FailureReason == "" {
+				conditions.MarkFalse(kairosConfig,
+					bootstrapv1beta2.BootstrapReadyCondition,
+					bootstrapv1beta2.ManagementCAUnavailableReason,
+					clusterv1.ConditionSeverityWarning,
+					"Waiting for the management API CA to verify the node-push channel")
+			}
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		// Typed not-ready signal from a JoinMaterialSource (ADR 0010 P1 item 6):
@@ -627,9 +668,15 @@ func (r *KairosConfigReconciler) reconcileBootstrapData(ctx context.Context, log
 	// Update status with dataSecretName
 	kairosConfig.Status.DataSecretName = &secretName
 
-	// Persist the NON-SECRET kubeadm bootstrap token ID for audit (ADR 0010 P1
-	// item 8). The secret half lives only in the rendered data Secret, never here.
+	// Persist the NON-SECRET kubeadm bootstrap token ID (ADR 0010 P1 item 8). Every
+	// later render reuses this token, and the lifecycle extends and revokes it by
+	// this ID. The secret half lives only in the rendered data Secret, never here.
 	if joinMaterial.Kubeadm != nil {
+		if replaced := joinMaterial.Kubeadm.ReplacedTokenID; replaced != "" {
+			log.Info("The recorded kubeadm bootstrap token is gone from the workload cluster; minted a replacement. "+
+				"A VM that already booted with the old token cannot join and must be replaced",
+				"oldTokenID", replaced, "tokenID", joinMaterial.Kubeadm.TokenID)
+		}
 		kairosConfig.Status.BootstrapTokenID = joinMaterial.Kubeadm.TokenID
 	}
 
@@ -938,11 +985,12 @@ func sanitizeCapkUserdata(content string) (string, bool) {
 				updated = append(updated, line)
 				continue
 			}
-			if trimmed == "groups: users, admin" {
+			switch trimmed {
+			case "groups: users, admin":
 				indent := len(line) - len(strings.TrimLeft(line, " "))
 				line = strings.Repeat(" ", indent) + "groups: [users, admin]"
 				changed = true
-			} else if trimmed == "groups:" {
+			case "groups:":
 				groupsIndent = len(line) - len(strings.TrimLeft(line, " "))
 				line = strings.Repeat(" ", groupsIndent) + "groups: [users, admin]"
 				expectGroupsList = true
@@ -978,62 +1026,215 @@ func (r *KairosConfigReconciler) generateCloudConfig(ctx context.Context, log lo
 
 // kubeadmTokenRefreshCapRequeue is the slow requeue cadence after the kubeadm
 // token-refresh hard cap is exceeded (ADR 0010 P1 item 7): keep the condition
-// surfaced without re-minting or hammering the workqueue.
+// surfaced without extending the token or hammering the workqueue.
 const kubeadmTokenRefreshCapRequeue = 10 * time.Minute
 
-// kubeadmRefreshDecision is the outcome of decideKubeadmTokenRefresh.
+// kubeadmRefreshDecision is the outcome of reconcileKubeadmWorkerToken.
 type kubeadmRefreshDecision int
 
 const (
-	// kubeadmRefreshNone: no refresh applies (not a kubeadm worker, the node has
-	// already registered, or the source cannot refresh).
+	// kubeadmRefreshNone: nothing more to do this pass (not a kubeadm worker, the
+	// token was extended, or it was revoked after the node registered).
 	kubeadmRefreshNone kubeadmRefreshDecision = iota
-	// kubeadmRefreshRegenerate: re-mint now by regenerating the bootstrap data.
+	// kubeadmRefreshRegenerate: there is no token left to extend, so re-render the
+	// bootstrap data; WorkerJoin mints a replacement.
 	kubeadmRefreshRegenerate
-	// kubeadmRefreshCapped: the hard cap elapsed; stop re-minting and surface a condition.
+	// kubeadmRefreshCapped: the hard cap elapsed; stop extending and surface a condition.
 	kubeadmRefreshCapped
 )
 
-// decideKubeadmTokenRefresh decides whether a kubeadm worker's bootstrap token
-// should be refreshed (ADR 0010 P1 item 7). It applies only to a kubeadm worker
-// whose Machine has not yet registered a Node, and only when the join source
-// implements workerTokenRefresher. A transient workload-cluster check returns a
-// bootstrapNotReadyError (the caller requeues). It never logs the token.
-func (r *KairosConfigReconciler) decideKubeadmTokenRefresh(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (kubeadmRefreshDecision, error) {
+// kubeadmTokenRefresher returns the kubeadm worker's workerTokenRefresher when
+// kairosConfig is a kubeadm worker whose join source implements it, else nil. A
+// wiring error (no kubeadm source, N2) is returned as-is.
+func (r *KairosConfigReconciler) kubeadmTokenRefresher(kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) (workerTokenRefresher, error) {
 	if bootstrapv1beta2.EffectiveDistribution(kairosConfig.Spec.Distribution) != bootstrapv1beta2.DistributionKubeadm {
-		return kubeadmRefreshNone, nil
+		return nil, nil
 	}
 	if resolveRole(kairosConfig, machine) != "worker" {
-		return kubeadmRefreshNone, nil
-	}
-	// Stop refreshing once the node has registered (nodeRef set) — the token is no
-	// longer needed. Also skip if there is no Machine to anchor the cap on.
-	if machine == nil || machine.Status.NodeRef.Name != "" {
-		return kubeadmRefreshNone, nil
+		return nil, nil
 	}
 	src, err := r.joinSourceFor(bootstrapv1beta2.DistributionKubeadm)
 	if err != nil {
-		return kubeadmRefreshNone, err // terminal wiring error (N2)
+		return nil, err
 	}
-	refresher, ok := src.(workerTokenRefresher)
-	if !ok {
+	refresher, _ := src.(workerTokenRefresher)
+	return refresher, nil
+}
+
+// reconcileKubeadmWorkerToken drives a kubeadm worker's bootstrap-token lifecycle
+// on the Machine half of CABPK's model (ADR 0010 P1 item 7). It runs on every
+// reconcile that finds the bootstrap data Secret already written:
+//
+//   - nodeRef set: revoke the recorded token and clear its ID. The node has joined.
+//   - no nodeRef, past the hard cap: stop extending and report kubeadmRefreshCapped.
+//   - no nodeRef: extend the recorded token in place. The VM is holding that token,
+//     so it is never replaced while it still exists. A KairosConfig rendered
+//     before the ID was recorded gets it back from dataSecret first. Only a token
+//     that is gone from the workload cluster yields kubeadmRefreshRegenerate.
+//
+// It mutates kairosConfig.Status.BootstrapTokenID only (recovery and revoke); the
+// deferred patch helper persists it. It never logs the token, only its ID.
+func (r *KairosConfigReconciler) reconcileKubeadmWorkerToken(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster, dataSecret *corev1.Secret) (kubeadmRefreshDecision, error) {
+	if machine == nil {
 		return kubeadmRefreshNone, nil
 	}
-	// Hard cap: stop re-minting once the Machine has waited too long for a Node.
+	refresher, err := r.kubeadmTokenRefresher(kairosConfig, machine)
+	if err != nil || refresher == nil {
+		return kubeadmRefreshNone, err // err is a terminal wiring error (N2)
+	}
+	req := JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster}
+
+	if machine.Status.NodeRef.Name != "" {
+		tokenID := kairosConfig.Status.BootstrapTokenID
+		if tokenID == "" {
+			return kubeadmRefreshNone, nil
+		}
+		if err := refresher.RevokeWorkerToken(ctx, req, tokenID); err != nil {
+			var notReady *bootstrapNotReadyError
+			if errors.As(err, &notReady) {
+				return kubeadmRefreshNone, err
+			}
+			// The trust check refused the workload cluster. Do not fail a joined
+			// worker over it: nothing extends the token any more, so it lapses on
+			// its own within the TTL. Forget it so this is not retried forever.
+			log.Info("Could not revoke the kubeadm bootstrap token of a joined worker; it will expire on its own",
+				"tokenID", tokenID, "reason", err.Error())
+		} else {
+			log.Info("Revoked the kubeadm bootstrap token: the Machine has a nodeRef", "tokenID", tokenID)
+		}
+		kairosConfig.Status.BootstrapTokenID = ""
+		return kubeadmRefreshNone, nil
+	}
+
+	// Hard cap: stop extending once the Machine has waited too long for a Node.
 	if !machine.CreationTimestamp.IsZero() && r.now().Sub(machine.CreationTimestamp.Time) > kubeadmTokenRefreshCap {
 		return kubeadmRefreshCapped, nil
 	}
-	need, err := refresher.TokenNeedsRefresh(ctx,
-		JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster},
-		kairosConfig.Status.BootstrapTokenID)
+
+	if kairosConfig.Status.BootstrapTokenID == "" {
+		// Rendered before the ID was recorded (or the status write was lost): the
+		// token the VM may hold is the one in the data Secret, so take its ID from
+		// there rather than minting a new one.
+		clusterName := ""
+		if cluster != nil {
+			clusterName = cluster.Name
+		}
+		if dataSecret != nil && bootstrapSecretBelongsTo(dataSecret, kairosConfig, clusterName) {
+			if id := bootstrapTokenIDFromBootstrapData(dataSecret.Data["value"]); id != "" {
+				log.Info("Recovered the kubeadm bootstrap token ID from the bootstrap data Secret", "tokenID", id)
+				kairosConfig.Status.BootstrapTokenID = id
+			}
+		}
+		if kairosConfig.Status.BootstrapTokenID == "" {
+			return kubeadmRefreshRegenerate, nil
+		}
+	}
+
+	found, err := refresher.ExtendWorkerToken(ctx, req, kairosConfig.Status.BootstrapTokenID)
 	if err != nil {
 		return kubeadmRefreshNone, err // bootstrapNotReadyError (transient) or terminal
 	}
-	if need {
-		log.V(4).Info("kubeadm bootstrap token due for refresh")
+	if !found {
+		log.Info("The kubeadm bootstrap token is gone from the workload cluster; re-rendering to mint a replacement",
+			"tokenID", kairosConfig.Status.BootstrapTokenID)
 		return kubeadmRefreshRegenerate, nil
 	}
+	log.V(4).Info("Extended the kubeadm bootstrap token", "tokenID", kairosConfig.Status.BootstrapTokenID)
 	return kubeadmRefreshNone, nil
+}
+
+// kubeadmTokenRecheck returns how long until the kubeadm worker token lifecycle
+// must run again, or 0 when it need not. A Machine with no nodeRef needs its token
+// extended on the token's clock, not whenever an unrelated event wakes this
+// KairosConfig; a joined Machine still holding a recorded ID needs it revoked.
+func (r *KairosConfigReconciler) kubeadmTokenRecheck(kairosConfig *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine) time.Duration {
+	if machine == nil {
+		return 0
+	}
+	refresher, err := r.kubeadmTokenRefresher(kairosConfig, machine)
+	if err != nil || refresher == nil {
+		return 0
+	}
+	if machine.Status.NodeRef.Name == "" || kairosConfig.Status.BootstrapTokenID != "" {
+		return refresher.TokenRecheckInterval()
+	}
+	return 0
+}
+
+// revokeKubeadmTokenOnDelete revokes a deleted kubeadm worker's recorded bootstrap
+// token. It is best-effort: deletion is never blocked on the workload cluster
+// (which may be going away with the Cluster). A token that cannot be revoked is no
+// longer extended by anyone, so it lapses within the TTL.
+func (r *KairosConfigReconciler) revokeKubeadmTokenOnDelete(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig) {
+	tokenID := kairosConfig.Status.BootstrapTokenID
+	if tokenID == "" {
+		return
+	}
+	skip := func(reason string) {
+		log.Info("Not revoking the kubeadm bootstrap token on delete; it will expire on its own",
+			"tokenID", tokenID, "reason", reason)
+	}
+	machine, err := util.GetOwnerMachine(ctx, r.Client, kairosConfig.ObjectMeta)
+	if err != nil || machine == nil {
+		skip("owning Machine not found")
+		return
+	}
+	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, machine.ObjectMeta)
+	if err != nil || cluster == nil {
+		skip("owning Cluster not found")
+		return
+	}
+	refresher, err := r.kubeadmTokenRefresher(kairosConfig, machine)
+	if err != nil || refresher == nil {
+		return
+	}
+	if err := refresher.RevokeWorkerToken(ctx, JoinRequest{Config: kairosConfig, Machine: machine, Cluster: cluster}, tokenID); err != nil {
+		skip(err.Error())
+		return
+	}
+	log.Info("Revoked the kubeadm bootstrap token of a deleted KairosConfig", "tokenID", tokenID)
+	kairosConfig.Status.BootstrapTokenID = ""
+}
+
+// kubeadmJoinConfigPath is where the kubeadm template writes the JoinConfiguration
+// (internal/bootstrap/templates/kubeadm_kairos_cloud_config.yaml.tmpl).
+const kubeadmJoinConfigPath = "/etc/kubernetes/kairos-kubeadm-join.yaml"
+
+// bootstrapTokenIDFromBootstrapData returns the non-secret ID of the bootstrap
+// token in rendered kubeadm bootstrap data, or "" when there is none. It parses
+// the cloud-config's write_files entry for the JoinConfiguration and reads
+// discovery.bootstrapToken.token; only the ID half leaves this function.
+func bootstrapTokenIDFromBootstrapData(data []byte) string {
+	var cc struct {
+		WriteFiles []struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		} `json:"write_files"`
+	}
+	if err := yaml.Unmarshal(data, &cc); err != nil {
+		return ""
+	}
+	for _, f := range cc.WriteFiles {
+		if f.Path != kubeadmJoinConfigPath {
+			continue
+		}
+		var jc struct {
+			Discovery struct {
+				BootstrapToken struct {
+					Token string `json:"token"`
+				} `json:"bootstrapToken"`
+			} `json:"discovery"`
+		}
+		if err := yaml.Unmarshal([]byte(f.Content), &jc); err != nil {
+			return ""
+		}
+		subs := bootstraputil.BootstrapTokenRegexp.FindStringSubmatch(jc.Discovery.BootstrapToken.Token)
+		if len(subs) != 3 {
+			return ""
+		}
+		return subs[1]
+	}
+	return ""
 }
 
 // now returns the current time, overridable in tests via r.Now.
@@ -1076,8 +1277,9 @@ func (r *KairosConfigReconciler) generateCloudConfigM(ctx context.Context, log l
 //
 // The join token is resolved from the distribution-appropriate *SecretRef
 // (TOKEN-INV: *SecretRef only). A missing token Secret surfaces as
-// errTokenNotReady so reconcileBootstrapData requeues — the init node may not
-// have pushed the k0s controller-join token yet. The token is never logged.
+// errTokenNotReady so reconcileBootstrapData requeues — the KCP may not have
+// written the k0s controller-join token for this joiner yet. The token is never
+// logged.
 func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context, td *bootstrap.TemplateData, kairosConfig *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster, role string) error {
 	if role != "control-plane" {
 		return nil // CPR-INV-1: workers never consume ControlPlaneRole/VIP.
@@ -1110,14 +1312,10 @@ func (r *KairosConfigReconciler) applyControlPlaneRenderData(ctx context.Context
 	// The join token is only meaningful for init/join nodes. single needs none.
 	switch kairosConfig.Spec.ControlPlaneRole {
 	case bootstrapv1beta2.ControlPlaneRoleInit:
-		// k0s init: the token does not exist until the node is up. The init node
-		// mints it via `k0s token create` and pushes it over the node-push
-		// channel; the renderer needs the target Secret name to build that push
-		// block. The init node does NOT embed a token in its own k0s config.
+		// k0s init: the init node needs no token, and it no longer mints or
+		// pushes one. The KairosControlPlane issues the controller-join token for
+		// each joiner through the workload API (ADR 0013).
 		if distribution == "k0s" {
-			if td.ManagementEndpoint != nil && cluster != nil {
-				td.ManagementEndpoint.JoinTokenSecretName = bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
-			}
 			break
 		}
 		// k3s init carries the controller-generated shared server token (written
@@ -1210,6 +1408,10 @@ func (r *KairosConfigReconciler) getControlPlaneLBEndpoint(ctx context.Context, 
 // object, and a follow-up patch from the deferred closure would race that
 // GC and surface as a 404.
 func (r *KairosConfigReconciler) reconcileDelete(ctx context.Context, log logr.Logger, kairosConfig *bootstrapv1beta2.KairosConfig) (result ctrl.Result, skipPatch bool, err error) {
+	// Revoke a kubeadm worker's bootstrap token, best-effort, before the data
+	// Secret that carries it goes.
+	r.revokeKubeadmTokenOnDelete(ctx, log, kairosConfig)
+
 	gone, err := deleteBootstrapSecret(ctx, r.Client, kairosConfig)
 	if err != nil {
 		log.Error(err, "Failed to delete bootstrap Secret",
@@ -1293,9 +1495,9 @@ func (r *KairosConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		// HA join-token Secret watch (ADR 0005 Phase 3, BLOCKER-2). Label-filtered
 		// to the join-token secret-type label so a join KairosConfig is
-		// re-reconciled the moment the k0s init node pushes the token, instead of
-		// waiting for the requeue backstop. Distinct handler from the userdata
-		// Secret watch above.
+		// re-reconciled the moment the KCP writes the k0s token it issued for it
+		// (ADR 0013), instead of waiting for the requeue backstop. Distinct
+		// handler from the userdata Secret watch above.
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.joinTokenSecretToKairosConfig),
@@ -1394,9 +1596,9 @@ func (r *KairosConfigReconciler) secretToKairosConfig(ctx context.Context, o cli
 // the control-plane KairosConfigs in its cluster that are waiting on the token
 // (ADR 0005 Phase 3, BLOCKER-2). It is label-filtered (the join-token
 // secret-type label + the cluster-name label), never name-suffix matched
-// (KD-15). When the k0s init node PATCHes its `k0s token create` output into the
-// Secret, this wakes every pending join KairosConfig immediately instead of
-// waiting for the 10s requeue.
+// (KD-15). When the KCP writes the k0s controller-join token it issued into the
+// Secret (ADR 0013), this wakes every pending join KairosConfig immediately
+// instead of waiting for the 10s requeue.
 //
 // It enqueues all control-plane KairosConfigs for the cluster (a small set); the
 // reconcile itself is idempotent and no-ops for configs whose bootstrap data is

@@ -1,0 +1,19 @@
+version: "2"
+
+linters:
+  default: standard
+  exclusions:
+    rules:
+      # ginkgo and gomega are dot-imported by convention in the e2e suite.
+      - path: ^test/e2e/
+        linters:
+          - staticcheck
+        text: "ST1001:"
+      # SingleNode stays readable until the v1beta3 API removes it.
+      - linters:
+          - staticcheck
+        text: 'SA1019: .*\.KairosConfigSpec\)\.SingleNode is deprecated'
+      # The v1beta1-style conditions stay until Cluster API drops v1beta1 support.
+      - linters:
+          - staticcheck
+        text: 'SA1019: sigs\.k8s\.io/cluster-api/api/core/v1beta2\.Condition(s|Type|Severity)? is deprecated'

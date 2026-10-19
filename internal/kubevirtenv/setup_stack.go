@@ -7,7 +7,8 @@ import (
 )
 
 // InstallBaseStackThroughCAPK creates the kind cluster (if needed) and installs Calico, local-path, CDI,
-// KubeVirt, Cluster API (kubeadm core/bootstrap/control-plane), and CAPK. It does not install cert-manager,
+// KubeVirt, and (in one clusterctl init) Cluster API with the kubeadm providers plus the KubeVirt
+// infrastructure provider. It does not install cert-manager,
 // the Kairos operator, or the Kairos CAPI provider.
 //
 // Calico runs before local-path: the kind config disables the default CNI, so nodes stay NotReady until
@@ -31,11 +32,8 @@ func InstallBaseStackThroughCAPK(ctx context.Context, env *Environment) error {
 	if err := env.InstallKubeVirt(ctx); err != nil {
 		return fmt.Errorf("kubevirt: %w", err)
 	}
-	if err := env.InstallCAPIKubeadmCore(ctx); err != nil {
-		return fmt.Errorf("capi: %w", err)
-	}
-	if err := env.InstallCAPK(ctx); err != nil {
-		return fmt.Errorf("capk: %w", err)
+	if err := env.InstallCAPIAndCAPK(ctx); err != nil {
+		return fmt.Errorf("capi and capk: %w", err)
 	}
 	return nil
 }

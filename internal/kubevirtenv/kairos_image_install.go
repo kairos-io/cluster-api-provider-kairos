@@ -117,6 +117,19 @@ func (e *Environment) BuildKairosCloudImage(ctx context.Context) error {
 	if err := e.downloadImageFromNginx(ctx, clientset, buildDir); err != nil {
 		return fmt.Errorf("download image: %w", err)
 	}
+	// The build can succeed and still publish an image with no baked
+	// cloud-config. Catch that here, while the reason is still legible,
+	// rather than 50 minutes later as a control-plane timeout blamed on node
+	// networking (kairos-io/kairos#4991).
+	imageFile, err := e.findKairosImageFile()
+	if err != nil {
+		return fmt.Errorf("locate built image: %w", err)
+	}
+	if err := verifyBakedCloudConfig(imageFile); err != nil {
+		e.dumpOSArtifactPodLogs(ctx, log)
+		return err
+	}
+	log.Infof("✓ Built image carries the baked install cloud-config")
 	log.Step("Kairos image build complete ✓")
 	return nil
 }
@@ -297,14 +310,7 @@ func (e *Environment) createCloudConfigSecret(ctx context.Context, clientset kub
 	// captures. Prior iteration ended `console=tty0` which routed the journal
 	// to the (uncaptured) graphics console and left us blind past t≈16s of
 	// the installed-system boot.
-	cloudConfig := `#cloud-config
-install:
-  auto: true
-  device: "/dev/vda"
-  reboot: true
-  grub_options:
-    extra_cmdline: "console=ttyS0 systemd.journald.forward_to_console=1"
-`
+	cloudConfig := installerCloudConfig
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-cloud-config", kairosCloudImageName),
@@ -372,8 +378,20 @@ func (e *Environment) createOSArtifactCR(ctx context.Context, dynamicClient dyna
 	if goarch != "amd64" && goarch != "arm64" {
 		return fmt.Errorf("OSArtifact: unsupported GOARCH %q (need amd64 or arm64)", goarch)
 	}
+	yaml := osArtifactManifest(goarch)
+	rc, err := e.RESTConfig()
+	if err != nil {
+		return err
+	}
+	return e.ApplyManifestContent(ctx, dynamicClient, rc, []byte(yaml))
+}
+
+// osArtifactManifest renders the OSArtifact the e2e builds its installer ISO
+// from. It is separate from createOSArtifactCR so a test can read the manifest
+// without a cluster.
+func osArtifactManifest(goarch string) string {
 	baseImg := kairosOSArtifactBaseImage(goarch)
-	yaml := fmt.Sprintf(`apiVersion: build.kairos.io/v1alpha2
+	return fmt.Sprintf(`apiVersion: build.kairos.io/v1alpha2
 kind: OSArtifact
 metadata:
   name: %s
@@ -394,7 +412,7 @@ spec:
         restartPolicy: Never
         containers:
         - name: upload-to-nginx
-          image: curlimages/curl:latest
+          image: %s
           command: ["sh", "-ec"]
           args:
             - |
@@ -407,12 +425,7 @@ spec:
           - name: artifacts
             mountPath: /artifacts
             readOnly: true
-`, kairosCloudImageName, baseImg, goarch, kairosOSArtifactDiskMiB, kairosCloudImageName)
-	rc, err := e.RESTConfig()
-	if err != nil {
-		return err
-	}
-	return e.ApplyManifestContent(ctx, dynamicClient, rc, []byte(yaml))
+`, kairosCloudImageName, baseImg, goarch, kairosOSArtifactDiskMiB, kairosCloudImageName, ExporterCurlImage)
 }
 
 func (e *Environment) waitForOSArtifactReady(ctx context.Context, dynamicClient dynamic.Interface) error {
