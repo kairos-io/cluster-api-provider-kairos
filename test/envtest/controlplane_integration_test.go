@@ -237,7 +237,10 @@ func TestControlPlaneIntegration(t *testing.T) {
 // Wiring the SSHFallback reconciler unconditionally is safe: its predicate
 // filters to KCPs with Spec.SSHFallback.Enabled=true, so tests that don't
 // configure SSHFallback are unaffected.
-func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config, *controlplane.SSHFallbackWorker, func()) {
+//
+// cpOpts adjust the KairosControlPlane reconciler before it is registered, for
+// example to point its workload-cluster client at the envtest apiserver.
+func startKCPEnvtest(t *testing.T, cpOpts ...func(*controlplane.KairosControlPlaneReconciler, *rest.Config)) (context.Context, client.Client, *rest.Config, *controlplane.SSHFallbackWorker, func()) {
 	t.Helper()
 	g := NewWithT(t)
 
@@ -271,6 +274,9 @@ func startKCPEnvtest(t *testing.T) (context.Context, client.Client, *rest.Config
 
 	cpReconciler := &controlplane.KairosControlPlaneReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+	}
+	for _, opt := range cpOpts {
+		opt(cpReconciler, cfg)
 	}
 	g.Expect(cpReconciler.SetupWithManager(mgr)).To(Succeed())
 

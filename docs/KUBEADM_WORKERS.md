@@ -1,7 +1,6 @@
 # Kubeadm Workers
 
-Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: not
-yet released (follows v0.1.3).
+Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: v0.2.0.
 
 Verification status, by control plane:
 
@@ -11,9 +10,11 @@ Verification status, by control plane:
   `spec.serverAddress`, and a bring-your-own CA with `advertiseAddress` and no
   `serverAddress`. Workers joined and became Ready in all three. Contributed by
   @patrostkowski.
-- **Upstream `KubeadmControlPlane`**: unit and envtest tests only. Not yet
-  validated against a live cluster. See also the namespace requirement below,
-  which applies specifically to this case.
+- **Upstream `KubeadmControlPlane`**: validated on a live management cluster
+  with KubeVirt workers and real Kairos images: the worker joined and became
+  Ready, the trust checks passed and refused as expected, DNS worked, and a
+  worker frozen past the bootstrap token's TTL still joined. See also the
+  namespace requirement below, which applies specifically to this case.
 
 Setting `spec.distribution: kubeadm` on a `KairosConfig` or
 `KairosConfigTemplate` bootstraps a Kairos **worker** node that joins a control
@@ -32,7 +33,7 @@ background discussion is in
 | --- | --- |
 | Kairos workers created by a `MachineDeployment` | Supported. |
 | Control planes of kind `KamajiControlPlane` | Supported. Validated on a live cluster; see the verification status above. |
-| Control planes of kind `KubeadmControlPlane` | Designed for, not yet validated live, and it **must** have its own namespace; see [the namespace requirement](#required-keep-upstream-kubeadmcontrolplane-clusters-in-their-own-namespace). |
+| Control planes of kind `KubeadmControlPlane` | Supported. Validated on a live cluster, and it **must** have its own namespace; see [the namespace requirement](#required-keep-upstream-kubeadmcontrolplane-clusters-in-their-own-namespace). |
 | Control planes of any other kind | Need an operator flag; see [Allowing other control-plane kinds](#allowing-other-control-plane-kinds). |
 | A kubeadm control plane run by this provider (`KairosControlPlane` with `distribution: kubeadm`) | Not supported. Refused; see [KairosControlPlane refuses kubeadm](#kairoscontrolplane-refuses-kubeadm). |
 | `MachinePool` workers | Not supported. Refused. |
@@ -44,8 +45,8 @@ background discussion is in
 
 **Do not put a cluster whose control plane is an upstream `KubeadmControlPlane`
 in the same namespace as a k0s or k3s Kairos cluster.** Give it a namespace of
-its own. This is a condition of using the kubeadm worker path at all while it is
-a preview, not a recommendation.
+its own. This is a condition of using the kubeadm worker path with an upstream
+`KubeadmControlPlane`, not a recommendation.
 
 The reason is how upstream `KubeadmControlPlane` obtains its PKI: it **adopts**
 a pre-existing `<cluster>-ca` or `<cluster>-kubeconfig` Secret rather than
@@ -95,6 +96,17 @@ bootstrap controller does the following for each Machine:
      kubeconfig `server`.
    - If a `<cluster>-ca` Secret exists, its `tls.crt` equals the kubeconfig's
      CA. A missing `<cluster>-ca` is allowed.
+   - The kubeconfig is self-contained: exactly one cluster, user and context;
+     the CA as `certificate-authority-data`; and the credential inline, as
+     `client-certificate-data` plus `client-key-data`, or as `token`. Fields
+     that point outside the kubeconfig are refused, in every entry: file paths
+     (`certificate-authority`, `client-certificate`, `client-key`,
+     `tokenFile`), `exec` and `auth-provider` plugins, `proxy-url`,
+     `tls-server-name`, `insecure-skip-tls-verify`, impersonation, and
+     basic-auth. The kubeconfigs `KubeadmControlPlane` and Kamaji publish meet
+     this. The controller connects to the workload cluster only with a
+     kubeconfig it has rebuilt from these fields, never with the Secret as
+     stored.
    - Under Kamaji, do not expect to control `<cluster>-ca` yourself. Kamaji
      honours a bring-your-own CA only as a pre-created `<tcp>-ca` holding a
      valid `ca.crt`/`ca.key` pair; a CAPI-style `<cluster>-ca` carrying only
@@ -103,8 +115,10 @@ bootstrap controller does the following for each Machine:
      @patrostkowski from a live Kamaji cluster. It does not weaken the anchor
      above, because `<cluster>-ca` still carries the tenant CA either way.
 3. Mints a bootstrap token in the workload cluster: a Secret named
-   `bootstrap-token-<id>` in `kube-system`, valid for 15 minutes. The
-   non-secret `<id>` is recorded in `KairosConfig.status.bootstrapTokenID`. The
+   `bootstrap-token-<id>` in `kube-system`, valid for 15 minutes and labelled
+   `bootstrap.cluster.x-k8s.io/kairosconfig-uid` with the KairosConfig's UID. The
+   non-secret `<id>` is recorded in `KairosConfig.status.bootstrapTokenID`. Each
+   KairosConfig has one token: later renders of its bootstrap data reuse it. The
    secret half never appears in `spec` or `status`. It is present in the
    workload-cluster Secret and in the rendered bootstrap data, and therefore on
    the node, so restrict read access to bootstrap data Secrets as you would for
@@ -120,8 +134,9 @@ bootstrap controller does the following for each Machine:
    that did not complete is not retried on the node: the unit removes
    `/etc/kubernetes/bootstrap-kubelet.conf` (which holds the token) and refuses on
    later boots, so a `MachineHealthCheck` must replace the Machine.
-6. CAPI links the Machine to the Node. The controller stops refreshing the token
-   when the Machine has a `status.nodeRef`.
+6. CAPI links the Machine to the Node. Once the Machine has a `status.nodeRef`,
+   the controller deletes the token Secret and clears
+   `status.bootstrapTokenID`.
 
 ## Prerequisites
 
@@ -233,8 +248,10 @@ field is optional. The controller sets or overwrites these:
   `spec.network.advertiseAddress`. The address must be covered by the API
   server certificate's SANs. The CA hash pins discovery either way.
 - `discovery.file`: cleared.
-- A kubelet `providerID` patch, applied through `kubeadm join --patches`, when the
-  infrastructure provider's providerID is known at render time.
+- `patches.directory`: `/etc/kubernetes/kairos-patches`, unless you set another one. It must be an absolute, clean path under `/etc/kubernetes/`: no `.` or `..` segments, no repeated or trailing slashes, no newline, CR or NUL. kubeadm applies every patch in it as root, and only root can write under `/etc/kubernetes/`. `/etc/kubernetes/manifests` and directories under it are refused: that is the kubelet's static pod directory. The node creates the directory before the join.
+- A kubelet `providerID` patch, `kubeletconfiguration0+merge.yaml` in that directory, when the infrastructure provider's providerID is known at render time.
+
+To patch the kubelet configuration kubeadm downloads from the cluster, for example to set `clusterDNS` or resource reservations, write a `kubeletconfiguration<suffix>+merge.yaml` file into the patches directory with `spec.files`. kubeadm applies patch files in alphanumeric order of their names. Do not use the name `kubeletconfiguration0+merge.yaml`: the providerID patch takes it.
 
 Everything else, such as `nodeRegistration.kubeletExtraArgs`, passes through.
 Do not set `joinConfiguration.controlPlane`: control-plane joins are not
@@ -278,17 +295,31 @@ to create the `KairosConfig`: check the MachineSet's conditions and events.
 
 ## Token lifetime and failed joins
 
-A token is valid for 15 minutes; this is not configurable in this release. A node
-reads its bootstrap data at first boot, so a token must be valid when the node
-boots. While a Machine has no `status.nodeRef`, the controller checks the token on
-each reconcile. When the token is missing from the workload cluster or past half
-its lifetime, it mints a new one, rewrites the bootstrap data Secret in place, and
-updates `status.bootstrapTokenID`. This helps nodes that boot late, such as
-bare-metal machines with slow provisioning. It does not change a node that has
-already booted.
+A token is valid for 15 minutes; this is not configurable in this release. The
+infrastructure provider copies the bootstrap data into the VM when it creates it,
+and the node does not read the bootstrap data Secret again. So the token a node
+joins with is the one in the bootstrap data at the time its VM was created, and
+the controller keeps that token valid rather than replacing it:
 
-The controller stops refreshing 24 hours after the Machine was created. It then
-sets `BootstrapReady` to `False` (Warning) with reason
+- Every render of a KairosConfig's bootstrap data uses the same token, including
+  the render that adds the providerID once the infrastructure provider publishes
+  it.
+- While the Machine has no `status.nodeRef`, the controller checks the token
+  every five minutes (a third of its lifetime) and moves its expiry to 15 minutes
+  from now. The token's ID and secret do not change.
+- Once the Machine has a `status.nodeRef`, or the KairosConfig is deleted, the
+  controller deletes the token Secret. Revocation on delete is best-effort: if the
+  workload cluster cannot be reached, deletion goes ahead and the token expires on
+  its own within 15 minutes.
+
+The controller mints a replacement token only when the recorded one is gone from
+the workload cluster, for example because someone deleted it. It rewrites the
+bootstrap data Secret, which helps a Machine whose VM has not been created yet. A
+node that already booted with the deleted token cannot join; replace its Machine.
+The controller logs both token IDs when this happens.
+
+The controller stops extending the token 24 hours after the Machine was created.
+It then sets `BootstrapReady` to `False` (Warning) with reason
 `BootstrapTokenRefreshCapExceeded`. It does not delete the Machine.
 
 Configure a `MachineHealthCheck` with `spec.checks.nodeStartupTimeoutSeconds` for
@@ -305,7 +336,8 @@ another control-plane kind, the operator sets
 operator-level setting; there is no per-Cluster field. The operator must also grant
 the bootstrap manager read access to the added kind. See
 [Optional manager flags](INSTALL.md#optional-manager-flags) for the format, the
-RBAC requirement, and how to set it.
+RBAC requirement, and how to set it. The added kind's `<cluster>-kubeconfig`
+must be self-contained, as described in [How it works](#how-it-works).
 
 ## KairosControlPlane refuses kubeadm
 
@@ -345,6 +377,7 @@ kubectl get kairosconfig <name> -o jsonpath='{.status.failureMessage}'
 | `is not on the kubeadm trust allowlist` | The control-plane kind is not `KubeadmControlPlane` or `KamajiControlPlane`. Use a supported kind or have the operator set `--kubeadm-extra-controlplane-kinds`. |
 | `kubeconfig CA does not match` | The CA in `<cluster>-kubeconfig` differs from `<cluster>-ca` `tls.crt`. Resolve which CA is correct before retrying. |
 | `carries no certificate-authority-data` | The kubeconfig has no CA to pin. Fix the control plane's kubeconfig Secret. |
+| `is not a kubeconfig this controller will connect with` | The kubeconfig is not self-contained: it has more than one cluster, user or context, or a field that points outside it (a file path, an `exec` or `auth-provider` plugin, a proxy, skipped TLS verification). The message names the rule. This usually means a control-plane kind added with `--kubeadm-extra-controlplane-kinds` publishes a kubeconfig in a different shape; it must publish an inline credential and CA. |
 | `does not support MachinePool` | Use a `MachineDeployment`. |
 | `requires Machine.spec.version` | Set `spec.template.spec.version` on the MachineDeployment. |
 | `not kubeadm: a kubeadm worker cannot join a k0s/k3s control plane` | The Cluster's control plane is a k0s or k3s `KairosControlPlane`. Use k0s or k3s workers. |

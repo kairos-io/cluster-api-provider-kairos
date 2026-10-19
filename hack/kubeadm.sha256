@@ -1,0 +1,7 @@
+# sha256 of the kubeadm release binaries `make test-kubeadm` downloads, pinned
+# so a changed binary on the download host fails the check.
+# Format: <version> <goarch> <sha256>
+v1.30.14 amd64 bf1f8af81af8ecf003cbc03a8700c6e94a74c183ee092bbc77b92270ada2be70
+v1.30.14 arm64 8020618ad265918cbf0268afda624923587ac5d7545848a3029a77f6322093e4
+v1.36.2 amd64 f95d1b345f97c673ce1c1347eb96bf2587850975155ae701cdfc629a5b575b70
+v1.36.2 arm64 c638f0b4d9b216df8d5bcf41473b81e59143aa0a690392c224e97e6ec91ed3e9

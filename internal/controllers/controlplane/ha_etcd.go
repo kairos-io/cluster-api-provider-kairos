@@ -58,6 +58,15 @@ func etcdStatusSecretName(clusterName string) string {
 // Gated by the caller on desiredReplicas > 1 (single-node clusters have no etcd
 // quorum to guard and no peers to report about).
 func (r *KairosControlPlaneReconciler) ensureEtcdStatusSecret(ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster) error {
+	// G10 (ADR 0011): refuse to adopt a same-name Secret this Cluster does not
+	// already control — a pre-existing `<cluster>-etcd-status` could carry
+	// member records the quorum guard would then read. Ownership is verified by
+	// controller-UID; a foreign or ownerless existing Secret is refused.
+	if err := refuseUnownedHASecret(ctx, r.Client,
+		types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}, cluster.UID); err != nil {
+		return err
+	}
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      etcdStatusSecretName(cluster.Name),
@@ -109,7 +118,7 @@ type etcdMemberStatus struct {
 func (r *KairosControlPlaneReconciler) readEtcdStatus(ctx context.Context, cluster *clusterv1.Cluster) (map[string]etcdMemberStatus, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}
-	if err := r.Client.Get(ctx, key, secret); err != nil {
+	if err := r.Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return map[string]etcdMemberStatus{}, nil
 		}
@@ -157,7 +166,7 @@ func etcdVotingHealthyCount(status map[string]etcdMemberStatus) int {
 //     never the node-reported `members` list length (unvalidated, forgeable).
 func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, target *clusterv1.Machine) (bool, string, error) {
 	// Whole-cluster teardown must never deadlock on quorum (the single bypass).
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kcp.DeletionTimestamp.IsZero() {
 		return true, "", nil
 	}
 	desiredReplicas := int32(1)

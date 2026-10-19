@@ -106,7 +106,7 @@ func TestCreateControlPlaneMachine_PropagatesNodeDrainTimeout(t *testing.T) {
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, cluster, 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle)).To(Succeed())
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),
@@ -132,7 +132,7 @@ func TestCreateControlPlaneMachine_NoNodeDrainTimeoutLeavesFieldUnset(t *testing
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, cluster, 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle)).To(Succeed())
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),

@@ -58,6 +58,7 @@ func dispatchKubeadmWorkerData(kubevirt bool) TemplateData {
 			JoinConfiguration: "apiVersion: kubeadm.k8s.io/v1beta4\nkind: JoinConfiguration\nnodeRegistration:\n  name: kairos-worker-0\n",
 			ProviderIDPatch:   "providerID: \"vsphere://vm-uuid\"\n",
 			KubernetesVersion: "v1.30.0",
+			PatchesDirectory:  "/etc/kubernetes/kairos-patches",
 		},
 	}
 	if kubevirt {
@@ -129,6 +130,24 @@ func TestRender_KubeadmWorker(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("kubeadm worker render missing %q", want)
 		}
+	}
+}
+
+// TestRender_KubeadmPatchesDirectoryBeforeAttemptMarker pins that the patches
+// directory is created before the attempted marker is written: a node gets one
+// join attempt, and a failing mkdir must not use it up.
+func TestRender_KubeadmPatchesDirectoryBeforeAttemptMarker(t *testing.T) {
+	out, err := Render(bootstrapv1beta2.DistributionKubeadm, dispatchKubeadmWorkerData(false))
+	if err != nil {
+		t.Fatalf("Render(kubeadm, worker): %v", err)
+	}
+	mkdir := strings.Index(out, "mkdir -p '/etc/kubernetes/kairos-patches'")
+	marker := strings.Index(out, `: > "${ATTEMPTED}"`)
+	if mkdir < 0 || marker < 0 {
+		t.Fatalf("render lacks the patches mkdir (%d) or the attempted marker (%d)", mkdir, marker)
+	}
+	if mkdir > marker {
+		t.Errorf("patches directory is created after the attempted marker is written")
 	}
 }
 

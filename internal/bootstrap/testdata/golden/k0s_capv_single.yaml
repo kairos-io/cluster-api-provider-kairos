@@ -181,7 +181,7 @@ write_files:
       echo "  wanted:  ${w}"
       systemctl restart "${UNIT}" || true
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |
