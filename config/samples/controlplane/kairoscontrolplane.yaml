@@ -37,8 +37,11 @@ metadata:
   name: kairos-control-plane
   namespace: default
 spec:
-  # Only replicas: 1 is supported. The webhook rejects values > 1.
-  # HA control planes are on the roadmap (KD-5b / KD-25).
+  # replicas must be 1, 3, or 5. The webhook rejects even counts and values
+  # above 5. 1 is a single-node control plane; 3 or 5 is highly available and
+  # also needs a stable control-plane endpoint (spec.ha.vip on CAPV and CAPM3,
+  # not on CAPK). See docs/HIGH_AVAILABILITY.md for the per-provider
+  # requirements and the worked HA samples.
   replicas: 1
   # Pin a version your Kairos image bundles (informational; see KD-24).
   version: "v1.34.1+k0s.1"

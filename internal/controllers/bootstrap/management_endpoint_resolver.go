@@ -23,8 +23,10 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -68,6 +70,16 @@ type kubeVirtTokenResolver struct {
 	// wiring pulls this from mgr.GetConfig().Host at SetupWithManager time.
 	// Empty string is the disabled-resolver signal.
 	ManagementAPIServer string
+
+	// ManagementCABundle is the canonical PEM CA bundle nodes verify the
+	// management API server's TLS certificate against (ADR 0011 PR-4). It is
+	// resolved once at manager startup (ResolveManagementCA) and stamped into
+	// every ManagementEndpoint the resolver returns. When ManagementAPIServer is
+	// set (push enabled) but this is empty, Resolve fails with
+	// ErrManagementCAUnavailable rather than emitting an unverifiable push — the
+	// manager's startup check normally prevents this, so a hit here is a wiring
+	// bug, not an operator error.
+	ManagementCABundle []byte
 }
 
 // Resolve performs the same idempotent SA/Role/RoleBinding upsert as the
@@ -84,14 +96,35 @@ type kubeVirtTokenResolver struct {
 // reconcile per CAPK control-plane Machine. Acceptable for alpha-2; revisit
 // once we have lab data on Reconcile frequency under steady-state. Caching
 // belongs here in the resolver, not on the reconciler.
-func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta2.KairosConfig, cluster *clusterv1.Cluster) (*ManagementEndpoint, error) {
+func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta2.KairosConfig, machine *clusterv1.Machine, cluster *clusterv1.Cluster) (*ManagementEndpoint, error) {
 	log := ctrl.LoggerFrom(ctx)
 	if r.ManagementAPIServer == "" {
 		log.Info("Skipping kubeconfig push config; REST config not available")
 		return nil, nil
 	}
 
-	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
+	// PR-4 (ADR 0011): the node-push channel is TLS-verified against the
+	// management API CA (curl --cacert; no -k fallback). If push is enabled but
+	// no CA was resolved, fail closed rather than render a push the node cannot
+	// verify. The startup check in main.go normally catches this first.
+	if len(r.ManagementCABundle) == 0 {
+		return nil, ErrManagementCAUnavailable
+	}
+
+	// PR-3 resolver gate (ADR 0011): the node PATCHes ONLY the controller-owned
+	// staging Secret <cluster>-kubeconfig-push. Do not hand out a push token until
+	// that Secret exists AND is controller-owned by the same KairosControlPlane
+	// that controls this Machine. The bootstrap manager reads Machines but not
+	// KCPs, so the authoritative check compares the staging Secret's controller
+	// owner UID with the Machine's controller owner UID (both are the KCP). A
+	// foreign or absent staging owner, or a missing staging Secret, is not-ready.
+	stagingName := bootstrapv1beta2.KubeconfigPushSecretName(cluster.Name)
+	if err := r.requireOwnedStaging(ctx, machine, cluster, stagingName); err != nil {
+		return nil, err
+	}
+
+	// The node's push target is the STAGING Secret, never the contract Secret.
+	secretName := stagingName
 	saName := kubeconfigWriterName(cluster.Name)
 
 	// OWNERSHIP (ADR 0005 § D.2): the SA/Role/RoleBinding are a single
@@ -131,71 +164,47 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		},
 	}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, role, func() error {
-		// Kubernetes RBAC silently ignores resourceNames for the `create`
-		// verb because at create-time the named resource doesn't exist yet
-		// (https://kubernetes.io/docs/reference/access-authn-authz/rbac/
-		//  #referring-to-resources). Granting `create` with resourceNames
-		// produces a Role that get/update/patch correctly on the named
-		// Secret but blocks create with HTTP 403 — observable as the node
-		// failing to push its kubeconfig on first boot. Split into two
-		// rules: a narrow create rule with no resourceNames, and a
-		// resourceNames-restricted rule for the rest. Net authorization
-		// after the split is "this SA may create any Secret in this
-		// namespace, and may get/update/patch ONLY the named Secret."
-		// The create-without-resourceNames widening is bounded by the
-		// per-cluster Role+RoleBinding scope (a node only ever has its own
-		// cluster's bearer token) and is least-privilege relative to
-		// granting `create` on all Secrets cluster-wide.
-		// KD-46 (RBAC minimization): the per-cluster node SA only needs the
-		// permissions the rendered cloud-config's bearer-token requests
-		// actually exercise. Audited against every template under
-		// internal/bootstrap/templates/:
+		// PR-3 (ADR 0011): nodes need only PATCH on two named, controller-created
+		// Secrets; no create, get or update. Every node-push in the rendered cloud-config is now a strategic-merge PATCH:
 		//
-		//   secrets:create                        — node-push POST (all
-		//                                            distros/infra) when the
-		//                                            kubeconfig Secret is absent.
-		//   secrets:get/update/patch (named)      — node-push PUT (all
-		//                                            distros/infra) to refresh
-		//                                            the existing Secret.
-		//   virtualmachineinstances:get           — ONLY the k0s CAPK
-		//                                            control-plane SAN-detection
-		//                                            block (fetch_vmi_ip_from_management
-		//                                            in k0s_kairos_cloud_config_capk.yaml.tmpl,
-		//                                            gated `and .IsKubeVirt (eq .Role "control-plane")`).
-		//                                            Granted conditionally below.
-		//   services:get                          — REMOVED. No template path
-		//                                            reads Services with the node
-		//                                            SA token; it was a dead grant.
-		//   secrets get/update/patch (join-token) — ADR 0005 Phase 3: the k0s HA
-		//                                            init node PATCHes the
-		//                                            controller-created,
-		//                                            owner-ref'd join-token Secret
-		//                                            with its `k0s token create`
-		//                                            output over the node-push
-		//                                            channel. No create verb: the
-		//                                            controller pre-creates the
-		//                                            Secret, so the node only
-		//                                            updates it. Named Secret only;
-		//                                            deliberate, bounded widening.
-		joinTokenSecretName := bootstrapv1beta2.ControlPlaneJoinTokenSecretName(cluster.Name)
-		// ADR 0005 §E.1: HA control-plane nodes also PATCH their own member key
-		// into the per-cluster etcd-status Secret over this same node-push
-		// channel. Add it to the resourceNames-scoped get/update/patch rule (no
-		// create — the controller pre-creates it, Cluster-owned). Named Secret
-		// only; deliberate, bounded widening, identical in shape to the join-token
-		// grant. Non-HA clusters never create the Secret, so the grant is inert.
+		//   secrets:patch (staging kubeconfig) — node-push kubeconfig PATCH of the
+		//                                        `value` key of the controller-owned
+		//                                        staging Secret <cluster>-kubeconfig-push.
+		//                                        The node no longer touches the
+		//                                        contract Secret <cluster>-kubeconfig.
+		//   secrets:patch (etcd-status)        — ADR 0005 §E.1: HA control-plane
+		//                                        nodes PATCH their own member key into
+		//                                        the per-cluster etcd-status Secret.
+		//   virtualmachineinstances:get        — ONLY the k0s CAPK control-plane
+		//                                        SAN-detection block
+		//                                        (fetch_vmi_ip_from_management in
+		//                                        k0s_kairos_cloud_config_capk.yaml.tmpl,
+		//                                        gated `and .IsKubeVirt (eq .Role "control-plane")`).
+		//                                        Granted conditionally below.
+		//   services:get                       — REMOVED. No template path reads
+		//                                        Services with the node SA token; it
+		//                                        was a dead grant.
+		//   secrets (join-token)               — REMOVED (ADR 0013). The k0s init
+		//                                        node used to PATCH its `k0s token
+		//                                        create` output into the join-token
+		//                                        Secret. The KairosControlPlane now
+		//                                        mints that token and is the Secret's
+		//                                        only writer, so no node is granted
+		//                                        it.
+		//
+		// Both Secrets are pre-created by the controller (staging: KCP-owned;
+		// etcd-status: Cluster-owned), so the node never needs `create`; and PATCH
+		// does not require `get` (strategic-merge-patch by name is authorized as
+		// the `patch` verb alone). Named Secrets only; per-cluster Role+RoleBinding
+		// scope — a node only ever holds its own cluster's token. Rewriting the
+		// rules on every Resolve narrows Roles created by older releases too.
 		etcdStatusSecretName := bootstrapv1beta2.EtcdStatusSecretName(cluster.Name)
 		role.Rules = []rbacv1.PolicyRule{
 			{
-				APIGroups: []string{""},
-				Resources: []string{"secrets"},
-				Verbs:     []string{"create"},
-			},
-			{
 				APIGroups:     []string{""},
 				Resources:     []string{"secrets"},
-				ResourceNames: []string{secretName, joinTokenSecretName, etcdStatusSecretName},
-				Verbs:         []string{"get", "update", "patch"},
+				ResourceNames: []string{secretName, etcdStatusSecretName},
+				Verbs:         []string{"patch"},
 			},
 		}
 		// Grant virtualmachineinstances:get only for the exact config shape
@@ -283,7 +292,40 @@ func (r *kubeVirtTokenResolver) Resolve(ctx context.Context, kc *bootstrapv1beta
 		APIServer:                 r.ManagementAPIServer,
 		KubeconfigSecretName:      secretName,
 		KubeconfigSecretNamespace: cluster.Namespace,
+		CABundle:                  r.ManagementCABundle,
 	}, nil
+}
+
+// requireOwnedStaging enforces the PR-3 resolver gate (ADR 0011): the per-cluster
+// staging kubeconfig Secret must exist AND be controller-owned by the same
+// KairosControlPlane that controls this Machine. It returns
+// ErrKubeconfigPushTargetNotReady otherwise, which the reconciler maps to a timed
+// requeue with WaitingForKubeconfigPushTargetReason so no push token is handed out
+// before the control plane has pre-created and owns the staging Secret. The check
+// compares the staging Secret's controller-owner UID with the Machine's
+// controller-owner UID (both the KCP) — the bootstrap manager reads Machines but
+// not KCPs, so it cannot resolve the KCP directly, and owner UIDs are not
+// node-forgeable.
+func (r *kubeVirtTokenResolver) requireOwnedStaging(ctx context.Context, machine *clusterv1.Machine, cluster *clusterv1.Cluster, stagingName string) error {
+	if machine == nil {
+		return ErrKubeconfigPushTargetNotReady
+	}
+	machineOwner := metav1.GetControllerOfNoCopy(machine)
+	if machineOwner == nil {
+		return ErrKubeconfigPushTargetNotReady
+	}
+	staging := &corev1.Secret{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: stagingName, Namespace: cluster.Namespace}, staging); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ErrKubeconfigPushTargetNotReady
+		}
+		return fmt.Errorf("get staging kubeconfig secret %s/%s: %w", cluster.Namespace, stagingName, err)
+	}
+	stagingOwner := metav1.GetControllerOfNoCopy(staging)
+	if stagingOwner == nil || stagingOwner.UID != machineOwner.UID {
+		return ErrKubeconfigPushTargetNotReady
+	}
+	return nil
 }
 
 // Compile-time guard that kubeVirtTokenResolver satisfies the interface.
@@ -293,11 +335,16 @@ var _ ManagementEndpointResolver = (*kubeVirtTokenResolver)(nil)
 // controller-runtime client's SubResource method directly. main.go calls this
 // at manager startup; tests in this package construct the struct literally
 // with a fake SubResource client.
-func NewKubeVirtTokenResolver(c client.Client, scheme *runtime.Scheme, mgmtAPIServer string) ManagementEndpointResolver {
+//
+// mgmtCABundle is the canonical PEM CA bundle nodes verify the management API
+// server against on the node-push channel (ADR 0011 PR-4), resolved by
+// ResolveManagementCA. It must be non-empty whenever mgmtAPIServer is set.
+func NewKubeVirtTokenResolver(c client.Client, scheme *runtime.Scheme, mgmtAPIServer string, mgmtCABundle []byte) ManagementEndpointResolver {
 	return &kubeVirtTokenResolver{
 		Client:              c,
 		SubResource:         c.SubResource,
 		Scheme:              scheme,
 		ManagementAPIServer: mgmtAPIServer,
+		ManagementCABundle:  mgmtCABundle,
 	}
 }

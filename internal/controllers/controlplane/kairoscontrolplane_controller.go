@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
@@ -66,6 +64,14 @@ type KairosControlPlaneReconciler struct {
 	// tests inject a fake. Kept as a struct field (not a hard dependency on
 	// remote.NewClusterClient) so unit tests need no live workload cluster.
 	WorkloadClientFactory func(ctx context.Context, cluster *clusterv1.Cluster) (client.Client, error)
+
+	// MemberClientFactory builds a client for the kube-apiserver of one
+	// control-plane member, addressed by an IP from its Machine's
+	// status.addresses. The etcd-leave handshake uses it so that, while any
+	// staying member answers, its traffic does not go through the
+	// control-plane endpoint (ADR 0014). nil → defaultMemberClient; tests
+	// inject a fake.
+	MemberClientFactory func(ctx context.Context, cluster *clusterv1.Cluster, ip string) (client.Client, error)
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
@@ -79,11 +85,11 @@ const controlPlaneLBServiceSuffix = "control-plane-lb"
 const kcpUnsupportedDistributionKubeadm = "kubeadm"
 
 // joinerGateRequeueAfter is the backstop requeue interval while waiting for the
-// HA init machine to become joinable (NodeRef + KubeconfigReady, plus the k0s
-// join-token Secret) before creating the next join machine (ADR 0005 Phase 3,
-// OQ-A). The Machine and Secret watches normally wake the reconcile on the
-// relevant transitions; this is the safety net for the k0s-token-Secret-appears
-// case until that Secret lands.
+// HA init machine to become joinable (NodeRef + KubeconfigReady + etcd health)
+// before creating the next join machine (ADR 0005 Phase 3, OQ-A), and while a
+// k0s joiner is pending: the k0s join-token extension (ADR 0013) runs on these
+// requeues. The Machine and Secret watches normally wake the reconcile on the
+// relevant transitions; this is the safety net.
 const joinerGateRequeueAfter = 15 * time.Second
 
 // The HA join-token Secret name/labels/data-key are defined once in the
@@ -217,7 +223,7 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// has already finalized the object via a bare r.Update; otherwise the
 	// deferred Patch should flush observedGeneration/conditions on the
 	// non-terminal drain-requeue path.
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kcp.DeletionTimestamp.IsZero() {
 		// A paused Cluster holds deletion too, as it does for upstream
 		// KubeadmControlPlane. Deleting the control plane marks every
 		// control-plane Machine for deletion and strips their etcd-leave hooks,
@@ -441,40 +447,41 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Track previous initialized state to detect transitions
 	wasInitialized := kcp.Status.Initialized
 
-	// Update status
-	if err := r.updateStatus(ctx, log, kcp, cluster); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	// Ensure the control-plane LoadBalancer Service exists for KubeVirt clusters.
+	// This runs BEFORE reconcileKubeconfig so resolveExpectedServer can read the
+	// LB endpoint the sanitizer forces into the CAPK kubeconfig's server URL.
 	if isKubevirtControlPlane(kcp) {
 		if err := r.reconcileControlPlaneLB(ctx, log, kcp, cluster); err != nil {
 			log.Error(err, "Failed to reconcile control plane load balancer service")
 		}
 	}
 
-	// KD-3b: the controller no longer SSHes into the node to fetch the
-	// kubeconfig. Instead, the node (CAPK + CAPV today) pushes its
-	// kubeconfig as a Secret using a per-cluster ServiceAccount token
-	// minted by the bootstrap controller's ManagementEndpointResolver.
-	// Here we observe the Secret's presence and reflect it on
-	// KubeconfigReadyCondition.
+	// ADR 0011: the management side no longer trusts a node-written
+	// kubeconfig verbatim. reconcileKubeconfig owns the contract Secret
+	// `<cluster>-kubeconfig` and KubeconfigReadyCondition: it validates the
+	// contract against the internal/kubeconfig sanitizer (must be a fixed
+	// point), adopts/rebuilds a clean legacy Secret through S5, forces the
+	// server the controller knows, pins the CA on a KCP annotation nodes cannot
+	// write, and neutralizes unsafe/oversized/unparseable/CA-mismatched content
+	// empty-in-place (never delete). It runs BEFORE updateStatus so the
+	// initialized check below sees S5 output, and it never returns a hard error
+	// for a rejected/absent kubeconfig (that is a condition, not a wedge).
 	//
-	// The Secret watch (SetupWithManager) wakes us when the node writes
-	// the kubeconfig, so no requeue is needed on the missing-Secret path.
-	// LastNodePushObserved is anchored on first-miss observation and
-	// drives the Info → Warning severity escalation after
-	// kubeconfigReadyTimeout.
-	kubeconfigReady, err := r.observeKubeconfigSecret(ctx, log, kcp, cluster)
+	// The Secret watch (SetupWithManager) wakes us when a node writes the
+	// contract or staging Secret, so no requeue is needed on the missing case.
+	kubeconfigReady, err := r.reconcileKubeconfig(ctx, log, kcp, cluster)
 	if err != nil {
-		// Hard errors (Get failures other than NotFound) propagate. The
-		// missing-Secret case is signalled by kubeconfigReady=false and a
-		// nil err.
-		return ctrl.Result{}, fmt.Errorf("observe kubeconfig secret: %w", err)
+		return ctrl.Result{}, fmt.Errorf("reconcile kubeconfig: %w", err)
 	}
 	if !kubeconfigReady {
-		log.V(4).Info("Kubeconfig Secret not yet observed; waiting for node push (KD-3b)",
+		log.V(4).Info("Contract kubeconfig not yet usable; waiting for node push or recovery (ADR 0011)",
 			"cluster", cluster.Name)
+	}
+
+	// Update status (reads the now-sanitized contract Secret for the initialized
+	// check).
+	if err := r.updateStatus(ctx, log, kcp, cluster); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Update Cluster status
@@ -621,7 +628,22 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 	return nil, nil
 }
 
-func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (ctrl.Result, error) {
+func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (result ctrl.Result, retErr error) {
+	// While a k0s joiner is pending, come back at least every
+	// k0sJoinTokenRecheckInterval so its join token is extended before it lapses
+	// (ADR 0013). Without this, a pending last joiner (machines == replicas)
+	// leaves nothing to requeue the KCP: the gate requeue only runs while a
+	// machine is still to be created, and the KCP has no resync.
+	var k0sJoinerPending bool
+	defer func() {
+		if retErr != nil || !k0sJoinerPending || result.Requeue {
+			return
+		}
+		if result.RequeueAfter == 0 || result.RequeueAfter > k0sJoinTokenRecheckInterval {
+			result.RequeueAfter = k0sJoinTokenRecheckInterval
+		}
+	}()
+
 	// Get desired replica count
 	desiredReplicas := int32(1)
 	if kcp.Spec.Replicas != nil {
@@ -663,7 +685,8 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// terminating and still carries our hook. This single sweep covers the
 	// controller's own quorum-approved deletes below, operator/MHC-initiated
 	// Machine deletes, and crash recovery — the hook keeps CAPI paused (after
-	// drain, node still up) until the member has cleanly left etcd. A workload
+	// drain, node still up) until the member has cleanly left etcd, and the
+	// leave starts only once CAPI has reached that pause. A workload
 	// client/read error keeps the hook set (fail-safe: the delete stays blocked
 	// and quorum is preserved) and requeues; an in-progress leave requeues so we
 	// do not churn other machines while a member is draining out of etcd.
@@ -671,7 +694,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		if m.DeletionTimestamp.IsZero() || !hasEtcdLeaveHook(m) {
 			continue
 		}
-		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, m)
+		done, err := r.reconcileMemberLeave(ctx, log, kcp, cluster, machines, m)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile etcd member leave for %s: %w", m.Name, err)
 		}
@@ -682,8 +705,9 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	// HA: ensure the per-cluster join-token Secret exists before any joiner is
 	// created (ADR 0005 Phase 3). For k3s the controller generates the shared
-	// server token up front; for k0s the Secret is created empty and the init
-	// node fills it over the node-push channel. Single-node clusters skip this.
+	// server token up front; for k0s the Secret is created empty and the KCP
+	// mints the controller-join token into it when it admits a joiner (ADR
+	// 0013). Single-node clusters skip this.
 	if desiredReplicas > 1 {
 		if err := r.ensureJoinTokenSecret(ctx, log, kcp, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to ensure join-token secret: %w", err)
@@ -694,6 +718,12 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		// EtcdHealthyCondition, and the quorum-safe-replacement guard.
 		if err := r.ensureEtcdStatusSecret(ctx, log, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to ensure etcd-status secret: %w", err)
+		}
+		// ADR 0013: keep the k0s join token of every pending joiner alive, and say
+		// why a joiner is stuck when the KCP cannot help it. Best effort: it never
+		// fails the reconcile and never gates the scale or rollout logic below.
+		if distributionOf(kcp) == "k0s" && conditions.IsTrue(kcp, controlplanev1beta2.KubeconfigReadyCondition) {
+			k0sJoinerPending = r.reconcileK0sJoinTokenLifetime(ctx, log, kcp, cluster, machines)
 		}
 	}
 
@@ -728,20 +758,23 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 		// HA joiner-sequencing gate (ADR 0005 Phase 3, OQ-A): a join machine is
 		// not created until the init machine is joinable — NodeRef set,
-		// KubeconfigReady, and (k0s) the controller-join token Secret populated.
-		// Creating a joiner before the init endpoint exists would fail the join.
+		// KubeconfigReady, etcd healthy, every earlier joiner joined — and, on
+		// k0s, the KCP holds a controller-join token for it (ADR 0013). Creating a
+		// joiner before the init endpoint exists would fail the join.
+		var joinTokenID string
 		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
-			joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+			admission, err := r.admitJoiner(ctx, log, kcp, cluster, machines)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
-			if !joinable {
-				log.Info("Holding back join machine until init machine is joinable", "reason", reason)
+			if !admission.admitted {
+				log.Info("Holding back join machine until init machine is joinable", "reason", admission.reason)
 				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 			}
+			joinTokenID = admission.k0sJoinTokenID
 		}
 
-		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine: %w", err)
 		}
 		// Only create one per reconcile to avoid over-scaling
@@ -793,14 +826,45 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 	return bootstrapv1beta2.ControlPlaneRoleJoin
 }
 
+// joinAdmission is the outcome of admitJoiner.
+type joinAdmission struct {
+	// admitted is true when the next join machine may be created now.
+	admitted bool
+	// reason says why not, for the hold-back log line.
+	reason string
+	// k0sJoinTokenID is the ID of the k0s controller-join token the new join
+	// KairosConfig must be stamped with. Empty for k3s.
+	k0sJoinTokenID string
+}
+
+// admitJoiner decides whether the next join machine may be created. It runs the
+// read-only join gate (initMachineJoinable) and, once that opens on k0s, makes
+// sure the KCP holds a controller-join token for the joiner (ADR 0013). The
+// token step replaced the gate's old "the init node pushed a token" clause.
+func (r *KairosControlPlaneReconciler) admitJoiner(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) (joinAdmission, error) {
+	joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+	if err != nil || !joinable {
+		return joinAdmission{reason: reason}, err
+	}
+	if distributionOf(kcp) != "k0s" {
+		return joinAdmission{admitted: true}, nil
+	}
+	id, reason, err := r.ensureK0sControllerJoinToken(ctx, log, kcp, cluster, machines)
+	if err != nil {
+		return joinAdmission{}, err
+	}
+	if id == "" {
+		return joinAdmission{reason: reason}, nil
+	}
+	return joinAdmission{admitted: true, k0sJoinTokenID: id}, nil
+}
+
 // initMachineJoinable reports whether it is safe to create another join
-// machine. The gate is (ADR 0005 Phase 3, OQ-A):
+// machine. It reads state and writes nothing. The gate is (ADR 0005 Phase 3,
+// OQ-A):
 //   - the init machine has Status.NodeRef set (it registered as a Node), AND
 //   - KubeconfigReadyCondition is True on the KCP (the node pushed its
 //     kubeconfig — KD-3b), AND
-//   - for k0s only, the join-token Secret has a non-empty token (the init node
-//     minted `k0s token create` and pushed it back). For k3s the token is
-//     controller-generated up front, so this clause is skipped, AND
 //   - the init node has reported a healthy voting etcd member into the
 //     etcd-status Secret (ADR 0005 §E.1) — strict for k0s (authoritative
 //     `k0s etcd member-list`), advisory for k3s (block only on an explicit
@@ -810,6 +874,10 @@ func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredRepl
 //     clauses above stay true while a joiner is still booting and a second
 //     joiner is cut loose, so two concurrent `etcd member add`s break quorum
 //     before either member serves. See the loop below for the full failure mode.
+//
+// On k0s, admitJoiner then makes sure a controller-join token exists for the
+// joiner. That used to be a clause here ("the init node pushed its token");
+// the KCP now mints the token itself (ADR 0013).
 //
 // reason is a short human-readable explanation when not joinable (for
 // logging/conditions).
@@ -828,15 +896,6 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 	distribution := kcp.Spec.Distribution
 	if distribution == "" {
 		distribution = "k0s"
-	}
-	if distribution == "k0s" {
-		token, err := r.joinTokenSecretValue(ctx, cluster)
-		if err != nil {
-			return false, "", err
-		}
-		if token == "" {
-			return false, "k0s controller-join token not yet pushed by init node", nil
-		}
 	}
 
 	// ADR 0005 §E.1: gate joiners on the init node having reported a healthy,
@@ -900,7 +959,12 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 	return true, "", nil
 }
 
-func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole) error {
+// createControlPlaneMachine creates the KairosConfig, infrastructure Machine and
+// Machine for one control-plane member. joinTokenID is the k0s controller-join
+// token ID admitJoiner returned for a k0s join, stamped on the KairosConfig so
+// the bootstrap controller renders exactly that token (ADR 0013); it is empty
+// for every other role and for k3s.
+func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) error {
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
 	// Create KairosConfig
@@ -949,10 +1013,22 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	// only when Role == "control-plane" (CPR-INV-1), which holds here.
 	r.applyControlPlaneHASpec(&kairosConfig.Spec, kcp, cluster, role)
 	log.Info("Assigned control-plane role", "role", role, "singleNode", kairosConfig.Spec.SingleNode)
+	if joinTokenID != "" {
+		kairosConfig.Annotations = map[string]string{k0sJoinTokenIDAnnotation: joinTokenID}
+	}
 
 	if err := r.Create(ctx, kairosConfig); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
+		}
+		// A retry after a partial create (the infrastructure Machine failed last
+		// time) finds the KairosConfig already there. The token may have been
+		// replaced since, so point the config at the current one as long as it
+		// has not been rendered yet.
+		if joinTokenID != "" {
+			if err := r.restampJoinConfigTokenID(ctx, log, kairosConfig.Namespace, kairosConfig.Name, joinTokenID); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1015,6 +1091,30 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	}
 
 	return r.Create(ctx, machine)
+}
+
+// restampJoinConfigTokenID points an existing, not yet rendered join
+// KairosConfig at the given k0s join-token ID. A config that already has
+// bootstrap data keeps its annotation: its token is fixed in that data.
+func (r *KairosControlPlaneReconciler) restampJoinConfigTokenID(ctx context.Context, log logr.Logger, namespace, name, joinTokenID string) error {
+	existing := &bootstrapv1beta2.KairosConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing); err != nil {
+		return fmt.Errorf("get existing KairosConfig %s/%s: %w", namespace, name, err)
+	}
+	if existing.Annotations[k0sJoinTokenIDAnnotation] == joinTokenID ||
+		existing.Status.DataSecretName != nil || !existing.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	base := existing.DeepCopy()
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	existing.Annotations[k0sJoinTokenIDAnnotation] = joinTokenID
+	if err := r.Patch(ctx, existing, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("update the k0s join-token ID on KairosConfig %s/%s: %w", namespace, name, err)
+	}
+	log.Info("Updated the k0s join-token ID on an existing join KairosConfig", "kairosConfig", name, "tokenID", joinTokenID)
+	return nil
 }
 
 func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machineName string) (client.Object, error) {
@@ -1328,120 +1428,13 @@ func (r *KairosControlPlaneReconciler) updateStatus(ctx context.Context, log log
 	return nil
 }
 
-// observeKubeconfigSecret implements the KD-3b node-push-wait pattern.
-//
-// The controller no longer SSHes into nodes to fetch the kubeconfig (KD-10).
-// The node (CAPK / CAPV under KD-3b) writes its kubeconfig as a Secret to
-// the management cluster using a per-cluster ServiceAccount token. Here we
-// observe that Secret's presence and reflect it on KubeconfigReadyCondition.
-//
-// Return values:
-//   - ready=true when the Secret exists, parses as a valid kubeconfig, and
-//     has the cluster-name label. KubeconfigReadyCondition transitions to
-//     True; Status.LastNodePushObserved is cleared.
-//   - ready=false on a missing or empty Secret. The condition is set to
-//     False(WaitingForNodePush). Status.LastNodePushObserved is anchored
-//     to now on first observation; once
-//     Now - LastNodePushObserved > kubeconfigReadyTimeout the condition
-//     severity escalates from Info to Warning. No requeue is issued; the
-//     Secret watch wakes us when the node writes the kubeconfig.
-//   - err is non-nil only for hard Get failures (apiserver unreachable,
-//     RBAC denied). NotFound is the missing-Secret signal, not an error.
-//
-// Why not parse-validate the kubeconfig in Go: the node-push payload
-// always writes a base64 of the actual on-node admin.conf / k3s.yaml.
-// The distribution (k0s / k3s) is the appointed writer and is trusted
-// to produce a syntactically valid kubeconfig. Parse-validation in the
-// controller would duplicate that responsibility without adding
-// correctness — if the distribution writes a malformed kubeconfig, the
-// right fix is in the cloud-config template, not in a Go parser here.
-// This posture is permanent; no future PR is expected to change it.
-func (r *KairosControlPlaneReconciler) observeKubeconfigSecret(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (bool, error) {
-	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
-	secretKey := types.NamespacedName{
-		Name:      secretName,
-		Namespace: cluster.Namespace,
-	}
-
-	secret := &corev1.Secret{}
-	err := r.Get(ctx, secretKey, secret)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return false, err
-	}
-	if err == nil {
-		if kubeconfig, ok := secret.Data["value"]; ok && len(kubeconfig) > 0 {
-			// Secret present and non-empty: kubeconfig is ready. Use
-			// conditions.Set rather than MarkTrue so the Reason is
-			// populated for downstream consumers — `MarkTrue` deliberately
-			// leaves Reason empty per CAPI convention, but KubeconfigReady
-			// is a custom condition where the Reason is the observable
-			// signal of which path achieved readiness (node-push vs.
-			// SSHFallback). The Reason surfaced here is what operators
-			// see in `kubectl describe kairoscontrolplane`:
-			//   - KubeconfigReady → node-push (normal path)
-			//   - KubeconfigReadyViaSSHFallback → SSH fallback supplied it
-			//
-			// The "ssh-fallback" annotation is stamped by the SSH
-			// fallback worker (see ssh_fallback_worker.go) so we can
-			// distinguish operator-audit-worthy SSH retrievals from
-			// the default node-push path without adding a new
-			// condition type.
-			kcp.Status.LastNodePushObserved = nil
-			reason := controlplanev1beta2.KubeconfigReadyReason
-			if secret.Annotations[KubeconfigSourceAnnotation] == KubeconfigSourceSSHFallback {
-				reason = controlplanev1beta2.KubeconfigReadyViaSSHFallbackReason
-			}
-			conditions.Set(kcp, &clusterv1.Condition{
-				Type:   controlplanev1beta2.KubeconfigReadyCondition,
-				Status: corev1.ConditionTrue,
-				Reason: reason,
-			})
-			log.V(4).Info("Kubeconfig Secret observed",
-				"secret", secretKey.String(),
-				"size", len(kubeconfig))
-			return true, nil
-		}
-	}
-
-	// Missing or empty Secret. Anchor LastNodePushObserved on first miss so
-	// the severity escalation has a stable timestamp; if a previous reconcile
-	// already anchored it, keep that timestamp (we're measuring elapsed since
-	// first observation, not since last).
-	if kcp.Status.LastNodePushObserved == nil {
-		now := metav1.Now()
-		kcp.Status.LastNodePushObserved = &now
-	}
-
-	// Defer to the SSH-fallback sibling once it owns KubeconfigReadyCondition.
-	// When Spec.SSHFallback is enabled and the eligibility gate has fired, the
-	// sibling reconciler (ssh_fallback_controller.go) drives this condition
-	// through Dialing -> Failed/Misconfigured. Re-asserting WaitingForNodePush
-	// here on every missing-Secret reconcile would fight the sibling for the
-	// same condition and make the Reason flap between WaitingForNodePush and the
-	// SSH-fallback Reasons: cosmetically confusing in production, and under
-	// workqueue contention on a busy runner enough to keep the envtest suite from
-	// ever snapshotting a stable SSH-fallback Reason (the
-	// TestSSHFallback_MisconfiguredSurfacesCondition flake). The main reconciler
-	// still owns the timestamp anchor above and the success transition (once a
-	// Secret appears, the ready path handles it before we reach here); it just
-	// stops clobbering the sibling's Reason.
-	if sshFallbackOwnsKubeconfigCondition(kcp) {
-		return false, nil
-	}
-
-	severity := clusterv1.ConditionSeverityInfo
-	message := fmt.Sprintf("Waiting for the workload node to push its kubeconfig as Secret %s/%s.", cluster.Namespace, secretName)
-	if elapsed := time.Since(kcp.Status.LastNodePushObserved.Time); elapsed > kubeconfigReadyTimeout {
-		severity = clusterv1.ConditionSeverityWarning
-		message = fmt.Sprintf("Workload node has not pushed its kubeconfig to %s/%s for %s; check node networking to the management API server.", cluster.Namespace, secretName, elapsed.Round(time.Second))
-	}
-	conditions.MarkFalse(kcp,
-		controlplanev1beta2.KubeconfigReadyCondition,
-		controlplanev1beta2.WaitingForNodePushReason,
-		severity,
-		"%s", message)
-	return false, nil
-}
+// observeKubeconfigSecret was removed with ADR 0011 PR-2. Its "any non-empty
+// value is ready" posture (G8) is exactly the trust the ADR reverses: the
+// management side must not accept a node-written kubeconfig verbatim. Its
+// responsibilities are now split across reconcileKubeconfig (the single owner of
+// the contract Secret's content and of KubeconfigReadyCondition) and
+// markWaitingForNodePush (the absent/empty waiting + escalation + SSH-fallback
+// deference), both in kubeconfig_publish.go.
 
 // ensureProviderIDOnNodes and getInfrastructureProviderID were deleted in
 // PR-8 of the KD-3b sequence. The in-VM cloud-config now owns setting
@@ -1476,59 +1469,23 @@ func controlPlaneLBServiceName(clusterName string) string {
 	return fmt.Sprintf("%s-%s", clusterName, controlPlaneLBServiceSuffix)
 }
 
-// updateClusterStatus updates the Cluster status based on control plane readiness
+// updateClusterStatus is retained as the hook for Cluster-status side effects of
+// control-plane readiness.
+//
+// KD-12: this controller MUST NOT write Cluster.Spec.ControlPlaneEndpoint. The
+// infrastructure provider populates <Infra>Cluster.Spec.ControlPlaneEndpoint,
+// CAPI core copies it into Cluster.Spec.ControlPlaneEndpoint, and this
+// control-plane provider only reads. See ADR 0003.
+//
+// The former CAPK kubeconfig-server rewrite lived here; it was removed with
+// ADR 0011 PR-2. The server URL is now forced by the publish path
+// (reconcileKubeconfig -> sanitizer S5), so there is nothing to retarget
+// after the fact and no reason to r.Update the contract Secret here.
 func (r *KairosControlPlaneReconciler) updateClusterStatus(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) error {
-	secretName := fmt.Sprintf("%s-kubeconfig", cluster.Name)
-	secretKey := types.NamespacedName{
-		Name:      secretName,
-		Namespace: cluster.Namespace,
-	}
-
-	// KD-12: this controller MUST NOT write Cluster.Spec.ControlPlaneEndpoint.
-	// The infrastructure provider populates <Infra>Cluster.Spec.ControlPlaneEndpoint,
-	// CAPI core copies it into Cluster.Spec.ControlPlaneEndpoint, and this
-	// control-plane provider only reads. See ADR 0003.
-	//
-	// The one remaining concern of this function is the CAPK-specific
-	// kubeconfig-server rewrite: when the kubeconfig Secret exists, we may
-	// need to retarget its `server:` URL at the LoadBalancer endpoint so
-	// `clusterctl get kubeconfig` and downstream tooling reach the cluster
-	// through the LB instead of the in-cluster API server address baked in
-	// by the distribution. (A follow-up split will rename this function to
-	// reconcileKubeconfigServer; out of scope for KD-12.)
-
-	// Check if the kubeconfig secret exists yet; if not, nothing to do here.
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.V(4).Info("Kubeconfig secret not found, skipping cluster status update", "secret", secretName)
-			return nil
-		}
-		return err
-	}
-
-	log.Info("updateClusterStatus called", "cluster", cluster.Name, "kubeconfigExists", true)
-
-	// For KubeVirt, ensure kubeconfig server URL matches LoadBalancer endpoint (only when secret exists)
-	if isKubevirtControlPlane(kcp) {
-		lbHost, lbPort, err := r.getControlPlaneLBEndpoint(ctx, log, cluster)
-		if err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to get control plane LoadBalancer endpoint for kubeconfig", "cluster", cluster.Name)
-		} else if lbHost != "" && lbPort != 0 {
-			updated, err := r.ensureKubeconfigServer(ctx, log, secret, lbHost, lbPort)
-			if err != nil {
-				log.Error(err, "Failed to ensure kubeconfig server", "cluster", cluster.Name)
-			} else if updated {
-				log.Info("Updated kubeconfig server to match LoadBalancer endpoint", "cluster", cluster.Name, "host", lbHost, "port", lbPort)
-			}
-		}
-	}
-
 	// Note: We do NOT update Cluster status conditions here.
 	// The Cluster controller manages ControlPlaneInitialized and ControlPlaneReady conditions
 	// based on the control plane's status.Initialized and ReadyReplicas fields.
 	// Attempting to set these conditions directly causes reconcile loops and conflicts.
-
 	return nil
 }
 
@@ -1651,9 +1608,18 @@ func (r *KairosControlPlaneReconciler) ensureControlPlaneLBEndpoints(ctx context
 }
 
 func (r *KairosControlPlaneReconciler) getControlPlaneLBEndpoint(ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster) (string, int32, error) {
+	return controlPlaneLBEndpoint(ctx, r.Client, cluster)
+}
+
+// controlPlaneLBEndpoint reads the CAPK control-plane LoadBalancer Service and
+// returns its (host, port). Extracted as a free function so both the reconciler
+// method above and the kubeconfig publish path's resolveExpectedServer (which
+// also runs from the SSH-fallback reconciler) can share it without a
+// KairosControlPlaneReconciler receiver.
+func controlPlaneLBEndpoint(ctx context.Context, c client.Client, cluster *clusterv1.Cluster) (string, int32, error) {
 	serviceName := controlPlaneLBServiceName(cluster.Name)
 	service := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: cluster.Namespace}, service); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: cluster.Namespace}, service); err != nil {
 		return "", 0, err
 	}
 
@@ -1681,154 +1647,13 @@ func (r *KairosControlPlaneReconciler) getControlPlaneLBEndpoint(ctx context.Con
 	return host, port, nil
 }
 
-// updateKubeconfigServerToNodeIP replaces 127.0.0.1/localhost in kubeconfig server with the node IP.
-// k3s default kubeconfig uses https://127.0.0.1:6443 which is not reachable from the management cluster.
-func updateKubeconfigServerToNodeIP(kubeconfig []byte, nodeIP string, port int32) ([]byte, error) {
-	if nodeIP == "" || port == 0 {
-		return kubeconfig, nil
-	}
-	config, err := clientcmd.Load(kubeconfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
-	}
-	desired := fmt.Sprintf("https://%s:%d", nodeIP, port)
-	changed := false
-	for _, cluster := range config.Clusters {
-		if cluster == nil {
-			continue
-		}
-		parsed, err := url.Parse(cluster.Server)
-		if err != nil {
-			cluster.Server = desired
-			changed = true
-			continue
-		}
-		// Replace 127.0.0.1 or localhost with node IP
-		if parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "localhost" {
-			cluster.Server = desired
-			changed = true
-		}
-	}
-	if !changed {
-		return kubeconfig, nil
-	}
-	out, err := clientcmd.Write(*config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize kubeconfig: %w", err)
-	}
-	return out, nil
-}
-
-// ensureKubeconfigServer updates the kubeconfig secret server to match the given endpoint.
-func (r *KairosControlPlaneReconciler) ensureKubeconfigServer(ctx context.Context, log logr.Logger, secret *corev1.Secret, host string, port int32) (bool, error) {
-	if host == "" || port == 0 {
-		return false, nil
-	}
-
-	kubeconfig, ok := secret.Data["value"]
-	if !ok || len(kubeconfig) == 0 {
-		return false, nil
-	}
-
-	if updated, err := r.ensureKubeconfigSecretMetadata(ctx, secret, nil); err != nil {
-		return false, err
-	} else if updated {
-		log.Info("Updated kubeconfig secret metadata", "secret", secret.Name)
-	}
-
-	config, err := clientcmd.Load(kubeconfig)
-	if err != nil {
-		return false, fmt.Errorf("failed to parse kubeconfig: %w", err)
-	}
-
-	desired := fmt.Sprintf("https://%s:%d", host, port)
-	changed := false
-	for _, cluster := range config.Clusters {
-		if cluster == nil {
-			continue
-		}
-		if cluster.Server == "" {
-			cluster.Server = desired
-			changed = true
-			continue
-		}
-		parsed, err := url.Parse(cluster.Server)
-		if err != nil {
-			cluster.Server = desired
-			changed = true
-			continue
-		}
-		if parsed.Host != fmt.Sprintf("%s:%d", host, port) {
-			cluster.Server = desired
-			changed = true
-		}
-	}
-
-	if !changed {
-		return false, nil
-	}
-
-	out, err := clientcmd.Write(*config)
-	if err != nil {
-		return false, fmt.Errorf("failed to serialize kubeconfig: %w", err)
-	}
-
-	secretCopy := secret.DeepCopy()
-	secretCopy.Data["value"] = out
-	if err := r.Update(ctx, secretCopy); err != nil {
-		return false, fmt.Errorf("failed to update kubeconfig secret: %w", err)
-	}
-
-	return true, nil
-}
-
-func (r *KairosControlPlaneReconciler) ensureKubeconfigSecretMetadata(ctx context.Context, secret *corev1.Secret, cluster *clusterv1.Cluster) (bool, error) {
-	changed := false
-	secretCopy := secret.DeepCopy()
-
-	if secretCopy.Labels == nil {
-		secretCopy.Labels = map[string]string{}
-	}
-	if cluster != nil {
-		if secretCopy.Labels[clusterv1.ClusterNameLabel] != cluster.Name {
-			secretCopy.Labels[clusterv1.ClusterNameLabel] = cluster.Name
-			changed = true
-		}
-	}
-
-	if cluster != nil {
-		ownerRef := metav1.OwnerReference{
-			APIVersion: cluster.APIVersion,
-			Kind:       cluster.Kind,
-			Name:       cluster.Name,
-			UID:        cluster.UID,
-			Controller: func() *bool { b := true; return &b }(),
-		}
-		hasOwner := false
-		for _, ref := range secretCopy.OwnerReferences {
-			if ref.UID == ownerRef.UID {
-				hasOwner = true
-				break
-			}
-		}
-		if !hasOwner {
-			secretCopy.OwnerReferences = append(secretCopy.OwnerReferences, ownerRef)
-			changed = true
-		}
-	}
-
-	if !changed {
-		return false, nil
-	}
-	if secretCopy.ResourceVersion == "" {
-		*secret = *secretCopy
-		return true, nil
-	}
-	if err := r.Update(ctx, secretCopy); err != nil {
-		return false, fmt.Errorf("failed to update kubeconfig secret metadata: %w", err)
-	}
-	return true, nil
-}
+// The former updateKubeconfigServerToNodeIP / ensureKubeconfigServer /
+// ensureKubeconfigSecretMetadata helpers were removed with ADR 0011 PR-2. The
+// server URL is no longer patched into node-written bytes after the fact: the
+// publish path (kubeconfig_publish.go) forces the server the controller already
+// knows via the sanitizer's S5 rebuild, and owns the contract Secret's metadata
+// (controller owner = the KCP), so an after-the-fact r.Update is both
+// unnecessary and unsafe.
 
 // triggerClusterReconciliation updates a Cluster annotation to trigger Cluster controller reconciliation
 // This is needed because the Cluster controller watches Cluster resources, not ControlPlane resources directly.
@@ -1956,22 +1781,31 @@ func (r *KairosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.secretToKairosControlPlane),
-			// KD-15-compliant predicate: filter by Type and the
-			// cluster-name label, never by name suffix. The previous
-			// strings.HasSuffix predicate matched anything-kubeconfig,
-			// including unrelated workload-cluster Secrets and any
-			// future tenant that happens to suffix with -kubeconfig.
-			// The KD-3b push payload always stamps both fields, so a
-			// node-pushed kubeconfig Secret reliably matches.
+			// KD-15-compliant predicate: filter by label, never by name
+			// suffix. The previous strings.HasSuffix predicate matched
+			// anything-kubeconfig, including unrelated workload-cluster
+			// Secrets and any future tenant that happens to suffix with
+			// -kubeconfig.
+			//
+			// Two shapes wake the reconcile (ADR 0011 step 11): the contract
+			// Secret (type cluster.x-k8s.io/secret) and the controller-owned
+			// staging Secret `<cluster>-kubeconfig-push` (type Opaque, marked
+			// by the kubeconfig-push type label). Both carry the cluster-name
+			// label, which is how secretToKairosControlPlane resolves them.
+			// Labels only, so this survives ADR 0010 P1's move to
+			// metadata-only Secret watches.
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 				secret, ok := obj.(*corev1.Secret)
 				if !ok {
 					return false
 				}
-				if secret.Type != clusterv1.ClusterSecretType {
+				if secret.Labels[clusterv1.ClusterNameLabel] == "" {
 					return false
 				}
-				return secret.Labels[clusterv1.ClusterNameLabel] != ""
+				if secret.Type == clusterv1.ClusterSecretType {
+					return true
+				}
+				return secret.Labels[bootstrapv1beta2.KubeconfigPushSecretTypeLabel] == bootstrapv1beta2.KubeconfigPushSecretTypeValue
 			})),
 		).
 		Complete(r)

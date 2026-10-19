@@ -88,19 +88,28 @@ var _ admission.Validator[*KairosControlPlaneTemplate] = &kairosControlPlaneTemp
 // ValidateCreate implements admission.Validator[*KairosControlPlaneTemplate].
 func (*kairosControlPlaneTemplateValidator) ValidateCreate(_ context.Context, r *KairosControlPlaneTemplate) (admission.Warnings, error) {
 	kairoscontrolplanetemplateLog.Info("validate create", "name", r.Name)
-	return nil, r.validate()
+	return r.validateWithWarnings()
 }
 
 // ValidateUpdate implements admission.Validator[*KairosControlPlaneTemplate].
 func (*kairosControlPlaneTemplateValidator) ValidateUpdate(_ context.Context, _, r *KairosControlPlaneTemplate) (admission.Warnings, error) {
 	kairoscontrolplanetemplateLog.Info("validate update", "name", r.Name)
-	return nil, r.validate()
+	return r.validateWithWarnings()
 }
 
 // ValidateDelete implements admission.Validator[*KairosControlPlaneTemplate].
 func (*kairosControlPlaneTemplateValidator) ValidateDelete(_ context.Context, r *KairosControlPlaneTemplate) (admission.Warnings, error) {
 	kairoscontrolplanetemplateLog.Info("validate delete", "name", r.Name)
 	return nil, nil
+}
+
+// validateWithWarnings runs validate() and also collects the same non-blocking
+// warnings the KairosControlPlane webhook collects, against the nested template
+// spec. A configuration that warns on a KairosControlPlane has to warn on the
+// template too, for the same reason the rejections are mirrored: staging it
+// otherwise hides the warning until a cluster is created from the template.
+func (r *KairosControlPlaneTemplate) validateWithWarnings() (admission.Warnings, error) {
+	return warnVIPOnSingleReplica(&r.Spec.Template.Spec, "spec.template.spec"), r.validate()
 }
 
 // validate mirrors the KairosControlPlane webhook's validate() against
@@ -164,6 +173,16 @@ func (r *KairosControlPlaneTemplate) validate() error {
 	// the template's namespace is the same one a stamped KCP would
 	// live in.
 	allErrs = append(allErrs, validateSSHFallback(s.SSHFallback, r.Namespace, base.Child("sshFallback"))...)
+
+	// machineTemplate.infrastructureRef: shared helper with KCP, and the same
+	// owner namespace the SSHFallback rule uses. A template that names another
+	// namespace stamps a KairosControlPlane the KCP webhook refuses, or, where
+	// that webhook is not in the request path, one whose first reconcile fails
+	// in createInfrastructureMachine. Both report the cluster, not the template
+	// that produced it.
+	allErrs = append(allErrs, validateInfrastructureRefNamespace(
+		s.MachineTemplate.InfrastructureRef.Namespace, r.Namespace,
+		base.Child("machineTemplate", "infrastructureRef", "namespace"))...)
 
 	if len(allErrs) > 0 {
 		return errors.NewInvalid(

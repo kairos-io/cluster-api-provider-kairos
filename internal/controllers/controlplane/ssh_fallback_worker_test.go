@@ -37,11 +37,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 // =====================================================================
@@ -333,10 +335,16 @@ func jobForFixture(srv *testSSHServer, cluster *clusterv1.Cluster) SSHFallbackJo
 				Name: "ssh-known-hosts",
 			},
 		},
-		Distribution: "k0s",
-		Host:         host,
+		Distribution:   "k0s",
+		Host:           host,
+		ExpectedServer: sshFallbackTestExpectedServer,
 	}
 }
+
+// sshFallbackTestExpectedServer is the server URL the worker forces into the
+// SSH-fetched kubeconfig via the sanitizer (ADR 0011). The success test computes
+// the expected written bytes with the same value.
+const sshFallbackTestExpectedServer = "https://10.0.0.1:6443"
 
 func buildSecrets(idData, knownHostsData []byte, namespace string) (*corev1.Secret, *corev1.Secret) {
 	idSecret := &corev1.Secret{
@@ -350,12 +358,19 @@ func buildSecrets(idData, knownHostsData []byte, namespace string) (*corev1.Secr
 	return idSecret, khSecret
 }
 
-func TestSSHFallbackWorker_Success_WritesSecretWithCorrectShape(t *testing.T) {
+func TestSSHFallbackWorker_Success_WritesSanitizedSecretWithCorrectShape(t *testing.T) {
 	g := NewWithT(t)
 	srv := newTestSSHServer(t)
 	t.Cleanup(srv.Close)
-	const kubeconfigBytes = "apiVersion: v1\nkind: Config\nclusters: []\n"
-	srv.SetFile("/var/lib/k0s/pki/admin.conf", []byte(kubeconfigBytes))
+
+	// The on-node file is a REAL admin.conf with a loopback server (as k3s.yaml
+	// ships) and a valid inline cert/key. The worker must sanitize it (ADR 0011,
+	// G9): the written value is S5 output with the expected server forced in, not
+	// the raw fetched bytes.
+	ca := genCACertPEM(t)
+	cert, key := genClientCertKeyPEM(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	rawFetched := rawKubeconfig(ca, &clientcmdapi.AuthInfo{ClientCertificateData: cert, ClientKeyData: key})
+	srv.SetFile("/var/lib/k0s/pki/admin.conf", rawFetched)
 
 	scheme := sshFallbackTestScheme(t)
 	cluster := &clusterv1.Cluster{
@@ -369,13 +384,17 @@ func TestSSHFallbackWorker_Success_WritesSecretWithCorrectShape(t *testing.T) {
 	g.Expect(res.Err).NotTo(HaveOccurred(), "unexpected error: %v", res.Err)
 	g.Expect(res.Category).To(Equal(SSHFallbackOK))
 
+	wantSanitized, err := kubeconfig.Sanitize(rawFetched, "test-cluster", sshFallbackTestExpectedServer)
+	g.Expect(err).NotTo(HaveOccurred())
+
 	// Secret shape assertions.
 	written := &corev1.Secret{}
 	g.Expect(c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-cluster-kubeconfig"}, written)).To(Succeed())
 	g.Expect(written.Type).To(Equal(clusterv1.ClusterSecretType))
 	g.Expect(written.Labels[clusterv1.ClusterNameLabel]).To(Equal("test-cluster"))
 	g.Expect(written.Annotations[KubeconfigSourceAnnotation]).To(Equal(KubeconfigSourceSSHFallback))
-	g.Expect(written.Data["value"]).To(Equal([]byte(kubeconfigBytes)))
+	g.Expect(written.Data["value"]).To(Equal(wantSanitized), "the written value must be the sanitized S5 output, not the raw fetched bytes")
+	g.Expect(written.Data["value"]).NotTo(Equal(rawFetched), "the raw loopback-server bytes must not be written verbatim")
 	// Owner ref: Cluster, Controller=false (CAPI convention).
 	g.Expect(written.OwnerReferences).To(HaveLen(1))
 	g.Expect(written.OwnerReferences[0].Kind).To(Equal("Cluster"))
@@ -383,6 +402,31 @@ func TestSSHFallbackWorker_Success_WritesSecretWithCorrectShape(t *testing.T) {
 	if written.OwnerReferences[0].Controller != nil {
 		g.Expect(*written.OwnerReferences[0].Controller).To(BeFalse())
 	}
+}
+
+// TestSSHFallbackWorker_RejectsUnsafeFetchedKubeconfig proves a malicious or
+// broken on-node kubeconfig (a file-path credential) fails sanitization and
+// is NOT written, rather than being trusted via the SSH path.
+func TestSSHFallbackWorker_RejectsUnsafeFetchedKubeconfig(t *testing.T) {
+	g := NewWithT(t)
+	srv := newTestSSHServer(t)
+	t.Cleanup(srv.Close)
+	srv.SetFile("/var/lib/k0s/pki/admin.conf", newTokenFileKubeconfig(t))
+
+	scheme := sshFallbackTestScheme(t)
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", UID: "cluster-uid"},
+	}
+	idSecret, khSecret := buildSecrets(srv.ClientPEM(), []byte(srv.KnownHostsLine()), "default")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, idSecret, khSecret).Build()
+	w := NewSSHFallbackWorker(c, scheme, record.NewFakeRecorder(10))
+
+	res := w.execute(context.Background(), testLogger(t), jobForFixture(srv, cluster))
+	g.Expect(res.Err).To(HaveOccurred(), "an unsafe fetched kubeconfig must not be written")
+
+	written := &corev1.Secret{}
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-cluster-kubeconfig"}, written)
+	g.Expect(err).To(HaveOccurred(), "no Secret should be written for an unsafe fetched kubeconfig")
 }
 
 func TestSSHFallbackWorker_HostKeyMismatch_Failed(t *testing.T) {

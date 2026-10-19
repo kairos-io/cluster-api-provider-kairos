@@ -175,6 +175,10 @@ type KubeadmTemplateData struct {
 	// KubernetesVersion is the exact Kubernetes version the node must run
 	// (Machine.spec.version). The join unit refuses on a `kubeadm version` mismatch.
 	KubernetesVersion string
+	// PatchesDirectory is the absolute kubeadm patches directory that
+	// JoinConfiguration names. The join unit creates it, because kubeadm fails on
+	// a missing one, and ProviderIDPatch is written into it.
+	PatchesDirectory string
 }
 
 // HasKubeadm reports whether this render carries kubeadm worker-join inputs.
@@ -206,26 +210,32 @@ type ManagementEndpoint struct {
 	KubeconfigSecretNamespace string
 	ClusterName               string
 	ControlPlaneEndpointHost  string
-	// JoinTokenSecretName, when non-empty AND the render is a k0s HA init node
-	// (IsInitControlPlane), enables the controller-join-token push block: the
-	// init node runs `k0s token create --role=controller` and PUSHes the token
-	// into this Secret over the same node-push channel as the kubeconfig (ADR
-	// 0005 Phase 3). The Secret lives in KubeconfigSecretNamespace (the cluster
-	// namespace) and is pre-created empty + owner-ref'd by the KCP controller.
-	// The token is base64-enveloped into data.token; it is NEVER interpolated
-	// through text/template. Only meaningful for k0s init; k3s uses a
-	// controller-generated token and never runs this block.
-	JoinTokenSecretName string
 	// EtcdStatusSecretName, when non-empty, enables the etcd-health reporter
 	// block (ADR 0005 §E.1): every HA control-plane node (init AND join) reports
 	// its own etcd member health into this per-cluster Secret over the same
-	// node-push channel as the kubeconfig/join-token. The Secret lives in
+	// node-push channel as the kubeconfig. The Secret lives in
 	// KubeconfigSecretNamespace, is pre-created empty + Cluster-owned by the KCP
 	// controller, and each node PATCHes only its own member key. etcd membership
 	// is non-sensitive cluster metadata (no secret material) but is still never
 	// interpolated through text/template — the reporter builds the JSON on-node.
 	// Set for init+join (both distros); empty for single-node and workers.
 	EtcdStatusSecretName string
+	// CABundle is the PEM-encoded certificate-authority bundle the node uses to
+	// verify the management API server's TLS certificate on the node-push channel
+	// (ADR 0011 PR-4). It is the management cluster's own API server CA, taken
+	// from the controller's in-cluster trust root (rest.Config CAData/CAFile) or
+	// an operator override (KAIROS_MANAGEMENT_API_CA_FILE); it is NEVER the tenant
+	// workload cluster's kube-root-ca.crt.
+	//
+	// The CA is a public certificate, not secret material, but it is still
+	// render-safety-sensitive: it is written to a fixed 0644 write_files path
+	// (/etc/kairos-capi/management-ca.crt) and the push curls point --cacert at
+	// that path. It is NEVER inlined into a curl argv. The bytes are validated
+	// and canonically re-encoded (CERTIFICATE blocks only, no PRIVATE KEY) by
+	// SanitizeManagementCABundle before they reach here, and validateTemplateData
+	// re-checks them at render time. Empty means no CA file is rendered and the
+	// push fails closed (there is no -k/--insecure fallback anywhere).
+	CABundle string
 }
 
 // InstallConfig holds installation configuration for the template

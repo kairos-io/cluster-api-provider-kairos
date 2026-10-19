@@ -26,6 +26,8 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -323,6 +325,83 @@ func TestBootstrapIntegration_KubeadmWorker(t *testing.T) {
 	// The stored token id is the non-secret half (no ".secret").
 	g.Expect(got.Status.BootstrapTokenID).NotTo(ContainSubstring("."))
 
+	// --- providerID regeneration keeps the token the VM may already hold ---
+	// The infrastructure provider copies the first render into the VM's userdata,
+	// and a booted VM never re-reads the bootstrap data Secret. The regeneration
+	// that runs when the providerID becomes known must therefore carry the SAME
+	// token, not mint a new one; otherwise the node joins with a token nothing
+	// keeps alive (the 2026-10-16 CAPK A/B failure).
+	firstID := got.Status.BootstrapTokenID
+	firstToken := joinTokenIn(cloudConfig)
+	g.Expect(firstToken).To(HavePrefix(firstID+"."), "the rendered token must be the one recorded in status")
+
+	const providerID = "docker:////worker-ok"
+	g.Eventually(func() error {
+		m := &clusterv1.Machine{}
+		if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-ok", Namespace: nsName}, m); err != nil {
+			return err
+		}
+		m.Spec.ProviderID = providerID
+		return mgr.GetClient().Update(ctx, m)
+	}, 20*time.Second, 1*time.Second).Should(Succeed())
+
+	g.Eventually(func() bool {
+		s := &corev1.Secret{}
+		if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: *got.Status.DataSecretName, Namespace: nsName}, s); err != nil {
+			return false
+		}
+		return strings.Contains(string(s.Data["value"]), providerID)
+	}, 40*time.Second, 1*time.Second).Should(BeTrue(), "the bootstrap data should be regenerated to carry the providerID")
+
+	regenerated := &corev1.Secret{}
+	g.Expect(mgr.GetClient().Get(ctx, types.NamespacedName{Name: *got.Status.DataSecretName, Namespace: nsName}, regenerated)).To(Succeed())
+	g.Expect(joinTokenIn(string(regenerated.Data["value"]))).To(Equal(firstToken),
+		"the providerID regeneration must reuse the token the VM may already hold")
+	afterRegen := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-ok", Namespace: nsName}, afterRegen)).To(Succeed())
+	g.Expect(afterRegen.Status.BootstrapTokenID).To(Equal(firstID))
+	g.Expect(bootstrapTokenIDsIn(ctx, t, workload)).To(ConsistOf(firstID), "no second token may be minted for the same Machine")
+
+	// --- Extension: a slow boot keeps the token alive in place ---
+	// Wind the token's expiry down to a minute out, the state a slow install
+	// reaches, and wake the reconcile. The expiry must move; the token must not.
+	tokenKey := client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-" + firstID}
+	nearExpiry := time.Now().UTC().Add(1 * time.Minute).Truncate(time.Second)
+	g.Expect(workload.Get(ctx, tokenKey, tokenSecret)).To(Succeed())
+	tokenSecret.Data[bootstrapapi.BootstrapTokenExpirationKey] = []byte(nearExpiry.Format(time.RFC3339))
+	g.Expect(workload.Update(ctx, tokenSecret)).To(Succeed())
+	wakeKairosConfig(ctx, g, mgr.GetClient(), types.NamespacedName{Name: "worker-ok", Namespace: nsName})
+
+	g.Eventually(func() bool {
+		s := &corev1.Secret{}
+		if err := workload.Get(ctx, tokenKey, s); err != nil {
+			return false
+		}
+		exp, perr := time.Parse(time.RFC3339, string(s.Data[bootstrapapi.BootstrapTokenExpirationKey]))
+		return perr == nil && exp.After(nearExpiry.Add(5*time.Minute))
+	}, 40*time.Second, 1*time.Second).Should(BeTrue(), "a token close to expiry must have its expiry pushed out")
+	g.Expect(bootstrapTokenIDsIn(ctx, t, workload)).To(ConsistOf(firstID), "extending must not mint a replacement")
+
+	// --- Revoke once the node has registered ---
+	g.Eventually(func() error {
+		m := &clusterv1.Machine{}
+		if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-ok", Namespace: nsName}, m); err != nil {
+			return err
+		}
+		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: "worker-ok"}
+		return mgr.GetClient().Status().Update(ctx, m)
+	}, 20*time.Second, 1*time.Second).Should(Succeed())
+	g.Eventually(func() []string {
+		return bootstrapTokenIDsIn(ctx, t, workload)
+	}, 40*time.Second, 1*time.Second).Should(BeEmpty(), "the token must be revoked once the Machine has a nodeRef")
+	g.Eventually(func() string {
+		kc := &bootstrapv1beta2.KairosConfig{}
+		if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: "worker-ok", Namespace: nsName}, kc); err != nil {
+			return "err"
+		}
+		return kc.Status.BootstrapTokenID
+	}, 20*time.Second, 1*time.Second).Should(BeEmpty(), "a revoked token's ID is cleared from status")
+
 	// --- Refuse case: kubeconfig owner UID does not match the control plane ---
 	setupCluster("wl-bad", false)
 	makeWorker("wl-bad", "worker-bad")
@@ -344,4 +423,52 @@ func TestBootstrapIntegration_KubeadmWorker(t *testing.T) {
 
 	cancel()
 	<-mgrErrCh
+}
+
+// joinTokenPattern matches the bootstrap token in a rendered kubeadm
+// JoinConfiguration (discovery.bootstrapToken.token).
+var joinTokenPattern = regexp.MustCompile(`token: ([a-z0-9]{6}\.[a-z0-9]{16})`)
+
+// joinTokenIn returns the bootstrap token embedded in rendered bootstrap data,
+// or "" when there is none.
+func joinTokenIn(cloudConfig string) string {
+	m := joinTokenPattern.FindStringSubmatch(cloudConfig)
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// bootstrapTokenIDsIn lists the IDs of every bootstrap token Secret in the
+// workload cluster's kube-system namespace.
+func bootstrapTokenIDsIn(ctx context.Context, t *testing.T, workload client.Client) []string {
+	t.Helper()
+	list := &corev1.SecretList{}
+	if err := workload.List(ctx, list, client.InNamespace(metav1.NamespaceSystem)); err != nil {
+		t.Fatalf("list workload token secrets: %v", err)
+	}
+	ids := []string{}
+	for _, s := range list.Items {
+		if s.Type == bootstrapapi.SecretTypeBootstrapToken {
+			ids = append(ids, string(s.Data[bootstrapapi.BootstrapTokenIDKey]))
+		}
+	}
+	return ids
+}
+
+// wakeKairosConfig touches an annotation so the controller reconciles now. It
+// retries on conflict, because the controller patches the object on its own
+// schedule.
+func wakeKairosConfig(ctx context.Context, g Gomega, c client.Client, key types.NamespacedName) {
+	g.Eventually(func() error {
+		kc := &bootstrapv1beta2.KairosConfig{}
+		if err := c.Get(ctx, key, kc); err != nil {
+			return err
+		}
+		if kc.Annotations == nil {
+			kc.Annotations = map[string]string{}
+		}
+		kc.Annotations["test.kairos.io/wake"] = time.Now().Format(time.RFC3339Nano)
+		return c.Update(ctx, kc)
+	}, 20*time.Second, 1*time.Second).Should(Succeed())
 }

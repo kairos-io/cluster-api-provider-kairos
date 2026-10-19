@@ -90,17 +90,19 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 		// add` on boot, so it needs the same quorum-safety gate as the plain
 		// scale-up path. Without it a rollout can add a member while a previous
 		// joiner is still booting and break quorum (ADR 0005 §E.1).
+		var joinTokenID string
 		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
-			joinable, reason, err := r.initMachineJoinable(ctx, kcp, cluster, machines)
+			admission, err := r.admitJoiner(ctx, log, kcp, cluster, machines)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
-			if !joinable {
-				log.Info("Holding back rollout surge machine until it is safe to add a member", "reason", reason)
+			if !admission.admitted {
+				log.Info("Holding back rollout surge machine until it is safe to add a member", "reason", admission.reason)
 				return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 			}
+			joinTokenID = admission.k0sJoinTokenID
 		}
-		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role); err != nil {
+		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
 		}
 		return ctrl.Result{}, nil

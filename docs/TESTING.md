@@ -1,12 +1,12 @@
 # Testing
 
-Last verified against: Go toolchain 1.26.3, provider v0.1.3.
+Last verified against: provider v0.1.3. The Go toolchain used was not recorded; `go.mod` requires 1.26.4 or later.
 
 See [Install guide](INSTALL.md) for development install.
 
 ## Prerequisites
 
-- Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0`; the toolchain line pins `go1.26.0` for reproducibility). The `go.mod` line is `go 1.26.0`; both refer to the same release series.
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
 
 ## Unit tests
 
@@ -33,6 +33,14 @@ binaries; it is a required check, not an optional one. (This note previously
 said the CI job was gated off with `if: false`. That was true when KD-19 was
 open; the job has since been enabled and there is no such gate in
 `.github/workflows/ci.yaml`.)
+
+## Kubeadm join command
+
+```bash
+make test-kubeadm
+```
+
+`make test-kubeadm` downloads kubeadm (`KUBEADM_VERSION`, Linux only), checks it against the sha256 pinned in `hack/kubeadm.sha256`, and runs `TestKubeadmJoinCommand` with it. A version without a pinned sum is refused; add its line to that file to test another version. The test renders the kubeadm worker cloud-config, runs its join script, and hands the resulting `kubeadm join` call to the real binary with every join phase skipped and `--dry-run`, so kubeadm parses the flags and loads the rendered configuration without touching the host or the network. Without `KUBEADM_BIN` the same test still runs in `go test` and checks the flags against a copy of kubeadm's rules. kubeadm's `--dry-run` creates `/etc/kubernetes/tmp` on the host whatever the test root is, so as a non-root user first create a directory you own: `sudo install -d -o "$(id -un)" /etc/kubernetes` (the CI job does the same). CI runs it in the `kubeadm-join` job against v1.30 (JoinConfiguration v1beta3) and v1.36 (v1beta4).
 
 ## Dependency vulnerability scanning
 
@@ -97,6 +105,6 @@ Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3,
 | Fleet | k0s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 | Fleet | k3s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 
-Kubeadm workers (`distribution: kubeadm`, see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. They are covered by unit and envtest tests only: the envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. No end-to-end run against a live Kamaji or `KubeadmControlPlane` cluster has been done.
+**Not in v0.1.4; planned for v0.2.0.** On `main`, kubeadm workers (`distribution: kubeadm`, see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. They are covered by unit and envtest tests only: the envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. No end-to-end run against a live Kamaji or `KubeadmControlPlane` cluster has been done.
 
 Hadron is the musl-libc-based next-generation Kairos OS; it is exercised alongside standard (glibc) Kairos images to confirm compatibility with both targets.

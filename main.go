@@ -340,10 +340,35 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 				"original", mgmtAPIServer, "override", override)
 			mgmtAPIServer = override
 		}
+
+		// ADR 0011 PR-4: the node-push channel is TLS-verified against the
+		// management API CA (curl --cacert) with NO insecure fallback. Resolve the
+		// CA once at startup, from the operator override
+		// (KAIROS_MANAGEMENT_API_CA_FILE) or the manager's own in-cluster trust
+		// root, and FAIL FAST if neither is available — better a loud startup
+		// error than silently rendering an unverifiable push. Only required when
+		// push is enabled (a non-empty management URL); the (nil,nil) disabled
+		// path (out-of-cluster `go run`, envtest without a REST config) needs no
+		// CA. We do not open a live TLS handshake here: the push URL is frequently
+		// the operator override (a LAN address reachable only from the workload
+		// VMs, not from this pod), so a startup dial would false-negative — the
+		// render-time CA validation plus the no-fallback curl are the guarantees.
+		var mgmtCABundle []byte
+		if mgmtAPIServer != "" {
+			ca, caErr := bootstrap.ResolveManagementCA(mgr.GetConfig())
+			if caErr != nil {
+				setupLog.Error(caErr, "management API CA unavailable; node-push TLS cannot be verified. "+
+					"Run in-cluster or set KAIROS_MANAGEMENT_API_CA_FILE to a CA PEM path or inline PEM")
+				return caErr
+			}
+			mgmtCABundle = ca
+		}
+
 		mgmtResolver := bootstrap.NewKubeVirtTokenResolver(
 			mgr.GetClient(),
 			mgr.GetScheme(),
 			mgmtAPIServer,
+			mgmtCABundle,
 		)
 
 		// kubeadm worker-join source (ADR 0010 P1). It needs dependencies only
@@ -361,8 +386,8 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		// cluster, Kairos or not, because spec.controlPlaneRef is all a filter can
 		// see (kairos-io/kairos#5466).
 		joinSources := map[string]bootstrap.JoinMaterialSource{}
-		// Uncached management reader for the <cluster>-ca cross-check (a planted or
-		// stale cached value must not be trusted).
+		// Uncached management reader for the <cluster>-ca cross-check (a stale or
+		// unexpected cached value must not be trusted).
 		uncachedReader, err := client.New(mgr.GetConfig(), client.Options{
 			Scheme: mgr.GetScheme(),
 			Mapper: mgr.GetRESTMapper(),
@@ -385,6 +410,16 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 			JoinSources:          joinSources,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "KairosConfig")
+			return err
+		}
+
+		// Startup Role migrator (ADR 0011, PR-3): narrow any pre-existing
+		// node-push Role to the reduced patch-only rule set the instant this manager
+		// takes leadership, so a booted node's stale token loses secrets:create and
+		// the contract-Secret write without waiting for a re-render. Leader-elected,
+		// run-once, uncached cluster-wide read; only ever removes permissions.
+		if err := mgr.Add(bootstrap.NewNodePushRoleMigrator(mgr.GetAPIReader(), mgr.GetClient())); err != nil {
+			setupLog.Error(err, "unable to add node-push Role migrator")
 			return err
 		}
 	}

@@ -30,7 +30,6 @@ import (
 	"sync"
 
 	"fmt"
-	"github.com/go-logr/logr"
 	"math/big"
 	"testing"
 	"time"
@@ -103,6 +102,22 @@ func makeKubeconfig(t *testing.T, server string, caPEM []byte) []byte {
 	return data
 }
 
+// kubeconfigWithUser builds a kubeconfig like makeKubeconfig, with the given
+// user entry.
+func kubeconfigWithUser(t *testing.T, server string, caPEM []byte, user *clientcmdapi.AuthInfo) []byte {
+	t.Helper()
+	cfg := clientcmdapi.NewConfig()
+	cfg.Clusters["wl"] = &clientcmdapi.Cluster{Server: server, CertificateAuthorityData: caPEM}
+	cfg.Contexts["wl"] = &clientcmdapi.Context{Cluster: "wl", AuthInfo: "admin"}
+	cfg.AuthInfos["admin"] = user
+	cfg.CurrentContext = "wl"
+	data, err := runtime.Encode(clientcmdlatest.Codec, cfg)
+	if err != nil {
+		t.Fatalf("encode kubeconfig: %v", err)
+	}
+	return data
+}
+
 func kubeadmTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -136,6 +151,9 @@ type kubeadmFixture struct {
 	endpointHost string // overrides testEndpointHost when set
 	endpointPort int32  // overrides testEndpointPort when non-zero
 	noController bool   // the kubeconfig ownerRef exists but is not a controller ref
+	// kubeconfigData, when set, is stored as the kubeconfig Secret's value
+	// instead of makeKubeconfig(server, kubeconfigCA).
+	kubeconfigData []byte
 }
 
 // defaultFixture is a passing KubeadmControlPlane fixture.
@@ -204,6 +222,9 @@ func buildSource(t *testing.T, fx kubeadmFixture, extraKinds map[schema.GroupKin
 				}},
 			},
 			Data: map[string][]byte{workloadKubeconfigSecretKey: makeKubeconfig(t, fx.server, fx.kubeconfigCA)},
+		}
+		if fx.kubeconfigData != nil {
+			kc.Data[workloadKubeconfigSecretKey] = fx.kubeconfigData
 		}
 		objs = append(objs, kc)
 	}
@@ -294,12 +315,12 @@ func TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig(t *testing.T) {
 	g.Expect(gvk.Kind).To(Equal("Secret"))
 }
 
-// TestKubeadmTokenNeedsRefresh_ReverifiesTrust pins that the refresh path runs the
+// TestKubeadmExtendWorkerToken_ReverifiesTrust pins that the extend path runs the
 // trust check before it reconnects. It used to lean on the clustercache
 // ClusterFilter, which is gone; a refresh that reconnected on bytes nothing
 // re-verified would be the one path that dials an unchecked address after the
 // kubeconfig Secret has been replaced.
-func TestKubeadmTokenNeedsRefresh_ReverifiesTrust(t *testing.T) {
+func TestKubeadmExtendWorkerToken_ReverifiesTrust(t *testing.T) {
 	g := NewWithT(t)
 	ca := genTestCA(t, "cluster-ca")
 	fx := defaultFixture(ca)
@@ -314,15 +335,15 @@ func TestKubeadmTokenNeedsRefresh_ReverifiesTrust(t *testing.T) {
 		return nil, errors.New("should not be reached")
 	}
 
-	_, err := s.TokenNeedsRefresh(context.Background(), req, "abcdef")
+	_, err := s.ExtendWorkerToken(context.Background(), req, "abcdef")
 	g.Expect(err).To(HaveOccurred())
-	g.Expect(connected).To(BeFalse(), "refresh connected to the workload cluster without re-verifying trust")
+	g.Expect(connected).To(BeFalse(), "extend connected to the workload cluster without re-verifying trust")
 }
 
-// TestKubeadmTokenNeedsRefresh_ConnectsOnVerifiedTrust is the other half: when trust
-// still holds, the refresh path does reach the workload cluster, and it is handed
+// TestKubeadmExtendWorkerToken_ConnectsOnVerifiedTrust is the other half: when trust
+// still holds, the extend path does reach the workload cluster, and it is handed
 // the kubeconfig the check verified rather than a cluster name to resolve itself.
-func TestKubeadmTokenNeedsRefresh_ConnectsOnVerifiedTrust(t *testing.T) {
+func TestKubeadmExtendWorkerToken_ConnectsOnVerifiedTrust(t *testing.T) {
 	g := NewWithT(t)
 	ca := genTestCA(t, "cluster-ca")
 	s, req, workload := buildSource(t, defaultFixture(ca), nil)
@@ -333,10 +354,11 @@ func TestKubeadmTokenNeedsRefresh_ConnectsOnVerifiedTrust(t *testing.T) {
 		return workload, nil
 	}
 
-	// No token Secret in the workload cluster: absent means re-mint.
-	refresh, err := s.TokenNeedsRefresh(context.Background(), req, "abcdef")
+	// No token Secret in the workload cluster: ExtendWorkerToken reports it is
+	// gone, and the caller re-renders so WorkerJoin mints a replacement.
+	found, err := s.ExtendWorkerToken(context.Background(), req, "abcdef")
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(refresh).To(BeTrue())
+	g.Expect(found).To(BeFalse())
 	g.Expect(got).To(Equal(makeKubeconfig(t, fmt.Sprintf("https://%s:%d", testEndpointHost, testEndpointPort), ca)))
 }
 
@@ -494,6 +516,19 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 		{"CA cross-check mismatch", func(fx *kubeadmFixture) { fx.clusterCA = otherCA }, nil, "does not match"},
 		{"lookalike kind in another group", func(fx *kubeadmFixture) { fx.cpGroup = "evil.example.com" }, nil, "not on the kubeadm trust allowlist"},
 		{"k0s KairosControlPlane", func(fx *kubeadmFixture) { fx.cpKind = "KairosControlPlane"; fx.cpDist = "k0s" }, nil, "not kubeadm"},
+		// The kubeconfig passes both anchors but names a credential file: the
+		// workload client is built from the sanitized form only, so refuse before
+		// a token exists.
+		{"kubeconfig with a token file", func(fx *kubeadmFixture) {
+			fx.kubeconfigData = kubeconfigWithUser(t, fx.server, fx.kubeconfigCA, &clientcmdapi.AuthInfo{
+				TokenFile: "/etc/example/token",
+			})
+		}, nil, "refusing to mint a token"},
+		{"kubeconfig with an exec plugin", func(fx *kubeadmFixture) {
+			fx.kubeconfigData = kubeconfigWithUser(t, fx.server, fx.kubeconfigCA, &clientcmdapi.AuthInfo{
+				Exec: &clientcmdapi.ExecConfig{Command: "/bin/sh", APIVersion: "client.authentication.k8s.io/v1"},
+			})
+		}, nil, "refusing to mint a token"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -501,12 +536,15 @@ func TestKubeadmWorkerJoin_TerminalRefusals(t *testing.T) {
 			g := NewWithT(t)
 			fx := defaultFixture(ca)
 			tc.mutate(&fx)
-			src, req, _ := buildSource(t, fx, tc.extra)
+			src, req, workload := buildSource(t, fx, tc.extra)
 			_, err := src.WorkerJoin(context.Background(), req)
 			g.Expect(err).To(HaveOccurred())
 			g.Expect(err.Error()).To(ContainSubstring(tc.wantSub))
 			var nr *bootstrapNotReadyError
 			g.Expect(errors.As(err, &nr)).To(BeFalse(), "refusal must be terminal, not not-ready")
+			minted := &corev1.SecretList{}
+			g.Expect(workload.List(context.Background(), minted)).To(Succeed())
+			g.Expect(minted.Items).To(BeEmpty(), "a refused trust check must not mint a token")
 		})
 	}
 }
@@ -618,137 +656,6 @@ func TestKubeadmWorkerJoin_MissingVersionTerminal(t *testing.T) {
 	g.Expect(err.Error()).To(ContainSubstring("Machine.spec.version"))
 	var nr *bootstrapNotReadyError
 	g.Expect(errors.As(err, &nr)).To(BeFalse())
-}
-
-// fakeRefresher is a JoinMaterialSource + workerTokenRefresher test double.
-type fakeRefresher struct {
-	need   bool
-	err    error
-	called int
-}
-
-func (f *fakeRefresher) WorkerJoin(context.Context, JoinRequest) (WorkerJoinMaterial, error) {
-	return WorkerJoinMaterial{Kubeadm: &KubeadmJoinMaterial{JoinConfiguration: "x", TokenID: "abcdef"}}, nil
-}
-func (f *fakeRefresher) TokenNeedsRefresh(context.Context, JoinRequest, string) (bool, error) {
-	f.called++
-	return f.need, f.err
-}
-
-// TestDecideKubeadmTokenRefresh pins the reconciler's refresh gate: regenerate when
-// the source says so, cap when the Machine is too old, and none when the node has
-// joined or the distribution is not kubeadm (ADR 0010 P1 item 7).
-func TestDecideKubeadmTokenRefresh(t *testing.T) {
-	scheme := charScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	kubeadmWorker := func() *bootstrapv1beta2.KairosConfig {
-		return &bootstrapv1beta2.KairosConfig{
-			ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "default"},
-			Spec:       bootstrapv1beta2.KairosConfigSpec{Distribution: bootstrapv1beta2.DistributionKubeadm, Role: "worker"},
-		}
-	}
-	youngMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{
-		Name: "w", Namespace: "default", CreationTimestamp: metav1.NewTime(now.Add(-1 * time.Hour))}}
-	oldMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{
-		Name: "w", Namespace: "default", CreationTimestamp: metav1.NewTime(now.Add(-48 * time.Hour))}}
-	joinedMachine := &clusterv1.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "default", CreationTimestamp: metav1.NewTime(now.Add(-1 * time.Hour))},
-		Status:     clusterv1.MachineStatus{NodeRef: clusterv1.MachineNodeReference{Name: "node-w"}},
-	}
-
-	t.Run("source says refresh -> regenerate", func(t *testing.T) {
-		g := NewWithT(t)
-		ref := &fakeRefresher{need: true}
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
-			JoinSources: map[string]JoinMaterialSource{bootstrapv1beta2.DistributionKubeadm: ref}}
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kubeadmWorker(), youngMachine, nil)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(d).To(Equal(kubeadmRefreshRegenerate))
-		g.Expect(ref.called).To(Equal(1))
-	})
-	t.Run("machine past cap -> capped, source not consulted", func(t *testing.T) {
-		g := NewWithT(t)
-		ref := &fakeRefresher{need: true}
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
-			JoinSources: map[string]JoinMaterialSource{bootstrapv1beta2.DistributionKubeadm: ref}}
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kubeadmWorker(), oldMachine, nil)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(d).To(Equal(kubeadmRefreshCapped))
-		g.Expect(ref.called).To(Equal(0), "cap must short-circuit before minting")
-	})
-	t.Run("node joined -> none", func(t *testing.T) {
-		g := NewWithT(t)
-		ref := &fakeRefresher{need: true}
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now },
-			JoinSources: map[string]JoinMaterialSource{bootstrapv1beta2.DistributionKubeadm: ref}}
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kubeadmWorker(), joinedMachine, nil)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(d).To(Equal(kubeadmRefreshNone))
-		g.Expect(ref.called).To(Equal(0))
-	})
-	t.Run("k0s worker -> none", func(t *testing.T) {
-		g := NewWithT(t)
-		r := &KairosConfigReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now }}
-		kc := kubeadmWorker()
-		kc.Spec.Distribution = bootstrapv1beta2.DistributionK0s
-		d, err := r.decideKubeadmTokenRefresh(context.Background(), logr.Discard(), kc, youngMachine, nil)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(d).To(Equal(kubeadmRefreshNone))
-	})
-}
-
-// TestKubeadmTokenNeedsRefresh pins the refresh decision against the workload token
-// Secret: missing -> refresh; past half-TTL -> refresh; fresh -> no refresh.
-func TestKubeadmTokenNeedsRefresh(t *testing.T) {
-	ca := genTestCA(t, "cluster-ca")
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	seedToken := func(workload client.Client, id string, exp time.Time) {
-		_ = workload.Create(context.Background(), &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-" + id},
-			Type:       bootstrapapi.SecretTypeBootstrapToken,
-			Data:       map[string][]byte{bootstrapapi.BootstrapTokenExpirationKey: []byte(exp.Format(time.RFC3339))},
-		})
-	}
-
-	t.Run("empty token id -> refresh", func(t *testing.T) {
-		g := NewWithT(t)
-		src, req, _ := buildSource(t, defaultFixture(ca), nil)
-		src.now = func() time.Time { return now }
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "")
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeTrue())
-	})
-	t.Run("token absent in workload -> refresh", func(t *testing.T) {
-		g := NewWithT(t)
-		src, req, _ := buildSource(t, defaultFixture(ca), nil)
-		src.now = func() time.Time { return now }
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeTrue())
-	})
-	t.Run("past half-TTL -> refresh", func(t *testing.T) {
-		g := NewWithT(t)
-		src, req, workload := buildSource(t, defaultFixture(ca), nil)
-		src.now = func() time.Time { return now }
-		// TTL 15m; half is 7m30s. Expire in 5m -> past half-TTL.
-		seedToken(workload, "abcdef", now.Add(5*time.Minute))
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeTrue())
-	})
-	t.Run("fresh -> no refresh", func(t *testing.T) {
-		g := NewWithT(t)
-		src, req, workload := buildSource(t, defaultFixture(ca), nil)
-		src.now = func() time.Time { return now }
-		// Expire in 14m -> well under half consumed.
-		seedToken(workload, "abcdef", now.Add(14*time.Minute))
-		need, err := src.TokenNeedsRefresh(context.Background(), req, "abcdef")
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(need).To(BeFalse())
-	})
 }
 
 // TestOnDemandWorkloadClient_TimesOut pins that a workload API server which

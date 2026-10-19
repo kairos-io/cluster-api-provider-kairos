@@ -58,12 +58,15 @@ fi
 
 echo ""
 echo "=== CLOUD-CONFIG SECTIONS (parsed) ==="
-echo "$CLOUD_CONFIG" | python3 << 'PYTHON'
-import sys
+# The heredoc is python3's stdin, so it would override a pipe and the config
+# would never reach the program. Hand it over in the environment instead, which
+# keeps the program itself readable as a heredoc.
+CLOUD_CONFIG="$CLOUD_CONFIG" python3 << 'PYTHON'
+import os
 import yaml
 
 try:
-    data = yaml.safe_load(sys.stdin.read())
+    data = yaml.safe_load(os.environ["CLOUD_CONFIG"])
     if data:
         for key, value in data.items():
             print(f"  {key}:")
