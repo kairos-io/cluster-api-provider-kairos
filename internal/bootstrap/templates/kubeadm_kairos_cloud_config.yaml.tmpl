@@ -75,9 +75,10 @@ write_files:
 {{ .Kubeadm.JoinConfiguration | indent 6 }}
   {{- if .Kubeadm.ProviderIDPatch }}
   # kubeadm patch: sets the kubelet providerID so the Node registers with the
-  # infrastructure provider's providerID (ADR 0010 P1 item 4). Applied via
-  # `kubeadm join --patches`, so no YAML tool is needed on the node.
-  - path: /etc/kubernetes/kairos-patches/kubeletconfiguration0+merge.yaml
+  # infrastructure provider's providerID (ADR 0010 P1 item 4). kubeadm reads it
+  # from the patches directory JoinConfiguration names, so no YAML tool is
+  # needed on the node.
+  - path: {{ printf "%s/kubeletconfiguration0+merge.yaml" .Kubeadm.PatchesDirectory | quote }}
     permissions: "0600"
     owner: root:root
     content: |
@@ -127,16 +128,17 @@ write_files:
       }
       trap cleanup_credentials ERR
 
+      # kubeadm fails on a missing patches directory, and write_files creates it
+      # only when it has a patch to put there. Created before the attempted
+      # marker, so a failing mkdir does not use up the node's one join attempt.
+      mkdir -p {{ .Kubeadm.PatchesDirectory | shquote }}
+
       mkdir -p "${MARKER_DIR}"
       # Record the attempt on persistent storage BEFORE kubeadm runs, so a crash
       # mid-join is refused (not retried) on the next boot.
       : > "${ATTEMPTED}"
 
-      JOIN_ARGS=(--config /etc/kubernetes/kairos-kubeadm-join.yaml)
-      {{- if .Kubeadm.ProviderIDPatch }}
-      JOIN_ARGS+=(--patches /etc/kubernetes/kairos-patches)
-      {{- end }}
-      kubeadm join "${JOIN_ARGS[@]}"
+      kubeadm join --config /etc/kubernetes/kairos-kubeadm-join.yaml
 
       # Verified success: mark complete on persistent storage.
       : > "${COMPLETED}"

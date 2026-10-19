@@ -337,6 +337,11 @@ write_files:
       ExecStartPre=/bin/sh -c '/usr/local/bin/kairos-k0s-etcd-peer-addr.sh || true'
   {{- end }}
   {{- if .IsJoinControlPlane }}
+  {{- /* ADR 0013: the KairosControlPlane mints this token and the bootstrap
+    controller renders it only when the KairosConfig's token-ID annotation matches
+    the join-token Secret. The init node no longer runs `k0s token create`. The
+    rendered comment below predates that and is kept as is so join renders stay
+    byte-identical; reword it with the next change that touches the join goldens. */}}
   # ADR 0005 (HA) join node on CAPK: k0s controller-role join token. Sourced
   # from .JoinToken, produced on the init controller (k0s token create
   # --role=controller) and delivered over the node-push channel by the Phase-3
@@ -562,13 +567,15 @@ write_files:
       # complement-translate, or it becomes a spurious trailing '-' that no
       # longer matches NodeRef.Name.
       member_key=$(hostname | tr -d '\n' | tr -c 'a-zA-Z0-9._-' '-')
-      # Target the control-plane LB endpoint, NOT this node's local apiserver:
-      # `k0s etcd leave` (below) drops THIS node's local apiserver (it loses its
-      # etcd backend), so a localhost read/ack would fail post-leave and never
-      # retry. CAPK has no VIP — the stable endpoint is the control-plane
-      # LoadBalancer Service (the same endpoint CP nodes use to join), which
-      # fronts the surviving apiservers after a node leaves. ControlPlaneLBEndpoint
-      # is shquoted (KD-2 follow-up); it is a --server flag value, never eval'd.
+      # Read and ack through the control-plane LB endpoint, not this node's own
+      # apiserver: `k0s etcd leave` (below) removes THIS node from etcd, after which
+      # its local apiserver has no backend and cannot take the ack. CAPK has no VIP;
+      # the endpoint is the control-plane LoadBalancer Service (the same one CP
+      # nodes join through). It picks a backend per connection and can still pick
+      # this node for a while, so every call is bounded, the ack is retried inside
+      # the run, and a completed leave is never re-run (below).
+      # ControlPlaneLBEndpoint is shquoted (KD-2 follow-up); it is a --server flag
+      # value, never eval'd.
       {{- if .ControlPlaneLBEndpoint }}
       lb_addr={{ .ControlPlaneLBEndpoint | shquote }}
       srv=(--server="https://${lb_addr}:6443")
@@ -576,24 +583,60 @@ write_files:
       srv=()
       {{- end }}
       # Read our own leave signal from the workload ConfigMap via the LB endpoint.
-      # Absent ConfigMap/key => empty => no-op exit.
-      val=$(k0s kubectl "${srv[@]}" -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
+      # Absent ConfigMap/key => empty (or an unreachable endpoint) => no-op exit.
+      val=$(k0s kubectl "${srv[@]}" --request-timeout=10s -n kube-system get configmap kairos-etcd-leave -o "jsonpath={.data.${member_key}}" 2>/dev/null || true)
       # Fixed sentinel, string-equality only — never eval'd, never a command arg.
       [ "${val}" = "leave-requested" ] || exit 0
-      echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
-      # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
-      # configured peer address — no ConfigMap/operator-derived value reaches the
-      # command (security constraint: peer-address is never externally supplied).
-      if k0s etcd leave 2>/dev/null; then
-        echo "etcd-leave: left etcd cluster"
+      # Set once `k0s etcd leave` has run to completion. The timer fires every 30s
+      # and the sentinel stays until the controller sees the ack, so without the
+      # marker a run that could not ack would start `k0s etcd leave` again against
+      # an etcd that is already gone, where it blocks. /run is cleared on reboot.
+      leave_marker=/run/kairos-etcd-left
+      if [ -e "${leave_marker}" ]; then
+        echo "etcd-leave: leave already completed for ${member_key}; acking"
       else
-        echo "etcd-leave: k0s etcd leave returned non-zero (already left?); acking anyway"
+        echo "etcd-leave: leave requested for ${member_key}; leaving etcd cluster"
+        # `k0s etcd leave` (no --peer-address) leaves THIS node using its own
+        # configured peer address — no ConfigMap/operator-derived value reaches the
+        # command. It has no deadline of its own, so bound it with timeout(1); an
+        # image without timeout(1) keeps the unbounded call. Its stderr goes to the
+        # journal.
+        rc=0
+        if command -v timeout >/dev/null 2>&1; then
+          timeout 120 k0s etcd leave || rc=$?
+        else
+          k0s etcd leave || rc=$?
+        fi
+        # Anything but a clean exit (a timeout, etcd refusing the removal, a peer
+        # address that cannot be found, a config that fails to load, a missing
+        # binary) leaves the membership unknown, so report nothing: no `left` and no
+        # marker. The next run tries again, and if it keeps failing the controller's
+        # own timeout handles the member.
+        if [ "${rc}" -ne 0 ]; then
+          echo "etcd-leave: k0s etcd leave failed (rc=${rc}); not acking, will retry on the next run" >&2
+          exit 1
+        fi
+        echo "etcd-leave: left etcd cluster"
+        touch "${leave_marker}"
       fi
-      # Ack by patching our own key to `left` via the LB endpoint (the local
-      # apiserver is gone now). Only member_key (locally sanitized) is
-      # interpolated; the read-back value is never reused.
-      k0s kubectl "${srv[@]}" -n kube-system patch configmap kairos-etcd-leave --type merge \
-        -p "{\"data\":{\"${member_key}\":\"left\"}}" 2>/dev/null || true
+      # Ack by patching our own key to `left` via the LB endpoint. Only member_key
+      # (locally sanitized) is interpolated; the read-back value is never reused.
+      # The endpoint can still be fronted by this node for a few seconds, so retry
+      # up to 24 x 5s. TimeoutStartSec on the service bounds the whole run; the
+      # marker above makes the next run resume at this step.
+      for attempt in {1..24}; do
+        if k0s kubectl "${srv[@]}" --request-timeout=10s -n kube-system patch configmap kairos-etcd-leave --type merge \
+          -p "{\"data\":{\"${member_key}\":\"left\"}}" >/dev/null 2>&1; then
+          echo "etcd-leave: acked left for ${member_key}"
+          exit 0
+        fi
+        if [ "${attempt}" -lt 24 ]; then
+          echo "etcd-leave: ack attempt ${attempt}/24 failed; retrying in 5s"
+          sleep 5
+        fi
+      done
+      echo "etcd-leave: could not ack left for ${member_key}; the next run resumes at the ack" >&2
+      exit 1
   - path: /etc/systemd/system/kairos-etcd-leave.service
     permissions: "0644"
     owner: root
@@ -608,6 +651,9 @@ write_files:
 
       [Service]
       Type=oneshot
+      # A oneshot unit has no start timeout by default. The script bounds each call
+      # and retries the ack for about two minutes, so five minutes is a hard stop.
+      TimeoutStartSec=300
       ExecStart=/usr/local/bin/kairos-etcd-leave.sh
   - path: /etc/systemd/system/kairos-etcd-leave.timer
     permissions: "0644"
@@ -700,8 +746,19 @@ write_files:
       {{- end }}
       systemctl restart "${UNIT}" || true
   {{- end }}
+  {{- if and .ManagementEndpoint .ManagementEndpoint.CABundle }}
+  # ADR 0011 PR-4: the management API CA the node-push curls verify the channel
+  # against (curl --cacert). Public certificate material (not secret), written
+  # 0644; validated + canonically re-encoded controller-side. Never the tenant
+  # workload cluster's CA.
+  - path: /etc/kairos-capi/management-ca.crt
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |{{ .ManagementEndpoint.CABundle | nindent 6 }}
+  {{- end }}
   - path: /usr/local/bin/kairos-k0s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |
@@ -752,6 +809,59 @@ write_files:
       fi
       {{- end }}
 
+      {{- if .ManagementEndpoint }}
+      # ADR 0011 PR-4: management-API request hardening, shared by the SAN-detection
+      # GET and every push below. TLS is verified against the management API CA at
+      # KAIROS_MGMT_CA (curl --cacert; there is no insecure fallback anywhere).
+      # The bearer token is kept out of curl's argv by writing it to a 0600 curl
+      # config file read via --config; request and response bodies are kept off argv
+      # and out of world-readable /tmp by staging them in mktemp 0600 files inside a
+      # 0700 tmpfs dir (a PATCH response echoes the Secret, so it is discarded; the
+      # GET response is staged to a 0600 file, read once, then removed).
+      KAIROS_MGMT_CA="/etc/kairos-capi/management-ca.crt"
+      KAIROS_MGMT_RUNDIR="/run/kairos-capi"
+      mkdir -p "${KAIROS_MGMT_RUNDIR}"
+      chmod 0700 "${KAIROS_MGMT_RUNDIR}"
+      # _mgmt_auth_conf writes a fresh 0600 curl --config file (mktemp) holding the
+      # bearer token as a `header` line, echoes its path, and each caller removes it
+      # immediately after the request — so the token file never lingers on tmpfs.
+      # mktemp creates the file 0600 in the 0700 run dir.
+      # SECURITY: the printf'd value is safe ONLY because .Token is a
+      # controller-minted TokenRequest JWT (charset [A-Za-z0-9_.-]; no double quote,
+      # backslash, or newline). shquote guards the shell layer but does NOT escape
+      # curl config-file double-quote syntax, so .Token must NEVER be populated from
+      # user-controlled data.
+      _mgmt_auth_conf() {
+        local _f
+        _f="$(mktemp "${KAIROS_MGMT_RUNDIR}/auth.XXXXXX")"
+        printf 'header = "Authorization: Bearer %s"\n' {{ .ManagementEndpoint.Token | shquote }} > "${_f}"
+        printf '%s' "${_f}"
+      }
+      mgmt_patch() {
+        local _url="$1" _body="$2" _bodyf _authf
+        _bodyf="$(mktemp "${KAIROS_MGMT_RUNDIR}/body.XXXXXX")"
+        _authf="$(_mgmt_auth_conf)"
+        printf '%s' "${_body}" > "${_bodyf}"
+        curl --cacert "${KAIROS_MGMT_CA}" --proto '=https' \
+          --config "${_authf}" \
+          -sS -o /dev/null -w "%{http_code}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH --data-binary @"${_bodyf}" \
+          "${_url}" || true
+        rm -f "${_bodyf}" "${_authf}"
+      }
+      mgmt_get() {
+        local _url="$1" _respf _authf
+        _respf="$(mktemp "${KAIROS_MGMT_RUNDIR}/get.XXXXXX")"
+        _authf="$(_mgmt_auth_conf)"
+        curl --cacert "${KAIROS_MGMT_CA}" --proto '=https' \
+          --config "${_authf}" \
+          -sS -o "${_respf}" "${_url}" 2>/dev/null || true
+        cat "${_respf}" 2>/dev/null || true
+        rm -f "${_respf}" "${_authf}"
+      }
+      {{- end }}
+
       {{- if and .IsKubeVirt (eq .Role "control-plane") }}
       # KubeVirt: ensure the API server cert includes the node IP (pod or bridged)
       # This prevents TLS SAN mismatch when CAPI connects to the workload cluster.
@@ -766,10 +876,14 @@ write_files:
       {{- end }}
       {{- if .ManagementEndpoint }}
       KAIROS_MGMT_API={{ .ManagementEndpoint.APIServer | shquote }}
-      KAIROS_MGMT_TOKEN={{ .ManagementEndpoint.Token | shquote }}
       {{- end }}
       fetch_vmi_ip_from_management() {
-        if [ -z "${KAIROS_MGMT_API}" ] || [ -z "${KAIROS_MGMT_TOKEN}" ] || [ -z "${KAIROS_VMI_NAME}" ] || [ -z "${KAIROS_VMI_NAMESPACE}" ]; then
+        # KAIROS_MGMT_API is set only when a management endpoint is configured, and
+        # the mgmt_get helper (with the token in the 0600 curl config file) is
+        # defined in the same block, so KAIROS_MGMT_API being non-empty implies the
+        # verified-TLS GET is available — the bearer token is no longer a separate
+        # shell var to gate on (PR-4).
+        if [ -z "${KAIROS_MGMT_API}" ] || [ -z "${KAIROS_VMI_NAME}" ] || [ -z "${KAIROS_VMI_NAMESPACE}" ]; then
           return 1
         fi
         if ! command -v curl >/dev/null 2>&1; then
@@ -777,7 +891,9 @@ write_files:
         fi
         local url="${KAIROS_MGMT_API}/apis/kubevirt.io/v1/namespaces/${KAIROS_VMI_NAMESPACE}/virtualmachineinstances/${KAIROS_VMI_NAME}"
         local json
-        json=$(curl -k -sS -H "Authorization: Bearer ${KAIROS_MGMT_TOKEN}" "${url}" 2>/dev/null || true)
+        # PR-4 (ADR 0011): TLS-verified GET via mgmt_get (curl --cacert; token off
+        # argv; response staged to a 0600 file, not world-readable /tmp).
+        json=$(mgmt_get "${url}")
         if [ -z "${json}" ]; then
           return 1
         fi
@@ -988,29 +1104,18 @@ MANIFEST_EOF
         local api={{ .ManagementEndpoint.APIServer | shquote }}
         local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
         local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
-        local token={{ .ManagementEndpoint.Token | shquote }}
-        local cluster_name={{ .ManagementEndpoint.ClusterName | shquote }}
-        local payload
-        # cluster.x-k8s.io/cluster-name label and node-push provenance
-        # annotation are required by the KCP controller's Secret-watch
-        # predicate (KD-15) and KD-3b observability respectively.
-        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        # PR-3 (ADR 0011): PATCH the `value` key of the controller-owned staging
+        # Secret <cluster>-kubeconfig-push. The node no longer creates or writes the
+        # contract Secret <cluster>-kubeconfig, and sends no metadata/labels/type —
+        # the KCP-created staging Secret already carries the cluster-name label and
+        # node-push provenance, and the control plane rebuilds the contract Secret.
+        local patch
+        patch="{\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        # PR-4 (ADR 0011): TLS-verified PATCH via mgmt_patch (curl --cacert; token
+        # and body off argv; no insecure fallback, no response body in /tmp).
         local status
-        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-          -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/json" \
-          -X PUT \
-          --data "${payload}" \
-          "${url}" || true)
-        if [ "${status}" = "404" ]; then
-          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            --data "${payload}" \
-            "${api}/api/v1/namespaces/${ns}/secrets" || true)
-        fi
+        status=$(mgmt_patch "${url}" "${patch}")
         if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
           echo "Pushed kubeconfig to management secret ${ns}/${name}"
           return 0
@@ -1029,84 +1134,6 @@ MANIFEST_EOF
       fi
       if ! push_kubeconfig; then
         echo "WARN: kubeconfig push failed; proceeding without blocking bootstrap"
-      fi
-      {{- end }}
-
-      {{- if and .IsInitControlPlane .ManagementEndpoint .ManagementEndpoint.JoinTokenSecretName }}
-      # ADR 0005 (HA) k0s init node: mint the controller-role join token and push
-      # it to the management cluster over the SAME node-push channel as the
-      # kubeconfig (NOT SSH — KD-3b / OQ-2). See the CAPV twin for the full
-      # rationale. SECURITY (TOKEN-INV): the token is captured into a shell var,
-      # base64-enveloped, scrubbed, and NEVER interpolated through text/template
-      # nor logged; management-endpoint values are shquote'd.
-      push_join_token() {
-        if ! command -v curl >/dev/null 2>&1; then
-          echo "WARN: curl not available; cannot push join token"
-          return 1
-        fi
-        if ! command -v base64 >/dev/null 2>&1; then
-          echo "WARN: base64 not available; cannot push join token"
-          return 1
-        fi
-        local jt=""
-        # Same race as the CAPV template: `k0s token create` needs the bootstrap
-        # token machinery serving, not just the apiserver, and this script runs
-        # within seconds of k0s starting. The token is the ONLY gate on HA
-        # formation and the unit is a oneshot, so a single failed attempt strands
-        # every joiner permanently — there is no "next boot" to retry on. Bounded
-        # on the same 300s budget as the node-registration waits.
-        for i in {1..60}; do
-          jt=$(k0s token create --role=controller --expiry=24h 2>/dev/null || true)
-          if [ -n "${jt}" ]; then
-            break
-          fi
-          echo "Attempt $i/60: k0s token create not ready yet, retrying in 5 seconds..."
-          sleep 5
-        done
-        if [ -z "${jt}" ]; then
-          echo "WARN: k0s token create still empty after 60 attempts (300s); joiners will block"
-          return 1
-        fi
-        local jt_b64
-        jt_b64=$(printf '%s' "${jt}" | base64 -w 0 2>/dev/null || printf '%s' "${jt}" | base64 | tr -d '\n')
-        unset jt
-        local api={{ .ManagementEndpoint.APIServer | shquote }}
-        local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
-        local jt_name={{ .ManagementEndpoint.JoinTokenSecretName | shquote }}
-        local token={{ .ManagementEndpoint.Token | shquote }}
-        local patch
-        patch="{\"data\":{\"token\":\"${jt_b64}\"}}"
-        local url="${api}/api/v1/namespaces/${ns}/secrets/${jt_name}"
-        # A transient failure here strands every joiner just as permanently, so
-        # retry. The 2xx test is a glob, not an arithmetic comparison, so an empty
-        # status from a failed curl cannot abort the loop.
-        local status="" pushed=""
-        for i in {1..30}; do
-          status=$(curl -k -sS -o /tmp/kairos-jointoken-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/strategic-merge-patch+json" \
-            -X PATCH \
-            --data "${patch}" \
-            "${url}" || true)
-          case "${status}" in
-            2[0-9][0-9]) pushed=yes ;;
-          esac
-          if [ -n "${pushed}" ]; then
-            break
-          fi
-          echo "Attempt $i/30: join-token push returned '${status}', retrying in 5 seconds..."
-          sleep 5
-        done
-        unset jt_b64 patch
-        if [ -n "${pushed}" ]; then
-          echo "Pushed controller-join token to management secret ${ns}/${jt_name}"
-          return 0
-        fi
-        echo "WARN: failed to push controller-join token after 30 attempts (last status '${status}')"
-        return 1
-      }
-      if ! push_join_token; then
-        echo "WARN: controller-join token push failed; joiners will wait until it succeeds"
       fi
       {{- end }}
 
@@ -1160,7 +1187,6 @@ MANIFEST_EOF
         local api={{ .ManagementEndpoint.APIServer | shquote }}
         local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
         local es_name={{ .ManagementEndpoint.EtcdStatusSecretName | shquote }}
-        local token={{ .ManagementEndpoint.Token | shquote }}
         # Strategic-merge PATCH only this member's own data key in the pre-created,
         # Cluster-owned etcd-status Secret. update/patch on the named Secret is
         # exactly the node SA's RBAC (no create).
@@ -1174,15 +1200,11 @@ MANIFEST_EOF
         # described behaviour that does not exist, since nothing reboots the node.
         # Retry here on the same cadence as the join-token push. The 2xx test is a
         # glob, not an arithmetic comparison, so an empty status from a failed curl
-        # cannot abort the loop.
+        # cannot abort the loop. PR-4: mgmt_patch is TLS-verified (curl --cacert),
+        # keeps the token/body off argv, and discards the response body.
         local status="" reported=""
         for i in {1..30}; do
-          status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/strategic-merge-patch+json" \
-            -X PATCH \
-            --data "${patch}" \
-            "${url}" || true)
+          status=$(mgmt_patch "${url}" "${patch}")
           case "${status}" in
             2[0-9][0-9]) reported=yes ;;
           esac
@@ -1192,7 +1214,6 @@ MANIFEST_EOF
           echo "Attempt $i/30: etcd-status report returned '${status}', retrying in 5 seconds..."
           sleep 5
         done
-        unset token
         if [ -n "${reported}" ]; then
           echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
           return 0

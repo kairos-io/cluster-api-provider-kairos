@@ -1,7 +1,10 @@
 # Install Guide
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4, cert-manager v1.15+,
-provider v0.1.3. The "Registering the Kairos fleet infrastructure
+Last verified against: provider v0.1.4, 2026-10-16. The `clusterctl` path was
+run with `clusterctl` v1.13.4 against a fresh kind management cluster
+(Kubernetes v1.34.0): CAPI v1.13.4, cert-manager v1.20.3, CAPV v1.17.0. The
+flat-manifest path was run as an in-place upgrade on a k0s management cluster
+with CAPI v1.12.2. The "Registering the Kairos fleet infrastructure
 provider" section below documents `cluster-api-provider-kairos-fleet`
 v0.1.3's own `clusterctl.yaml` entry; it has not been re-verified by
 running `clusterctl init --infrastructure kairos-fleet` in this repository's
@@ -43,7 +46,7 @@ providers:
 `clusterctl` discovers `metadata.yaml` next to each components file in the same GitHub release; it does not need its own entry in this file.
 
 Point `url` at a specific tag instead of `latest` to pin a version, for example
-`https://github.com/kairos-io/cluster-api-provider-kairos/releases/v0.1.3/bootstrap-components.yaml`.
+`https://github.com/kairos-io/cluster-api-provider-kairos/releases/v0.1.4/bootstrap-components.yaml`.
 
 A `clusterctl` provider `url` is not a browser download link: `clusterctl`
 parses it as
@@ -51,13 +54,13 @@ parses it as
 reads everything after `releases/` as the version. The
 `releases/download/<tag>/<file>` form that `kubectl apply -f` and `curl` use
 elsewhere in this guide is correct for them, but wrong here in both of its
-variants: `releases/download/v0.1.3/...` fails immediately with `release not
+variants: `releases/download/v0.1.4/...` fails immediately with `release not
 found for version download` (`clusterctl` reads the literal string `download`
 as the version), and `releases/latest/download/...` is the more dangerous case
 — it appears to work, because `clusterctl`'s fast path builds its own download
 URL from the file name alone, and only fails once it falls back to the GitHub
 API — on a failed direct download, under `GOPROXY=off`, or on a rate-limited or
-proxied network — with `failed to get file "metadata.yaml" from "v0.1.3"
+proxied network — with `failed to get file "metadata.yaml" from "v0.1.4"
 release`.
 
 ### Registering the Kairos fleet infrastructure provider
@@ -148,7 +151,7 @@ Use this if you want a single `kubectl apply -f` without configuring `clusterctl
 ### Install
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.3/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
 ```
 
 This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
@@ -170,7 +173,7 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 ### Uninstall
 
 ```bash
-kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.3/kairos-capi-provider.yaml
+kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
 ```
 
 **Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:
@@ -197,10 +200,11 @@ Use this if you are hacking on the provider itself.
 
 ### Prerequisites
 
-- Go toolchain 1.26.3 (matches `go.mod` directive `go 1.26.0` / toolchain `go1.26.0`).
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
 - A Kubernetes cluster acting as the management cluster.
 - cert-manager and Cluster API core installed (same as Path 2).
 - `kubectl` configured to use the management cluster.
+- `kustomize` on your `PATH`. `make deploy` and `make undeploy` call it directly. `make kustomize` installs a pinned copy into `bin/`, which those two targets do not use.
 
 ### Install
 
@@ -216,16 +220,18 @@ This installs CRDs, RBAC, webhooks, and the controller to the `kairos-capi-syste
 IMG=MY_REGISTRY/cluster-api-provider-kairos:dev make deploy
 ```
 
-**CRD installation note**: `make deploy` uses `kustomize build config/crd | kubectl apply -f -`, which applies kustomize-managed labels that CAPI's conversion webhook expects (`cluster.x-k8s.io/v1beta1`, `cluster.x-k8s.io/v1beta2`). If you apply raw CRD YAML via `kubectl apply -f config/crd/bases/`, those labels are absent and CAPI core may reject the CRDs. Use `make deploy` or `bin/kustomize build config/crd | kubectl apply -f -`.
+**CRD installation note**: `make deploy` runs `kustomize edit set image` in `config/manager`, which rewrites `config/manager/kustomization.yaml` in your checkout, and then `kustomize build config/default | kubectl apply -f -`. `config/default` includes `config/crd`, which adds the `cluster.x-k8s.io/v1beta1: v1beta2` and `cluster.x-k8s.io/v1beta2: v1beta2` contract labels. CAPI core needs those labels to resolve this provider's object references. The generated CRDs in `config/crd/bases/` do not carry them, so applying them directly with `kubectl apply -f config/crd/bases/` leaves CAPI core unable to resolve the references; see [UPGRADING.md](UPGRADING.md). Use `make deploy`, or `kustomize build config/crd | kubectl apply -f -`.
 
 ### Run the controller on your host (optional)
 
 To run the controller on your host instead of deploying to the cluster:
 
 ```bash
-make install     # installs only the CRDs via kustomize
-make run         # runs the controller in the foreground against your kubeconfig
+kustomize build config/crd | kubectl apply -f -   # installs only the CRDs, with the contract labels
+make run                                          # runs the controller in the foreground against your kubeconfig
 ```
+
+Do not use `make install` for the first step against a management cluster that runs Cluster API. It runs `kubectl apply -f config/crd/bases`, which applies the CRDs without the contract labels described in the CRD installation note above.
 
 ### Uninstall
 
@@ -239,6 +245,10 @@ make uninstall
 ## Optional manager flags
 
 ### `--kubeadm-extra-controlplane-kinds`
+
+Not in v0.1.4. This flag ships with the kubeadm worker distribution, which is
+planned for v0.2.0. A v0.1.4 manager given this flag refuses to start, with
+`flag provided but not defined`.
 
 Applies to the bootstrap manager only. It widens the set of control-plane kinds
 that a kubeadm worker (a `KairosConfig` with `distribution: kubeadm`) may join.
@@ -289,19 +299,70 @@ there.
 
 ## Network reachability requirement for non-CAPK infrastructure
 
-Starting with v0.1.0-alpha.2 (carried forward in v0.1.0-beta.1), the controller no longer SSHes into nodes to
-retrieve the workload kubeconfig. Instead, control-plane nodes POST their
-kubeconfig back to a Secret in the management cluster.
+Starting with v0.1.0-alpha.2, the controller no longer SSHes into nodes to
+retrieve the workload kubeconfig. Instead, control-plane nodes push their
+kubeconfig back to a staging Secret that the control plane creates and owns
+in the management cluster; see
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the current mechanism.
 
 **Workload nodes running on non-CAPK infrastructure (CAPV / CAPM3 / Kairos
 fleet / Tinkerbell and any future provider) must have network reachability to
 the management cluster's API server URL.** This includes bare-metal nodes
 provisioned via Metal3 and nodes claimed via the Kairos fleet provider — they
-POST their kubeconfig to a Secret in the management cluster. Verify
-reachability from a sample workload node before deploying:
+push their kubeconfig to that staging Secret in the management cluster.
+
+### Set the URL the nodes push to
+
+By default, the bootstrap provider gives nodes the API server URL it uses
+itself. Inside the management cluster that is the in-cluster Service URL,
+typically `https://10.96.0.1:443`. KubeVirt VMs run as pods and can reach it,
+so CAPK needs nothing more. Nodes on any other infrastructure are on another
+network and cannot, so their kubeconfig is never pushed and the
+`KairosControlPlane` waits forever on `KubeconfigReady`.
+
+For those providers, set `KAIROS_MANAGEMENT_API_OVERRIDE` on the bootstrap
+provider's Deployment to a URL the nodes can reach, such as a management
+control-plane node address or a load balancer in front of the API server:
 
 ```bash
-curl -k https://<mgmt-api-server-host>:6443/api
+# clusterctl install (Path 1): the bootstrap provider has its own Deployment
+kubectl -n capi-kairos-bootstrap-system set env \
+  deployment/capi-kairos-bootstrap-controller-manager \
+  KAIROS_MANAGEMENT_API_OVERRIDE=https://<mgmt-api-server-host>:6443
+
+# flat manifest (Path 2): one Deployment runs both providers
+kubectl -n kairos-capi-system set env \
+  deployment/kairos-capi-controller-manager \
+  KAIROS_MANAGEMENT_API_OVERRIDE=https://<mgmt-api-server-host>:6443
+```
+
+The provider manifests do not set this variable, and `clusterctl` has no
+setting for it, so set it after `clusterctl init`. Check that it is still set
+after a `clusterctl upgrade`. Re-applying the flat manifest with
+`kubectl apply` keeps it.
+
+To confirm the value, look for `Overriding management API server URL from
+environment` in the bootstrap provider's log. It prints the original and the
+override. The URL is rendered into each control-plane node's bootstrap data
+when that data is generated, so changing the variable does not affect nodes
+that have already been rendered.
+
+If the management cluster is a kind cluster, its API server listens on
+`127.0.0.1` by default. Set `networking.apiServerAddress` (and, if needed,
+`networking.apiServerPort`) in the kind configuration to a host address the
+nodes can reach, and use that address in the override.
+
+Verify reachability from a sample workload node before deploying (the node-push itself
+always verifies TLS against the management API CA — the provider uses no
+`curl -k` / `--insecure` anywhere, so verify the same way here):
+
+```bash
+# Point --cacert at the same CA the controller renders to the node at
+# /etc/kairos-capi/management-ca.crt (see "Management API TLS verification"
+# below). Do NOT use curl -k here: an unverified check can pass even when the
+# CA is wrong, so it would not catch a CA mismatch the node-push itself rejects.
+curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api
 ```
 
 For air-gapped or strictly-segmented network environments, enable the opt-in
@@ -309,6 +370,27 @@ For air-gapped or strictly-segmented network environments, enable the opt-in
 host-key-verified SSH identity Secret and a `known_hosts` Secret. See
 [QUICKSTART_CAPV.md — Air-gapped fallback](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback)
 for the full configuration steps.
+
+### Management API TLS verification and the CA source
+
+The node-to-management push (kubeconfig staging, etcd-status) is
+TLS-verified: nodes run `curl --cacert` against the management API server's CA,
+which the controller renders into each node's cloud-config at
+`/etc/kairos-capi/management-ca.crt`. There is no insecure opt-out; a wrong or
+missing CA makes the push fail closed, and air-gapped environments use
+`SSHFallback` instead.
+
+Two environment variables on the controller Deployment tune this:
+
+| Env var | Purpose |
+| --- | --- |
+| `KAIROS_MANAGEMENT_API_OVERRIDE` | The URL nodes dial back to. Required for non-CAPK infrastructure where the in-cluster service IP is not routable from workload VMs — set it to a LAN-reachable URL such as `https://<mgmt-cp-node-ip>:6443`. |
+| `KAIROS_MANAGEMENT_API_CA_FILE` | Overrides the CA nodes verify that URL against. Accepts either a filesystem path to a PEM bundle or an inline PEM. When unset, the controller uses its own in-cluster trust root (the management API server CA). Set this when the override URL is served by a load balancer or proxy whose certificate is not issued by the cluster CA. |
+
+By default (no override), the controller resolves the CA from its own
+`rest.Config` (the management API server CA it already trusts). The controller
+**fails fast at startup** if push is enabled but no CA is available — it never
+falls back to an unverified push.
 
 ---
 
@@ -321,4 +403,4 @@ for the full configuration steps.
 - [Fleet Quickstart](QUICKSTART_FLEET.md) — create a cluster from AuroraBoot-claimed nodes with the Kairos fleet infrastructure provider.
 - [Kubeadm workers](KUBEADM_WORKERS.md) — join Kairos workers to a Kamaji or `KubeadmControlPlane` control plane.
 
-For the current release status, breaking changes, and security caveats, read the [v0.1.0 release notes](release-notes/v0.1.0.md).
+For the current release status, read the [v0.1.4 release notes](release-notes/v0.1.4.md). For the breaking changes and security caveats of the first non-beta release, read the [v0.1.0 release notes](release-notes/v0.1.0.md).

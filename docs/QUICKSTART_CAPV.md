@@ -1,6 +1,6 @@
 # Quick Start Guide - CAPV (vSphere)
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4, CAPV v1.11.x+, provider v0.1.3.
+Last verified against: provider v0.1.4, 2026-10-16, with Kairos v4.1.2 (Hadron v0.4.0, k0s v1.34.8), CAPI v1.13.4, and CAPV v1.17.0: a single-node k0s cluster with a static IP, and a 3-node HA k0s cluster with a kube-vip VIP. On v0.1.4 a rolling replacement of an HA k0s control plane stalls; see [Known issue: k0s HA rollouts on v0.1.4](HIGH_AVAILABILITY.md#known-issue-k0s-ha-rollouts-on-v014).
 
 This guide walks you through creating a single-node k0s or k3s cluster on Kairos using Cluster API with the vSphere provider (CAPV). For a 3-node highly-available k0s control plane, see [High-Availability: 3-node k0s control plane](#high-availability-3-node-k0s-control-plane) below.
 
@@ -18,9 +18,9 @@ This guide walks you through creating a single-node k0s or k3s cluster on Kairos
 
 3. **Cluster API**: CAPI v1.13.4+ installed (v1beta2 contract).
 
-4. **CAPV**: Cluster API Provider vSphere installed and configured.
+4. **CAPV**: Cluster API Provider vSphere installed and configured. The samples use the `infrastructure.cluster.x-k8s.io/v1beta1` vSphere kinds. CAPV v1.17 still serves them, and prints a deprecation warning on apply that names `v1beta2` as the replacement.
 
-5. **Kairos CAPI Provider**: Installed (see [Install guide](INSTALL.md)).
+5. **Kairos CAPI Provider**: Installed (see [Install guide](INSTALL.md)), with `KAIROS_MANAGEMENT_API_OVERRIDE` set on the bootstrap provider (see [Set the URL the nodes push to](INSTALL.md#set-the-url-the-nodes-push-to)).
 
 ### Installing Prerequisites
 
@@ -69,7 +69,7 @@ kubectl label namespace default vsphere-identity=allowed
 **Recommended (released artifact):**
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.3/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
 ```
 
 **Developer install (from source):**
@@ -305,8 +305,11 @@ kubectl --kubeconfig=kairos-kubeconfig.yaml get pods -n kube-system
 longer SSHes into nodes to retrieve the kubeconfig. The node pushes its
 kubeconfig to a Secret in the management cluster at bootstrap time. The
 workload VM must have network reachability to the management cluster's API
-server (`<mgmt-api-server-host>:6443`). See
-[docs/INSTALL.md](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure)
+server (`<mgmt-api-server-host>:6443`), and the bootstrap provider must be
+told that URL with `KAIROS_MANAGEMENT_API_OVERRIDE`: without it, nodes are
+given the in-cluster Service URL, which a vSphere VM cannot reach. See
+[docs/INSTALL.md](INSTALL.md#set-the-url-the-nodes-push-to) for how to set it,
+and [Network reachability](INSTALL.md#network-reachability-requirement-for-non-capk-infrastructure)
 for verification steps. If the VM has no network path to the API server,
 enable the opt-in
 [Air-gapped fallback (SSHFallback)](#air-gapped-fallback-sshfallback)
@@ -479,9 +482,9 @@ If `KairosConfig.status.failureMessage` is set, the issue is transient — it cl
 
 **When to use:** the workload VM has no network route back to the management
 cluster API server (`<mgmt-api-server-host>:6443`). The node-push path —
-where the VM POSTs its kubeconfig to a management cluster Secret — is
-unreachable. Without this fallback, `KubeconfigReadyCondition` stays
-`False(WaitingForNodePush)` indefinitely.
+where the VM PATCHes its kubeconfig into a staging Secret the control plane
+owns in the management cluster — is unreachable. Without this fallback,
+`KubeconfigReadyCondition` stays `False(WaitingForNodePush)` indefinitely.
 
 **When NOT to use:** the default node-push path works in most networks. Do
 not enable SSHFallback unless you have confirmed that the VM cannot reach
@@ -565,6 +568,12 @@ The `KubeconfigReadyCondition` Reason tells you which path is active:
 | `SSHFallbackDialing` | SSH fallback is in progress; wait up to 30 seconds. |
 | `SSHFallbackFailed` | SSH attempt failed. Check Events for the categorized error (host-key mismatch, auth failure, file not found). |
 | `SSHFallbackMisconfigured` | A referenced Secret is missing, empty, or unparseable. Fix the Secret; the controller retries automatically. |
+
+`KubeconfigReadyCondition` can also go `False` for reasons unrelated to
+SSHFallback — a rejected or CA-mismatched kubeconfig, or a Secret the
+controller cannot take ownership of. See
+[API_REFERENCE.md — KubeconfigReady condition](API_REFERENCE.md#kubeconfigready-condition)
+for the full reason list, including the `NodePushCAMismatch` re-pin runbook.
 
 For detailed error information when the Reason is `SSHFallbackFailed` or
 `SSHFallbackMisconfigured`:

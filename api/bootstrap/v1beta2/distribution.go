@@ -18,7 +18,9 @@ package v1beta2
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"path"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -181,6 +183,8 @@ func validateK3sConfig(kc *KairosConfig) field.ErrorList {
 //     so an unexpanded "{{ ... }}" would land verbatim in node-side config.
 //   - a nodeRegistration.name that is not a DNS-1123 subdomain (it becomes the
 //     Node object name and the kubelet client-cert CommonName).
+//   - a patches.directory that ValidatePatchesDirectory refuses: kubeadm applies
+//     every patch in it as root.
 func validateKubeadmConfig(kc *KairosConfig) field.ErrorList {
 	var errs field.ErrorList
 
@@ -277,5 +281,41 @@ func validateKubeadmConfig(kc *KairosConfig) field.ErrorList {
 		}
 	}
 
+	if dir := jc.Patches.Directory; dir != "" {
+		if err := ValidatePatchesDirectory(dir); err != nil {
+			errs = append(errs, field.Invalid(
+				jcPath.Child("patches", "directory"), dir, "patches.directory "+err.Error(),
+			))
+		}
+	}
+
 	return errs
+}
+
+// kubeadmPatchesRoot is the tree a kubeadm patches directory must live in.
+// kubeadm walks the directory recursively and applies every patch it finds as
+// root, so it must not be writable by unprivileged users (/tmp, /dev/shm) and
+// must not be a tree as wide as /.
+const kubeadmPatchesRoot = "/etc/kubernetes/"
+
+// kubeletStaticPodPath is the staticPodPath kubeadm configures for the kubelet.
+const kubeletStaticPodPath = "/etc/kubernetes/manifests"
+
+// ValidatePatchesDirectory reports why dir cannot be a kubeadm patches
+// directory. The admission webhook and the renderer both call it, so a value
+// admission accepts never fails at render time.
+func ValidatePatchesDirectory(dir string) error {
+	if strings.ContainsAny(dir, "\n\r\x00") {
+		return errors.New("must not contain a newline, carriage return or NUL")
+	}
+	if !path.IsAbs(dir) || path.Clean(dir) != dir {
+		return errors.New("must be an absolute, clean path")
+	}
+	if !strings.HasPrefix(dir, kubeadmPatchesRoot) {
+		return fmt.Errorf("must be a directory under %s", kubeadmPatchesRoot)
+	}
+	if dir == kubeletStaticPodPath || strings.HasPrefix(dir, kubeletStaticPodPath+"/") {
+		return fmt.Errorf("must not be %s or a directory under it: that is the kubelet's static pod directory", kubeletStaticPodPath)
+	}
+	return nil
 }

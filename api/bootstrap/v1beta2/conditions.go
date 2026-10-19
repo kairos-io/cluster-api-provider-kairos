@@ -48,9 +48,27 @@ const (
 	// BootstrapTokenRefreshCapExceededReason is the False(Warning) reason on
 	// BootstrapReadyCondition for a kubeadm worker whose Machine has still not
 	// registered a Node after the token-refresh hard cap elapsed (ADR 0010 P1
-	// item 7). The controller stops re-minting bootstrap tokens past the cap; a
+	// item 7). The controller stops extending the bootstrap token past the cap; a
 	// MachineHealthCheck with a nodeStartupTimeout is expected to replace the stuck
 	// Machine. Resolution: check why the node never joined (image/version mismatch,
 	// network, CNI), then let the MHC or a manual delete replace the Machine.
 	BootstrapTokenRefreshCapExceededReason = "BootstrapTokenRefreshCapExceeded"
+
+	// WaitingForKubeconfigPushTargetReason indicates that bootstrap rendering for
+	// a control-plane KairosConfig is waiting on the KairosControlPlane: the
+	// per-cluster staging kubeconfig Secret (<cluster>-kubeconfig-push) must
+	// exist and be owned by the control plane before a control-plane node can be
+	// handed a push token, because the rendered node only ever PATCHes that
+	// controller-owned Secret. Clears on its own once the control plane has
+	// created and taken ownership of the staging Secret; see ADR 0011.
+	WaitingForKubeconfigPushTargetReason = "WaitingForKubeconfigPushTarget"
+
+	// ManagementCAUnavailableReason indicates that bootstrap rendering for a
+	// control-plane KairosConfig cannot proceed because no management API CA was
+	// resolved to verify the node-push channel against (ADR 0011 PR-4). The
+	// node-push TLS has no insecure fallback, so without a CA the push cannot be
+	// rendered. Resolve on its own once the operator supplies a CA
+	// (KAIROS_MANAGEMENT_API_CA_FILE) or the in-cluster trust root becomes
+	// available; the manager normally fails fast at startup instead.
+	ManagementCAUnavailableReason = "ManagementCAUnavailable"
 )

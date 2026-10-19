@@ -137,7 +137,7 @@ write_files:
       printf 'kubelet-arg:\n  - provider-id=kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/90-provider-id.yaml"
       echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |

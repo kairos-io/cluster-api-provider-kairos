@@ -99,8 +99,10 @@ test-envtest: ## Run envtest-based integration tests.
 	@go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 	@echo "Downloading CAPI CRDs..."
 	@mkdir -p test/crd/capi
-	@curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.13.4/cluster-api-components.yaml -o test/crd/capi/cluster-api-components.yaml || \
-		(echo "Warning: Failed to download CAPI CRDs. Tests may fail." && rm -f test/crd/capi/cluster-api-components.yaml)
+	@test -n "$(CAPI_VERSION)" || { echo "error: could not read sigs.k8s.io/cluster-api from go.mod"; exit 1; }
+	@curl -fsSL --retry 3 --retry-all-errors \
+		https://github.com/kubernetes-sigs/cluster-api/releases/download/$(CAPI_VERSION)/cluster-api-components.yaml \
+		-o test/crd/capi/cluster-api-components.yaml
 	@echo "Setting up kubebuilder tools..."
 	@export PATH=$$(go env GOPATH)/bin:$$PATH && \
 	eval $$(setup-envtest use -p env $(ENVTEST_K8S_VERSION)) && \
@@ -218,11 +220,14 @@ $(LOCALBIN):
 ## Tool Binaries
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
-GOLANGCI_LINT_VERSION ?= v1.60.0
+# Pinned because `make release-manifests` renders the release artifacts with it. v5.8.3 requires
+# go >= 1.27 and broke the v0.1.4 release job (GOTOOLCHAIN=local, go.mod Go). v5.8.1 rendered v0.1.3.
+KUSTOMIZE_VERSION ?= v5.8.1
+GOLANGCI_LINT_VERSION ?= v2.14.0
 # Pinned so `make test-envtest` is reproducible (rule 4: no unpinned @latest / floating envtest assets).
 # ENVTEST_K8S_VERSION is the Kubernetes API-server/etcd binary version the controllers are tested
 # against; 1.36 is the top of Cluster API v1.13's supported management-cluster band. Bump deliberately.
@@ -231,6 +236,32 @@ GOLANGCI_LINT_VERSION ?= v1.60.0
 # skew (one minor), NOT a mismatch to "fix" by bumping go.mod: MVS would revert it to CAPI's requirement.
 SETUP_ENVTEST_VERSION ?= v0.24.1
 ENVTEST_K8S_VERSION ?= 1.36.2
+# kubeadm used by `make test-kubeadm`; the JoinConfiguration API version the
+# controller renders follows it.
+KUBEADM_VERSION ?= v$(ENVTEST_K8S_VERSION)
+KUBEADM ?= $(LOCALBIN)/kubeadm-$(KUBEADM_VERSION)
+
+.PHONY: test-kubeadm
+test-kubeadm: $(KUBEADM) ## Run the rendered kubeadm worker join against a real kubeadm (Linux only).
+	KUBEADM_BIN=$(KUBEADM) go test ./internal/controllers/bootstrap/ -run TestKubeadmJoinCommand -count=1 -v
+
+$(KUBEADM): hack/kubeadm.sha256 | $(LOCALBIN)
+	@[ "$$(uname -s)" = Linux ] || { echo "test-kubeadm needs Linux: kubeadm is released for Linux only"; exit 1; }
+	@arch=$$(go env GOARCH); \
+	sum=$$(awk -v v=$(KUBEADM_VERSION) -v a=$$arch '$$1 == v && $$2 == a { print $$3 }' hack/kubeadm.sha256); \
+	[ -n "$$sum" ] || { echo "no sha256 pinned for kubeadm $(KUBEADM_VERSION) $$arch in hack/kubeadm.sha256"; exit 1; }; \
+	curl --fail --silent --show-error --location --output $@.tmp https://dl.k8s.io/release/$(KUBEADM_VERSION)/bin/linux/$$arch/kubeadm; \
+	echo "$$sum  $@.tmp" | sha256sum --check --quiet
+	chmod +x $@.tmp
+	mv $@.tmp $@
+
+# The CAPI CRDs the envtest suite installs have to come from the release the module
+# is built against, so the version is read from go.mod instead of written out a
+# second time. Renovate automerges a patch bump of sigs.k8s.io/cluster-api once the
+# checks pass (see the gomod rule in renovate.json), and a literal here would stay
+# behind it with nothing to report the gap: the download would still succeed and the
+# suite would install CRDs from the older release.
+CAPI_VERSION ?= $(shell go list -m -f '{{.Version}}' sigs.k8s.io/cluster-api)
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
@@ -240,12 +271,17 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
-	test -s $(LOCALBIN)/kustomize || GOBIN=$(LOCALBIN) go install sigs.k8s.io/kustomize/kustomize/v5@latest
+	test -s $(LOCALBIN)/kustomize || GOBIN=$(LOCALBIN) go install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
-	test -s $(LOCALBIN)/golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(LOCALBIN) $(GOLANGCI_LINT_VERSION)
+# The install script is taken from the same tag as the binary: the one on the
+# abandoned master branch fails the checksum check for v2.12.2 and later.
+$(GOLANGCI_LINT): | $(LOCALBIN)
+	rm -rf $@.tmp
+	curl --fail --silent --show-error --location https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh | sh -s -- -b $@.tmp $(GOLANGCI_LINT_VERSION)
+	mv $@.tmp/golangci-lint $@
+	rmdir $@.tmp
 
 .PHONY: tidy
 tidy: ## Run go mod tidy
