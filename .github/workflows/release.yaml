@@ -28,7 +28,7 @@ jobs:
   # to main, the Monday cron), and that workflow is the only whole-tree scan in
   # the repository. Without this job a release cut between two Mondays can
   # publish while an advisory is already open against an unchanged dependency,
-  # with nothing red anywhere. Same reusable workflow, same SHA pin and same
+  # with nothing red anywhere. Same scanner version, same SHA pin and same
   # --config as osv-scanner.yaml, so the ignore list in osv-scanner.toml cannot
   # fork between the two.
   #
@@ -37,24 +37,36 @@ jobs:
   # trade-off is that an ignore added in the release commit silences this gate,
   # so a change to osv-scanner.toml is a change that wants review on its own.
   #
-  # upload-sarif is off. osv-scanner.yaml owns the Security > Code scanning
-  # view, keyed on main; a second analysis keyed on refs/tags/<tag> would add
-  # nothing a failed release job does not already say. The job still needs
-  # security-events: write, because a reusable workflow cannot request a
-  # permission its caller has not granted and the called job asks for it.
+  # This calls the scanner action directly instead of reusing
+  # osv-scanner-reusable.yml, because that workflow is built to report, not to
+  # gate: it runs the scanner step under `continue-on-error: true` and hands the
+  # results file to osv-reporter, which treats a missing file as "no
+  # vulnerabilities" and exits 0. An osv.dev outage, a network failure or a
+  # malformed osv-scanner.toml would therefore leave this gate green and let the
+  # tag through. Invoked directly and without continue-on-error, a finding and a
+  # scanner error both fail the job.
+  #
+  # No SARIF upload, so no security-events: write. osv-scanner.yaml owns the
+  # Security > Code scanning view, keyed on main; a second analysis keyed on
+  # refs/tags/<tag> would add nothing a failed release job does not already say.
   osv:
     name: osv-scan (release gate)
+    runs-on: ubuntu-latest
     permissions:
-      actions: read
       contents: read
-      security-events: write
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
-    with:
-      upload-sarif: false
-      scan-args: |-
-        --config=./osv-scanner.toml
-        -r
-        ./
+    steps:
+      - name: Checkout the tagged tree
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Scan for known vulnerabilities
+        uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        with:
+          scan-args: |-
+            --config=./osv-scanner.toml
+            -r
+            ./
 
   release:
     needs: osv
@@ -70,6 +82,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.4'
+          # A release must build from the tagged tree alone. setup-go restores
+          # the module and build caches by default, and this job builds the
+          # kustomize and controller-gen that render and checksum the published
+          # dist/*.yaml, so a stale or poisoned cache entry would reach the
+          # released artefacts.
+          cache: false
 
       - name: Verify release notes exist
         run: |
