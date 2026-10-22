@@ -288,22 +288,6 @@ write_files:
     permissions: "0644"
     owner: root:root
 stages:
-  # boot.before finishes before boot starts, and runcmd is part of boot,
-  # so the resolvers are in place before anything runcmd starts.
-  boot.before:
-    - name: "Configure DNS resolvers for early boot"
-      dns:
-        nameservers:
-          - 1.1.1.1
-          - 8.8.8.8
-        # Staged, then renamed over /etc/resolv.conf by the next step. On
-        # systemd-resolved images /etc/resolv.conf is a symlink into a file
-        # resolved regenerates when a DHCP lease brings DNS, and this stage
-        # is not ordered after the first lease. A rename replaces the link.
-        path: "/etc/.kairos-capi-resolv.conf"
-    - name: "Install the DNS resolvers as /etc/resolv.conf"
-      commands:
-        - mv -f /etc/.kairos-capi-resolv.conf /etc/resolv.conf
   boot:
     - name: "Ensure SSH service is enabled"
       commands:
@@ -312,6 +296,12 @@ stages:
       commands:
         - mkdir -p /etc/rancher/k3s
         - mkdir -p /etc/rancher/k3s/config.yaml.d
+    - name: "Configure DNS resolvers for early boot"
+      dns:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+        path: "/etc/resolv.conf"
 
 runcmd:
   # `enable --now`: create the multi-user.target.wants/ symlink AND start

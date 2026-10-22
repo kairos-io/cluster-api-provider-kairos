@@ -173,29 +173,19 @@ write_files:
 {{- end }}
 
 stages:
-  {{- if .DNSServers }}
-  # boot.before finishes before boot starts, and runcmd is part of boot,
-  # so the resolvers are in place before anything runcmd starts.
-  boot.before:
+  boot:
+    - name: "Ensure SSH service is enabled"
+      commands:
+        - systemctl enable --now sshd || systemctl enable --now ssh || true
+    {{- if .DNSServers }}
     - name: "Configure DNS resolvers for early boot"
       dns:
         nameservers:
         {{- range .DNSServers }}
           - {{ . | quote }}
         {{- end }}
-        # Staged, then renamed over /etc/resolv.conf by the next step. On
-        # systemd-resolved images /etc/resolv.conf is a symlink into a file
-        # resolved regenerates when a DHCP lease brings DNS, and this stage
-        # is not ordered after the first lease. A rename replaces the link.
-        path: "/etc/.kairos-capi-resolv.conf"
-    - name: "Install the DNS resolvers as /etc/resolv.conf"
-      commands:
-        - mv -f /etc/.kairos-capi-resolv.conf /etc/resolv.conf
-  {{- end }}
-  boot:
-    - name: "Ensure SSH service is enabled"
-      commands:
-        - systemctl enable --now sshd || systemctl enable --now ssh || true
+        path: "/etc/resolv.conf"
+    {{- end }}
 
 runcmd:
   - /bin/systemctl daemon-reload || true
