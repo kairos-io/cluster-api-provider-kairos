@@ -577,6 +577,54 @@ func TestK0sJoinTokenLifetime_IdentityGatesTheExtension(t *testing.T) {
 	})
 }
 
+// TestConnectForLeave_UnpinnedIsNoConnection: with no identity pinned, no
+// connection can be verified, so connectForLeave tries no apiserver and
+// returns errWorkloadIdentityNotPinned, which the caller treats as nothing
+// answering (ADR 0015 PR-3). Before PR-3 it used the first apiserver that
+// answered, whatever cluster that was.
+func TestConnectForLeave_UnpinnedIsNoConnection(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+	target := leavingMachine("cp-0", nil, "10.0.0.10")
+	machines := []*clusterv1.Machine{target, nodeMachine("cp-1", false, "10.0.0.11")}
+	endpointCalls := 0
+	members := &fakeMembers{clients: map[string]client.Client{"10.0.0.11": workloadWithUID(scheme, uidA)}}
+	r := &KairosControlPlaneReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme,
+		WorkloadClientFactory: func(context.Context, *clusterv1.Cluster) (client.Client, error) {
+			endpointCalls++
+			return workloadWithUID(scheme, uidA), nil
+		},
+		MemberClientFactory: members.factory}
+
+	_, err := r.connectForLeave(context.Background(), log.Log, vipKCP(), haCluster(), machines, target)
+
+	g.Expect(errors.Is(err, errWorkloadIdentityNotPinned)).To(BeTrue())
+	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeFalse(), "an absent pin is not a freeze")
+	g.Expect(members.dialed).To(BeEmpty())
+	g.Expect(endpointCalls).To(BeZero())
+}
+
+// TestVerifyPinnedWorkloadIdentity: the strict check refuses an unpinned
+// control plane and otherwise behaves as verifyWorkloadIdentity.
+func TestVerifyPinnedWorkloadIdentity(t *testing.T) {
+	g := NewWithT(t)
+	scheme := haTestScheme(g)
+	kcp := vipKCP()
+	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kcp).Build()
+	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, Recorder: record.NewFakeRecorder(4)}
+	ctx := context.Background()
+
+	err := r.verifyPinnedWorkloadIdentity(ctx, log.Log, kcp, workloadWithUID(scheme, uidA), "10.0.0.11")
+	g.Expect(errors.Is(err, errWorkloadIdentityNotPinned)).To(BeTrue(), "unpinned")
+
+	g.Expect(mgmt.Get(ctx, client.ObjectKeyFromObject(kcp), kcp)).To(Succeed())
+	kcp.Annotations = map[string]string{WorkloadClusterUIDAnnotation: uidA}
+	g.Expect(r.verifyPinnedWorkloadIdentity(ctx, log.Log, kcp, workloadWithUID(scheme, uidA), "10.0.0.11")).To(Succeed(), "pinned, matching")
+
+	err = r.verifyPinnedWorkloadIdentity(ctx, log.Log, kcp, workloadWithUID(scheme, uidB), "10.0.0.11")
+	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeTrue(), "pinned, another cluster")
+}
+
 // TestConnectForLeave_UnverifiedMemberIsSkipped: a member whose identity
 // cannot be read counts as not answering, and the next one is used.
 func TestConnectForLeave_UnverifiedMemberIsSkipped(t *testing.T) {

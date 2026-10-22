@@ -118,6 +118,12 @@ const (
 // errors.Is and hold instead of failing the reconcile.
 var errWorkloadIdentityChanged = errors.New("the workload cluster identity does not match the pinned identity")
 
+// errWorkloadIdentityNotPinned marks a connection refused because no identity
+// is pinned yet, by the paths that need a verified connection to act at all
+// (verifyPinnedWorkloadIdentity). It is not a freeze: the caller treats the
+// connection as one that did not answer.
+var errWorkloadIdentityNotPinned = errors.New("no workload cluster identity is pinned, so no connection can be verified")
+
 // uidShape accepts what a Kubernetes UID can look like (an RFC 4122 UUID in
 // practice), and nothing that could carry markup or a separator.
 var uidShape = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
@@ -417,6 +423,26 @@ func (r *KairosControlPlaneReconciler) verifyWorkloadIdentity(ctx context.Contex
 		return r.tripIdentityFreeze(ctx, log, kcp, uid, via, pin, "")
 	}
 	return nil
+}
+
+// verifyPinnedWorkloadIdentity is verifyWorkloadIdentity without the unpinned
+// leniency: with no pin it returns an errWorkloadIdentityNotPinned error, so
+// the caller treats wc as not answering.
+//
+// The etcd-leave handshake and the orphan etcd-member cleanup use it (ADR
+// 0015 PR-3). Both may conclude from an absence ("no EtcdMember of that name")
+// that a hook can go or a member is an orphan, and an absence read from a
+// cluster nobody verified is how the original members were released on
+// 2026-10-17. The central gate already holds those paths while a pin is due;
+// this makes each connection carry the proof itself.
+func (r *KairosControlPlaneReconciler) verifyPinnedWorkloadIdentity(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, wc client.Client, via string) error {
+	if err := errIfIdentityFrozen(kcp, "use workload apiserver "+via); err != nil {
+		return err
+	}
+	if kcp.Annotations[WorkloadClusterUIDAnnotation] == "" {
+		return fmt.Errorf("verify the workload cluster identity via %s: %w", via, errWorkloadIdentityNotPinned)
+	}
+	return r.verifyWorkloadIdentity(ctx, log, kcp, wc, via)
 }
 
 // verifyIdentityViaEndpoint runs verifyWorkloadIdentity on a fresh endpoint

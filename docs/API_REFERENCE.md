@@ -49,7 +49,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `k3sTokenSecretRef` | `WorkerTokenSecretReference` | No | — | Reference to a Secret containing the k3s join token. Required for k3s workers; prefer this over inline `k3sToken`. |
 | `caCertHashes` | `[]string` | No | — | Reserved; not implemented. The value is accepted and stored, but no controller reads it and it is rendered into no cloud-config, so setting it does not pin the join to a CA. Setting it produces an admission warning. Neither distribution can consume it: a k0s worker joins with the bundle `k0s token create` produces, which already carries the cluster CA, and a k3s agent takes no CA-hash flag. To get k3s to validate the server, pass the server's full node-token (`K10<hash>::server:<password>`) as `k3sToken` / `k3sTokenSecretRef`. See kairos-io/kairos#4937. |
 | `caCertSecretRef` | `ObjectReference` | No | — | Reserved; not implemented. The reference is accepted and stored, but no controller reads the Secret and its contents reach no node. Setting it produces an admission warning. Use `files` to place a CA certificate on the node. See kairos-io/kairos#4937. |
-| `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. |
+| `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. On control-plane configs (`role: control-plane`) it must be a lowercase DNS-1123 label (at most 63 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit) with no `{{` template markup: the control plane finds the node's k0s etcd member by this name. Enforced on create, and on update only when the field changes, so existing objects keep their value. Worker configs are not checked. A `KairosControlPlane` applies the same rule to the `KairosConfigTemplate` it references: it emits a Warning event `InvalidControlPlaneHostname` and creates no control-plane Machine from a template that breaks it. |
 | `hostnamePrefix` | `string` | No | `"metal-"` | Prefix for the auto-generated hostname. The final hostname is `{hostnamePrefix}{4-char-machine-id}`. |
 | `dnsServers` | `[]string` | No | — | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). |
 | `podCIDR` | `string` | No | — | Pod network CIDR for k0s. Uses k0s defaults when unset. |
@@ -538,7 +538,7 @@ A `KairosControlPlane` with more than one replica records which workload cluster
 - before a joiner is admitted, on the same connection the k0s join token is issued through (k3s: through the endpoint);
 - before a k0s join token is extended or deleted;
 - before the controller deletes a control-plane Machine, for a rollout or a scale-down;
-- on every connection the k0s etcd-leave handshake uses;
+- on every connection the k0s etcd-leave handshake and the orphan etcd-member cleanup use; these two paths use no connection at all until a pin exists;
 - and through every reachable path at most once a minute, even with nothing to do.
 
 An API server whose identity cannot be read is treated as not answering: the action waits and is retried.
@@ -576,6 +576,18 @@ Deleting the whole cluster is not affected: control-plane deletion strips the et
   ```
 
 Write access to the `KairosControlPlane` is required for all three, the same access that can scale the control plane.
+
+### k0s etcd leave and orphan members
+
+On k0s HA control planes the controller removes a deleted control-plane Machine's etcd member before it lets the deletion proceed, including for a Machine that never got a Node, and it removes etcd members no control-plane Machine accounts for. The rules are in [High availability: etcd health and quorum-safe replacement](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement). The controller keeps its state in these annotations; none is meant to be set by hand.
+
+| Annotation | On | Purpose |
+|---|---|---|
+| `controlplane.cluster.x-k8s.io/etcd-leave-requested-at` | Machine | When the leave was first requested (RFC3339). Starts the ~5-minute wait for the node's own ack. |
+| `controlplane.cluster.x-k8s.io/etcd-member-leave-requested-at` | Machine | When the leave was handed to k0s. Starts the ~10-minute wait for k0s. |
+| `controlplane.cluster.x-k8s.io/etcd-member-leave-member-id` | Machine | The etcd member ID first seen for the leaving node. k0s's `EtcdMember` is acted on only while it carries this ID. |
+| `controlplane.cluster.x-k8s.io/etcd-leave-unreachable-since` | Machine | The first time, before any leave request, that no verified workload API server answered. After ~15 minutes the deletion proceeds with `EtcdMemberLeaveTimedOut`. |
+| `controlplane.cluster.x-k8s.io/etcd-orphan-member-leave` | KairosControlPlane | The orphan etcd member being removed: `<EtcdMember name> <member ID> <RFC3339>`. While set, no other orphan is removed and no control-plane Machine is created or deleted. |
 
 ### Template ownership
 

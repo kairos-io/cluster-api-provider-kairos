@@ -1,5 +1,17 @@
 # Upgrading Kairos CAPI Provider
 
+## Next release (after v0.2.0)
+
+### Behaviour changes to expect
+
+- **Control-plane `spec.hostname` is validated.** A new or changed
+  `spec.hostname` on a control-plane `KairosConfig` must be a lowercase
+  DNS-1123 label (at most 63 characters of `a-z`, `0-9` and `-`) without
+  `{{`, and a `KairosControlPlane` refuses to create Machines from a
+  referenced `KairosConfigTemplate` whose hostname breaks that rule (Warning
+  event `InvalidControlPlaneHostname`). Existing objects are unaffected until
+  the field is changed, and worker configs are not checked.
+
 ## v0.1.3 → v0.1.4
 
 Full release notes: [v0.1.4](release-notes/v0.1.4.md).

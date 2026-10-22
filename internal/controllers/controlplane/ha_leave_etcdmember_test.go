@@ -23,8 +23,10 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -112,6 +114,11 @@ func newLeaveFixtureFor(g *WithT, target *clusterv1.Machine, workload []client.O
 	b := fake.NewClientBuilder().WithScheme(f.scheme).
 		WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).
 		WithObjects(workload...)
+	// The member serves the pinned cluster, unless the test brings its own
+	// kube-system to say otherwise.
+	if !hasKubeSystem(workload) {
+		b = b.WithObjects(kubeSystem(uidA))
+	}
 	if intercept != nil {
 		b = b.WithInterceptorFuncs(*intercept)
 	}
@@ -124,7 +131,17 @@ func newLeaveFixtureFor(g *WithT, target *clusterv1.Machine, workload []client.O
 }
 
 func (f *leaveFixture) reconcile() (bool, error) {
-	return f.r.reconcileMemberLeave(context.Background(), log.Log, vipKCP(), haCluster(), f.machines, f.target)
+	return f.r.reconcileMemberLeave(context.Background(), log.Log, pinnedVIPKCP(), haCluster(), f.machines, f.target)
+}
+
+// hasKubeSystem reports whether objs holds the kube-system Namespace.
+func hasKubeSystem(objs []client.Object) bool {
+	for _, o := range objs {
+		if ns, ok := o.(*corev1.Namespace); ok && ns.Name == metav1.NamespaceSystem {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *leaveFixture) events() []string {

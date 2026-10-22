@@ -849,6 +849,47 @@ func TestGenerateK0sCloudConfig_HostnameTemplating(t *testing.T) {
 	g.Expect(cloudConfig).NotTo(ContainSubstring("{{.MachineID}}"))
 }
 
+// TestRenderCloudConfig_HostnameIsRenderedHostname: the hostname the node
+// gets is bootstrapv1beta2.RenderedHostname, the name the KairosControlPlane
+// controller looks the node's k0s EtcdMember and etcd-leave key up by when the
+// Machine has no NodeRef (ADR 0015 PR-3). If the two ever differ, a deleted
+// joiner's etcd member is orphaned again.
+func TestRenderCloudConfig_HostnameIsRenderedHostname(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hostname string
+	}{
+		{"no spec.hostname", ""},
+		{"spec.hostname", "cp-explicit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := runtime.NewScheme()
+			g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
+			g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+			g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+			reconciler := &KairosConfigReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
+			kc := &bootstrapv1beta2.KairosConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: "kc", Namespace: "default"},
+				Spec: bootstrapv1beta2.KairosConfigSpec{
+					Role: "control-plane", Distribution: "k0s", KubernetesVersion: "v1.30.0+k0s.0",
+					SingleNode: true, UserName: "kairos", UserPassword: "kairos", UserGroups: []string{"admin"},
+					Hostname: tc.hostname,
+				},
+			}
+			machine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "kcp-7", Namespace: "default"}}
+			cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"}}
+
+			cloudConfig, err := reconciler.renderCloudConfig(context.Background(), log.Log, bootstrapv1beta2.DistributionK0s,
+				kc, machine, cluster, "control-plane", "")
+
+			g.Expect(err).NotTo(HaveOccurred())
+			want := bootstrapv1beta2.RenderedHostname(&kc.Spec, machine.Name)
+			g.Expect(cloudConfig).To(ContainSubstring("hostname: " + want + "\n"))
+		})
+	}
+}
+
 func TestGenerateK3sCloudConfig_WorkerTokenSecretRef(t *testing.T) {
 	g := NewWithT(t)
 

@@ -78,6 +78,11 @@ type KairosControlPlaneReconciler struct {
 	// periodic workload-identity recheck (ADR 0015 PR-2, ha_identity.go).
 	identityMu        sync.Mutex
 	identityCheckedAt map[string]time.Time
+
+	// orphanMu guards orphanCheckedAt, the in-memory rate limit of the orphan
+	// etcd-member check (ADR 0015 PR-3, ha_etcd_orphans.go).
+	orphanMu        sync.Mutex
+	orphanCheckedAt map[string]time.Time
 }
 
 const controlPlaneLBServiceSuffix = "control-plane-lb"
@@ -677,6 +682,11 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	log.Info("Reconciling control plane machines", "desired", desiredReplicas, "current", currentReplicas)
 
+	// ADR 0015 PR-3: say at once, not at the next scale-up, when the
+	// referenced KairosConfigTemplate's hostname cannot be used for
+	// control-plane nodes. createControlPlaneMachine refuses such a template.
+	r.reportControlPlaneTemplateHostname(ctx, log, kcp)
+
 	// Carry the current machineTemplate.nodeDrainTimeout onto the Machines that
 	// already exist. This runs before the etcd-leave sweep below so a Machine
 	// that is terminating right now picks up an edited deadline.
@@ -768,6 +778,25 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		if _, frozen := workloadIdentityFrozen(kcp); frozen {
 			return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
 		}
+	}
+
+	// ADR 0015 PR-3: remove, one at a time and only when quorum allows, k0s
+	// etcd members that no control-plane Machine accounts for, as upstream's
+	// kubeadm control plane does in reconcileEtcdMembers. A removal in
+	// progress holds every scale and rollout step below, so membership never
+	// changes twice at once. It runs whatever the replica count: a removal
+	// recorded before a scale to one replica is still followed to its end and
+	// still holds; new removals start only on k0s HA.
+	res, hold, err := r.reconcileOrphanEtcdMembers(ctx, log, kcp, cluster, machines, desiredReplicas)
+	if errors.Is(err, errWorkloadIdentityChanged) {
+		log.Info("Holding orphan etcd member cleanup: the workload cluster identity changed", "reason", err.Error())
+		return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile orphan etcd members: %w", err)
+	}
+	if hold {
+		return res, nil
 	}
 
 	maxSurge := int32(1)
@@ -1040,6 +1069,13 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) error {
 	if err := errIfIdentityFrozen(kcp, "create a control-plane Machine"); err != nil {
 		return err
+	}
+	// ADR 0015 PR-3: never stamp a control-plane config from a template whose
+	// hostname control-plane nodes cannot use; fail before anything exists.
+	if problem, err := r.controlPlaneTemplateHostnameProblem(ctx, kcp); err != nil {
+		return err
+	} else if problem != "" {
+		return errors.New(problem)
 	}
 	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
 
