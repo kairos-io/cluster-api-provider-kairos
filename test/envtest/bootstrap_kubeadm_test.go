@@ -168,9 +168,9 @@ func TestBootstrapIntegration_KubeadmWorker(t *testing.T) {
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 
-	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+	mgr, err := manager.New(cfg, withProductionSecretCache(manager.Options{Scheme: scheme, Logger: log.Log,
 		Metrics:    metricsserver.Options{BindAddress: "0"},
-		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}}))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	// Uncached reader for the kubeadm source (mgmt reads + <cluster>-ca cross-check)
