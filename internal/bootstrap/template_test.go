@@ -280,7 +280,7 @@ func TestRenderK3sCloudConfig_ControlPlaneSingleNode(t *testing.T) {
 	if !strings.Contains(result, "path: /usr/local/bin/kairos-k3s-post-bootstrap.sh") {
 		t.Error("Missing kairos-k3s-post-bootstrap.sh in write_files")
 	}
-	if !strings.Contains(result, "systemctl enable --now kairos-k3s-post-bootstrap.service") {
+	if !strings.Contains(result, "systemctl enable --now --no-block kairos-k3s-post-bootstrap.service") {
 		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
 	}
 }
@@ -438,7 +438,7 @@ func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
 	// PR-3: the node PATCHes the staging Secret's value key; it does NOT rewrite
 	// the server (no node-side sed) — the control plane forces the LB endpoint.
 	assertPatchesStagingNoMetadata(t, result, "cluster-kubeconfig-push")
-	if !strings.Contains(result, "systemctl enable --now kairos-k3s-post-bootstrap.service") {
+	if !strings.Contains(result, "systemctl enable --now --no-block kairos-k3s-post-bootstrap.service") {
 		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
 	}
 }

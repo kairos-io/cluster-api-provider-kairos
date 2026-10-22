@@ -247,12 +247,12 @@ write_files:
     content: |
       [Unit]
       Description=Kairos k3s post-bootstrap tasks
-      # Skip on Kairos live installer (cdroot present in cmdline) — the
-      # post-bootstrap script would block for 7+ minutes waiting for k3s
-      # node registration that never happens on the installer (overlayfs
-      # snapshotter cannot nest on the live tmpfs overlay), holding up
-      # cloud-init's runcmd and preventing kairos-agent from rebooting
-      # into the installed system. (KD-3b lab finding on Hadron.)
+      # Skip on Kairos live installer (cdroot present in cmdline): k3s node
+      # registration never happens there (overlayfs snapshotter cannot nest
+      # on the live tmpfs overlay). The script would still run to its end: it
+      # writes the bootstrap-success sentinel, and on an HA control plane it
+      # reports a healthy etcd member under the installer's hostname, both for
+      # a node that does not exist. (KD-3b lab finding on Hadron.)
       ConditionKernelCommandLine=!cdroot
       After=k3s.service
       Wants=k3s.service
@@ -314,7 +314,8 @@ write_files:
           FORMATTED="${T0}-${T1}-${T2}-${REST:0:4}-${REST:4:12}"
           PROVIDER_ID="vsphere://${FORMATTED}"
           mkdir -p /etc/rancher/k3s/config.yaml.d
-          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
+          printf "kubelet-arg:\n  - provider-id=%s\n" "$PROVIDER_ID" > /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$
+          mv -f /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$ /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
           echo "Discovered providerID: $PROVIDER_ID"
         fi
       fi
@@ -549,5 +550,7 @@ runcmd:
   # service would only auto-start on the NEXT boot — too late for the
   # KD-3b push pattern, which needs to fire on the first installed-system
   # boot. Same fix the k0s templates use via the helper service.
+  # --no-block: the unit is a oneshot that can retry for minutes, and
+  # waiting for it holds this cloud-config stage.
   - /bin/systemctl daemon-reload || true
-  - /bin/systemctl enable --now kairos-k3s-post-bootstrap.service || true
+  - /bin/systemctl enable --now --no-block kairos-k3s-post-bootstrap.service || true

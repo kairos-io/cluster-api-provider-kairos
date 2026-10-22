@@ -645,7 +645,8 @@ write_files:
       # KubeletConfiguration drop-in merged via --config-dir before the kubelet
       # registers the Node. Written with printf (not an interpolated heredoc); the
       # only substituted value is the UUID validated above.
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nproviderID: kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/10-provider-id.conf"
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nproviderID: kairos-fleet://%s\n' "${NODE_ID}" > "${DROPIN_DIR}/10-provider-id.conf.tmp.$$"
+      mv -f "${DROPIN_DIR}/10-provider-id.conf.tmp.$$" "${DROPIN_DIR}/10-provider-id.conf"
       echo "fleet: providerID set to kairos-fleet://${NODE_ID}"
   {{- end }}
   {{- /*
@@ -1576,10 +1577,11 @@ MANIFEST_EOF
 stages:
   boot:
     {{- if and .IsFleet (not .ProviderID) (ne .Role "control-plane") }}
-    # Fleet worker: also run the providerID drop-in writer as an early boot stage
-    # (belt-and-suspenders alongside the k0sworker.service ExecStartPre), so the
-    # KubeletConfiguration drop-in is present before the kubelet registers. The
-    # script is idempotent and fails closed on a missing/malformed node_id.
+    # Fleet worker: also run the providerID drop-in writer as a boot stage step,
+    # as a backstop. The k0sworker.service ExecStartPre is what puts the
+    # KubeletConfiguration drop-in in place before the kubelet registers; this
+    # step can run at the same time, which is why the script renames the file
+    # into place. It is idempotent and fails closed on a missing/malformed node_id.
     - name: "Discover providerID for k0s worker (fleet self-discovery)"
       commands:
         - /usr/local/bin/kairos-k0s-fleet-provider-id.sh || true
