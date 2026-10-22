@@ -43,6 +43,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -383,6 +384,10 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinToken(ctx context.
 }
 
 func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, now time.Time) (string, string, error) {
+	// ADR 0015 PR-2: no token is minted while the workload identity is frozen.
+	if err := errIfIdentityFrozen(kcp, "issue a k0s join token"); err != nil {
+		return "", "", err
+	}
 	// Never replace the token while a joiner rendered with it is still joining.
 	// The gate already guarantees this; checking again keeps the invariant local.
 	etcdStatus, err := r.readEtcdStatus(ctx, cluster)
@@ -422,6 +427,15 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 	wc, err := r.workloadClientFor(ctx, cluster)
 	if err != nil {
 		return "", fmt.Sprintf("cannot reach the workload cluster to issue a k0s join token: %v", err), nil
+	}
+	// ADR 0015 PR-2: admit a joiner only into the pinned cluster, checked on
+	// the client the token is minted through. A token minted in another
+	// cluster would let the joiner join it.
+	if err := r.verifyWorkloadIdentity(ctx, log, kcp, wc, leaveViaEndpoint); err != nil {
+		if errors.Is(err, errWorkloadIdentityChanged) {
+			return "", "", err
+		}
+		return "", fmt.Sprintf("cannot verify the workload cluster identity before issuing a k0s join token: %v", err), nil
 	}
 	servers, err := liveK0sJoinServers(ctx, wc, machines)
 	if err != nil {
@@ -469,6 +483,26 @@ func (r *KairosControlPlaneReconciler) ensureK0sControllerJoinTokenAt(ctx contex
 			return "", "the join-token Secret changed while a new token was being stored; retrying", nil
 		}
 		return "", fmt.Sprintf("issuing a k0s join token failed: %v", err), nil
+	}
+	// ADR 0015 PR-2: narrow the verify-then-act window. The identity was read
+	// before the mint; read it again on the same client now the token exists.
+	// If the cluster changed in between, delete the token (best effort; it
+	// also lapses with its TTL) and freeze, so no joiner is ever created with
+	// it. The management Secret keeps the encoded token, but no KairosConfig is
+	// stamped with its ID, and after an operator clears the freeze the next
+	// admission re-checks it against the pinned cluster before reusing it.
+	//
+	// This narrows the window but cannot close it: through the VIP, each
+	// request may reach a different apiserver, so the mint itself may land in
+	// a cluster that neither read saw. The node-side join check (ADR 0015
+	// PR-1: a joiner that sees itself as the only etcd member refuses to
+	// serve) is the backstop for that residue.
+	if verr := r.verifyWorkloadIdentity(ctx, log, kcp, wc, leaveViaEndpoint); verr != nil {
+		if errors.Is(verr, errWorkloadIdentityChanged) {
+			deleteK0sJoinToken(ctx, log, wc, id)
+			return "", "", verr
+		}
+		return "", fmt.Sprintf("cannot re-verify the workload cluster identity after issuing a k0s join token: %v", verr), nil
 	}
 	for _, old := range stored.supersededIDs() {
 		if old != id {
@@ -638,6 +672,11 @@ func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetime(ctx context
 }
 
 func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetimeAt(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, now time.Time) bool {
+	// ADR 0015 PR-2: no token is extended or deleted while the workload
+	// identity is frozen. The freeze requeues the control plane by itself.
+	if _, frozen := workloadIdentityFrozen(kcp); frozen {
+		return false
+	}
 	etcdStatus, err := r.readEtcdStatus(ctx, cluster)
 	if err != nil {
 		log.Info("Cannot check pending k0s joiners", "error", err.Error())
@@ -673,6 +712,12 @@ func (r *KairosControlPlaneReconciler) reconcileK0sJoinTokenLifetimeAt(ctx conte
 	wc, err := r.workloadClientFor(ctx, cluster)
 	if err != nil {
 		log.Info("Cannot reach the workload cluster to maintain k0s join tokens", "error", err.Error())
+		return len(pending) > 0
+	}
+	// ADR 0015 PR-2: extend or delete tokens only in the pinned cluster. A
+	// mismatch freezes the control plane; reconcileMachines then holds.
+	if err := r.verifyWorkloadIdentity(ctx, log, kcp, wc, leaveViaEndpoint); err != nil {
+		log.Info("Not maintaining k0s join tokens: cannot verify the workload cluster identity", "error", err.Error())
 		return len(pending) > 0
 	}
 

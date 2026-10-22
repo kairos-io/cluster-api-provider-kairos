@@ -18,6 +18,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -265,6 +266,10 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //  6. Otherwise → write the leave-requested sentinel, stamp the first-request
 //     timestamp, requeue (done=false).
 //
+// Identity (ADR 0015 PR-2): every connection connectForLeave returns serves
+// the pinned cluster. One that does not freezes the control plane, and while
+// frozen nothing here writes to the workload cluster or removes the hook.
+//
 // SECURITY / fail-safe (ADR 0005 §E.5): a workload-client BUILD error or a
 // ConfigMap READ error, on every apiserver connectForLeave tries, or a failed
 // write, returns the error with the hook STILL SET — the delete stays blocked
@@ -273,14 +278,19 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // read returned ahead of it, so a leave whose reads kept failing was never
 // bounded.
 func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, target *clusterv1.Machine) (bool, error) {
+	// (0) ADR 0015 PR-2: a frozen control plane neither writes to the workload
+	// cluster nor removes the hook.
+	if err := errIfIdentityFrozen(kcp, "progress the etcd leave of Machine "+target.Name); err != nil {
+		return false, err
+	}
 	// (1) Never-registered node: nothing to leave, nothing alive to run it.
 	if !target.Status.NodeRef.IsDefined() {
 		log.Info("etcd-leave: target has no NodeRef; removing hook without leave handshake", "machine", target.Name)
-		return true, r.removeEtcdLeaveHook(ctx, target)
+		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 	// (2) Defensive: only k0s stamps the hook.
 	if distributionOf(kcp) != "k0s" {
-		return true, r.removeEtcdLeaveHook(ctx, target)
+		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 
 	nodeName := target.Status.NodeRef.Name
@@ -302,6 +312,13 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// through it. Nothing answering is fail-safe: hook retained, except that
 	// the timeout backstop below is still evaluated once a leave was requested.
 	conn, connErr := r.connectForLeave(ctx, log, kcp, cluster, machines, target)
+	// An apiserver that serves another cluster froze the control plane
+	// (connectForLeave verifies the identity of every connection). Its
+	// answers must not drive a single step below: not the ack, not the
+	// etcd-status shortcut, and not the timeout, which would remove the hook.
+	if errors.Is(connErr, errWorkloadIdentityChanged) {
+		return false, connErr
+	}
 
 	// (3) First entry for THIS eviction cycle (no timestamp stamped yet). FORCE the
 	// leave-requested sentinel, overwriting any STALE `left` a prior eviction of a
@@ -334,14 +351,14 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 		// Node acked the leave → done.
 		if conn.cm.Data[nodeName] == etcdLeftValue {
 			log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
-			return true, r.removeEtcdLeaveHook(ctx, target)
+			return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 		}
 		// Member gone from node-reported etcd-status → treat as left. Best-effort: a
 		// read error leaves the member "present" so we keep waiting, never skip.
 		if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
 			if _, present := status[nodeName]; !present {
 				log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
-				return true, r.removeEtcdLeaveHook(ctx, target)
+				return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 			}
 		}
 	}
@@ -451,9 +468,18 @@ func (r *KairosControlPlaneReconciler) annotateOnce(ctx context.Context, m *clus
 
 // removeEtcdLeaveHook drops the etcd-leave pre-terminate hook from the Machine so
 // CAPI can proceed with termination. Idempotent: a no-op if the hook is absent.
-func (r *KairosControlPlaneReconciler) removeEtcdLeaveHook(ctx context.Context, m *clusterv1.Machine) error {
+//
+// It refuses while the workload identity is frozen (ADR 0015 PR-2). Every
+// hook removal outside whole-cluster teardown goes through here, so a frozen
+// control plane keeps every hooked Machine, and its etcd data, until an
+// operator decides. Teardown strips hooks through stripEtcdLeaveHooks and is
+// not affected.
+func (r *KairosControlPlaneReconciler) removeEtcdLeaveHook(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, m *clusterv1.Machine) error {
 	if !hasEtcdLeaveHook(m) {
 		return nil
+	}
+	if err := errIfIdentityFrozen(kcp, "remove the etcd-leave hook from Machine "+m.Name); err != nil {
+		return err
 	}
 	helper, err := patch.NewHelper(m, r.Client)
 	if err != nil {

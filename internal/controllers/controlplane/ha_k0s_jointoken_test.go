@@ -936,12 +936,12 @@ func TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending(t *testing.T) {
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane"))}},
 		Data: map[string][]byte{joinTokenSecretDataKey: []byte(enc)},
 	}
-	wc := fake.NewClientBuilder().WithScheme(workloadTestScheme(g)).
-		WithObjects(ws, kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.20"))).Build()
+	workload := withPinnedWorkload(workloadTestScheme(g), kcp,
+		ws, kubernetesSlice("kubernetes", discoveryv1.AddressTypeIPv4, epReady("10.0.0.20")))
 
 	run := func(objs ...client.Object) ctrl.Result {
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
-		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
+		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: workload}
 		res, err := r.reconcileMachines(context.Background(), logr.Discard(), kcp, cluster)
 		g.Expect(err).NotTo(HaveOccurred())
 		return res

@@ -174,7 +174,7 @@ func TestReconcileMachines_HARolloutKeepsOldMembersWhileTheReplacementBoots(t *t
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(old0, old1, old2, booting, machineMetaInfraTemplate(),
 			rolloutEtcdStatus(cluster, old0, old1, old2)).Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
 	res, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -208,7 +208,7 @@ func TestReconcileMachines_HARolloutRemovesTheOldestMemberOnceTheReplacementJoin
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(old0, old1, old2, joined, machineMetaInfraTemplate(),
 			rolloutEtcdStatus(cluster, old0, old1, old2, joined)).Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
 	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())

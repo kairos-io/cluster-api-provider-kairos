@@ -97,6 +97,16 @@ const (
 	// bring-up window (before members have reported).
 	EtcdQuorumAtRiskReason = "EtcdQuorumAtRisk"
 
+	// WorkloadClusterIdentityChangedReason is the False(Error) reason on
+	// Ready, EtcdHealthyCondition and AvailableCondition while the control plane is
+	// frozen because a workload apiserver answered with a kube-system Namespace
+	// UID other than the one pinned on the KairosControlPlane (ADR 0015 PR-2).
+	// It means the controller reached a different cluster that shares the CA,
+	// for example a member that bootstrapped a new etcd cluster. Control-plane
+	// Machine creation and deletion and etcd-leave hook removal stop until an
+	// operator re-pins; whole-cluster deletion is not affected.
+	WorkloadClusterIdentityChangedReason = "WorkloadClusterIdentityChanged"
+
 	// WaitingForEtcdMemberReason is the False(Info) reason surfaced while the
 	// init node has not yet reported a healthy voting etcd member (ADR 0005 §E.1,
 	// k0s joiner gate).

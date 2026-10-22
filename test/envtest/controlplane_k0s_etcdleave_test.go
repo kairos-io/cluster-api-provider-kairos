@@ -29,12 +29,14 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -132,10 +134,59 @@ func k0sEtcdMemberLeave(ctx context.Context, wc client.Client, name string) (boo
 }
 
 // recordingMembers stands in for MemberClientFactory: every member address
-// reaches the envtest apiserver, and every address asked for is recorded.
+// reaches the envtest apiserver, and every address that carries etcd-leave
+// traffic is recorded. The KCP's read-only workload identity checks (the
+// kube-system Namespace, ADR 0015 PR-2) also go to members, including members
+// that are not leaving yet; they are not etcd-leave traffic and are not
+// recorded.
 type recordingMembers struct {
 	mu     sync.Mutex
 	dialed map[string]bool
+}
+
+// record marks ip as having carried etcd-leave traffic.
+func (m *recordingMembers) record(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dialed[ip] = true
+}
+
+// client returns a client of the envtest apiserver for member ip that
+// records every request except the workload identity read.
+func (m *recordingMembers) client(t *testing.T, cfg *rest.Config, ip string) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	base, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityRead := func(obj client.Object) bool {
+		_, ok := obj.(*corev1.Namespace)
+		return ok
+	}
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if !identityRead(obj) {
+				m.record(ip)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			m.record(ip)
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			m.record(ip)
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			m.record(ip)
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
 }
 
 func (m *recordingMembers) addresses() []string {
@@ -176,16 +227,16 @@ func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[strin
 			return nil, errors.New("the control-plane endpoint does not answer")
 		}
 		r.MemberClientFactory = func(_ context.Context, _ *clusterv1.Cluster, ip string) (client.Client, error) {
-			members.mu.Lock()
-			members.dialed[ip] = true
-			members.mu.Unlock()
-			return envtestWorkloadClient(t, cfg), nil
+			return members.client(t, cfg, ip), nil
 		}
 	})
 	installK0sEtcdMemberCRD(t, cfg)
 	k := &k0sLeaveCluster{ctx: ctx, c: c, wc: envtestWorkloadClient(t, cfg), members: members, nsName: name, kcpName: name + "-kcp"}
 	clusterName := name + "-cluster"
 	haFixture(t, ctx, c, k.nsName, clusterName, k.kcpName, "k0s")
+	// The cluster is long past its first contact, so the KCP pinned its
+	// identity then (ADR 0015 PR-2). The envtest apiserver is the workload.
+	pinEnvtestWorkloadIdentity(t, ctx, c, k.wc, k.nsName, k.kcpName)
 	endpointHost := testControlPlaneEndpoint().Host
 	vip := getKCP(g, ctx, c, k.nsName, k.kcpName).Spec.HA.VIP.Address
 

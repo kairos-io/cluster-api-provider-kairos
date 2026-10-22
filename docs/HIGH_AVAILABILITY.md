@@ -114,3 +114,68 @@ On k0s, the departing node runs `k0s etcd leave` before the Machine is deleted; 
 A k0s node that never acks its leave within ~5 minutes is deleted anyway (the delete was already proven quorum-safe); watch for `EtcdMemberLeaveTimedOut` and remove the member manually if it fires.
 
 **KD-51:** etcd health/leave signals are node-self-reported over vanilla RBAC, so a compromised control-plane node can forge them. Not a privilege escalation (a compromised node already has cluster-admin-equivalent access) and it cannot force an unsafe deletion — quorum-safety is decided independently of any node signal. A forged signal can only self-downgrade the clean-leave/health guarantee.
+
+## Day-2: workload cluster identity and the freeze
+
+An HA control plane pins the identity of the workload cluster it manages, and freezes control-plane membership changes if a workload API server ever answers as a different cluster (ADR 0015). The identity is the UID of the workload `kube-system` Namespace, stored on the `KairosControlPlane` in the `controlplane.cluster.x-k8s.io/workload-cluster-uid` annotation. The full rules (when it is pinned, what is checked, the annotations) are in [API_REFERENCE.md — Workload cluster identity](API_REFERENCE.md#workload-cluster-identity).
+
+Why it exists: on k0s, a joining member whose join failed half-way can start a new etcd cluster with the certificate authority it received while joining. The new cluster's API server is trusted by the same CA, kube-vip there can take the VIP, and a controller that cannot tell the two clusters apart then removes the original members as "gone". The freeze turns that into a stop that waits for a person.
+
+While frozen:
+
+- `Ready`, `Available` and `EtcdHealthy` are `False` (Error) with reason `WorkloadClusterIdentityChanged`, and a Warning event `WorkloadClusterIdentityChanged` names the pinned UID, the UID read, and where it was read from;
+- the controller creates and deletes no control-plane Machine and removes no etcd-leave hook, so a k0s Machine deleted by you or a MachineHealthCheck stays at its pre-terminate hook, its VM and etcd data intact;
+- the controller writes nothing to the workload cluster (no etcd-leave request, no join token);
+- deleting the whole cluster still works.
+
+The freeze is sticky on purpose: it never clears by itself, because the two clusters can keep answering in turn. A wrong edit to the pin annotation also freezes the control plane.
+
+### Runbook: `WorkloadClusterIdentityChanged`
+
+1. **Read the freeze.** The mismatch annotation says what was seen, where, and against which pin:
+   ```bash
+   kubectl get kairoscontrolplane <name> -n <namespace> -o jsonpath='{.metadata.annotations}'
+   kubectl describe kairoscontrolplane <name> -n <namespace>   # the Warning event
+   ```
+2. **Read the identity through every control-plane member, not only through the endpoint.** Two clusters elect two VIP holders, so the endpoint alone proves nothing. With the workload kubeconfig, address each member's API server by the IP its Machine reports (`kubectl get machines -n <namespace> -l cluster.x-k8s.io/control-plane -o yaml`, `status.addresses`); TLS is still verified against the cluster CA:
+   ```bash
+   clusterctl get kubeconfig <cluster> -n <namespace> > workload.kubeconfig
+   for ip in <member-ip> ...; do
+     printf '%s ' "$ip"
+     kubectl --kubeconfig workload.kubeconfig --server "https://$ip:6443" \
+       get namespace kube-system -o jsonpath='{.metadata.uid}{"\n"}'
+   done
+   ```
+   Where member addresses are not in the API server certificate (CAPK reports pod IPs), run the same read on each node: `k0s kubectl get namespace kube-system -o jsonpath='{.metadata.uid}'` (k3s: `k3s kubectl`). On k0s, also run `k0s etcd member-list` on each node: a member that started its own cluster lists only itself.
+3. **Decide which cluster to keep.**
+   - **One or a few members (usually the newest joiner) answer with a different UID; the rest answer with the pinned one.** Those members serve a cluster of their own. Power off their VMs through the infrastructure provider; deleting the Machine is not enough while frozen, because the hook keeps it. Check again that every remaining member answers with the pinned UID, then clear the freeze by removing only the mismatch annotation (step 4). The k0s member those joiners left in the original cluster's etcd may then need removing by hand: compare `k0s etcd member-list` on a surviving member with the live Machines, and run `k0s etcd leave --peer-address <ip>` there for the stale entry.
+   - **Every member answers with the same new UID.** The pinned cluster no longer exists; its state is already lost. Re-pin to the new UID so the control plane can be managed again (step 4), then restore workloads from backup if you have one.
+   - **Every member answers with the pinned UID.** The cause is gone (for example, the stray VM was already powered off). Remove only the mismatch annotation (step 4).
+4. **Clear the freeze.** Pick the command that matches step 3:
+   ```bash
+   # keep the pin; the next check freezes again if any path still disagrees
+   kubectl annotate kairoscontrolplane <name> -n <namespace> \
+     controlplane.cluster.x-k8s.io/workload-cluster-identity-mismatch-
+
+   # re-pin to the UID every member now answers with
+   kubectl annotate kairoscontrolplane <name> -n <namespace> --overwrite \
+     controlplane.cluster.x-k8s.io/workload-cluster-uid=<verified-uid>
+   ```
+   Changing or removing the pin annotation clears the freeze by itself; the controller removes the mismatch annotation and emits a Normal event `WorkloadClusterIdentityFreezeCleared`. Removing the pin instead of setting it makes the controller pin again, which it does only if every path agrees. Membership changes resume on the next reconcile.
+
+### Before upgrading an existing HA cluster
+
+Left alone, the controller pins an existing cluster on its first reconcile after the upgrade, from whatever answers then. It refuses to pin, and freezes, if the endpoint and the members disagree, but it cannot detect a split that every path reports the same way. Close that gap by setting the pin yourself before you upgrade:
+
+1. Run step 2 of the runbook above and check that every control-plane member answers with the same UID.
+2. Set that UID as the pin. A pin that is already set is never replaced by first-use pinning, so the controller checks against your value from its first reconcile:
+   ```bash
+   kubectl annotate kairoscontrolplane <name> -n <namespace> \
+     controlplane.cluster.x-k8s.io/workload-cluster-uid=<verified-uid>
+   ```
+
+**CAPK:** Machines usually report pod IPs, which are not in the API server certificate, so the controller's reads through member addresses do not answer and its first-use pin rests on the control-plane endpoint alone. Pre-seeding the pin matters most there. A split that appears later is still caught by the per-connection checks and the once-a-minute recheck.
+
+### When the controller cannot pin
+
+Once an HA control plane has a registered member, the controller takes no membership action until the identity is pinned. If no path answers the identity read, or `KubeconfigReady` stays `False`, that hold has no time limit: no joiner is admitted, no control-plane Machine is deleted, and a Machine being deleted stays at its etcd-leave hook, because the bounded etcd-leave timeout is suspended too. The controller logs `Holding control-plane membership changes until the workload cluster identity is pinned` with the reason. The way out is to verify the UID through every member (step 2 of the runbook) and set the pin annotation by hand, as above.
