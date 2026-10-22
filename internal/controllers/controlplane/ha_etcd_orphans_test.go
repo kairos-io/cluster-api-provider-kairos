@@ -24,6 +24,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -764,6 +765,74 @@ func TestOrphanEtcdMembers_RecordedRemovalRechecksBeforeTheFirstWrite(t *testing
 		g.Expect(f.stored().Annotations).ToNot(HaveKey(etcdOrphanLeaveAnnotation))
 		g.Expect(f.events()).To(ContainElement(ContainSubstring("Warning EtcdOrphanMemberRemovalTimedOut")))
 	})
+}
+
+// TestOrphanEtcdMembers_NeverTouchTheLeaveConfigMap: the orphan cleanup has
+// no use for the etcd-leave ConfigMap and never reads or writes it, through
+// any member. Reading it is etcd-leave traffic, which must not reach a member
+// CAPI is still draining (ADR 0014). It used to read it through every
+// connection it made, and so reached the leaving member in the window before
+// its deletion showed in the cache.
+func TestOrphanEtcdMembers_NeverTouchTheLeaveConfigMap(t *testing.T) {
+	g := NewWithT(t)
+	touched := 0
+	isLeaveCM := func(obj client.Object) bool {
+		cm, ok := obj.(*corev1.ConfigMap)
+		return ok && cm.Name == etcdLeaveConfigMapName
+	}
+	watch := &interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == etcdLeaveConfigMapName {
+				touched++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if isLeaveCM(obj) {
+				touched++
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if isLeaveCM(obj) {
+				touched++
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}
+	f := newOrphanFixtureWith(g, nil, watch, withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+
+	_, hold, err := f.reconcile()
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(hold).To(BeTrue())
+	f.setJoined("kcp-old", "False")
+	_, _, err = f.reconcile()
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(f.leaveSet("kcp-old")).To(BeTrue(), "the cleanup ran")
+	g.Expect(touched).To(BeZero(), "no etcd-leave ConfigMap access")
+}
+
+// TestOrphanEtcdMembers_RecordedRemovalWaitsForADeletingMachine: a recorded
+// removal whose first spec.leave was never written does not write it while a
+// control-plane Machine is being deleted: that Machine has its own etcd leave
+// to make, and two membership changes must not run at once.
+func TestOrphanEtcdMembers_RecordedRemovalWaitsForADeletingMachine(t *testing.T) {
+	g := NewWithT(t)
+	rec := orphanLeave{name: "kcp-old", memberID: testMemberID, at: time.Now().Add(-time.Minute)}
+	f := newOrphanFixture(g, map[string]string{etcdOrphanLeaveAnnotation: rec.String()},
+		withOrphans(k0sEtcdMember("kcp-old", "10.0.0.7", false, "True"))...)
+	stored := getMachine(g, f.mgmt, "cp-2")
+	stored.Finalizers = []string{"test.kairos.io/hold"}
+	g.Expect(f.mgmt.Update(context.Background(), stored)).To(Succeed())
+	g.Expect(f.mgmt.Delete(context.Background(), stored)).To(Succeed())
+
+	_, hold, err := f.reconcile()
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(hold).To(BeTrue())
+	g.Expect(f.leaveSet("kcp-old")).To(BeFalse(), "no spec.leave while a Machine is being deleted")
+	g.Expect(f.stored().Annotations).To(HaveKey(etcdOrphanLeaveAnnotation))
 }
 
 // TestReconcileMachines_OrphanRemovalHoldsMembershipChanges: while an orphan

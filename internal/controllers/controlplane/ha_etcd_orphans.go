@@ -311,7 +311,7 @@ func (r *KairosControlPlaneReconciler) removeOneOrphan(ctx context.Context, log 
 		}
 	}
 
-	conn, err := r.connectForLeave(ctx, log, kcp, cluster, machines, &clusterv1.Machine{})
+	conn, err := r.connectForOrphans(ctx, log, kcp, cluster, machines)
 	if err != nil {
 		if errors.Is(err, errWorkloadIdentityChanged) {
 			return ctrl.Result{}, false, err
@@ -432,7 +432,7 @@ func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, 
 			"k0s did not report etcd member %q (ID %s) removed within %s; it may need removing by hand", rec.name, rec.memberID, etcdMemberLeaveCap)
 	}
 
-	conn, err := r.connectForLeave(ctx, log, kcp, cluster, machines, &clusterv1.Machine{})
+	conn, err := r.connectForOrphans(ctx, log, kcp, cluster, machines)
 	if err != nil {
 		if errors.Is(err, errWorkloadIdentityChanged) {
 			return ctrl.Result{}, false, err
@@ -487,6 +487,16 @@ func (r *KairosControlPlaneReconciler) progressOrphanLeave(ctx context.Context, 
 		joined, lerr := listJoinedEtcdMembers(ctx, conn.client)
 		status, serr := r.readEtcdStatus(ctx, cluster)
 		switch {
+		case deletingMachine(machines) != "":
+			// As for a first request: never start a removal while a
+			// control-plane Machine is being deleted, which has its own leave
+			// to make.
+			if capped {
+				return timedOut()
+			}
+			log.Info("Waiting to request the recorded orphan etcd member removal: a control-plane Machine is being deleted",
+				"member", rec.name, "machine", deletingMachine(machines))
+			return wait, true, nil
 		case lerr != nil || serr != nil:
 			if capped {
 				return timedOut()
@@ -546,6 +556,17 @@ func (r *KairosControlPlaneReconciler) orphanRemovalBlocked(log logr.Logger, kcp
 		return true
 	}
 	return false
+}
+
+// deletingMachine returns the name of the first of machines being deleted,
+// or "" when none is.
+func deletingMachine(machines []*clusterv1.Machine) string {
+	for _, m := range machines {
+		if !m.DeletionTimestamp.IsZero() {
+			return m.Name
+		}
+	}
+	return ""
 }
 
 // listJoinedEtcdMembers lists the EtcdMembers through wc and returns those k0s
