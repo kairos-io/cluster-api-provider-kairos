@@ -74,7 +74,7 @@ func TestBootstrapIntegration(t *testing.T) {
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 
 	// Create manager
-	mgr, err := manager.New(cfg, manager.Options{
+	mgr, err := manager.New(cfg, withProductionSecretCache(manager.Options{
 		Scheme: scheme,
 		Logger: log.Log,
 		// Tests don't scrape metrics; disable the listener so the manager does not
@@ -85,7 +85,7 @@ func TestBootstrapIntegration(t *testing.T) {
 		// process-global controller-name uniqueness, so the "kairosconfig" name
 		// collides across per-test managers. Test-harness only.
 		Controller: config.Controller{SkipNameValidation: ptr.To(true)},
-	})
+	}))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	// Setup bootstrap controller
@@ -311,9 +311,9 @@ func TestBootstrapIntegration_LatchedFailureClearsOnRecovery(t *testing.T) {
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 
-	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+	mgr, err := manager.New(cfg, withProductionSecretCache(manager.Options{Scheme: scheme, Logger: log.Log,
 		Metrics:    metricsserver.Options{BindAddress: "0"},
-		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}}))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	reconciler := &bootstrap.KairosConfigReconciler{
@@ -484,9 +484,9 @@ func TestBootstrapIntegration_K3sWorker(t *testing.T) {
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(bootstrapv1beta2.AddToScheme(scheme)).To(Succeed())
 
-	mgr, err := manager.New(cfg, manager.Options{Scheme: scheme, Logger: log.Log,
+	mgr, err := manager.New(cfg, withProductionSecretCache(manager.Options{Scheme: scheme, Logger: log.Log,
 		Metrics:    metricsserver.Options{BindAddress: "0"},
-		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}}))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	reconciler := &bootstrap.KairosConfigReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
