@@ -28,6 +28,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.26.4'
+        # The job restores its own module and build caches with
+        # actions/cache below; setup-go's built-in cache on the same
+        # paths double-restores ("Cannot open: File exists").
+        cache: false
 
     - name: Cache Go modules
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -110,6 +114,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.26.4'
+        # The job restores its own module and build caches with
+        # actions/cache below; setup-go's built-in cache on the same
+        # paths double-restores ("Cannot open: File exists").
+        cache: false
 
     - name: Cache Go modules
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -147,6 +155,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.26.4'
+        # The job restores its own module and build caches with
+        # actions/cache below; setup-go's built-in cache on the same
+        # paths double-restores ("Cannot open: File exists").
+        cache: false
 
     - name: Cache Go modules
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -186,6 +198,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.26.4'
+        # The job restores its own module and build caches with
+        # actions/cache below; setup-go's built-in cache on the same
+        # paths double-restores ("Cannot open: File exists").
+        cache: false
 
     - name: Install envtest tools
       run: |
@@ -223,6 +239,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.26.4'
+        # The job restores its own module and build caches with
+        # actions/cache below; setup-go's built-in cache on the same
+        # paths double-restores ("Cannot open: File exists").
+        cache: false
 
     - name: Cache Go modules
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -265,6 +285,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.26.4'
+        # The job restores its own module and build caches with
+        # actions/cache below; setup-go's built-in cache on the same
+        # paths double-restores ("Cannot open: File exists").
+        cache: false
 
     - name: Cache Go modules
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
