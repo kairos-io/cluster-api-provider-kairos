@@ -58,15 +58,13 @@ type membershipScenario struct {
 	acted func(g *WithT, c client.Client) bool
 }
 
-func createdMachine(name string) func(g *WithT, c client.Client) bool {
+// createdMachine reports whether a Machine was added to the existing ones.
+// New Machine names are random (ADR 0015 PR-4), so it counts them rather than
+// looking for one name.
+func createdMachine(existing int) func(g *WithT, c client.Client) bool {
 	return func(g *WithT, c client.Client) bool {
 		names, _ := remainingMachines(g, c)
-		for _, n := range names {
-			if n == name {
-				return true
-			}
-		}
-		return false
+		return len(names) > existing
 	}
 }
 
@@ -88,7 +86,7 @@ var membershipScenarios = []membershipScenario{
 		build: func(kcp *controlplanev1beta2.KairosControlPlane) (int32, []*clusterv1.Machine) {
 			return 3, []*clusterv1.Machine{rolloutMachine(kcp, "test-kcp-0", rolloutNewVersion, time.Hour, true)}
 		},
-		acted: createdMachine("test-kcp-1"),
+		acted: createdMachine(1),
 	},
 	{
 		name: "scale-down delete",
@@ -111,7 +109,7 @@ var membershipScenarios = []membershipScenario{
 				rolloutMachine(kcp, "test-kcp-2", rolloutOldVersion, 2*time.Hour, true),
 			}
 		},
-		acted: createdMachine("test-kcp-3"),
+		acted: createdMachine(3),
 	},
 	{
 		name: "rollout delete",
@@ -302,9 +300,15 @@ func TestCreateAndDeleteControlPlaneMachine_RefuseWhileFrozen(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machineMetaInfraTemplate(), victim).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 1, bootstrapv1beta2.ControlPlaneRoleJoin, "")
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleJoin, "")
 	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeTrue())
-	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-kcp-1", Namespace: "default"}, &bootstrapv1beta2.KairosConfig{})).ToNot(Succeed())
+	g.Expect(created).To(BeNil())
+	// Names are random (ADR 0015 PR-4), so look for anything created, not for
+	// one name: the freeze refuses before the first object.
+	configs, infra, machines := objectNames(g, c)
+	g.Expect(configs).To(BeEmpty())
+	g.Expect(infra).To(BeEmpty())
+	g.Expect(machines).To(ConsistOf("test-kcp-0"))
 
 	err = r.deleteControlPlaneMachine(context.Background(), kcp, victim)
 	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeTrue())

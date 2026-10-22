@@ -20,9 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -673,10 +670,9 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		return ctrl.Result{}, fmt.Errorf("failed to list control plane machines: %w", err)
 	}
 
-	// Sort machines by creation timestamp (oldest first) for stable operations
-	sort.Slice(machines, func(i, j int) bool {
-		return machines[i].CreationTimestamp.Before(&machines[j].CreationTimestamp)
-	})
+	// Sort machines by creation timestamp (oldest first) for stable operations.
+	// Names carry no order (ADR 0015 PR-4).
+	sortMachinesOldestFirst(machines)
 
 	currentReplicas := int32(len(machines))
 
@@ -850,7 +846,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 			joinTokenID = admission.k0sJoinTokenID
 		}
 
-		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
+		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, role, joinTokenID); err != nil {
 			if errors.Is(err, errWorkloadIdentityChanged) {
 				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
 			}
@@ -900,9 +896,9 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 //   - replicas > 1 and no machine exists yet → init (the oldest CP machine).
 //   - replicas > 1 and at least one machine exists → join.
 //
-// The decision resolves against the EXISTING sorted machine set, not the name
-// index, so a deleted-and-recreated machine-0 cannot accidentally yield two
-// init nodes.
+// The decision resolves against the EXISTING machine set, never against
+// machine names, so neither a deleted first machine nor a cluster that mixes
+// index names with random names (ADR 0015 PR-4) can yield two init nodes.
 func (r *KairosControlPlaneReconciler) controlPlaneRoleForNewMachine(desiredReplicas int32, existing []*clusterv1.Machine) bootstrapv1beta2.ControlPlaneRole {
 	if desiredReplicas <= 1 {
 		return bootstrapv1beta2.ControlPlaneRoleSingle
@@ -1058,32 +1054,61 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 }
 
 // createControlPlaneMachine creates the KairosConfig, infrastructure Machine and
-// Machine for one control-plane member. joinTokenID is the k0s controller-join
-// token ID admitJoiner returned for a k0s join, stamped on the KairosConfig so
-// the bootstrap controller renders exactly that token (ADR 0013); it is empty
-// for every other role and for k3s.
+// Machine for one control-plane member, all three under one fresh random name
+// that no Machine has had before (ADR 0015 PR-4). joinTokenID is the k0s
+// controller-join token ID admitJoiner returned for a k0s join, stamped on the
+// KairosConfig so the bootstrap controller renders exactly that token (ADR
+// 0013); it is empty for every other role and for k3s.
+//
+// A failed create leaves nothing behind: the objects the attempt made are
+// deleted before the error is returned, so the next reconcile starts over with
+// a new name and a new KairosConfig stamped with the then-current token ID.
+// When a generated name is already taken, a new one is tried.
+//
+// After the Machine is created it waits for the cache to show it, so the next
+// reconcile cannot miss it and create one more. If that wait fails, the
+// Machine is returned with the error, and nothing is deleted.
 //
 // It refuses while the workload identity is frozen (ADR 0015 PR-2): every
 // control-plane create goes through here, so the freeze holds even for a
-// caller that did not check it.
-func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, index int32, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) error {
+// caller that did not check it. The check runs before the first object of the
+// first attempt, so a frozen create makes nothing that needs cleaning up. The
+// same holds for the referenced KairosConfigTemplate's hostname (ADR 0015
+// PR-3): a template control-plane nodes cannot use is refused up front.
+func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) (*clusterv1.Machine, error) {
 	if err := errIfIdentityFrozen(kcp, "create a control-plane Machine"); err != nil {
-		return err
+		return nil, err
 	}
 	// ADR 0015 PR-3: never stamp a control-plane config from a template whose
 	// hostname control-plane nodes cannot use; fail before anything exists.
 	if problem, err := r.controlPlaneTemplateHostnameProblem(ctx, kcp); err != nil {
-		return err
+		return nil, err
 	} else if problem != "" {
-		return errors.New(problem)
+		return nil, errors.New(problem)
 	}
-	machineName := fmt.Sprintf("%s-%d", kcp.Name, index)
+	for attempt := 1; ; attempt++ {
+		name := newControlPlaneMachineName(kcp.Name)
+		machine, err := r.createControlPlaneMachineNamed(ctx, log, kcp, cluster, name, role, joinTokenID)
+		if err == nil {
+			log.Info("Created control plane machine", "machine", name, "role", role)
+			return machine, waitForMachineInCache(ctx, r.Client, machine)
+		}
+		if !errors.Is(err, errControlPlaneNameTaken) || attempt >= controlPlaneMachineNameAttempts {
+			return nil, err
+		}
+		log.Info("Control-plane machine name already taken; trying a new one", "name", name, "attempt", attempt, "error", err.Error())
+	}
+}
 
+// createControlPlaneMachineNamed is one attempt of createControlPlaneMachine
+// under machineName. It returns an error wrapping errControlPlaneNameTaken when
+// an object of that name already exists; it never adopts one.
+func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machineName string, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) (*clusterv1.Machine, error) {
 	// Create KairosConfig
 	distribution := distributionOf(kcp)
 	kairosConfig := &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-%d", kcp.Name, index),
+			Name:      machineName,
 			Namespace: kcp.Namespace,
 			Labels: map[string]string{
 				clusterv1.ClusterNameLabel:         cluster.Name,
@@ -1110,7 +1135,7 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 			Name:      kcp.Spec.KairosConfigTemplate.Name,
 		}
 		if err := r.Get(ctx, templateKey, template); err != nil {
-			return fmt.Errorf("failed to get KairosConfigTemplate: %w", err)
+			return nil, fmt.Errorf("failed to get KairosConfigTemplate: %w", err)
 		}
 		// Merge template spec
 		kairosConfig.Spec = template.Spec.Template.Spec
@@ -1129,26 +1154,25 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		kairosConfig.Annotations = map[string]string{k0sJoinTokenIDAnnotation: joinTokenID}
 	}
 
+	// The name is fresh, so an existing KairosConfig of that name belongs to
+	// something else: never adopt it. (ADR 0013's restamp of a KairosConfig a
+	// partial create had left behind went with the index names: a failed create
+	// now deletes what it made, and the retry stamps a new KairosConfig with the
+	// current token ID.)
 	if err := r.Create(ctx, kairosConfig); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return err
+		if apierrors.IsAlreadyExists(err) {
+			return nil, nameTakenError("KairosConfig", machineName, err)
 		}
-		// A retry after a partial create (the infrastructure Machine failed last
-		// time) finds the KairosConfig already there. The token may have been
-		// replaced since, so point the config at the current one as long as it
-		// has not been rendered yet.
-		if joinTokenID != "" {
-			if err := r.restampJoinConfigTokenID(ctx, log, kairosConfig.Namespace, kairosConfig.Name, joinTokenID); err != nil {
-				return err
-			}
-		}
+		return nil, err
 	}
+	created := createdObjects{kairosConfig}
 
 	// Create infrastructure machine (clone from template)
 	infraMachine, err := r.createInfrastructureMachine(ctx, log, kcp, cluster, machineName)
 	if err != nil {
-		return fmt.Errorf("failed to create infrastructure machine: %w", err)
+		return nil, created.cleanup(ctx, log, r.Client, fmt.Errorf("failed to create infrastructure machine: %w", err))
 	}
+	created = append(created, infraMachine)
 
 	// Create Machine
 	// machineTemplate.metadata is documented as "metadata to apply to created
@@ -1202,31 +1226,13 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		machine.Annotations[etcdLeaveHookAnnotation()] = ""
 	}
 
-	return r.Create(ctx, machine)
-}
-
-// restampJoinConfigTokenID points an existing, not yet rendered join
-// KairosConfig at the given k0s join-token ID. A config that already has
-// bootstrap data keeps its annotation: its token is fixed in that data.
-func (r *KairosControlPlaneReconciler) restampJoinConfigTokenID(ctx context.Context, log logr.Logger, namespace, name, joinTokenID string) error {
-	existing := &bootstrapv1beta2.KairosConfig{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing); err != nil {
-		return fmt.Errorf("get existing KairosConfig %s/%s: %w", namespace, name, err)
+	if err := r.Create(ctx, machine); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			err = nameTakenError("Machine", machineName, err)
+		}
+		return nil, created.cleanup(ctx, log, r.Client, fmt.Errorf("failed to create Machine %s: %w", machineName, err))
 	}
-	if existing.Annotations[k0sJoinTokenIDAnnotation] == joinTokenID ||
-		existing.Status.DataSecretName != nil || !existing.DeletionTimestamp.IsZero() {
-		return nil
-	}
-	base := existing.DeepCopy()
-	if existing.Annotations == nil {
-		existing.Annotations = map[string]string{}
-	}
-	existing.Annotations[k0sJoinTokenIDAnnotation] = joinTokenID
-	if err := r.Patch(ctx, existing, client.MergeFrom(base)); err != nil {
-		return fmt.Errorf("update the k0s join-token ID on KairosConfig %s/%s: %w", namespace, name, err)
-	}
-	log.Info("Updated the k0s join-token ID on an existing join KairosConfig", "kairosConfig", name, "tokenID", joinTokenID)
-	return nil
+	return machine, nil
 }
 
 func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machineName string) (client.Object, error) {
@@ -1275,15 +1281,13 @@ func (r *KairosControlPlaneReconciler) createInfrastructureMachine(ctx context.C
 		return nil, fmt.Errorf("failed to set controller reference: %w", err)
 	}
 
-	// Create the infrastructure machine
+	// Create the infrastructure machine. The name is fresh (ADR 0015 PR-4), so
+	// an existing object of that name is not ours to adopt.
 	if err := r.Create(ctx, infraMachine); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create infrastructure machine: %w", err)
+		if apierrors.IsAlreadyExists(err) {
+			return nil, nameTakenError(infraRef.Kind, machineName, err)
 		}
-		// Machine already exists, get it
-		if err := r.Get(ctx, types.NamespacedName{Name: machineName, Namespace: kcp.Namespace}, infraMachine); err != nil {
-			return nil, fmt.Errorf("failed to get existing infrastructure machine: %w", err)
-		}
+		return nil, fmt.Errorf("failed to create infrastructure machine: %w", err)
 	}
 
 	log.Info("Created infrastructure machine", "kind", infraRef.Kind, "name", machineName)
@@ -1319,26 +1323,6 @@ func (r *KairosControlPlaneReconciler) machineMatchesVersion(machine *clusterv1.
 		return false
 	}
 	return machine.Spec.Version == desiredVersion
-}
-
-func (r *KairosControlPlaneReconciler) nextMachineIndex(machines []*clusterv1.Machine, kcpName string) int32 {
-	prefix := fmt.Sprintf("%s-", kcpName)
-	maxIndex := int32(-1)
-	for _, machine := range machines {
-		if !strings.HasPrefix(machine.Name, prefix) {
-			continue
-		}
-		suffix := strings.TrimPrefix(machine.Name, prefix)
-		if suffix == "" {
-			continue
-		}
-		if idx, err := strconv.Atoi(suffix); err == nil {
-			if int32(idx) > maxIndex {
-				maxIndex = int32(idx)
-			}
-		}
-	}
-	return maxIndex + 1
 }
 
 func (r *KairosControlPlaneReconciler) selectMachineForDeletion(machines []*clusterv1.Machine, outdatedMachines []*clusterv1.Machine) *clusterv1.Machine {

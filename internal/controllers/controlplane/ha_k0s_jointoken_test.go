@@ -18,6 +18,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -1070,10 +1071,11 @@ func TestAdmitJoiner_K0sStampsTheIssuedTokenOnTheJoinConfig(t *testing.T) {
 	g.Expect(admission.admitted).To(BeTrue(), admission.reason)
 	g.Expect(admission.k0sJoinTokenID).To(MatchRegexp(`^[a-z0-9]{6}$`))
 
-	g.Expect(e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster, 1,
-		bootstrapv1beta2.ControlPlaneRoleJoin, admission.k0sJoinTokenID)).To(Succeed())
+	created, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster,
+		bootstrapv1beta2.ControlPlaneRoleJoin, admission.k0sJoinTokenID)
+	g.Expect(err).NotTo(HaveOccurred())
 	kc := &bootstrapv1beta2.KairosConfig{}
-	g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: "kcp-1", Namespace: "default"}, kc)).To(Succeed())
+	g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: created.Name, Namespace: "default"}, kc)).To(Succeed())
 	g.Expect(kc.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, admission.k0sJoinTokenID))
 	g.Expect(e.mgmtSecret().Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, admission.k0sJoinTokenID))
 
@@ -1086,34 +1088,51 @@ func TestAdmitJoiner_K0sStampsTheIssuedTokenOnTheJoinConfig(t *testing.T) {
 	g.Expect(admission.k0sJoinTokenID).To(BeEmpty())
 }
 
-// TestCreateControlPlaneMachine_RestampsAnUnrenderedJoinConfig: a create that is
-// retried after a partial failure finds its KairosConfig already there, possibly
-// naming a token that has since been replaced. Until the config is rendered it
-// follows the current token; once rendered it is left alone.
-func TestCreateControlPlaneMachine_RestampsAnUnrenderedJoinConfig(t *testing.T) {
-	for _, rendered := range []bool{false, true} {
-		t.Run(fmt.Sprintf("rendered=%v", rendered), func(t *testing.T) {
-			g := NewWithT(t)
-			stale := joinConfig("kcp-1", "oldold")
-			stale.Labels = map[string]string{clusterv1.ClusterNameLabel: "c"}
-			if rendered {
-				stale.Status.DataSecretName = ptr.To("kcp-1")
-			}
-			e := newPolicyEnv(t, policyOpts{configs: []client.Object{stale}})
-			g.Expect(e.mgmt.Create(context.Background(), fleetMachineTemplate())).To(Succeed())
-			e.kcp.Spec.MachineTemplate.InfrastructureRef = fleetTemplateRef()
+// TestCreateControlPlaneMachine_RetryAfterAFailedCreateStampsTheCurrentToken
+// keeps ADR 0013's binding of one token ID to one KairosConfig now that ADR
+// 0013's restamp is gone (ADR 0015 PR-4). A create that fails after its
+// KairosConfig exists deletes that KairosConfig, so nothing is left naming the
+// token of the failed attempt; the retry makes a new KairosConfig, under a new
+// name, stamped with whatever token is current. A KairosConfig a partial
+// create of an older release left behind under an index name is neither
+// adopted nor restamped.
+func TestCreateControlPlaneMachine_RetryAfterAFailedCreateStampsTheCurrentToken(t *testing.T) {
+	g := NewWithT(t)
+	legacy := joinConfig("kcp-1", "oldold")
+	legacy.Labels = map[string]string{clusterv1.ClusterNameLabel: "c"}
 
-			g.Expect(e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster, 1,
-				bootstrapv1beta2.ControlPlaneRoleJoin, "newnew")).To(Succeed())
-			kc := &bootstrapv1beta2.KairosConfig{}
-			g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: "kcp-1", Namespace: "default"}, kc)).To(Succeed())
-			want := "newnew"
-			if rendered {
-				want = "oldold"
+	failMachineCreate := true
+	e := newPolicyEnv(t, policyOpts{
+		configs: []client.Object{legacy},
+		mgmtIntercep: &interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*clusterv1.Machine); ok && failMachineCreate {
+				return apierrors.NewInternalError(errors.New("injected Machine create failure"))
 			}
-			g.Expect(kc.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, want))
-		})
-	}
+			return c.Create(ctx, obj, opts...)
+		}},
+	})
+	g.Expect(e.mgmt.Create(context.Background(), fleetMachineTemplate())).To(Succeed())
+	e.kcp.Spec.MachineTemplate.InfrastructureRef = fleetTemplateRef()
+
+	_, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster,
+		bootstrapv1beta2.ControlPlaneRoleJoin, "midmid")
+	g.Expect(err).To(HaveOccurred())
+	configs := &bootstrapv1beta2.KairosConfigList{}
+	g.Expect(e.mgmt.List(context.Background(), configs, client.InNamespace("default"))).To(Succeed())
+	g.Expect(configs.Items).To(HaveLen(1), "the failed attempt's KairosConfig is deleted")
+	g.Expect(configs.Items[0].Name).To(Equal("kcp-1"))
+
+	failMachineCreate = false
+	created, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster,
+		bootstrapv1beta2.ControlPlaneRoleJoin, "newnew")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(created.Name).NotTo(Equal("kcp-1"))
+	kc := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: created.Name, Namespace: "default"}, kc)).To(Succeed())
+	g.Expect(kc.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, "newnew"))
+
+	g.Expect(e.mgmt.Get(context.Background(), types.NamespacedName{Name: "kcp-1", Namespace: "default"}, kc)).To(Succeed())
+	g.Expect(kc.Annotations).To(HaveKeyWithValue(k0sJoinTokenIDAnnotation, "oldold"), "a legacy KairosConfig is left alone")
 }
 
 // TestInitMachineJoinable_NoLongerReadsTheJoinToken: the gate opens on node,

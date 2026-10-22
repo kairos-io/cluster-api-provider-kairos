@@ -103,6 +103,34 @@ register a Node before an outdated member is removed, and the rollout waits
 while any control-plane machine is still being deleted. Progress is reported on
 the `MachinesUpToDate` condition.
 
+## Control-plane Machine names
+
+Each control-plane Machine is named `<kcp-name>-<5 random characters>`, for
+example `my-cluster-cp-x7k2p`, as the upstream kubeadm control plane names
+them. Its `KairosConfig` and infrastructure Machine have the same name. The
+name is always a valid hostname under the `spec.hostname` rule: dots in the
+`KairosControlPlane` name become dashes, and a name longer than 57 characters
+is shortened, so the Machine name fits in 63 characters.
+
+A name is never given to a second Machine. By default the Machine name is also
+the node's hostname, its Node name, and its etcd member name. If a replacement got the
+name of a member that had just left, it could find state that member left
+behind, and on k0s that can split etcd into two clusters.
+
+Do not rely on the order of the names. Use the creation time, as the
+controller does: the oldest control-plane Machine is the one the cluster was
+initialised on, and a scale-down removes the newest.
+
+If a Machine cannot be created, for example because the infrastructure
+template is missing, the controller deletes the `KairosConfig` and
+infrastructure Machine it made for that attempt and tries again under a new
+name. While this repeats, short-lived `KairosConfig` objects appear and
+disappear, and the controller log gives the reason.
+
+Clusters created with releases up to v0.2.0 keep their `-0`, `-1` and `-2`
+Machines until those Machines are replaced. New Machines get random names,
+and a control plane can have both kinds of name at once.
+
 ## Day-2: etcd health and quorum-safe replacement
 
 Each control-plane node reports its own etcd member health as the `EtcdHealthy` condition on `KairosControlPlane`: `True` when every voting member is healthy, `False(Info)` when quorum holds but a member is degraded, `False(Warning)` at or below the `(N/2)+1` quorum minimum.
