@@ -179,7 +179,7 @@ func TestControllerRole_LeaderElectionIDsAreDistinct(t *testing.T) {
 //
 //   - internal/controllers/bootstrap: the bootstrap-data Secret and the join tokens
 //   - internal/controllers/controlplane: the HA token, etcd and SSH-fallback Secrets
-//   - clustercache's SecretClient, which resolves <cluster>-kubeconfig on connect
+//   - the kubeadm trust check, which reads <cluster>-kubeconfig before a join
 //
 // If a later change drops this the regression is silent: nothing fails, those
 // reads just start populating the cache again. Hence a test rather than a comment.
