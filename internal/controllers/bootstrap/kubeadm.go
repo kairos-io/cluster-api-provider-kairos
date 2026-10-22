@@ -128,13 +128,14 @@ func newNotReady(reason, format string, args ...any) error {
 }
 
 // workloadClientFactory returns a client to the workload cluster identified by
-// clusterKey, built from the kubeconfig the caller has already verified.
+// clusterKey, built from the sanitized kubeconfig the trust check verified.
 //
 // Taking the kubeconfig as an argument is what keeps the connection on-demand and
 // trust-gated. There is no resident accessor that could connect ahead of a join,
 // and the only bytes a connection can be built from are the ones verifyTrustChain
-// returned, so a caller that has not run the trust check has nothing to pass.
-// Tests inject a fake.
+// returned: the sanitizer's rebuilt (S5) form of `<cluster>-kubeconfig`, never
+// the Secret's raw bytes (ADR 0011). A caller that has not run the trust check
+// has nothing to pass. Tests inject a fake.
 type workloadClientFactory func(ctx context.Context, clusterKey client.ObjectKey, kubeconfig []byte) (client.Client, error)
 
 // kubeadmJoinSource is the kubeadm worker JoinMaterialSource (ADR 0010 P1). It runs
@@ -221,11 +222,14 @@ func NewOnDemandWorkloadClient() workloadClientFactory {
 // timeout as a parameter, so a test can prove the timeout is honoured without
 // waiting the production ten seconds.
 func newOnDemandWorkloadClient(timeout time.Duration) workloadClientFactory {
-	return func(_ context.Context, clusterKey client.ObjectKey, kubeconfig []byte) (client.Client, error) {
-		if len(kubeconfig) == 0 {
+	return func(_ context.Context, clusterKey client.ObjectKey, verified []byte) (client.Client, error) {
+		if len(verified) == 0 {
 			return nil, fmt.Errorf("refusing to connect to workload cluster %s without a verified kubeconfig", clusterKey)
 		}
-		restCfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+		if err := requireSanitizedKubeconfig(verified, clusterKey.Name); err != nil {
+			return nil, fmt.Errorf("refusing to connect to workload cluster %s: %w", clusterKey, err)
+		}
+		restCfg, err := clientcmd.RESTConfigFromKubeConfig(verified)
 		if err != nil {
 			return nil, fmt.Errorf("parse verified kubeconfig for workload cluster %s: %w", clusterKey, err)
 		}
@@ -241,6 +245,30 @@ func newOnDemandWorkloadClient(timeout time.Duration) workloadClientFactory {
 		}
 		return wc, nil
 	}
+}
+
+// requireSanitizedKubeconfig reports an error unless data is exactly the
+// sanitizer's rebuilt (S5) kubeconfig for clusterName, which is what
+// verifyTrustChain returns. The factory checks this itself so that it can only
+// ever build a client from the sanitized kubeconfig, whichever caller hands it
+// the bytes.
+func requireSanitizedKubeconfig(data []byte, clusterName string) error {
+	cfg, err := clientcmd.Load(data)
+	if err != nil {
+		return fmt.Errorf("the kubeconfig does not parse")
+	}
+	entry, ok := cfg.Clusters[clusterName]
+	if !ok || entry == nil {
+		return fmt.Errorf("the kubeconfig is not the sanitized kubeconfig for cluster %q", clusterName)
+	}
+	fixed, err := kubeconfig.IsFixedPoint(data, clusterName, entry.Server)
+	if err != nil {
+		return fmt.Errorf("the kubeconfig failed sanitization: %w", err)
+	}
+	if !fixed {
+		return fmt.Errorf("the kubeconfig is not the sanitized kubeconfig for cluster %q", clusterName)
+	}
+	return nil
 }
 
 // workloadClientTimeout bounds every request this client makes, as the
@@ -417,10 +445,10 @@ type trustedControlPlane struct {
 	endpointHost string
 	endpointPort int32
 	caCertHashes []string
-	// kubeconfig is the verified <cluster>-kubeconfig payload. It is the only
-	// thing a workload-cluster connection may be built from: it has passed the
-	// owner leg and one of the two independent anchors below, so the address it
-	// steers a client at is not tenant-chosen.
+	// kubeconfig is the sanitizer's rebuilt (S5) form of the verified
+	// <cluster>-kubeconfig: an inline credential, an inline CA, and the anchored
+	// server. It is the only thing a workload-cluster connection may be built
+	// from; the raw Secret bytes never leave verifyTrustChain.
 	kubeconfig []byte
 }
 
@@ -553,12 +581,14 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 			kubeconfigKey.Name, server, wantServer, caKey.Name)
 	}
 
-	// The kubeconfig must also survive the sanitizer (ADR 0011): the workload
-	// client that mints the token is built from its rebuilt (S5) form, never the
-	// raw bytes (SanitizingKubeconfigReader), so a kubeconfig the sanitizer
-	// refuses would never connect. Refuse here, before any token exists, with the
-	// rule that failed (never a byte of the content).
-	if _, err := kubeconfig.Sanitize(kcData, cluster.Name, anchoredServer(server, wantServer)); err != nil {
+	// Rebuild the kubeconfig with the sanitizer (ADR 0011). The workload client
+	// that mints and extends the token is built from this rebuilt (S5) form only:
+	// an inline credential, an inline CA and the anchored server, never the
+	// Secret's raw bytes. A kubeconfig the sanitizer refuses is refused here,
+	// before any token exists, with the rule that failed (never a byte of the
+	// content).
+	sanitized, err := kubeconfig.Sanitize(kcData, cluster.Name, anchoredServer(server, wantServer))
+	if err != nil {
 		return zero, fmt.Errorf("the %s Secret is not a kubeconfig this controller will connect with: %v; refusing to mint a token",
 			kubeconfigKey.Name, err)
 	}
@@ -568,7 +598,7 @@ func (s *kubeadmJoinSource) verifyTrustChain(ctx context.Context, req JoinReques
 		endpointHost: cluster.Spec.ControlPlaneEndpoint.Host,
 		endpointPort: cluster.Spec.ControlPlaneEndpoint.Port,
 		caCertHashes: hashes,
-		kubeconfig:   kcData,
+		kubeconfig:   sanitized,
 	}, nil
 }
 

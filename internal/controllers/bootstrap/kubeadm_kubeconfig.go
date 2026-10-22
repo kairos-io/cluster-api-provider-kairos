@@ -18,33 +18,25 @@ package bootstrap
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
-// This file holds the kubeadm worker path's workload-kubeconfig trust helpers:
-// the <cluster>-ca cross-check verifyTrustChain uses, and the reader the
-// bootstrap manager's workload ClusterCache loads `<cluster>-kubeconfig`
-// through.
+// This file holds the kubeadm worker path's workload-kubeconfig trust helpers
+// that verifyTrustChain uses: the <cluster>-ca cross-check, and the choice of
+// the server the sanitized kubeconfig is anchored to.
 //
-// Why the reader exists: verifyTrustChain checks the kubeconfig Secret, but the
-// workload client that mints the bootstrap token comes from a ClusterCache,
-// which reads the same Secret again, later, on its own, and hands the bytes to
-// clientcmd.RESTConfigFromKubeConfig. The rule for every workload client this
-// project builds is that it comes from the sanitizer's rebuilt (S5) kubeconfig:
-// an inline credential and an inline CA, nothing that refers to a file, a
-// plugin, a proxy or skipped TLS verification (ADR 0011). ClusterCache has
-// exactly one input for the kubeconfig, clustercache.Options.SecretClient, so
-// that reader is where the sanitizer goes.
+// The rule for every workload client this project builds is that it comes from
+// the sanitizer's rebuilt (S5) kubeconfig: an inline credential and an inline
+// CA, nothing that refers to a file, a plugin, a proxy or skipped TLS
+// verification (ADR 0011). On the kubeadm path verifyTrustChain produces that
+// form from the `<cluster>-kubeconfig` it has just verified, and
+// NewOnDemandWorkloadClient builds the client from it and from nothing else.
 
 // crossCheckClusterCA compares the kubeconfig's CA certificates with the
 // <cluster>-ca Secret's tls.crt, read through caReader (UNCACHED, cert only). It
@@ -87,102 +79,4 @@ func anchoredServer(kubeconfigServer, clusterEndpoint string) string {
 		return clusterEndpoint
 	}
 	return kubeconfigServer
-}
-
-// trustedWorkloadKubeconfig returns the S5 output of a kubeadm workload
-// cluster's kubeconfig, or an error. It applies the same two independent
-// anchors as verifyTrustChain (the kubeconfig names the Cluster control-plane
-// endpoint, or its CA matches <cluster>-ca), because ClusterCache reads the
-// Secret at a different time than verifyTrustChain did, and then rebuilds the
-// kubeconfig with the sanitizer. The output carries an inline credential and an
-// inline CA only, and the anchored server.
-func trustedWorkloadKubeconfig(ctx context.Context, caReader client.Reader, cluster *clusterv1.Cluster, kcData []byte) ([]byte, error) {
-	if !cluster.Spec.ControlPlaneEndpoint.IsValid() {
-		return nil, fmt.Errorf("cluster %s/%s has no valid control-plane endpoint yet", cluster.Namespace, cluster.Name)
-	}
-	if len(kcData) == 0 {
-		return nil, fmt.Errorf("the kubeconfig Secret of cluster %s/%s has no %q payload", cluster.Namespace, cluster.Name, workloadKubeconfigSecretKey)
-	}
-	server, caData, err := serverAndCAFromKubeconfig(kcData)
-	if err != nil {
-		return nil, fmt.Errorf("the kubeconfig Secret of cluster %s/%s is not a valid kubeconfig: %v", cluster.Namespace, cluster.Name, err)
-	}
-	_, kubeconfigCADER, err := caCertHashesFromPEM(caData)
-	if err != nil {
-		return nil, fmt.Errorf("the kubeconfig Secret of cluster %s/%s has an unparseable certificate-authority: %v", cluster.Namespace, cluster.Name, err)
-	}
-	wantServer := "https://" + cluster.Spec.ControlPlaneEndpoint.String()
-	if !sameServer(server, wantServer) {
-		checked, err := crossCheckClusterCA(ctx, caReader, cluster, kubeconfigCADER)
-		if err != nil {
-			return nil, err
-		}
-		if !checked {
-			return nil, fmt.Errorf("the kubeconfig Secret of cluster %s/%s names a server other than the control-plane endpoint %q, and there is no %s-ca Secret to cross-check its CA against",
-				cluster.Namespace, cluster.Name, wantServer, cluster.Name)
-		}
-	}
-	sanitized, err := kubeconfig.Sanitize(kcData, cluster.Name, anchoredServer(server, wantServer))
-	if err != nil {
-		// The error names the failing rule, never a byte of the content.
-		return nil, fmt.Errorf("the kubeconfig Secret of cluster %s/%s failed sanitization: %w", cluster.Namespace, cluster.Name, err)
-	}
-	return sanitized, nil
-}
-
-// errNotAKubeconfigRead is returned by SanitizingKubeconfigReader for any read
-// other than a typed Get of a `<cluster>-kubeconfig` Secret.
-var errNotAKubeconfigRead = errors.New("this reader serves only typed Gets of <cluster>-kubeconfig Secrets")
-
-// sanitizingKubeconfigReader is a client.Reader that returns
-// `<cluster>-kubeconfig` Secrets with their value replaced by
-// trustedWorkloadKubeconfig's output. Any other read fails closed.
-type sanitizingKubeconfigReader struct {
-	// mgmt reads the kubeconfig Secret and the Cluster.
-	mgmt client.Reader
-	// caReader is an UNCACHED reader for the <cluster>-ca cross-check.
-	caReader client.Reader
-}
-
-// NewSanitizingKubeconfigReader returns the reader main.go passes to the
-// bootstrap manager's workload ClusterCache as clustercache.Options.SecretClient.
-// mgmt is the (cached) management reader for the kubeconfig Secret and the
-// Cluster; caReader is an UNCACHED management reader for the <cluster>-ca
-// cross-check.
-func NewSanitizingKubeconfigReader(mgmt, caReader client.Reader) client.Reader {
-	return &sanitizingKubeconfigReader{mgmt: mgmt, caReader: caReader}
-}
-
-// Get implements client.Reader.
-func (r *sanitizingKubeconfigReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
-		return errNotAKubeconfigRead
-	}
-	clusterName, isKubeconfig := strings.CutSuffix(key.Name, "-kubeconfig")
-	if !isKubeconfig || clusterName == "" {
-		return errNotAKubeconfigRead
-	}
-	if err := r.mgmt.Get(ctx, key, secret, opts...); err != nil {
-		return err
-	}
-	cluster := &clusterv1.Cluster{}
-	if err := r.mgmt.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: clusterName}, cluster); err != nil {
-		return fmt.Errorf("get cluster %s/%s for its kubeconfig: %w", key.Namespace, clusterName, err)
-	}
-	sanitized, err := trustedWorkloadKubeconfig(ctx, r.caReader, cluster, secret.Data[workloadKubeconfigSecretKey])
-	if err != nil {
-		return err
-	}
-	// Replace the whole data map: nothing but the rebuilt kubeconfig leaves this
-	// reader.
-	secret.Data = map[string][]byte{workloadKubeconfigSecretKey: sanitized}
-	secret.StringData = nil
-	return nil
-}
-
-// List implements client.Reader. ClusterCache never lists through its
-// SecretClient; fail closed rather than return unsanitized Secrets.
-func (r *sanitizingKubeconfigReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
-	return errNotAKubeconfigRead
 }

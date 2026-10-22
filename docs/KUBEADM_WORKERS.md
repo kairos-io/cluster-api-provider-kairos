@@ -142,7 +142,9 @@ bootstrap controller does the following for each Machine:
 
 Step 2 is also the connect gate, not only the mint gate. The bootstrap manager
 builds a workload-cluster client in step 3, for the join that asked for it, from
-the kubeconfig step 2 just verified. The client is discarded with that request
+the kubeconfig step 2 just verified, in the form the kubeconfig sanitizer
+rebuilds it: an inline credential, an inline CA and the anchored server, never
+the Secret's raw bytes. The client is discarded with that request
 and every call it makes is bounded by a 10-second timeout. The TCP connection
 itself can outlive it: client-go caches transports process-wide by TLS
 configuration, so a later join to the same cluster may reuse an idle connection.

@@ -395,8 +395,9 @@ func registerControllers(ctx context.Context, mgr manager.Manager, role controll
 		// bootstrap token), an UNCACHED management reader (for the <cluster>-ca
 		// cross-check), and the operator-level trust allowlist.
 		//
-		// The connection is made ON DEMAND, by the join itself, from the kubeconfig
-		// the FINE owner-verified trust check just validated. Installing this
+		// The connection is made ON DEMAND, by the join itself, from the sanitized
+		// kubeconfig the FINE owner-verified trust check just validated (ADR 0011
+		// S5 form; never the Secret's raw bytes). Installing this
 		// provider therefore opens no workload-cluster connection at all until one
 		// of our own kubeadm workers joins. It used to be wired through a
 		// clustercache whose ClusterFilter was the coarse gate, but clustercache is

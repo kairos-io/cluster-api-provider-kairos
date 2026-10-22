@@ -54,6 +54,7 @@ import (
 	kubeadmv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 const (
@@ -116,6 +117,17 @@ func kubeconfigWithUser(t *testing.T, server string, caPEM []byte, user *clientc
 		t.Fatalf("encode kubeconfig: %v", err)
 	}
 	return data
+}
+
+// sanitizedKubeconfig returns the sanitizer's rebuilt (S5) kubeconfig for
+// clusterName at server: the only form NewOnDemandWorkloadClient accepts.
+func sanitizedKubeconfig(t *testing.T, clusterName, server string, caPEM []byte) []byte {
+	t.Helper()
+	out, err := kubeconfig.Sanitize(makeKubeconfig(t, server, caPEM), clusterName, server)
+	if err != nil {
+		t.Fatalf("sanitize kubeconfig: %v", err)
+	}
+	return out
 }
 
 func kubeadmTestScheme(t *testing.T) *runtime.Scheme {
@@ -296,6 +308,19 @@ func TestOnDemandWorkloadClient_RefusesUnverifiedKubeconfig(t *testing.T) {
 	wc, err := factory(context.Background(), key, []byte("not a kubeconfig"))
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(wc).To(BeNil())
+
+	// A well-formed kubeconfig that is not the sanitizer's rebuilt form for this
+	// cluster is refused: the factory builds clients from the sanitized
+	// kubeconfig the trust check verified, and from nothing else.
+	ca := genTestCA(t, "cluster-ca")
+	wc, err = factory(context.Background(), key, makeKubeconfig(t, "https://10.0.0.1:6443", ca))
+	g.Expect(err).To(MatchError(ContainSubstring("not the sanitized kubeconfig")))
+	g.Expect(wc).To(BeNil())
+
+	// The sanitized form for a different cluster is refused too.
+	wc, err = factory(context.Background(), key, sanitizedKubeconfig(t, "other", "https://10.0.0.1:6443", ca))
+	g.Expect(err).To(MatchError(ContainSubstring("not the sanitized kubeconfig")))
+	g.Expect(wc).To(BeNil())
 }
 
 // TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig proves the factory builds its
@@ -305,9 +330,9 @@ func TestOnDemandWorkloadClient_RefusesUnverifiedKubeconfig(t *testing.T) {
 func TestOnDemandWorkloadClient_UsesTheVerifiedKubeconfig(t *testing.T) {
 	g := NewWithT(t)
 	ca := genTestCA(t, "cluster-ca")
-	kubeconfig := makeKubeconfig(t, "https://10.0.0.1:6443", ca)
+	verified := sanitizedKubeconfig(t, "c", "https://10.0.0.1:6443", ca)
 
-	wc, err := NewOnDemandWorkloadClient()(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, kubeconfig)
+	wc, err := NewOnDemandWorkloadClient()(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, verified)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(wc).NotTo(BeNil())
 	gvk, err := apiutil.GVKForObject(&corev1.Secret{}, wc.Scheme())
@@ -359,7 +384,17 @@ func TestKubeadmExtendWorkerToken_ConnectsOnVerifiedTrust(t *testing.T) {
 	found, err := s.ExtendWorkerToken(context.Background(), req, "abcdef")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeFalse())
-	g.Expect(got).To(Equal(makeKubeconfig(t, fmt.Sprintf("https://%s:%d", testEndpointHost, testEndpointPort), ca)))
+	// The client is built from the sanitizer's rebuilt (S5) form of the
+	// kubeconfig the trust check verified, not from the Secret's raw bytes.
+	server := fmt.Sprintf("https://%s:%d", testEndpointHost, testEndpointPort)
+	raw := makeKubeconfig(t, server, ca)
+	want, err := kubeconfig.Sanitize(raw, testKubeadmCluster, server)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(got).NotTo(Equal(raw))
+	g.Expect(got).To(Equal(want))
+	fixed, err := kubeconfig.IsFixedPoint(got, testKubeadmCluster, server)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(fixed).To(BeTrue())
 }
 
 // TestKubeadmWorkerJoin_Accepts covers the three legitimate trust shapes and
@@ -679,7 +714,8 @@ func TestOnDemandWorkloadClient_TimesOut(t *testing.T) {
 	}()
 
 	const timeout = 300 * time.Millisecond
-	wc, err := newOnDemandWorkloadClient(timeout)(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, makeKubeconfig(t, srv.URL, nil))
+	verified := sanitizedKubeconfig(t, "c", srv.URL, genTestCA(t, "cluster-ca"))
+	wc, err := newOnDemandWorkloadClient(timeout)(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, verified)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	// A context with no deadline: only the client's own timeout can end this. The
@@ -724,9 +760,10 @@ func TestOnDemandWorkloadClient_RunsNoDiscovery(t *testing.T) {
 
 	factory := newOnDemandWorkloadClient(5 * time.Second)
 	key := client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-abcdef"}
+	verified := sanitizedKubeconfig(t, "c", srv.URL, genTestCA(t, "cluster-ca"))
 	// Two clients, as a mint followed by a refresh would build.
 	for i := 0; i < 2; i++ {
-		wc, err := factory(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, makeKubeconfig(t, srv.URL, nil))
+		wc, err := factory(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, verified)
 		g.Expect(err).NotTo(HaveOccurred())
 		err = wc.Get(context.Background(), key, &corev1.Secret{})
 		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "unexpected error from the workload server: %v", err)
