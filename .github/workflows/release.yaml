@@ -1,10 +1,11 @@
 name: Release
 
 # Triggered by pushing a `v*` tag (e.g. `v0.1.0-alpha.1`). The workflow:
-#   1. Builds and pushes a multi-arch container image tagged with the tag name.
-#   2. Renders the all-in-one provider manifest (kustomize) against that image.
-#   3. Computes sha256 checksums.
-#   4. Publishes a GitHub release with the manifest + checksums attached, body
+#   1. Scans the tagged tree for known vulnerabilities and stops if any are open.
+#   2. Builds and pushes a multi-arch container image tagged with the tag name.
+#   3. Renders the all-in-one provider manifest (kustomize) against that image.
+#   4. Computes sha256 checksums.
+#   5. Publishes a GitHub release with the manifest + checksums attached, body
 #      taken from docs/release-notes/<tag>.md.
 #
 # Pre-conditions for a clean release:
@@ -18,13 +19,82 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write  # create the GitHub release
-  packages: write  # push to ghcr.io
+# Every job starts with no token permissions; each job grants only what it
+# needs. The write grants live on the release job alone.
+permissions: {}
 
 jobs:
-  release:
+  # A tag push matches none of osv-scanner.yaml's triggers (pull_request, push
+  # to main, the Monday cron), and that workflow is the only whole-tree scan in
+  # the repository. Without this job a release cut between two Mondays can
+  # publish while an advisory is already open against an unchanged dependency,
+  # with nothing red anywhere. Same scanner version and same --config as
+  # osv-scanner.yaml, so the ignore list in osv-scanner.toml cannot fork between
+  # the two. The two pins are different SHAs of google/osv-scanner-action for
+  # the same release: osv-scanner.yaml pins the reusable workflow, this job pins
+  # the action that workflow itself calls. Bump them together.
+  #
+  # The scan reads the tagged tree, not main: the release is what ships, and
+  # everything else about this workflow is already resolved at the tag. The
+  # trade-off is that an ignore added in the release commit silences this gate,
+  # so a change to osv-scanner.toml is a change that wants review on its own.
+  #
+  # This calls the scanner action directly instead of reusing
+  # osv-scanner-reusable.yml. Invoked directly and without continue-on-error, a
+  # finding and a scanner error both fail the job, so an osv.dev outage, a
+  # network failure or a malformed osv-scanner.toml cannot let a tag through on
+  # a green gate. The scanner image maps "no package sources found" to success,
+  # so the scan also writes its results to a file, and the next step fails the
+  # gate when that file is missing or empty: a scan that read nothing passes
+  # nothing.
+  #
+  # No SARIF upload, so no security-events: write. osv-scanner.yaml owns the
+  # Security > Code scanning view, keyed on main; a second analysis keyed on
+  # refs/tags/<tag> would add nothing a failed release job does not already say.
+  osv:
+    name: osv-scan (release gate)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the tagged tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Scan for known vulnerabilities
+        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        with:
+          scan-args: |-
+            --config=./osv-scanner.toml
+            --format=json
+            --output=osv-results.json
+            -r
+            ./
+
+      - name: Require scan results
+        if: ${{ !cancelled() }}
+        run: |
+          if [ ! -s osv-results.json ]; then
+            echo "::error::The OSV scan produced no results file, so it scanned nothing. Refusing to release."
+            exit 1
+          fi
+          # A completed scan always writes a JSON document with a "results"
+          # array (empty when nothing is vulnerable). "No package sources
+          # found" writes no file at all, which the check above catches.
+          if ! jq -e 'has("results")' osv-results.json >/dev/null; then
+            echo "::error::The OSV results file is not a scan result. Refusing to release."
+            exit 1
+          fi
+          vulns=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' osv-results.json)
+          echo "OSV scan completed; ${vulns} unignored vulnerability record(s) in the results."
+
+  release:
+    needs: osv
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the GitHub release
+      packages: write  # push to ghcr.io
     env:
       GOTOOLCHAIN: local
       IMG_REGISTRY: ghcr.io/kairos-io/cluster-api-provider-kairos
@@ -36,6 +106,12 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.4'
+          # A release must build from the tagged tree alone. setup-go restores
+          # the module and build caches by default, and this job builds the
+          # kustomize and controller-gen that render and checksum the published
+          # dist/*.yaml, so a stale or poisoned cache entry would reach the
+          # released artefacts.
+          cache: false
 
       - name: Verify release notes exist
         run: |

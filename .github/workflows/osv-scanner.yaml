@@ -31,9 +31,14 @@ jobs:
       contents: read
       security-events: write
     # The reusable workflow is SHA-pinned (and SHA-pins its own actions), but its
-    # scanner steps pull docker://ghcr.io/google/osv-scanner-action:v2.5.1 by tag.
-    # Residual risk accepted for org consistency; release builds do not consume
-    # Actions caches (release.yaml), which bounds what a repointed image could reach.
+    # scanner steps pull docker://ghcr.io/google/osv-scanner-action:v2.7.0 by tag.
+    # Residual risk accepted for org consistency, and bounded because the release
+    # job sets `cache: false` on setup-go (release.yaml), so nothing this
+    # workflow writes to the Actions cache can reach a released artefact.
+    #
+    # This is the reporting scan, and it stays on the reusable workflow. The
+    # release gate in release.yaml does not, because it must build only from the
+    # tag it is gating; see the comment on that job.
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
       # The reusable workflow defaults to "-r ./"; this is that plus an explicit
