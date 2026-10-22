@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -56,6 +57,10 @@ func TestRender_PostBootstrapStartDoesNotBlock(t *testing.T) {
 		{"k3s capk control-plane", bootstrapv1beta2.DistributionK3s, dispatchCPData(true)},
 		{"k3s capv worker", bootstrapv1beta2.DistributionK3s, worker(dispatchCPData(false))},
 		{"k3s capk worker", bootstrapv1beta2.DistributionK3s, worker(dispatchCPData(true))},
+		{"k0s capv control-plane", bootstrapv1beta2.DistributionK0s, dispatchCPData(false)},
+		{"k0s capk control-plane", bootstrapv1beta2.DistributionK0s, dispatchCPData(true)},
+		{"k0s capv worker", bootstrapv1beta2.DistributionK0s, worker(dispatchCPData(false))},
+		{"k0s capk worker", bootstrapv1beta2.DistributionK0s, worker(dispatchCPData(true))},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,4 +117,73 @@ func startsOneOf(command string, units map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// TestRender_K0sLBSANsWaitsForPostBootstrap pins that the CAPK k0s lb-sans
+// update cannot start while post-bootstrap runs. kairos-k0s-lb-sans.sh removes
+// the apiserver cert and restarts k0scontroller, which must not overlap
+// k0scontroller's HA etcd join, the apply-args join branch or
+// post-bootstrap's own edits of k0s.yaml. The service is ordered after
+// post-bootstrap, and its path unit is started by the systemctl call that
+// queues post-bootstrap, after it in the argument list: an ordering only
+// binds jobs that are queued, and systemctl starts its arguments in order, so
+// a path listed first, or started on its own, could fire before the
+// post-bootstrap job exists.
+func TestRender_K0sLBSANsWaitsForPostBootstrap(t *testing.T) {
+	out, err := Render(bootstrapv1beta2.DistributionK0s, dispatchCPData(true))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	var cc struct {
+		RunCmd     []string `yaml:"runcmd"`
+		WriteFiles []struct {
+			Path    string `yaml:"path"`
+			Content string `yaml:"content"`
+		} `yaml:"write_files"`
+	}
+	if err := yaml.Unmarshal([]byte(stripCloudConfigHeader(out)), &cc); err != nil {
+		t.Fatalf("parse cloud-config: %v", err)
+	}
+	units := map[string]string{}
+	for _, f := range cc.WriteFiles {
+		units[path.Base(f.Path)] = f.Content
+	}
+	lbSANs, ok := units["kairos-k0s-lb-sans.service"]
+	if !ok {
+		t.Fatal("no kairos-k0s-lb-sans.service in the CAPK control-plane render")
+	}
+	ordered := false
+	for _, line := range strings.Split(lbSANs, "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "After="); ok &&
+			slices.Contains(strings.Fields(after), "kairos-k0s-post-bootstrap.service") {
+			ordered = true
+		}
+	}
+	if !ordered {
+		t.Error("kairos-k0s-lb-sans.service is not ordered after kairos-k0s-post-bootstrap.service")
+	}
+	for _, c := range cc.RunCmd {
+		if strings.Contains(c, "kairos-k0s-lb-sans.path") && systemctlStart.MatchString(c) {
+			t.Errorf("runcmd starts the lb-sans path on its own: %q", c)
+		}
+	}
+	together := false
+	for _, line := range strings.Split(units["kairos-k0s-post-bootstrap-enable.service"], "\n") {
+		m := execLine.FindStringSubmatch(line)
+		if m == nil || !systemctlStart.MatchString(m[1]) {
+			continue
+		}
+		fields := strings.Fields(m[1])
+		pb := slices.Index(fields, "kairos-k0s-post-bootstrap.service")
+		lb := slices.Index(fields, "kairos-k0s-lb-sans.path")
+		if pb >= 0 && lb >= 0 {
+			together = true
+			if lb < pb {
+				t.Errorf("the helper starts kairos-k0s-lb-sans.path before kairos-k0s-post-bootstrap.service: %q", m[1])
+			}
+		}
+	}
+	if !together {
+		t.Error("the helper does not start kairos-k0s-lb-sans.path in the systemctl call that queues kairos-k0s-post-bootstrap.service")
+	}
 }
