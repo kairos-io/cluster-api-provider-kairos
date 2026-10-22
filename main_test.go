@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
@@ -188,11 +187,9 @@ func TestControllerRole_LeaderElectionIDsAreDistinct(t *testing.T) {
 // What this does NOT cover, and what no assertion on manager.Options can: the
 // three Watches(&corev1.Secret{}) calls in kairosconfig_controller.go and
 // kairoscontrolplane_controller.go build their informers on mgr.GetCache()
-// directly, which Client.Cache.DisableFor does not reach, so Secret data from
-// the watched scope is still resident. Covering that needs an envtest running
-// the manager under the generated ClusterRole and asserting on the cache, and
-// narrowing the watches themselves is kairos-io/kairos#5499. Read a pass here as
-// "the client read path does not cache Secrets", not as "no Secret is cached".
+// directly, which Client.Cache.DisableFor does not reach. Those watches are
+// metadata-only; test/envtest/manager_secret_cache_test.go is the guard that
+// runs the real controllers and asserts no Secret body reaches the cache.
 func TestManagerOptions_SecretsAreNotCached(t *testing.T) {
 	secretGVK, err := apiutil.GVKForObject(&corev1.Secret{}, scheme)
 	if err != nil {
@@ -251,87 +248,8 @@ func TestManagerOptions_LeaderElectionIDFollowsRole(t *testing.T) {
 	}
 }
 
-// TestStripSecretCachePayload_RemovesBodyCarryingMetadata is the guard for the
-// cache transform installed on v1/Secret. The Secret watches are metadata-only,
-// so the cache holds PartialObjectMetadata and never the Secret body — but
-// ObjectMeta can smuggle the body back in two ways, and both must be gone
-// before the object is committed.
-func TestStripSecretCachePayload_RemovesBodyCarryingMetadata(t *testing.T) {
-	in := &metav1.PartialObjectMetadata{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "workload-kubeconfig",
-			Namespace: "default",
-			Labels:    map[string]string{"cluster.x-k8s.io/cluster-name": "workload"},
-			Annotations: map[string]string{
-				// kubectl's copy of the applied object: the whole Secret,
-				// base64 data included.
-				lastAppliedConfigAnnotation: `{"apiVersion":"v1","kind":"Secret","data":{"value":"c3VwZXItc2VjcmV0"}}`,
-				"keep-me":                   "yes",
-			},
-			ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubectl", Operation: metav1.ManagedFieldsOperationApply}},
-		},
-	}
-
-	out, err := stripSecretCachePayload(in)
-	if err != nil {
-		t.Fatalf("stripSecretCachePayload returned an error: %v", err)
-	}
-	got, ok := out.(*metav1.PartialObjectMetadata)
-	if !ok {
-		t.Fatalf("transform changed the object type: got %T", out)
-	}
-	if got.ManagedFields != nil {
-		t.Errorf("managedFields survived the transform: %v", got.ManagedFields)
-	}
-	if v, present := got.Annotations[lastAppliedConfigAnnotation]; present {
-		t.Errorf("last-applied-configuration survived the transform, carrying the Secret body: %q", v)
-	}
-	// The transform must strip, not sanitise: everything else is load-bearing
-	// for the mappers and predicates that read this object.
-	if got.Annotations["keep-me"] != "yes" {
-		t.Errorf("unrelated annotation was dropped: %v", got.Annotations)
-	}
-	if got.Labels["cluster.x-k8s.io/cluster-name"] != "workload" {
-		t.Errorf("labels were dropped, which would break every Secret mapper: %v", got.Labels)
-	}
-	if got.Name != "workload-kubeconfig" || got.Namespace != "default" {
-		t.Errorf("name/namespace were altered: %s/%s", got.Namespace, got.Name)
-	}
-}
-
-// TestStripSecretCachePayload_PassesThroughNonObjects asserts the transform
-// never drops a value it cannot introspect. A cache transform that returns an
-// error on a DeletedFinalStateUnknown tombstone loses the delete event, so the
-// controller would keep a Secret alive in cache forever.
-func TestStripSecretCachePayload_PassesThroughNonObjects(t *testing.T) {
-	in := "not an api object"
-	out, err := stripSecretCachePayload(in)
-	if err != nil {
-		t.Fatalf("stripSecretCachePayload returned an error: %v", err)
-	}
-	if out != in {
-		t.Errorf("transform did not pass the value through: got %v", out)
-	}
-}
-
-// TestStripSecretCachePayload_NoAnnotations asserts the nil-annotation path
-// does not panic and does not materialise an empty map.
-func TestStripSecretCachePayload_NoAnnotations(t *testing.T) {
-	in := &metav1.PartialObjectMetadata{
-		ObjectMeta: metav1.ObjectMeta{Name: "bare", Namespace: "default"},
-	}
-	out, err := stripSecretCachePayload(in)
-	if err != nil {
-		t.Fatalf("stripSecretCachePayload returned an error: %v", err)
-	}
-	if got := out.(*metav1.PartialObjectMetadata); got.Annotations != nil {
-		t.Errorf("transform created an annotations map where there was none: %v", got.Annotations)
-	}
-}
-
 // TestManagerOptions_SecretTransformInstalled asserts the manager the provider
-// actually starts installs stripSecretCachePayload on v1/Secret, in every role
+// actually starts installs secretcache.StripPayload on v1/Secret, in every role
 // and both watch scopes. The single-namespace branch replaces opts.Cache, so an
 // assignment made before it would be silently lost.
 func TestManagerOptions_SecretTransformInstalled(t *testing.T) {

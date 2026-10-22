@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -47,6 +46,7 @@ import (
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/config"
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/bootstrap"
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/controlplane"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/secretcache"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -136,36 +136,6 @@ func (r controllerRole) leaderElectionID() string {
 	}
 }
 
-// uncachedTypes are the types the manager's client reads straight from the API
-// server instead of from the shared cache. Every entry is a credential.
-//
-// The manager reads Secrets on two paths: the bootstrap-data Secrets the
-// KairosConfig, KairosControlPlane and SSH-fallback controllers write and read
-// back, and, through the clustercache SecretClient, the <cluster>-kubeconfig of
-// every workload cluster it connects to. controller-runtime starts an informer
-// on the first cached read of a type, and that informer lists and watches the
-// whole scope the manager is configured for, not the one object asked for. On a
-// management cluster watching all namespaces that means the process holds, for
-// its whole lifetime, admin credentials for every workload cluster present,
-// Kairos or not, plus Kamaji's CA key material.
-//
-// A label selector does not narrow this: CAPI labels the kubeconfig Secrets
-// with cluster.x-k8s.io/cluster-name, which is the same label the watch
-// predicates select on, so a selector-scoped cache would still hold them.
-// Not caching them at all is what removes the resident copy.
-//
-// This costs a GET per read on paths that run per reconcile. It covers the
-// client read path only: Watches builds its informer on mgr.GetCache() directly,
-// which Client.Cache.DisableFor does not reach. The three Secret watches
-// (kairosconfig_controller.go, kairoscontrolplane_controller.go) are therefore
-// registered with builder.OnlyMetadata, so their informers hold
-// PartialObjectMetadata, and managerOptions installs stripSecretCachePayload to
-// remove the two ObjectMeta fields that can still carry a Secret body
-// (kairos-io/kairos#5499). The role still needs list and watch on secrets for
-// those metadata informers: without watch the reflector falls back to
-// re-LISTing every Secret in scope.
-var uncachedTypes = []client.Object{&corev1.Secret{}}
-
 // managerOptions builds the options ctrl.NewManager is called with. It is the
 // one place the manager is configured, so a guard test can assert on the value
 // the running provider actually gets instead of on a copy that can drift.
@@ -188,11 +158,6 @@ func managerOptions(role controllerRole, metricsAddr, probeAddr string, enableLe
 		// 0007) never contend for a shared lease; roleAll keeps the historical
 		// ID so flat-manifest installs retain their lease across upgrades.
 		LeaderElectionID: role.leaderElectionID(),
-		Client: client.Options{
-			Cache: &client.CacheOptions{
-				DisableFor: uncachedTypes,
-			},
-		},
 	}
 	if watchSingle {
 		opts.Cache = cache.Options{
@@ -201,54 +166,12 @@ func managerOptions(role controllerRole, metricsAddr, probeAddr string, enableLe
 			},
 		}
 	}
-	// Secret cache hygiene. The Secret watches are metadata-only, so the cache
-	// holds PartialObjectMetadata and never the Secret body — but ObjectMeta
-	// still carries two things that can hold the body anyway:
-	//
-	//   - managedFields, which is pure bookkeeping for anything we do here;
-	//   - the kubectl.kubernetes.io/last-applied-configuration annotation,
-	//     which is the full serialised object, data included, for any Secret
-	//     created with `kubectl apply`.
-	//
-	// Strip both before the object is committed to the cache. Keyed by
-	// corev1.Secret: the cache resolves ByObject entries by GVK, and a
-	// PartialObjectMetadata for v1/Secret resolves to the same GVK, so this
-	// reaches the metadata informers. Set after the watch-scope branch above,
-	// which replaces opts.Cache; ByObject.Namespaces is left nil so it inherits
-	// DefaultNamespaces.
-	opts.Cache.ByObject = map[client.Object]cache.ByObject{
-		&corev1.Secret{}: {Transform: stripSecretCachePayload},
-	}
+	// Keep Secret bodies out of the manager's cache: the client reads Secrets
+	// live, and the metadata-only Secret watches get a transform that strips
+	// body-carrying metadata. Applied after the watch-scope branch above, which
+	// replaces opts.Cache. See internal/secretcache.
+	secretcache.Apply(&opts)
 	return opts
-}
-
-// lastAppliedConfigAnnotation is kubectl's record of the object as applied. On
-// a Secret it is the full object, data included, so it defeats a metadata-only
-// watch unless it is stripped before the object reaches the cache.
-const lastAppliedConfigAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
-
-// stripSecretCachePayload removes everything that can carry Secret data into
-// the cache through ObjectMeta. It is a cache transform, so it runs on the
-// cache's own copy and never on an object handed back to a caller by a live
-// (uncached) read.
-func stripSecretCachePayload(in any) (any, error) {
-	obj, err := meta.Accessor(in)
-	if err != nil {
-		// Not an API object (a cache.DeletedFinalStateUnknown tombstone, say).
-		// Nothing to strip, and dropping it would lose the delete event.
-		return in, nil
-	}
-	// Nil-check before setting, per kubernetes/kubernetes#124337.
-	if obj.GetManagedFields() != nil {
-		obj.SetManagedFields(nil)
-	}
-	if annotations := obj.GetAnnotations(); annotations != nil {
-		if _, ok := annotations[lastAppliedConfigAnnotation]; ok {
-			delete(annotations, lastAppliedConfigAnnotation)
-			obj.SetAnnotations(annotations)
-		}
-	}
-	return in, nil
 }
 
 func main() {
