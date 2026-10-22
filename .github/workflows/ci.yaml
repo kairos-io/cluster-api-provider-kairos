@@ -57,7 +57,10 @@ jobs:
       # unit-test gate the repository has.
       continue-on-error: true
       with:
-        file: ./coverage.out
+        # v5 renamed `file` to `files`; v7 drops `file`. disable_search makes
+        # the upload exactly this profile, not whatever auto-search finds.
+        files: ./coverage.out
+        disable_search: true
         flags: unittests
         name: codecov-umbrella
         # Codecov refuses tokenless uploads for a protected branch, so without
