@@ -46,6 +46,7 @@ import (
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/config"
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/bootstrap"
 	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/controlplane"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/secretcache"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -135,6 +136,44 @@ func (r controllerRole) leaderElectionID() string {
 	}
 }
 
+// managerOptions builds the options ctrl.NewManager is called with. It is the
+// one place the manager is configured, so a guard test can assert on the value
+// the running provider actually gets instead of on a copy that can drift.
+//
+// watchSingle restricts the cache to watchNamespace: --namespace (clusterctl's
+// single-namespace install) or the legacy WATCH_NAMESPACE. When it is false the
+// manager watches all namespaces, which is the flat-manifest default.
+func managerOptions(role controllerRole, metricsAddr, probeAddr string, enableLeaderElection bool, watchNamespace string, watchSingle bool) ctrl.Options {
+	opts := ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
+		WebhookServer: webhook.NewServer(webhook.Options{
+			Port: 9443,
+		}),
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		// Role-specific so the bootstrap and control-plane Deployments (ADR
+		// 0007) never contend for a shared lease; roleAll keeps the historical
+		// ID so flat-manifest installs retain their lease across upgrades.
+		LeaderElectionID: role.leaderElectionID(),
+	}
+	if watchSingle {
+		opts.Cache = cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				watchNamespace: {},
+			},
+		}
+	}
+	// Keep Secret bodies out of the manager's cache: the client reads Secrets
+	// live, and the metadata-only Secret watches get a transform that strips
+	// body-carrying metadata. Applied after the watch-scope branch above, which
+	// replaces opts.Cache. See internal/secretcache.
+	secretcache.Apply(&opts)
+	return opts
+}
+
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
@@ -200,23 +239,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Configure manager options
-	mgrOptions := ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
-		},
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Port: 9443,
-		}),
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		// Role-specific so the bootstrap and control-plane Deployments (ADR
-		// 0007) never contend for a shared lease; roleAll keeps the historical
-		// ID so flat-manifest installs retain their lease across upgrades.
-		LeaderElectionID: role.leaderElectionID(),
-	}
-
 	// --namespace (clusterctl single-namespace watch) takes precedence over the
 	// legacy WATCH_NAMESPACE env path. When --namespace is empty the prior
 	// WATCH_NAMESPACE behavior is preserved byte-for-byte (roleAll + empty
@@ -229,15 +251,12 @@ func main() {
 		watchNamespace, watchSingle = cfg.GetWatchNamespace(), true
 	}
 	if watchSingle {
-		mgrOptions.Cache = cache.Options{
-			DefaultNamespaces: map[string]cache.Config{
-				watchNamespace: {},
-			},
-		}
 		setupLog.Info("Watching single namespace", "namespace", watchNamespace)
 	} else {
 		setupLog.Info("Watching all namespaces")
 	}
+
+	mgrOptions := managerOptions(role, metricsAddr, probeAddr, enableLeaderElection, watchNamespace, watchSingle)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
