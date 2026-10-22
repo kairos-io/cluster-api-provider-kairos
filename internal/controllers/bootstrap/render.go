@@ -79,12 +79,17 @@ var bootstrapDistributions = map[string]bootstrapDistribution{
 			td.Kubeadm = &bootstrap.KubeadmTemplateData{
 				JoinConfiguration: w.Kubeadm.JoinConfiguration,
 				KubernetesVersion: w.Kubeadm.KubernetesVersion,
+				PatchesDirectory:  w.Kubeadm.PatchesDirectory,
 				ProviderIDPatch:   kubeadmProviderIDPatch(td.ProviderID),
 			}
 		},
 		builtinJoin: nil,
 	},
 }
+
+// defaultKubeadmPatchesDir is the kubeadm patches directory used when the spec
+// does not name one.
+const defaultKubeadmPatchesDir = "/etc/kubernetes/kairos-patches"
 
 // kubeadmProviderIDPatch returns a kubeadm kubeletconfiguration merge-patch that
 // sets the Node providerID (ADR 0010 P1 item 4), or "" when no providerID is known
@@ -162,11 +167,13 @@ func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log log
 		hostnamePrefix = "metal-"
 	}
 
-	// Prefer explicit hostname, otherwise use Machine name.
-	hostname := kairosConfig.Spec.Hostname
-	if hostname == "" && machine != nil {
-		hostname = machine.Name
+	// Prefer explicit hostname, otherwise use Machine name. The KCP looks the
+	// node up by the same name (bootstrapv1beta2.RenderedHostname, ADR 0015).
+	machineName := ""
+	if machine != nil {
+		machineName = machine.Name
 	}
+	hostname := bootstrapv1beta2.RenderedHostname(&kairosConfig.Spec, machineName)
 
 	// Set install configuration (with defaults).
 	var installConfig *bootstrap.InstallConfig
@@ -207,7 +214,7 @@ func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log log
 	var mgmtEndpoint *ManagementEndpoint
 	if supportsManagementEndpoint(machine) && role == "control-plane" && r.MgmtEndpointResolver != nil {
 		var err error
-		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, cluster)
+		mgmtEndpoint, err = r.MgmtEndpointResolver.Resolve(ctx, kairosConfig, machine, cluster)
 		if err != nil {
 			return "", WorkerJoinMaterial{}, err
 		}
@@ -254,6 +261,7 @@ func (r *KairosConfigReconciler) renderCloudConfigM(ctx context.Context, log log
 			KubeconfigSecretNamespace: mgmtEndpoint.KubeconfigSecretNamespace,
 			ClusterName:               cluster.Name,
 			ControlPlaneEndpointHost:  cluster.Spec.ControlPlaneEndpoint.Host,
+			CABundle:                  string(mgmtEndpoint.CABundle),
 		}
 	}
 	if machine != nil {

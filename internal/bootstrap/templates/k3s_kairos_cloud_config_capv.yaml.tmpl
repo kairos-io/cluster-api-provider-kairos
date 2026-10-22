@@ -233,6 +233,8 @@ write_files:
   # --enable-worker is needed as on k0s); the instances leader-elect on the
   # plndr-cp-lock Lease (hence the RBAC) and the leader ARPs the floating
   # control-plane VIP, so VIP ownership fails over when the leader's Node dies.
+  # Each instance elects through its own Node's apiserver (127.0.0.1:6443), so a
+  # member keeps the VIP only while its own apiserver can write to etcd (ADR 0014).
   - path: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
     permissions: "0644"
     owner: root
@@ -517,8 +519,19 @@ write_files:
         fi
       fi
   {{- end }}
+  {{- if and .ManagementEndpoint .ManagementEndpoint.CABundle }}
+  # ADR 0011 PR-4: the management API CA the node-push curls verify the channel
+  # against (curl --cacert). Public certificate material (not secret), written
+  # 0644; validated + canonically re-encoded controller-side. Never the tenant
+  # workload cluster's CA.
+  - path: /etc/kairos-capi/management-ca.crt
+    permissions: "0644"
+    owner: root
+    group: root
+    content: |{{ .ManagementEndpoint.CABundle | nindent 6 }}
+  {{- end }}
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |
@@ -597,6 +610,45 @@ MANIFEST_EOF
       */ -}}
 
       {{- if .ManagementEndpoint }}
+      # ADR 0011 PR-4: management-API request hardening, shared by every push
+      # below. TLS is verified against the management API CA at KAIROS_MGMT_CA
+      # (curl --cacert; there is no insecure fallback anywhere). The bearer
+      # token is kept out of curl's argv by writing it to a 0600 curl config file
+      # read via --config; request and response bodies are kept off argv and out
+      # of world-readable /tmp by staging them in mktemp 0600 files inside a 0700
+      # tmpfs dir (a PATCH response echoes the Secret, so it is discarded).
+      KAIROS_MGMT_CA="/etc/kairos-capi/management-ca.crt"
+      KAIROS_MGMT_RUNDIR="/run/kairos-capi"
+      mkdir -p "${KAIROS_MGMT_RUNDIR}"
+      chmod 0700 "${KAIROS_MGMT_RUNDIR}"
+      # _mgmt_auth_conf writes a fresh 0600 curl --config file (mktemp) holding the
+      # bearer token as a `header` line, echoes its path, and each caller removes it
+      # immediately after the request — so the token file never lingers on tmpfs.
+      # mktemp creates the file 0600 in the 0700 run dir.
+      # SECURITY: the printf'd value is safe ONLY because .Token is a
+      # controller-minted TokenRequest JWT (charset [A-Za-z0-9_.-]; no double quote,
+      # backslash, or newline). shquote guards the shell layer but does NOT escape
+      # curl config-file double-quote syntax, so .Token must NEVER be populated from
+      # user-controlled data.
+      _mgmt_auth_conf() {
+        local _f
+        _f="$(mktemp "${KAIROS_MGMT_RUNDIR}/auth.XXXXXX")"
+        printf 'header = "Authorization: Bearer %s"\n' {{ .ManagementEndpoint.Token | shquote }} > "${_f}"
+        printf '%s' "${_f}"
+      }
+      mgmt_patch() {
+        local _url="$1" _body="$2" _bodyf _authf
+        _bodyf="$(mktemp "${KAIROS_MGMT_RUNDIR}/body.XXXXXX")"
+        _authf="$(_mgmt_auth_conf)"
+        printf '%s' "${_body}" > "${_bodyf}"
+        curl --cacert "${KAIROS_MGMT_CA}" --proto '=https' \
+          --config "${_authf}" \
+          -sS -o /dev/null -w "%{http_code}" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -X PATCH --data-binary @"${_bodyf}" \
+          "${_url}" || true
+        rm -f "${_bodyf}" "${_authf}"
+      }
       # Push kubeconfig to management cluster without SSH (KD-3b).
       # CAPV has no LB Service: rewrite k3s.yaml's `server:` URL to use the
       # cluster's controlPlaneEndpoint host (CAPV-controlled, set on the
@@ -627,39 +679,22 @@ MANIFEST_EOF
           return 1
         fi
         local kubeconfig_b64
-        {{- if .ManagementEndpoint.ControlPlaneEndpointHost }}
-        local tmp_kubeconfig
-        tmp_kubeconfig=$(mktemp)
-        local cp_endpoint_host={{ .ManagementEndpoint.ControlPlaneEndpointHost | shquote }}
-        sed "s|https://[^[:space:]]*:6443|https://${cp_endpoint_host}:6443|g" "${kubeconfig_file}" > "${tmp_kubeconfig}"
-        kubeconfig_b64=$(base64 -w 0 "${tmp_kubeconfig}" 2>/dev/null || base64 "${tmp_kubeconfig}" | tr -d '\n')
-        rm -f "${tmp_kubeconfig}"
-        {{- else }}
         kubeconfig_b64=$(base64 -w 0 "${kubeconfig_file}" 2>/dev/null || base64 "${kubeconfig_file}" | tr -d '\n')
-        {{- end }}
         local api={{ .ManagementEndpoint.APIServer | shquote }}
         local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
         local name={{ .ManagementEndpoint.KubeconfigSecretName | shquote }}
-        local token={{ .ManagementEndpoint.Token | shquote }}
-        local cluster_name={{ .ManagementEndpoint.ClusterName | shquote }}
-        local payload
-        payload="{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\",\"labels\":{\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"},\"annotations\":{\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"}},\"type\":\"cluster.x-k8s.io/secret\",\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
+        # PR-3 (ADR 0011): PATCH the `value` key of the controller-owned staging
+        # Secret <cluster>-kubeconfig-push. The node no longer creates or writes the
+        # contract Secret <cluster>-kubeconfig, sends no metadata/labels/type, and no
+        # longer rewrites the server URL — the control plane rebuilds the kubeconfig
+        # and forces the endpoint it already knows.
+        local patch
+        patch="{\"data\":{\"value\":\"${kubeconfig_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${name}"
+        # PR-4 (ADR 0011): TLS-verified PATCH via mgmt_patch (curl --cacert; token
+        # and body off argv; no insecure fallback, no response body in /tmp).
         local status
-        status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-          -H "Authorization: Bearer ${token}" \
-          -H "Content-Type: application/json" \
-          -X PUT \
-          --data "${payload}" \
-          "${url}" || true)
-        if [ "${status}" = "404" ]; then
-          status=$(curl -k -sS -o /tmp/kairos-kubeconfig-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            --data "${payload}" \
-            "${api}/api/v1/namespaces/${ns}/secrets" || true)
-        fi
+        status=$(mgmt_patch "${url}" "${patch}")
         if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
           echo "Pushed kubeconfig to management secret ${ns}/${name}"
           return 0
@@ -722,7 +757,6 @@ MANIFEST_EOF
         local api={{ .ManagementEndpoint.APIServer | shquote }}
         local ns={{ .ManagementEndpoint.KubeconfigSecretNamespace | shquote }}
         local es_name={{ .ManagementEndpoint.EtcdStatusSecretName | shquote }}
-        local token={{ .ManagementEndpoint.Token | shquote }}
         local patch
         patch="{\"data\":{\"${member_key}\":\"${status_b64}\"}}"
         local url="${api}/api/v1/namespaces/${ns}/secrets/${es_name}"
@@ -733,15 +767,11 @@ MANIFEST_EOF
         # described behaviour that does not exist, since nothing reboots the node.
         # Retry here on the same cadence as the join-token push. The 2xx test is a
         # glob, not an arithmetic comparison, so an empty status from a failed curl
-        # cannot abort the loop.
+        # cannot abort the loop. PR-4: mgmt_patch is TLS-verified (curl --cacert),
+        # keeps the token/body off argv, and discards the response body.
         local status="" reported=""
         for i in {1..30}; do
-          status=$(curl -k -sS -o /tmp/kairos-etcdstatus-push.log -w "%{http_code}" \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/strategic-merge-patch+json" \
-            -X PATCH \
-            --data "${patch}" \
-            "${url}" || true)
+          status=$(mgmt_patch "${url}" "${patch}")
           case "${status}" in
             2[0-9][0-9]) reported=yes ;;
           esac
@@ -751,7 +781,6 @@ MANIFEST_EOF
           echo "Attempt $i/30: etcd-status report returned '${status}', retrying in 5 seconds..."
           sleep 5
         done
-        unset token
         if [ -n "${reported}" ]; then
           echo "Reported etcd status to management secret ${ns}/${es_name} (member ${member_key})"
           return 0

@@ -58,6 +58,15 @@ func etcdStatusSecretName(clusterName string) string {
 // Gated by the caller on desiredReplicas > 1 (single-node clusters have no etcd
 // quorum to guard and no peers to report about).
 func (r *KairosControlPlaneReconciler) ensureEtcdStatusSecret(ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster) error {
+	// G10 (ADR 0011): refuse to adopt a same-name Secret this Cluster does not
+	// already control — a pre-existing `<cluster>-etcd-status` could carry
+	// member records the quorum guard would then read. Ownership is verified by
+	// controller-UID; a foreign or ownerless existing Secret is refused.
+	if err := refuseUnownedHASecret(ctx, r.Client,
+		types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}, cluster.UID); err != nil {
+		return err
+	}
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      etcdStatusSecretName(cluster.Name),
@@ -109,7 +118,7 @@ type etcdMemberStatus struct {
 func (r *KairosControlPlaneReconciler) readEtcdStatus(ctx context.Context, cluster *clusterv1.Cluster) (map[string]etcdMemberStatus, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace}
-	if err := r.Client.Get(ctx, key, secret); err != nil {
+	if err := r.Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return map[string]etcdMemberStatus{}, nil
 		}
@@ -157,7 +166,7 @@ func etcdVotingHealthyCount(status map[string]etcdMemberStatus) int {
 //     never the node-reported `members` list length (unvalidated, forgeable).
 func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, target *clusterv1.Machine) (bool, string, error) {
 	// Whole-cluster teardown must never deadlock on quorum (the single bypass).
-	if !kcp.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !kcp.DeletionTimestamp.IsZero() {
 		return true, "", nil
 	}
 	desiredReplicas := int32(1)
@@ -170,9 +179,18 @@ func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp 
 	}
 	// Failed-node fast path — OBJECTIVE liveness only (Machine phase / NodeRef),
 	// NOT the etcd self-report: a target that never registered a Node or is not
-	// Running is presumed dead/failed, is not a healthy voting member, and cannot
-	// reduce the healthy-voting count — allow. This is the primary replacement
-	// case for an unreachable node.
+	// Running is presumed failed and not counted among the healthy voting
+	// members this guard protects — allow. This is the primary replacement case
+	// for an unreachable node.
+	//
+	// "No NodeRef" does NOT mean "not an etcd member" (ADR 0015, KD-80): a k0s
+	// joiner joins etcd before its Node registers, and may never get a NodeRef.
+	// Deleting it is still allowed here because the delete is followed by a
+	// real leave of its member under its rendered node name
+	// (reconcileMemberLeave, inspectUnregisteredLeave), not by a bare hook
+	// release. Open (KD-80): such a node reports its etcd status under its
+	// hostname whether or not it has a NodeRef, so it can be counted as a
+	// healthy voter that this fast path removes without the quorum check below.
 	if !target.Status.NodeRef.IsDefined() || target.Status.Phase != string(clusterv1.MachinePhaseRunning) {
 		return true, "", nil
 	}

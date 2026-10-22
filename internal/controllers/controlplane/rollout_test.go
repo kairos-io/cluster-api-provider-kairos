@@ -85,9 +85,24 @@ func rolloutEtcdStatus(cluster *clusterv1.Cluster, machines ...*clusterv1.Machin
 		b, _ := json.Marshal(etcdMemberStatus{Name: node, Healthy: true, Voting: true, Members: len(machines)})
 		data[node] = b
 	}
+	// Owner-ref to the Cluster (Controller=true), matching how
+	// ensureEtcdStatusSecret creates it: reconcileMachines now refuses to adopt a
+	// same-name etcd-status Secret that this Cluster does not already control
+	// (ADR 0011, closing G10), so the fixture must present the real ownership.
+	ctlTrue := true
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: etcdStatusSecretName(cluster.Name), Namespace: cluster.Namespace},
-		Data:       data,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      etcdStatusSecretName(cluster.Name),
+			Namespace: cluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "Cluster",
+				Name:       cluster.Name,
+				UID:        cluster.UID,
+				Controller: &ctlTrue,
+			}},
+		},
+		Data: data,
 	}
 }
 
@@ -159,7 +174,7 @@ func TestReconcileMachines_HARolloutKeepsOldMembersWhileTheReplacementBoots(t *t
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(old0, old1, old2, booting, machineMetaInfraTemplate(),
 			rolloutEtcdStatus(cluster, old0, old1, old2)).Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
 	res, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -193,7 +208,7 @@ func TestReconcileMachines_HARolloutRemovesTheOldestMemberOnceTheReplacementJoin
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(old0, old1, old2, joined, machineMetaInfraTemplate(),
 			rolloutEtcdStatus(cluster, old0, old1, old2, joined)).Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
 	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())

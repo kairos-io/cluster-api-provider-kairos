@@ -314,6 +314,9 @@ func TestSSHFallback_AnnotationDrivesReason(t *testing.T) {
 				Kind:     "KairosControlPlane",
 				Name:     clusterName + "-kcp",
 			},
+			// ADR 0011: the publish path needs a known endpoint to canonicalize
+			// the kubeconfig before KubeconfigReady can go True.
+			ControlPlaneEndpoint: testControlPlaneEndpoint(),
 		},
 	}
 	g.Expect(c.Create(ctx, cluster)).To(Succeed())
@@ -375,9 +378,11 @@ func TestSSHFallback_AnnotationDrivesReason(t *testing.T) {
 	g.Expect(c.Create(ctx, machine)).To(Succeed())
 
 	// Write the kubeconfig Secret with the ssh-fallback annotation — this is
-	// the byte-for-byte shape the worker (ssh_fallback_worker.go) produces on
-	// success. Doing it from the test exercises observeKubeconfigSecret's
-	// annotation-aware branch without any SSH dialing.
+	// the shape the worker (ssh_fallback_worker.go) produces on success (now S5
+	// output). Doing it from the test exercises the publish path's source-aware
+	// Reason routing without any SSH dialing. ADR 0011: the payload must be a
+	// real, sanitizer-valid kubeconfig, and adoption preserves the ssh-fallback
+	// source annotation.
 	pushed := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      clusterName + "-kubeconfig",
@@ -388,9 +393,7 @@ func TestSSHFallback_AnnotationDrivesReason(t *testing.T) {
 			},
 		},
 		Type: clusterv1.ClusterSecretType,
-		Data: map[string][]byte{
-			"value": []byte("apiVersion: v1\nkind: Config\nclusters: []\ncontexts: []\nusers: []\n"),
-		},
+		Data: map[string][]byte{"value": validWorkloadKubeconfig(t)},
 	}
 	g.Expect(c.Create(ctx, pushed)).To(Succeed())
 

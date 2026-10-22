@@ -28,6 +28,8 @@ spec:
 
 Where `spec.ha.vip` applies, the controller renders a kube-vip DaemonSet into each control-plane node's bootstrap cloud-config; one Pod holds leader election and advertises the VIP, failing over to a surviving node if the leader is lost.
 
+The kube-vip Pod talks to its own node's API server on `127.0.0.1:6443`, so a member holds the VIP only while its own API server works. A custom API server port, or a bind address that excludes loopback, leaves the VIP down.
+
 Worked samples:
 
 - [`config/samples/capv/kairos_cluster_k0s_ha.yaml`](../config/samples/capv/kairos_cluster_k0s_ha.yaml) / [`kairos_cluster_k3s_ha.yaml`](../config/samples/capv/kairos_cluster_k3s_ha.yaml)
@@ -35,6 +37,40 @@ Worked samples:
 - [`config/samples/capm3/kairos_cluster_k0s_ha.yaml`](../config/samples/capm3/kairos_cluster_k0s_ha.yaml) / [`kairos_cluster_k3s_ha.yaml`](../config/samples/capm3/kairos_cluster_k3s_ha.yaml)
 
 See the [CAPV HA quickstart walkthrough](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane) for the full procedure.
+
+## Known issue: k0s HA rollouts on v0.1.4
+
+Affects k0s HA control planes on every infrastructure provider except CAPK
+(CAPV, CAPM3, the Kairos fleet provider, and the generic path), in v0.1.4 and
+earlier. k3s and CAPK are not affected.
+
+In these releases only the first control-plane node puts the control-plane
+endpoint in its API server certificate. The nodes that join after it do not.
+Creating the cluster works. But when the first node is removed, for example during a rollout after a `spec.version` change,
+the VIP moves to a joiner, and every client that checks the certificate
+against the endpoint fails. That includes the management cluster. The rollout
+then stops at the first node, with a `KairosControlPlane` message such as:
+
+```text
+failed to reconcile etcd member leave for <cluster>-cp-0: ... tls: failed to verify certificate: x509: certificate is valid for ..., not <endpoint>
+```
+
+The fix renders the endpoint into every control-plane member's certificate,
+and ships in the next release. Until then, avoid changes that replace the first
+control-plane node of an affected cluster.
+
+A second issue affects the same k0s clusters, CAPK included. The token that new
+control-plane members join with is created once, by the first control-plane
+node. It points at that node's own address and expires 24 hours after it was
+created. A member created after the first node has been removed, or more than
+24 hours after the cluster was created, therefore cannot join. Its Machine
+stays `Provisioned` without a Node, and the `KairosControlPlane` keeps waiting
+for it to join. This affects rollouts, remediation and scale-up. A fix that
+has the control plane issue a fresh join token for each new member is being
+prepared for the next release. A member stuck this way does not recover on its
+own: after upgrading to that release, delete its Machine so that a replacement
+is created with a fresh token. The stuck Machine has no Node yet, so deleting
+it does not touch etcd.
 
 ## Scale-up: joiners are created one at a time
 
@@ -67,6 +103,34 @@ register a Node before an outdated member is removed, and the rollout waits
 while any control-plane machine is still being deleted. Progress is reported on
 the `MachinesUpToDate` condition.
 
+## Control-plane Machine names
+
+Each control-plane Machine is named `<kcp-name>-<5 random characters>`, for
+example `my-cluster-cp-x7k2p`, as the upstream kubeadm control plane names
+them. Its `KairosConfig` and infrastructure Machine have the same name. The
+name is always a valid hostname under the `spec.hostname` rule: dots in the
+`KairosControlPlane` name become dashes, and a name longer than 57 characters
+is shortened, so the Machine name fits in 63 characters.
+
+A name is never given to a second Machine. By default the Machine name is also
+the node's hostname, its Node name, and its etcd member name. If a replacement got the
+name of a member that had just left, it could find state that member left
+behind, and on k0s that can split etcd into two clusters.
+
+Do not rely on the order of the names. Use the creation time, as the
+controller does: the oldest control-plane Machine is the one the cluster was
+initialised on, and a scale-down removes the newest.
+
+If a Machine cannot be created, for example because the infrastructure
+template is missing, the controller deletes the `KairosConfig` and
+infrastructure Machine it made for that attempt and tries again under a new
+name. While this repeats, short-lived `KairosConfig` objects appear and
+disappear, and the controller log gives the reason.
+
+Clusters created with releases up to v0.2.0 keep their `-0`, `-1` and `-2`
+Machines until those Machines are replaced. New Machines get random names,
+and a control plane can have both kinds of name at once.
+
 ## Day-2: etcd health and quorum-safe replacement
 
 Each control-plane node reports its own etcd member health as the `EtcdHealthy` condition on `KairosControlPlane`: `True` when every voting member is healthy, `False(Info)` when quorum holds but a member is degraded, `False(Warning)` at or below the `(N/2)+1` quorum minimum.
@@ -75,6 +139,99 @@ Rollouts and scale-downs are quorum-safe — the controller refuses a control-pl
 
 On k0s, the departing node runs `k0s etcd leave` before the Machine is deleted; a CAPI pre-terminate hook blocks termination until it acks, so no member is left orphaned. **k3s has no supported clean member-remove (KD-5d):** replacing a k3s control-plane node leaves an orphaned etcd member requiring manual `etcdctl member remove` (the controller emits `EtcdMemberRemoveUnsupportedForK3s`). k0s is the fully-supported HA distribution.
 
-A k0s node that never acks its leave within ~5 minutes is deleted anyway (the delete was already proven quorum-safe); watch for `EtcdMemberLeaveTimedOut` and remove the member manually if it fires.
+A k0s node that never acks its leave within ~5 minutes has its leave handed to k0s (`spec.leave` on its `EtcdMember`); the delete proceeds once k0s reports the member gone, or after a further ~10 minutes with a warning. Watch for `EtcdMemberLeaveTimedOut` and remove the member manually if it fires.
+
+**A k0s Machine without a Node still leaves etcd (ADR 0015).** A joiner joins etcd before its Node registers, and can be deleted before it ever gets a NodeRef (for example, when its providerID was never set). The controller no longer releases such a Machine at once: it looks up the k0s `EtcdMember` under the hostname the node was given (`spec.hostname` of its `KairosConfig`, else the Machine name), and runs the same leave as for any other member. It releases the Machine straight away only when the pinned workload cluster has no `EtcdMember` of that name (a VM that never booted lands here), or k0s already reports it not joined. If no workload API server answers, or none can be verified against the pinned identity, the Machine is held for at most ~15 minutes before the delete proceeds with `EtcdMemberLeaveTimedOut`; this bound now also applies to Machines with a Node before the first leave request. A member that was added to etcd but never started has no `EtcdMember` and is not visible to the controller (KD-78). On control-plane configs, `spec.hostname` must be a lowercase DNS-1123 label with no `{{`. The webhook enforces this for new or changed configs, and the `KairosControlPlane` refuses a referenced `KairosConfigTemplate` that breaks it (`InvalidControlPlaneHostname`). For an older config whose rendered hostname is not, the controller cannot tell which member is the node's, so it never takes a missing `EtcdMember` as proof and holds the Machine for the same ~15 minutes.
+
+### Orphan etcd members (k0s)
+
+Like the upstream kubeadm control plane, the controller removes etcd members that no control-plane Machine accounts for, for example a member orphaned by an older controller version. It asks k0s to remove the member through its `EtcdMember`, one at a time, and only:
+
+- through a workload API server verified against the pinned identity, and never while frozen;
+- in a steady state: replicas as desired, no rollout, and no control-plane Machine of the cluster, whoever owns it, being deleted or without a Node; every member must report healthy and voting;
+- only when every control-plane Machine is paired with an `EtcdMember` of its own, by Node name or by a peer address it reports. If one is not (a member's name has drifted from its Node name, and on CAPK its bridge peer address matches no Machine), nothing is removed and `EtcdOrphanMemberRemovalBlocked` says "member naming does not match";
+- for a member whose name is no control-plane Machine's node name and whose peer address no control-plane Machine reports (on CAPK the peer address is on the bridge network, so the name decides);
+- when the healthy voting members left are still a majority, of the members left and of the desired replicas. Otherwise it emits `EtcdOrphanMemberRemovalBlocked` and writes nothing.
+
+While a removal is in progress it is recorded in the `controlplane.cluster.x-k8s.io/etcd-orphan-member-leave` annotation, and no control-plane Machine is created or deleted, even if the control plane is scaled to one replica in the meantime. A record dated more than 5 minutes in the future is discarded. Events: `EtcdOrphanMemberLeaveRequested`, then `EtcdOrphanMemberRemoved`, or `EtcdOrphanMemberRemovalTimedOut` after ~10 minutes (remove it by hand: `k0s etcd leave --peer-address <ip>` on a surviving member), or `EtcdOrphanMemberChanged` if the `EtcdMember` came to describe another member. Unstarted members (the empty-name entry in `k0s etcd member-list`) are not visible and still need removing by hand.
 
 **KD-51:** etcd health/leave signals are node-self-reported over vanilla RBAC, so a compromised control-plane node can forge them. Not a privilege escalation (a compromised node already has cluster-admin-equivalent access) and it cannot force an unsafe deletion — quorum-safety is decided independently of any node signal. A forged signal can only self-downgrade the clean-leave/health guarantee.
+
+## A refused k0s joiner (ADR 0015)
+
+A k0s control-plane joiner checks that it really joined a cluster. If the live `k0scontroller` was started with its join token but `k0s etcd member-list` shows only the joiner itself, the node has bootstrapped a cluster of its own (it shares the CA, so TLS cannot tell). It then stops k0s, never sets its providerID, and refuses every later start.
+
+**Recognise it:**
+- The Machine never gets a NodeRef, and the rollout or scale-up stalls on it.
+- On the node, `/var/lib/k0s/.kairos-join-refused` exists, `systemctl status k0scontroller` shows the start refused, and the journal has `kairos-join-guard: REFUSED`.
+- A joiner whose confirmation passed has `/var/lib/k0s/.kairos-join-confirmed` instead.
+
+**Fix:** delete the Machine. Do not remove the marker or start k0s by hand on that node; the replacement joins as a fresh VM. If the failed join left an unstarted etcd member behind, the replacement may stall with `Peer URLs already exists`: remove that member on a surviving control-plane node with `k0s etcd leave --peer-address <ip>` (the empty-name entry in `k0s etcd member-list`).
+
+**Do not** delete or replace all of the older control-plane members while a joiner is still unconfirmed (no `.kairos-join-confirmed`). Until it is confirmed you cannot tell whether it joined the real cluster.
+
+## Day-2: workload cluster identity and the freeze
+
+An HA control plane pins the identity of the workload cluster it manages, and freezes control-plane membership changes if a workload API server ever answers as a different cluster (ADR 0015). The identity is the UID of the workload `kube-system` Namespace, stored on the `KairosControlPlane` in the `controlplane.cluster.x-k8s.io/workload-cluster-uid` annotation. The full rules (when it is pinned, what is checked, the annotations) are in [API_REFERENCE.md — Workload cluster identity](API_REFERENCE.md#workload-cluster-identity).
+
+Why it exists: on k0s, a joining member whose join failed half-way can start a new etcd cluster with the certificate authority it received while joining. The new cluster's API server is trusted by the same CA, kube-vip there can take the VIP, and a controller that cannot tell the two clusters apart then removes the original members as "gone". The freeze turns that into a stop that waits for a person.
+
+While frozen:
+
+- `Ready`, `Available` and `EtcdHealthy` are `False` (Error) with reason `WorkloadClusterIdentityChanged`, and a Warning event `WorkloadClusterIdentityChanged` names the pinned UID, the UID read, and where it was read from;
+- the controller creates and deletes no control-plane Machine and removes no etcd-leave hook, so a k0s Machine deleted by you or a MachineHealthCheck stays at its pre-terminate hook, its VM and etcd data intact;
+- the controller writes nothing to the workload cluster (no etcd-leave request, no join token, no orphan etcd-member removal);
+- anything that waits on the Cluster being `Ready` or `Available` (GitOps health checks, the fleet provider) holds too, which is intended;
+- deleting the whole cluster still works.
+
+The freeze is sticky on purpose: it never clears by itself, because the two clusters can keep answering in turn. A wrong edit to the pin annotation also freezes the control plane.
+
+### Runbook: `WorkloadClusterIdentityChanged`
+
+1. **Read the freeze.** The mismatch annotation says what was seen, where, and against which pin:
+   ```bash
+   kubectl get kairoscontrolplane <name> -n <namespace> -o jsonpath='{.metadata.annotations}'
+   kubectl describe kairoscontrolplane <name> -n <namespace>   # the Warning event
+   ```
+2. **Read the identity through every control-plane member, not only through the endpoint.** Two clusters elect two VIP holders, so the endpoint alone proves nothing. With the workload kubeconfig, address each member's API server by the IP its Machine reports (`kubectl get machines -n <namespace> -l cluster.x-k8s.io/control-plane -o yaml`, `status.addresses`); TLS is still verified against the cluster CA:
+   ```bash
+   clusterctl get kubeconfig <cluster> -n <namespace> > workload.kubeconfig
+   for ip in <member-ip> ...; do
+     printf '%s ' "$ip"
+     kubectl --kubeconfig workload.kubeconfig --server "https://$ip:6443" \
+       get namespace kube-system -o jsonpath='{.metadata.uid}{"\n"}'
+   done
+   ```
+   Where member addresses are not in the API server certificate (CAPK reports pod IPs), run the same read on each node: `k0s kubectl get namespace kube-system -o jsonpath='{.metadata.uid}'` (k3s: `k3s kubectl`). On k0s, also run `k0s etcd member-list` on each node: a member that started its own cluster lists only itself.
+3. **Decide which cluster to keep.**
+   - **One or a few members (usually the newest joiner) answer with a different UID; the rest answer with the pinned one.** Those members serve a cluster of their own. Power off their VMs through the infrastructure provider; deleting the Machine is not enough while frozen, because the hook keeps it. Check again that every remaining member answers with the pinned UID, then clear the freeze by removing only the mismatch annotation (step 4). Once the freeze is cleared and the control plane is steady, the controller removes a started k0s member those joiners left in the original cluster's etcd (see [Orphan etcd members](#orphan-etcd-members-k0s)). A member that never started, or one the controller reports `EtcdOrphanMemberRemovalBlocked` or `EtcdOrphanMemberRemovalTimedOut` for, needs removing by hand: compare `k0s etcd member-list` on a surviving member with the live Machines, and run `k0s etcd leave --peer-address <ip>` there for the stale entry.
+   - **Every member answers with the same new UID.** The pinned cluster no longer exists; its state is already lost. Re-pin to the new UID so the control plane can be managed again (step 4), then restore workloads from backup if you have one.
+   - **Every member answers with the pinned UID.** The cause is gone (for example, the stray VM was already powered off). Remove only the mismatch annotation (step 4).
+4. **Clear the freeze.** Pick the command that matches step 3:
+   ```bash
+   # keep the pin; the next check freezes again if any path still disagrees
+   kubectl annotate kairoscontrolplane <name> -n <namespace> \
+     controlplane.cluster.x-k8s.io/workload-cluster-identity-mismatch-
+
+   # re-pin to the UID every member now answers with
+   kubectl annotate kairoscontrolplane <name> -n <namespace> --overwrite \
+     controlplane.cluster.x-k8s.io/workload-cluster-uid=<verified-uid>
+   ```
+   Changing or removing the pin annotation clears the freeze by itself; the controller removes the mismatch annotation and emits a Normal event `WorkloadClusterIdentityFreezeCleared`. Removing the pin instead of setting it makes the controller pin again, which it does only if every path agrees. Membership changes resume on the next reconcile.
+
+### Before upgrading an existing HA cluster
+
+Left alone, the controller pins an existing cluster on its first reconcile after the upgrade, from whatever answers then. It refuses to pin, and freezes, if the endpoint and the members disagree, but it cannot detect a split that every path reports the same way. Close that gap by setting the pin yourself before you upgrade:
+
+1. Run step 2 of the runbook above and check that every control-plane member answers with the same UID.
+2. Set that UID as the pin. A pin that is already set is never replaced by first-use pinning, so the controller checks against your value from its first reconcile:
+   ```bash
+   kubectl annotate kairoscontrolplane <name> -n <namespace> \
+     controlplane.cluster.x-k8s.io/workload-cluster-uid=<verified-uid>
+   ```
+
+**CAPK:** Machines usually report pod IPs, which are not in the API server certificate, so the controller's reads through member addresses do not answer and its first-use pin rests on the control-plane endpoint alone. Pre-seeding the pin matters most there. A split that appears later is still caught by the per-connection checks and the once-a-minute recheck.
+
+### When the controller cannot pin
+
+Once an HA control plane has a registered member, the controller takes no membership action until the identity is pinned. If no path answers the identity read, or `KubeconfigReady` stays `False`, that hold has no time limit: no joiner is admitted, no control-plane Machine is deleted, and a Machine being deleted stays at its etcd-leave hook, because the bounded etcd-leave timeout is suspended too. The controller logs `Holding control-plane membership changes until the workload cluster identity is pinned` with the reason. The way out is to verify the UID through every member (step 2 of the runbook) and set the pin annotation by hand, as above.

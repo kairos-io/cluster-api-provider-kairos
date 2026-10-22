@@ -226,6 +226,21 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
 	}
 
+	// Resolve the server URL the worker forces into the fetched kubeconfig
+	// (ADR 0011 step 2): the SSH fallback goes through the same sanitizer as a
+	// node push, so it needs the same expected server as the main publish path.
+	// If the endpoint is not known yet, retry rather than publish an unforced
+	// server.
+	expectedServer, ok, err := resolveExpectedServer(ctx, r.Client, kcp, cluster)
+	if err != nil {
+		log.Info("could not resolve expected control-plane server; will retry", "error", err.Error())
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
+	}
+	if !ok {
+		log.Info("expected control-plane server not known yet; will retry")
+		return ctrl.Result{RequeueAfter: r.evalRequeue()}, nil
+	}
+
 	// Mark the condition Dialing and enqueue.
 	conditions.MarkFalse(kcp,
 		controlplanev1beta2.KubeconfigReadyCondition,
@@ -237,11 +252,12 @@ func (r *SSHFallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	patchOnExit = true
 
 	job := SSHFallbackJob{
-		KCPKey:       req.NamespacedName,
-		Cluster:      cluster,
-		Spec:         *kcp.Spec.SSHFallback,
-		Distribution: kcp.Spec.Distribution,
-		Host:         host,
+		KCPKey:         req.NamespacedName,
+		Cluster:        cluster,
+		Spec:           *kcp.Spec.SSHFallback,
+		Distribution:   kcp.Spec.Distribution,
+		Host:           host,
+		ExpectedServer: expectedServer,
 	}
 	if !r.Worker.Enqueue(ctx, job) {
 		// Pool full or already in flight. Either way: retry shortly.

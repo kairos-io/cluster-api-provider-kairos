@@ -65,6 +65,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/kubeconfig"
 )
 
 // KubeconfigSourceAnnotation is the annotation key the worker stamps on the
@@ -129,6 +130,14 @@ type SSHFallbackJob struct {
 	// Status.Addresses (InternalIP > ExternalIP > any). The worker does
 	// NOT attempt DNS or additional resolution.
 	Host string
+
+	// ExpectedServer is the control-plane server URL the sanitizer forces
+	// into the fetched kubeconfig (ADR 0011 step 2), resolved by the
+	// reconciler via resolveExpectedServer so the worker and the main
+	// publish path agree byte-for-byte. Empty means the endpoint was not
+	// known at enqueue time; the worker then refuses to write rather than
+	// publish an unforced server.
+	ExpectedServer string
 }
 
 // SSHFallbackResultCategory classifies a finished SSH-fetch attempt for
@@ -635,11 +644,32 @@ func (w *SSHFallbackWorker) runRemoteCat(ctx context.Context, log logr.Logger, s
 // writeKubeconfigSecret upserts the cluster kubeconfig Secret with the
 // SSH-fallback annotation stamped on. Mirrors the shape the node-push
 // payload writes, with the source annotation set to "ssh-fallback" so
-// observeKubeconfigSecret can route the Reason.
+// reconcileKubeconfig can route the Reason.
 //
-// Owner reference: the Cluster, Controller=false (matches CAPI convention
-// for kubeconfig Secrets; see internal/controllers/CLAUDE.md § 3).
+// ADR 0011: the SSH-fetched file (raw admin.conf / k3s.yaml, whose k3s
+// server is a loopback address — G9) goes through the SAME trust reduction as a
+// node push: internal/kubeconfig.Sanitize rebuilds it (S5) with the server the
+// controller knows forced in, dropping any file-path credentials, exec plugins
+// or insecure TLS. There is no separate SSH trust path. A Sanitize failure is
+// returned as an error, which the reconciler maps to SSHFallbackFailed, rather
+// than writing untrusted bytes. The contract Secret is UPDATED in place when it
+// already exists (CreateOrUpdate), which is exactly what recovers a Secret the
+// steady-state check emptied (empty-in-place neutralization).
+//
+// Owner reference: the Cluster, Controller=false (matches CAPI convention for
+// kubeconfig Secrets; see internal/controllers/CLAUDE.md § 3). The main
+// reconcile later adopts it (KCP controller owner, CA pin) while preserving the
+// ssh-fallback source annotation.
 func (w *SSHFallbackWorker) writeKubeconfigSecret(ctx context.Context, log logr.Logger, job SSHFallbackJob, payload []byte) error {
+	if job.ExpectedServer == "" {
+		return fmt.Errorf("SSH fallback: no expected control-plane server resolved for cluster %s/%s; cannot sanitize kubeconfig", job.Cluster.Namespace, job.Cluster.Name)
+	}
+	sanitized, err := kubeconfig.Sanitize(payload, job.Cluster.Name, job.ExpectedServer)
+	if err != nil {
+		// The message names the failing rule, never a byte of the payload.
+		return fmt.Errorf("SSH fallback: fetched kubeconfig failed sanitization: %w", err)
+	}
+
 	secretName := fmt.Sprintf("%s-kubeconfig", job.Cluster.Name)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -658,7 +688,7 @@ func (w *SSHFallbackWorker) writeKubeconfigSecret(ctx context.Context, log logr.
 		}
 		secret.Annotations[KubeconfigSourceAnnotation] = KubeconfigSourceSSHFallback
 		secret.Type = clusterv1.ClusterSecretType
-		secret.Data = map[string][]byte{"value": payload}
+		secret.Data = map[string][]byte{"value": sanitized}
 		// Owner ref: Cluster (Controller=false) per CAPI convention.
 		return controllerutil.SetOwnerReference(job.Cluster, secret, w.Scheme)
 	})

@@ -417,7 +417,7 @@ func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
 		IsKubeVirt: true,
 		ManagementEndpoint: &ManagementEndpoint{
 			Token:                     "test-token",
-			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretName:      "cluster-kubeconfig-push",
 			KubeconfigSecretNamespace: "default",
 			APIServer:                 "https://1.2.3.4:6443",
 		},
@@ -435,19 +435,44 @@ func TestRenderK3sCloudConfig_CapkKubeconfigPush(t *testing.T) {
 	if !strings.Contains(result, "/etc/rancher/k3s/k3s.yaml") {
 		t.Error("Missing k3s kubeconfig path in push block")
 	}
-	// ControlPlaneLBEndpoint is routed through a shquote'd shell variable
-	// (`local lb_endpoint='10.0.0.1'`) and then referenced as
-	// `https://${lb_endpoint}:6443` in the sed substitution, so the literal
-	// "https://10.0.0.1:6443" no longer appears verbatim in the rendered
-	// output. Assert on the safe-routing observable shape instead.
-	if !strings.Contains(result, "local lb_endpoint='10.0.0.1'") {
-		t.Error("Missing shquote'd lb_endpoint local var for ControlPlaneLBEndpoint")
-	}
-	if !strings.Contains(result, "https://${lb_endpoint}:6443") {
-		t.Error("Missing ${lb_endpoint} reference in sed URL substitution")
-	}
+	// PR-3: the node PATCHes the staging Secret's value key; it does NOT rewrite
+	// the server (no node-side sed) — the control plane forces the LB endpoint.
+	assertPatchesStagingNoMetadata(t, result, "cluster-kubeconfig-push")
 	if !strings.Contains(result, "systemctl enable --now --no-block kairos-k3s-post-bootstrap.service") {
 		t.Error("Missing systemctl enable for k3s post-bootstrap service in runcmd")
+	}
+}
+
+// assertPatchesStagingNoMetadata asserts the PR-3 (ADR 0011) node kubeconfig-push
+// shape: a strategic-merge PATCH of the `value` key of the named STAGING Secret,
+// with no server-rewriting sed, no PUT/POST, and no contract-Secret create payload
+// (no metadata/labels/type/provenance-annotation in the request body).
+func assertPatchesStagingNoMetadata(t *testing.T, result, stagingName string) {
+	t.Helper()
+	if !strings.Contains(result, `patch="{\"data\":{\"value\":\"${kubeconfig_b64}\"}}"`) {
+		t.Error("push block must PATCH only the value key of the staging Secret")
+	}
+	if !strings.Contains(result, "-X PATCH") {
+		t.Error("push block must use PATCH")
+	}
+	if !strings.Contains(result, "application/strategic-merge-patch+json") {
+		t.Error("push block must send a strategic-merge-patch content type")
+	}
+	if !strings.Contains(result, "/api/v1/namespaces/${ns}/secrets/${name}") {
+		t.Error("push block must target the named staging Secret by name")
+	}
+	if !strings.Contains(result, `local name='`+stagingName+`'`) {
+		t.Errorf("push block must target the staging Secret %q", stagingName)
+	}
+	// Negatives: no create/write of the contract Secret, no server-rewrite sed.
+	if strings.Contains(result, "-X PUT") || strings.Contains(result, "-X POST") {
+		t.Error("push block must not PUT or POST (no node-side contract-Secret create/write)")
+	}
+	if strings.Contains(result, `\"kind\":\"Secret\"`) || strings.Contains(result, "controllers.cluster.x-k8s.io/kubeconfig-source") {
+		t.Error("push block must not send a full Secret create payload (metadata/type/provenance)")
+	}
+	if strings.Contains(result, "https://${lb_endpoint}:6443") || strings.Contains(result, "https://${cp_endpoint_host}:6443") {
+		t.Error("push block must not rewrite the server URL on the node side (sed removed)")
 	}
 }
 
@@ -699,7 +724,7 @@ func TestRenderK0sCloudConfig_CapvKubeconfigPush(t *testing.T) {
 		IsKubeVirt: false, // CAPV path
 		ManagementEndpoint: &ManagementEndpoint{
 			Token:                     "test-token",
-			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretName:      "cluster-kubeconfig-push",
 			KubeconfigSecretNamespace: "default",
 			APIServer:                 "https://mgmt.example.com:6443",
 			ClusterName:               "test-cluster",
@@ -726,24 +751,9 @@ func TestRenderK0sCloudConfig_CapvKubeconfigPush(t *testing.T) {
 	if !strings.Contains(result, "while [ ! -f \"${kubeconfig_file}\" ]") {
 		t.Error("Missing wait-loop guard on kubeconfig_file existence")
 	}
-	if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
-		t.Error("Push block must stamp cluster-name label on the Secret payload")
-	}
-	if !strings.Contains(result, `\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"`) {
-		t.Error("Push block must stamp node-push provenance annotation")
-	}
-	// ControlPlaneEndpointHost is shquote'd into a local shell var, then
-	// referenced via ${cp_endpoint_host} in the sed substitution.
-	if !strings.Contains(result, "local cp_endpoint_host='10.0.0.42'") {
-		t.Error("Missing shquote'd cp_endpoint_host local var")
-	}
-	if !strings.Contains(result, "https://${cp_endpoint_host}:6443") {
-		t.Error("Missing ${cp_endpoint_host} reference in sed URL rewrite")
-	}
-	// cluster_name shquote envelope must be present.
-	if !strings.Contains(result, "local cluster_name='test-cluster'") {
-		t.Error("Missing shquote'd cluster_name local var")
-	}
+	// PR-3: PATCH the staging Secret's value key, no node-side sed server rewrite,
+	// no contract-Secret create payload.
+	assertPatchesStagingNoMetadata(t, result, "cluster-kubeconfig-push")
 }
 
 // TestRenderK3sCloudConfig_CapvKubeconfigPush is the k3s twin of the CAPV
@@ -757,7 +767,7 @@ func TestRenderK3sCloudConfig_CapvKubeconfigPush(t *testing.T) {
 		IsKubeVirt: false, // CAPV path
 		ManagementEndpoint: &ManagementEndpoint{
 			Token:                     "test-token",
-			KubeconfigSecretName:      "cluster-kubeconfig",
+			KubeconfigSecretName:      "cluster-kubeconfig-push",
 			KubeconfigSecretNamespace: "default",
 			APIServer:                 "https://mgmt.example.com:6443",
 			ClusterName:               "test-cluster",
@@ -784,18 +794,9 @@ func TestRenderK3sCloudConfig_CapvKubeconfigPush(t *testing.T) {
 	if !strings.Contains(result, "while [ ! -f \"${kubeconfig_file}\" ]") {
 		t.Error("Missing wait-loop guard on kubeconfig_file existence")
 	}
-	if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
-		t.Error("Push block must stamp cluster-name label on the Secret payload")
-	}
-	if !strings.Contains(result, `\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"`) {
-		t.Error("Push block must stamp node-push provenance annotation")
-	}
-	if !strings.Contains(result, "local cp_endpoint_host='10.0.0.42'") {
-		t.Error("Missing shquote'd cp_endpoint_host local var")
-	}
-	if !strings.Contains(result, "https://${cp_endpoint_host}:6443") {
-		t.Error("Missing ${cp_endpoint_host} reference in sed URL rewrite")
-	}
+	// PR-3: PATCH the staging Secret's value key, no node-side sed server rewrite,
+	// no contract-Secret create payload.
+	assertPatchesStagingNoMetadata(t, result, "cluster-kubeconfig-push")
 }
 
 // TestRenderK0sCloudConfig_CapvNoManagementEndpoint guards the gate: with a
@@ -843,11 +844,13 @@ func TestRenderK3sCloudConfig_CapvNoManagementEndpoint(t *testing.T) {
 	}
 }
 
-// TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation asserts the
-// CAPK templates also gained the cluster-name label and node-push annotation
-// (so the controlplane controller's label-based watch predicate works
-// uniformly across CAPK and CAPV).
-func TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation(t *testing.T) {
+// TestRenderCapkKubeconfigPush_PatchesStagingNoMetadata asserts the PR-3 (ADR
+// 0011) node kubeconfig-push shape on both CAPK templates: a strategic-merge PATCH
+// of the staging Secret's value key, with no full Secret create payload
+// (metadata/labels/type/provenance) and no server-rewriting sed. The
+// cluster-name label and provenance annotation are now set by the control plane
+// on the controller-owned staging/contract Secrets, not by the node.
+func TestRenderCapkKubeconfigPush_PatchesStagingNoMetadata(t *testing.T) {
 	for _, dist := range []string{"k0s", "k3s"} {
 		t.Run(dist, func(t *testing.T) {
 			data := TemplateData{
@@ -857,7 +860,7 @@ func TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation(t *testing.T) 
 				IsKubeVirt: true,
 				ManagementEndpoint: &ManagementEndpoint{
 					Token:                     "test-token",
-					KubeconfigSecretName:      "cluster-kubeconfig",
+					KubeconfigSecretName:      "capk-cluster-kubeconfig-push",
 					KubeconfigSecretNamespace: "default",
 					APIServer:                 "https://1.2.3.4:6443",
 					ClusterName:               "capk-cluster",
@@ -876,15 +879,7 @@ func TestRenderCapkKubeconfigPush_CarriesClusterNameAndAnnotation(t *testing.T) 
 			if err != nil {
 				t.Fatalf("render: %v", err)
 			}
-			if !strings.Contains(result, `\"cluster.x-k8s.io/cluster-name\":\"${cluster_name}\"`) {
-				t.Errorf("CAPK %s push payload missing cluster-name label", dist)
-			}
-			if !strings.Contains(result, `\"controllers.cluster.x-k8s.io/kubeconfig-source\":\"node-push\"`) {
-				t.Errorf("CAPK %s push payload missing node-push annotation", dist)
-			}
-			if !strings.Contains(result, "local cluster_name='capk-cluster'") {
-				t.Errorf("CAPK %s push block missing shquote'd cluster_name var", dist)
-			}
+			assertPatchesStagingNoMetadata(t, result, "capk-cluster-kubeconfig-push")
 			// KD-3b race fix: wait-loop must be rendered in CAPK too — the race
 			// exists for any distribution whose service starts faster than its
 			// kubeconfig is written.

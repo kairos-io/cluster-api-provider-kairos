@@ -122,7 +122,7 @@ write_files:
         mv -f /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml.tmp.$$ /etc/rancher/k3s/config.yaml.d/90-provider-id.yaml
       fi
   - path: /usr/local/bin/kairos-k3s-post-bootstrap.sh
-    permissions: "0755"
+    permissions: "0700"
     owner: root
     group: root
     content: |

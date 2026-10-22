@@ -953,14 +953,14 @@ spec:
                           Defaults to k0s defaults if not specified.
                         type: string
                       postCommands:
-                        description: PostCommands are commands to run after k0s/k3s
-                          installation
+                        description: PostCommands is reserved and not yet rendered
+                          into the cloud-config.
                         items:
                           type: string
                         type: array
                       preCommands:
-                        description: PreCommands are commands to run before k0s/k3s
-                          installation
+                        description: PreCommands is reserved and not yet rendered
+                          into the cloud-config.
                         items:
                           type: string
                         type: array

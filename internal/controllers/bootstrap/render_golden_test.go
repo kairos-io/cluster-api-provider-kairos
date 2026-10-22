@@ -90,7 +90,6 @@ var updateControllerGolden = flag.Bool("update", false, "regenerate controller g
 //	JoinToken                         | k3s_cp_init_*, *_cp_join_* (resolved from SecretRef)
 //	VIP                               | *_capv_cp_init_* / *_capv_cp_join_* (spec.controlPlaneVIP)
 //	ManagementEndpoint                | *_cp_* with a resolver (init/join/single capk+capv)
-//	  .JoinTokenSecretName            | k0s_cp_init_* (k0s init push block)
 //	  .EtcdStatusSecretName           | *_cp_init_*, *_cp_join_* (HA reporter)
 //	  .ControlPlaneEndpointHost       | *_cp_* (stamped from cluster)
 // ---------------------------------------------------------------------------
@@ -108,7 +107,7 @@ const (
 // rule 5) so the goldens are reproducible.
 type goldenResolver struct{ endpoint *ManagementEndpoint }
 
-func (g *goldenResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
+func (g *goldenResolver) Resolve(_ context.Context, _ *bootstrapv1beta2.KairosConfig, _ *clusterv1.Machine, _ *clusterv1.Cluster) (*ManagementEndpoint, error) {
 	return g.endpoint, nil
 }
 
