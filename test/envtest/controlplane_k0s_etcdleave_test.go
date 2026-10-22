@@ -135,10 +135,12 @@ func k0sEtcdMemberLeave(ctx context.Context, wc client.Client, name string) (boo
 
 // recordingMembers stands in for MemberClientFactory: every member address
 // reaches the envtest apiserver, and every address that carries etcd-leave
-// traffic is recorded. The KCP's read-only workload identity checks (the
-// kube-system Namespace, ADR 0015 PR-2) also go to members, including members
-// that are not leaving yet; they are not etcd-leave traffic and are not
-// recorded.
+// traffic is recorded. The KCP's read-only checks also go to members,
+// including members that are not leaving yet: the workload identity read (the
+// kube-system Namespace, ADR 0015 PR-2) and the orphan etcd-member cleanup's
+// EtcdMember reads (PR-3). They are not etcd-leave traffic and are not
+// recorded. Requests on the leave ConfigMap and writes to an EtcdMember are,
+// whoever makes them.
 type recordingMembers struct {
 	mu     sync.Mutex
 	dialed map[string]bool
@@ -152,7 +154,7 @@ func (m *recordingMembers) record(ip string) {
 }
 
 // client returns a client of the envtest apiserver for member ip that
-// records every request except the workload identity read.
+// records its etcd-leave traffic.
 func (m *recordingMembers) client(t *testing.T, cfg *rest.Config, ip string) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -163,27 +165,42 @@ func (m *recordingMembers) client(t *testing.T, cfg *rest.Config, ip string) cli
 	if err != nil {
 		t.Fatal(err)
 	}
-	identityRead := func(obj client.Object) bool {
-		_, ok := obj.(*corev1.Namespace)
-		return ok
+	// etcd-leave traffic is any request on the leave ConfigMap (the
+	// handshake's read, the sentinel write) and any write to a k0s EtcdMember
+	// (the spec.leave delegation). Read-only checks are not: the identity
+	// read (kube-system), and the orphan cleanup's EtcdMember reads. Those
+	// may reach any member, including one about to leave.
+	leaveCM := func(name string, obj client.Object) bool {
+		_, ok := obj.(*corev1.ConfigMap)
+		return ok && name == "kairos-etcd-leave"
 	}
+	etcdMember := func(obj client.Object) bool {
+		return obj.GetObjectKind().GroupVersionKind().GroupKind() == k0sEtcdMemberGVK.GroupKind()
+	}
+	leaveWrite := func(obj client.Object) bool { return leaveCM(obj.GetName(), obj) || etcdMember(obj) }
 	return interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if !identityRead(obj) {
+			if leaveCM(key.Name, obj) {
 				m.record(ip)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			m.record(ip)
+			if leaveWrite(obj) {
+				m.record(ip)
+			}
 			return c.Create(ctx, obj, opts...)
 		},
 		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			m.record(ip)
+			if leaveWrite(obj) {
+				m.record(ip)
+			}
 			return c.Update(ctx, obj, opts...)
 		},
 		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			m.record(ip)
+			if leaveWrite(obj) {
+				m.record(ip)
+			}
 			return c.Patch(ctx, obj, patch, opts...)
 		},
 	})
