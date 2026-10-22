@@ -179,9 +179,18 @@ func (r *KairosControlPlaneReconciler) canRemoveMember(ctx context.Context, kcp 
 	}
 	// Failed-node fast path — OBJECTIVE liveness only (Machine phase / NodeRef),
 	// NOT the etcd self-report: a target that never registered a Node or is not
-	// Running is presumed dead/failed, is not a healthy voting member, and cannot
-	// reduce the healthy-voting count — allow. This is the primary replacement
-	// case for an unreachable node.
+	// Running is presumed failed and not counted among the healthy voting
+	// members this guard protects — allow. This is the primary replacement case
+	// for an unreachable node.
+	//
+	// "No NodeRef" does NOT mean "not an etcd member" (ADR 0015, KD-80): a k0s
+	// joiner joins etcd before its Node registers, and may never get a NodeRef.
+	// Deleting it is still allowed here because the delete is followed by a
+	// real leave of its member under its rendered node name
+	// (reconcileMemberLeave, inspectUnregisteredLeave), not by a bare hook
+	// release. Open (KD-80): such a node reports its etcd status under its
+	// hostname whether or not it has a NodeRef, so it can be counted as a
+	// healthy voter that this fast path removes without the quorum check below.
 	if !target.Status.NodeRef.IsDefined() || target.Status.Phase != string(clusterv1.MachinePhaseRunning) {
 		return true, "", nil
 	}

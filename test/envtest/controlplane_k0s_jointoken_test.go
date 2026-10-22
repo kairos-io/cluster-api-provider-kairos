@@ -240,6 +240,7 @@ func TestHA_K0sJoinToken_KCPMintsAndStampsJoinConfig(t *testing.T) {
 		clusterName = "ha-k0s-mint-cluster"
 		kcpName     = "ha-k0s-mint-kcp"
 	)
+	configs := recordKairosConfigs(t, ctx, cfg, nsName)
 	haFixture(t, ctx, c, nsName, clusterName, kcpName, "k0s")
 	// The init Machine reports the live apiserver's address and one more; an
 	// extra slice lists that other, lower address. Only the apiserver's own
@@ -248,15 +249,20 @@ func TestHA_K0sJoinToken_KCPMintsAndStampsJoinConfig(t *testing.T) {
 	publishForeignKubernetesSlice(t, ctx, wc, k0sEnvtestForeignAddr)
 	makeK0sInitJoinable(t, ctx, c, nsName, clusterName, kcpName, k0sWorkloadKubeconfig(t, cfg), apiAddr, k0sEnvtestForeignAddr)
 
-	joinCfg := &bootstrapv1beta2.KairosConfig{}
-	g.Eventually(func() (string, error) {
-		if err := c.Get(ctx, types.NamespacedName{Name: kcpName + "-1", Namespace: nsName}, joinCfg); err != nil {
-			return "", err
+	// No infrastructure provider runs here, so each join create fails at the
+	// infrastructure Machine and deletes its KairosConfig again (ADR 0015
+	// PR-4); read the join KairosConfig from the record of what was created.
+	var joinCfg *bootstrapv1beta2.KairosConfig
+	g.Eventually(func() string {
+		joins := configs.withRole(bootstrapv1beta2.ControlPlaneRoleJoin)
+		if len(joins) == 0 {
+			return ""
 		}
-		return joinCfg.Annotations[bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation], nil
+		joinCfg = joins[0]
+		return joinCfg.Annotations[bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation]
 	}, 30*time.Second, 500*time.Millisecond).Should(MatchRegexp(`^[a-z0-9]{6}$`),
 		"the join KairosConfig must name the token the KCP minted for it")
-	g.Expect(joinCfg.Spec.ControlPlaneRole).To(Equal(bootstrapv1beta2.ControlPlaneRoleJoin))
+	g.Expect(joinCfg.Name).To(MatchRegexp(`^` + kcpName + `-[a-z0-9]{5}$`))
 	id := joinCfg.Annotations[bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation]
 
 	// The management Secret holds that token, written together with its ID.
@@ -293,4 +299,14 @@ func TestHA_K0sJoinToken_KCPMintsAndStampsJoinConfig(t *testing.T) {
 		_ = c.Get(ctx, types.NamespacedName{Name: bootstrapv1beta2.ControlPlaneJoinTokenSecretName(clusterName), Namespace: nsName}, cur)
 		return cur.Annotations[bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation]
 	}, 4*time.Second, 500*time.Millisecond).Should(Equal(id))
+	// Each retry is a new KairosConfig under a new name, stamped with that same
+	// token: no Machine was ever created with it.
+	joins := configs.withRole(bootstrapv1beta2.ControlPlaneRoleJoin)
+	g.Expect(len(joins)).To(BeNumerically(">=", 2))
+	names := map[string]bool{}
+	for _, kc := range joins {
+		g.Expect(names).NotTo(HaveKey(kc.Name))
+		names[kc.Name] = true
+		g.Expect(kc.Annotations).To(HaveKeyWithValue(bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation, id))
+	}
 }

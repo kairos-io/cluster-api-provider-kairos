@@ -117,12 +117,13 @@ func TestCreateControlPlaneMachine_PropagatesTemplateMetadata(t *testing.T) {
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(),
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	g.Expect(err).NotTo(HaveOccurred())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),
-		types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, machine)).To(Succeed())
+		types.NamespacedName{Name: created.Name, Namespace: "default"}, machine)).To(Succeed())
 
 	g.Expect(machine.Labels).To(HaveKeyWithValue("node-role.kubernetes.io/control-plane", ""))
 	g.Expect(machine.Labels).To(HaveKeyWithValue("tier", "platform"))
@@ -148,8 +149,9 @@ func TestCreateControlPlaneMachine_InfraMachineKeepsTemplateMetadata(t *testing.
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0,
-		bootstrapv1beta2.ControlPlaneRoleSingle, "")).To(Succeed())
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(),
+		bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	g.Expect(err).NotTo(HaveOccurred())
 
 	infraMachine := &unstructured.Unstructured{}
 	infraMachine.SetGroupVersionKind(schema.GroupVersionKind{
@@ -158,7 +160,7 @@ func TestCreateControlPlaneMachine_InfraMachineKeepsTemplateMetadata(t *testing.
 		Kind:    "DockerMachine",
 	})
 	g.Expect(c.Get(context.Background(),
-		types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, infraMachine)).To(Succeed())
+		types.NamespacedName{Name: created.Name, Namespace: "default"}, infraMachine)).To(Succeed())
 
 	g.Expect(infraMachine.GetLabels()).To(HaveKeyWithValue("tier", "platform"))
 	g.Expect(infraMachine.GetAnnotations()).To(HaveKeyWithValue("example.com/owner", "platform-team"))
@@ -229,12 +231,13 @@ func TestCreateControlPlaneMachine_EtcdHookWinsOverTemplateAnnotation(t *testing
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	g.Expect(r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), 0,
-		bootstrapv1beta2.ControlPlaneRoleInit, "")).To(Succeed())
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(),
+		bootstrapv1beta2.ControlPlaneRoleInit, "")
+	g.Expect(err).NotTo(HaveOccurred())
 
 	machine := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),
-		types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, machine)).To(Succeed())
+		types.NamespacedName{Name: created.Name, Namespace: "default"}, machine)).To(Succeed())
 
 	g.Expect(machine.Annotations).To(HaveKeyWithValue(etcdLeaveHookAnnotation(), ""))
 }

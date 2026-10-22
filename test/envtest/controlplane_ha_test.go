@@ -31,6 +31,7 @@ import (
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
+	"github.com/kairos-io/cluster-api-provider-kairos/internal/controllers/controlplane"
 )
 
 // haFixture creates a Cluster + KCP (replicas=3) in a fresh namespace and waits
@@ -38,6 +39,8 @@ import (
 // template is intentionally not installed: the controller's HA bookkeeping
 // (join-token Secret, role assignment on the KairosConfig) runs BEFORE infra
 // cloning, so these tests assert that bookkeeping without needing CAPD CRDs.
+// The failed create deletes its KairosConfig again (ADR 0015 PR-4); tests that
+// inspect it read it through recordKairosConfigs.
 func haFixture(t *testing.T, ctx context.Context, c client.Client, nsName, clusterName, kcpName, distribution string) {
 	t.Helper()
 	g := NewWithT(t)
@@ -83,7 +86,8 @@ func haFixture(t *testing.T, ctx context.Context, c client.Client, nsName, clust
 			},
 			// No KairosConfigTemplate: createControlPlaneMachine builds the config
 			// inline, so the init KairosConfig is created (with role=init) before
-			// infra cloning fails on the missing DockerMachineTemplate CRD.
+			// infra cloning fails on the missing DockerMachineTemplate CRD, and
+			// is then deleted by the failed create's cleanup.
 		},
 	}
 	g.Expect(c.Create(ctx, kcp)).To(Succeed())
@@ -205,33 +209,41 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 		clusterName = "ha-seq-cluster"
 		kcpName     = "ha-seq-kcp"
 	)
+	configs := recordKairosConfigs(t, ctx, cfg, nsName)
 	haFixture(t, ctx, c, nsName, clusterName, kcpName, "k0s")
 	apiAddr := envtestAPIServerAddress(t, ctx, envtestWorkloadClient(t, cfg))
 
-	// The controller creates the KairosConfig for machine-0 (init) before infra
-	// cloning fails, so it should appear with role=init.
-	initCfgName := kcpName + "-0"
-	initCfg := &bootstrapv1beta2.KairosConfig{}
-	g.Eventually(func() (bootstrapv1beta2.ControlPlaneRole, error) {
-		if err := c.Get(ctx, types.NamespacedName{Name: initCfgName, Namespace: nsName}, initCfg); err != nil {
-			return "", err
-		}
-		return initCfg.Spec.ControlPlaneRole, nil
-	}, 15*time.Second, 500*time.Millisecond).Should(Equal(bootstrapv1beta2.ControlPlaneRoleInit))
+	// The controller creates the init KairosConfig before infra cloning fails.
+	// The failed attempt deletes it again (ADR 0015 PR-4), so read it from the
+	// record of what was created.
+	g.Eventually(func() []*bootstrapv1beta2.KairosConfig {
+		return configs.withRole(bootstrapv1beta2.ControlPlaneRoleInit)
+	}, 15*time.Second, 500*time.Millisecond).ShouldNot(BeEmpty())
+	initCfg := configs.withRole(bootstrapv1beta2.ControlPlaneRoleInit)[0]
+	g.Expect(initCfg.Name).To(MatchRegexp(`^` + kcpName + `-[a-z0-9]{5}$`))
 	g.Expect(initCfg.Spec.SingleNode).To(BeFalse())
 	// VIP copied down onto the config.
 	g.Expect(initCfg.Spec.ControlPlaneVIP).ToNot(BeNil())
 	g.Expect(initCfg.Spec.ControlPlaneVIP.Address).To(Equal("192.168.1.240"))
 	// The init config carries no join-token ID: only joiners consume a token.
 	g.Expect(initCfg.Annotations).ToNot(HaveKey(bootstrapv1beta2.K0sControllerJoinTokenIDAnnotation))
+	// A failed create leaves nothing behind, on a real apiserver too.
+	g.Eventually(func() bool { return configs.wasDeleted(initCfg.Name) }, 15*time.Second, 200*time.Millisecond).
+		Should(BeTrue(), "the KairosConfig of a failed create must be deleted")
+	// Every retry uses a new name.
+	g.Eventually(func() int { return len(configs.withRole(bootstrapv1beta2.ControlPlaneRoleInit)) }, 30*time.Second, 500*time.Millisecond).
+		Should(BeNumerically(">=", 2))
+	seen := map[string]bool{}
+	for _, kc := range configs.withRole(bootstrapv1beta2.ControlPlaneRoleInit) {
+		g.Expect(seen).NotTo(HaveKey(kc.Name), "a retried create reused a name")
+		seen[kc.Name] = true
+	}
 
 	// No join config yet: the init machine is not joinable (no NodeRef, no
-	// kubeconfig, no etcd report). Assert machine-1 config does NOT appear.
-	joinCfgName := kcpName + "-1"
-	g.Consistently(func() bool {
-		err := c.Get(ctx, types.NamespacedName{Name: joinCfgName, Namespace: nsName}, &bootstrapv1beta2.KairosConfig{})
-		return err != nil // still not created
-	}, 4*time.Second, 500*time.Millisecond).Should(BeTrue(), "join config must not be created before init is joinable")
+	// kubeconfig, no etcd report).
+	g.Consistently(func() []*bootstrapv1beta2.KairosConfig {
+		return configs.withRole(bootstrapv1beta2.ControlPlaneRoleJoin)
+	}, 4*time.Second, 500*time.Millisecond).Should(BeEmpty(), "join config must not be created before init is joinable")
 
 	// Make the init machine joinable: NodeRef + Running, the address of the live
 	// apiserver, the kubeconfig Secret (opens KubeconfigReady), and a healthy
@@ -239,15 +251,19 @@ func TestHA_RoleAssignment_InitFirstThenJoin(t *testing.T) {
 	// hand: the KCP mints the token.
 	makeK0sInitJoinable(t, ctx, c, nsName, clusterName, kcpName, k0sWorkloadKubeconfig(t, cfg), apiAddr)
 
-	// The gate should now open and the controller should create the join config.
-	g.Eventually(func() (bootstrapv1beta2.ControlPlaneRole, error) {
-		cfg := &bootstrapv1beta2.KairosConfig{}
-		if err := c.Get(ctx, types.NamespacedName{Name: joinCfgName, Namespace: nsName}, cfg); err != nil {
-			return "", err
-		}
-		return cfg.Spec.ControlPlaneRole, nil
-	}, 30*time.Second, 500*time.Millisecond).Should(Equal(bootstrapv1beta2.ControlPlaneRoleJoin),
+	// The gate should now open and the controller should create a join config.
+	g.Eventually(func() []*bootstrapv1beta2.KairosConfig {
+		return configs.withRole(bootstrapv1beta2.ControlPlaneRoleJoin)
+	}, 30*time.Second, 500*time.Millisecond).ShouldNot(BeEmpty(),
 		"join config must be created once the init machine is joinable")
+	joinCfg := configs.withRole(bootstrapv1beta2.ControlPlaneRoleJoin)[0]
+	g.Expect(joinCfg.Name).To(MatchRegexp(`^` + kcpName + `-[a-z0-9]{5}$`))
+	g.Expect(seen).NotTo(HaveKey(joinCfg.Name))
+
+	// ADR 0015 PR-2: the joiner was admitted only after the KCP pinned the
+	// identity of the workload cluster it admitted it into.
+	g.Expect(getKCP(g, ctx, c, nsName, kcpName).Annotations).To(HaveKeyWithValue(
+		controlplane.WorkloadClusterUIDAnnotation, envtestKubeSystemUID(t, ctx, envtestWorkloadClient(t, cfg))))
 }
 
 // TestHA_JoinTokenWatch_ReReconcilesJoinConfig asserts BLOCKER-2: writing the
@@ -440,6 +456,34 @@ func getKCP(g *WithT, ctx context.Context, c client.Client, ns, name string) *co
 	kcp := &controlplanev1beta2.KairosControlPlane{}
 	g.Expect(c.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, kcp)).To(Succeed())
 	return kcp
+}
+
+// envtestKubeSystemUID returns the UID of kube-system in the envtest
+// apiserver, which plays the workload cluster in these tests.
+func envtestKubeSystemUID(t *testing.T, ctx context.Context, wc client.Client) string {
+	t.Helper()
+	ns := &corev1.Namespace{}
+	NewWithT(t).Expect(wc.Get(ctx, types.NamespacedName{Name: metav1.NamespaceSystem}, ns)).To(Succeed())
+	return string(ns.UID)
+}
+
+// pinEnvtestWorkloadIdentity records the workload identity pin (ADR 0015
+// PR-2) on the KCP, as the KCP does at first contact, for tests whose
+// cluster is already past that point.
+func pinEnvtestWorkloadIdentity(t *testing.T, ctx context.Context, c, wc client.Client, ns, name string) {
+	t.Helper()
+	uid := envtestKubeSystemUID(t, ctx, wc)
+	NewWithT(t).Eventually(func() error {
+		kcp := &controlplanev1beta2.KairosControlPlane{}
+		if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, kcp); err != nil {
+			return err
+		}
+		if kcp.Annotations == nil {
+			kcp.Annotations = map[string]string{}
+		}
+		kcp.Annotations[controlplane.WorkloadClusterUIDAnnotation] = uid
+		return c.Update(ctx, kcp)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 }
 
 func touchKCP(g *WithT, ctx context.Context, c client.Client, ns, name string) {

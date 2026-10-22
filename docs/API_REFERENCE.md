@@ -49,7 +49,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `k3sTokenSecretRef` | `WorkerTokenSecretReference` | No | — | Reference to a Secret containing the k3s join token. Required for k3s workers; prefer this over inline `k3sToken`. |
 | `caCertHashes` | `[]string` | No | — | Reserved; not implemented. The value is accepted and stored, but no controller reads it and it is rendered into no cloud-config, so setting it does not pin the join to a CA. Setting it produces an admission warning. Neither distribution can consume it: a k0s worker joins with the bundle `k0s token create` produces, which already carries the cluster CA, and a k3s agent takes no CA-hash flag. To get k3s to validate the server, pass the server's full node-token (`K10<hash>::server:<password>`) as `k3sToken` / `k3sTokenSecretRef`. See kairos-io/kairos#4937. |
 | `caCertSecretRef` | `ObjectReference` | No | — | Reserved; not implemented. The reference is accepted and stored, but no controller reads the Secret and its contents reach no node. Setting it produces an admission warning. Use `files` to place a CA certificate on the node. See kairos-io/kairos#4937. |
-| `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. |
+| `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. On control-plane configs (`role: control-plane`) it must be a lowercase DNS-1123 label (at most 63 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit) with no `{{` template markup: the control plane finds the node's k0s etcd member by this name. Enforced on create, and on update only when the field changes, so existing objects keep their value. Worker configs are not checked. A `KairosControlPlane` applies the same rule to the `KairosConfigTemplate` it references: it emits a Warning event `InvalidControlPlaneHostname` and creates no control-plane Machine from a template that breaks it. |
 | `hostnamePrefix` | `string` | No | `"metal-"` | Prefix for the auto-generated hostname. The final hostname is `{hostnamePrefix}{4-char-machine-id}`. |
 | `dnsServers` | `[]string` | No | — | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). |
 | `podCIDR` | `string` | No | — | Pod network CIDR for k0s. Uses k0s defaults when unset. |
@@ -449,7 +449,7 @@ Cross-field validation (enforced by the validating webhook, not expressible as k
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
 | `updatedReplicas` | `int32` | Number of Machines running the desired version. |
 | `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). `Ready`, `Available` and `EtcdHealthy` are `False` with reason `WorkloadClusterIdentityChanged` while control-plane membership changes are frozen; see [Workload cluster identity](#workload-cluster-identity). |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
 | `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
@@ -513,6 +513,7 @@ Surfaced on `KairosControlPlane.status.conditions` for HA control planes only (`
 | `False` (Info) | `EtcdQuorumDegraded` | Quorum still holds, but fewer than all desired members are healthy and voting. |
 | `False` (Warning) | `EtcdQuorumAtRisk` | The healthy+voting member count is at or below the `(N/2)+1` quorum minimum — one more member loss breaks quorum. Also covers the bring-up window before any member has reported. |
 | `False` (Info) | `WaitingForEtcdMember` | The init node has not yet reported a healthy voting etcd member. |
+| `False` (Error) | `WorkloadClusterIdentityChanged` | A workload API server answered with a different cluster identity than the one pinned on this `KairosControlPlane`. Control-plane membership changes are frozen until an operator re-pins. `Ready` and `Available` carry the same reason. This overrides every other `EtcdHealthy` state, and is also set on a control plane that has been scaled down to one replica after it was pinned. See [Workload cluster identity](#workload-cluster-identity). |
 
 The condition is derived from a per-cluster, node-reported etcd-status Secret (see [Security Considerations](#security-considerations) for the trust model of this signal). The controller uses this condition, together with the desired replica count, to refuse control-plane Machine deletions that would drop etcd below the quorum minimum — this quorum-safety decision is made independently of, and before, any single node's self-reported signal.
 
@@ -525,6 +526,68 @@ Reports whether every control-plane Machine runs `spec.version`.
 | `True` | — | No control-plane Machine is outdated. |
 | `False` (Info) | `RollingOut` | Outdated Machines are being replaced, one at a time. A replacement is added and must register a Node before an outdated Machine is removed, and the rollout waits while any control-plane Machine is still being deleted. |
 | `False` (Warning) | `SingleNodeRolloutUnsupported` | A single-node control plane (`replicas: 1`) has a Machine whose version differs from `spec.version`. The Machine is left unchanged: it runs the whole cluster, so a replacement would start a separate, empty cluster. Set `spec.version` back to the version the Machine runs to clear the condition. |
+
+### Workload cluster identity
+
+A `KairosControlPlane` with more than one replica records which workload cluster it manages, and refuses to change control-plane membership through any other cluster. The identity is the UID of the workload cluster's `kube-system` Namespace. Every API server creates that Namespace the first time it starts against an empty etcd, so two clusters have different UIDs even when they share a certificate authority, as they do after a joining k0s member has started a new etcd cluster of its own.
+
+**When the identity is pinned.** On the first reconcile after the control plane is highly available, `KubeconfigReady` is `True`, and a control-plane Machine has a Node, the controller reads the UID through the control-plane endpoint and through every control-plane member it can reach directly. It stores the UID only when at least one path answered, every answer is shaped like a Kubernetes UID, and every answer agrees. If the answers disagree, or one is not UID-shaped, the control plane is frozen at once; nothing a workload API server returns is copied into an annotation or an event unless it is UID-shaped. Existing clusters are pinned the same way on the first reconcile after the controller is upgraded. Once a control-plane Machine of an HA control plane has a Node, and until the identity is pinned, no joiner is admitted, no control-plane Machine is deleted, and no etcd-leave hook is removed. That hold has no time limit, and it also suspends the bounded etcd-leave timeout: a Machine being deleted stays at its etcd-leave hook. If the controller cannot pin (no path answers, or `KubeconfigReady` stays `False`), set the pin annotation by hand to the UID you verified; a pin that is already set is never replaced by first-use pinning. See [Before upgrading an existing HA cluster](HIGH_AVAILABILITY.md#before-upgrading-an-existing-ha-cluster).
+
+**When it is checked.** The UID must match the pin:
+
+- before a joiner is admitted, on the same connection the k0s join token is issued through (k3s: through the endpoint);
+- before a k0s join token is extended or deleted;
+- before the controller deletes a control-plane Machine, for a rollout or a scale-down;
+- on every connection the k0s etcd-leave handshake and the orphan etcd-member cleanup use; these two paths use no connection at all until a pin exists;
+- and through every reachable path at most once a minute, even with nothing to do.
+
+An API server whose identity cannot be read is treated as not answering: the action waits and is retried.
+
+**The freeze.** On a mismatch the controller sets the mismatch annotation and, until an operator clears it:
+
+- creates and deletes no control-plane Machine, and removes no etcd-leave hook, so a Machine deleted by an operator or a MachineHealthCheck stays at its pre-terminate hook (k0s); k3s Machines carry no hook, so the controller cannot hold their deletion;
+- writes nothing to the workload cluster: no etcd-leave request, no join token;
+- sets `Ready`, `Available` and `EtcdHealthy` to `False` (Error) with reason `WorkloadClusterIdentityChanged`, and emits a Warning event `WorkloadClusterIdentityChanged` that names the pinned UID, the UID it read, and the address it read it through;
+- requeues every 60 seconds.
+
+Deleting the whole cluster is not affected: control-plane deletion strips the etcd-leave hooks and deletes the Machines whatever the identity.
+
+| Annotation | Set by | Purpose |
+|---|---|---|
+| `controlplane.cluster.x-k8s.io/workload-cluster-uid` | Controller, once; operator to re-pin | The pinned `kube-system` Namespace UID. The controller sets it at first contact and never rewrites it. Changing it, or removing it so the controller pins again, clears a freeze. |
+| `controlplane.cluster.x-k8s.io/workload-cluster-identity-mismatch` | Controller | The freeze marker: `<observed UID> via <member IP\|endpoint> at <RFC3339>; pinned <UID>`. It keeps the first mismatch seen. The `pinned` part records the pin the mismatch was measured against; when the pin annotation no longer equals it, the controller removes this annotation and emits a Normal event `WorkloadClusterIdentityFreezeCleared`. |
+
+**Clearing the freeze.** Only an operator clears it; a changed identity does not heal by itself. Follow the runbook in [High availability: workload cluster identity](HIGH_AVAILABILITY.md#day-2-workload-cluster-identity-and-the-freeze), then do one of:
+
+- **Re-pin to a verified UID** (recommended). Set the pin to the UID every member now answers with:
+  ```bash
+  kubectl annotate kairoscontrolplane <name> -n <namespace> --overwrite \
+    controlplane.cluster.x-k8s.io/workload-cluster-uid=<verified-uid>
+  ```
+- **Let the controller pin again.** Remove the pin; the controller pins only if every path agrees, and freezes again if they do not:
+  ```bash
+  kubectl annotate kairoscontrolplane <name> -n <namespace> \
+    controlplane.cluster.x-k8s.io/workload-cluster-uid-
+  ```
+- **Keep the pin.** If the cause is gone and every member answers with the pinned UID again, remove only the mismatch annotation. The next check freezes again if any path still disagrees:
+  ```bash
+  kubectl annotate kairoscontrolplane <name> -n <namespace> \
+    controlplane.cluster.x-k8s.io/workload-cluster-identity-mismatch-
+  ```
+
+Write access to the `KairosControlPlane` is required for all three, the same access that can scale the control plane.
+
+### k0s etcd leave and orphan members
+
+On k0s HA control planes the controller removes a deleted control-plane Machine's etcd member before it lets the deletion proceed, including for a Machine that never got a Node, and it removes etcd members no control-plane Machine accounts for. The rules are in [High availability: etcd health and quorum-safe replacement](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement). The controller keeps its state in these annotations; none is meant to be set by hand.
+
+| Annotation | On | Purpose |
+|---|---|---|
+| `controlplane.cluster.x-k8s.io/etcd-leave-requested-at` | Machine | When the leave was first requested (RFC3339). Starts the ~5-minute wait for the node's own ack. |
+| `controlplane.cluster.x-k8s.io/etcd-member-leave-requested-at` | Machine | When the leave was handed to k0s. Starts the ~10-minute wait for k0s. |
+| `controlplane.cluster.x-k8s.io/etcd-member-leave-member-id` | Machine | The etcd member ID first seen for the leaving node. k0s's `EtcdMember` is acted on only while it carries this ID. |
+| `controlplane.cluster.x-k8s.io/etcd-leave-unreachable-since` | Machine | The first time, before any leave request, that no verified workload API server answered. After ~15 minutes the deletion proceeds with `EtcdMemberLeaveTimedOut`. |
+| `controlplane.cluster.x-k8s.io/etcd-orphan-member-leave` | KairosControlPlane | The orphan etcd member being removed: `<EtcdMember name> <member ID> <RFC3339>`. While set, no other orphan is removed and no control-plane Machine is created or deleted. |
 
 ### Template ownership
 

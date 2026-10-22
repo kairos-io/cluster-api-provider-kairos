@@ -29,12 +29,14 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -132,10 +134,76 @@ func k0sEtcdMemberLeave(ctx context.Context, wc client.Client, name string) (boo
 }
 
 // recordingMembers stands in for MemberClientFactory: every member address
-// reaches the envtest apiserver, and every address asked for is recorded.
+// reaches the envtest apiserver, and every address that carries etcd-leave
+// traffic is recorded. The KCP's read-only checks also go to members,
+// including members that are not leaving yet: the workload identity read (the
+// kube-system Namespace, ADR 0015 PR-2) and the orphan etcd-member cleanup's
+// EtcdMember reads (PR-3). They are not etcd-leave traffic and are not
+// recorded. Requests on the leave ConfigMap and writes to an EtcdMember are,
+// whoever makes them.
 type recordingMembers struct {
 	mu     sync.Mutex
 	dialed map[string]bool
+}
+
+// record marks ip as having carried etcd-leave traffic.
+func (m *recordingMembers) record(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dialed[ip] = true
+}
+
+// client returns a client of the envtest apiserver for member ip that
+// records its etcd-leave traffic.
+func (m *recordingMembers) client(t *testing.T, cfg *rest.Config, ip string) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	base, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// etcd-leave traffic is any request on the leave ConfigMap (the
+	// handshake's read, the sentinel write) and any write to a k0s EtcdMember
+	// (the spec.leave delegation). Read-only checks are not: the identity
+	// read (kube-system), and the orphan cleanup's EtcdMember reads. Those
+	// may reach any member, including one about to leave.
+	leaveCM := func(name string, obj client.Object) bool {
+		_, ok := obj.(*corev1.ConfigMap)
+		return ok && name == "kairos-etcd-leave"
+	}
+	etcdMember := func(obj client.Object) bool {
+		return obj.GetObjectKind().GroupVersionKind().GroupKind() == k0sEtcdMemberGVK.GroupKind()
+	}
+	leaveWrite := func(obj client.Object) bool { return leaveCM(obj.GetName(), obj) || etcdMember(obj) }
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if leaveCM(key.Name, obj) {
+				m.record(ip)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if leaveWrite(obj) {
+				m.record(ip)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if leaveWrite(obj) {
+				m.record(ip)
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if leaveWrite(obj) {
+				m.record(ip)
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
 }
 
 func (m *recordingMembers) addresses() []string {
@@ -161,6 +229,8 @@ type k0sLeaveCluster struct {
 	nsName    string
 	kcpName   string
 	leaverKey types.NamespacedName
+	// unregistered is k0sLeaveOptions.unregisteredLeaver.
+	unregistered bool
 }
 
 const k0sLeaverIP = "10.11.0.10"
@@ -169,23 +239,57 @@ const k0sLeaverIP = "10.11.0.10"
 // leaving Machine next to the etcd-leave hook, before it is deleted.
 func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[string]string) (*k0sLeaveCluster, func()) {
 	t.Helper()
+	return startK0sLeaveClusterWith(t, name, k0sLeaveOptions{leaverAnnotations: leaverAnnotations})
+}
+
+// k0sLeaveOptions vary the cluster startK0sLeaveClusterWith builds.
+type k0sLeaveOptions struct {
+	// leaverAnnotations are set on the leaving Machine next to the hook.
+	leaverAnnotations map[string]string
+	// unregisteredLeaver: the leaving Machine never got a NodeRef (ADR 0015
+	// PR-3). Its node, and its EtcdMember, go by the Machine name, which is
+	// what the renderer names a node with no spec.hostname. It never reported
+	// into etcd-status.
+	unregisteredLeaver bool
+	// keepLeaver: the leaving Machine is created but not deleted, so the
+	// control plane is in a steady state of three members.
+	keepLeaver bool
+	// extraMembers are EtcdMembers (name → peer address) with no Machine.
+	extraMembers map[string]string
+}
+
+// leaverNode is the leaving node's name: its NodeRef name, or its Machine
+// name when it has no NodeRef.
+func (k *k0sLeaveCluster) leaverNode() string {
+	if k.unregistered {
+		return k.leaverKey.Name
+	}
+	return "leaver-node"
+}
+
+// startK0sLeaveClusterWith builds the cluster with opts.
+func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (*k0sLeaveCluster, func()) {
+	t.Helper()
 	g := NewWithT(t)
+	leaverAnnotations := opts.leaverAnnotations
 	members := &recordingMembers{dialed: map[string]bool{}}
 	ctx, c, cfg, _, teardown := startKCPEnvtest(t, func(r *controlplane.KairosControlPlaneReconciler, cfg *rest.Config) {
 		r.WorkloadClientFactory = func(context.Context, *clusterv1.Cluster) (client.Client, error) {
 			return nil, errors.New("the control-plane endpoint does not answer")
 		}
 		r.MemberClientFactory = func(_ context.Context, _ *clusterv1.Cluster, ip string) (client.Client, error) {
-			members.mu.Lock()
-			members.dialed[ip] = true
-			members.mu.Unlock()
-			return envtestWorkloadClient(t, cfg), nil
+			return members.client(t, cfg, ip), nil
 		}
 	})
 	installK0sEtcdMemberCRD(t, cfg)
-	k := &k0sLeaveCluster{ctx: ctx, c: c, wc: envtestWorkloadClient(t, cfg), members: members, nsName: name, kcpName: name + "-kcp"}
+	k := &k0sLeaveCluster{ctx: ctx, c: c, wc: envtestWorkloadClient(t, cfg), members: members, nsName: name, kcpName: name + "-kcp",
+		unregistered: opts.unregisteredLeaver}
+	k.leaverKey = types.NamespacedName{Name: k.kcpName + "-0", Namespace: k.nsName}
 	clusterName := name + "-cluster"
 	haFixture(t, ctx, c, k.nsName, clusterName, k.kcpName, "k0s")
+	// The cluster is long past its first contact, so the KCP pinned its
+	// identity then (ADR 0015 PR-2). The envtest apiserver is the workload.
+	pinEnvtestWorkloadIdentity(t, ctx, c, k.wc, k.nsName, k.kcpName)
 	endpointHost := testControlPlaneEndpoint().Host
 	vip := getKCP(g, ctx, c, k.nsName, k.kcpName).Spec.HA.VIP.Address
 
@@ -197,16 +301,24 @@ func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[strin
 			return err
 		}
 		es.Data = map[string][]byte{}
-		for _, n := range []string{"leaver-node", "keeper-a", "keeper-b"} {
+		reporters := []string{"keeper-a", "keeper-b"}
+		if !k.unregistered {
+			reporters = append(reporters, "leaver-node")
+		}
+		for _, n := range reporters {
 			es.Data[n] = []byte(`{"name":"` + n + `","healthy":true,"voting":true,"members":3,"reportedAt":"t"}`)
 		}
 		return c.Update(ctx, es)
 	}, 15*time.Second, 500*time.Millisecond).Should(Succeed())
 
-	// k0s's view: one EtcdMember per controller, all joined.
-	createK0sEtcdMember(t, ctx, k.wc, "leaver-node", k0sLeaverIP)
+	// k0s's view: one EtcdMember per controller, all joined, plus any member
+	// with no Machine.
+	createK0sEtcdMember(t, ctx, k.wc, k.leaverNode(), k0sLeaverIP)
 	createK0sEtcdMember(t, ctx, k.wc, "keeper-a", "10.11.0.11")
 	createK0sEtcdMember(t, ctx, k.wc, "keeper-b", "10.11.0.12")
+	for member, peer := range opts.extraMembers {
+		createK0sEtcdMember(t, ctx, k.wc, member, peer)
+	}
 
 	// The Machines. The leaver holds the VIP; a keeper reports the endpoint
 	// host too. Neither address may ever be dialled.
@@ -228,8 +340,12 @@ func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[strin
 			},
 		}
 		g.Expect(c.Create(ctx, m)).To(Succeed())
-		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: node}
-		m.Status.Phase = string(clusterv1.MachinePhaseRunning)
+		if node != "" {
+			m.Status.NodeRef = clusterv1.MachineNodeReference{Name: node}
+			m.Status.Phase = string(clusterv1.MachinePhaseRunning)
+		} else {
+			m.Status.Phase = string(clusterv1.MachinePhaseProvisioned)
+		}
 		for _, a := range addrs {
 			m.Status.Addresses = append(m.Status.Addresses, clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
 		}
@@ -240,11 +356,16 @@ func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[strin
 	for key, v := range leaverAnnotations {
 		annotations[key] = v
 	}
-	leaver := mk(k.kcpName+"-0", "leaver-node", annotations, k0sLeaverIP, vip)
+	leaverNodeRef := "leaver-node"
+	if k.unregistered {
+		leaverNodeRef = ""
+	}
+	leaver := mk(k.leaverKey.Name, leaverNodeRef, annotations, k0sLeaverIP, vip)
 	mk(k.kcpName+"-1", "keeper-a", nil, "10.11.0.11", endpointHost)
 	mk(k.kcpName+"-2", "keeper-b", nil, "10.11.0.12")
-	g.Expect(c.Delete(ctx, leaver)).To(Succeed())
-	k.leaverKey = types.NamespacedName{Name: leaver.Name, Namespace: k.nsName}
+	if !opts.keepLeaver {
+		g.Expect(c.Delete(ctx, leaver)).To(Succeed())
+	}
 	return k, teardown
 }
 

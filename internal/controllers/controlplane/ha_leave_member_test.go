@@ -253,14 +253,14 @@ func TestReconcileMemberLeave_MemberAnswersWhileEndpointHangs(t *testing.T) {
 	target := leavingMachine("cp-0", nil, "10.0.0.10")
 	machines := []*clusterv1.Machine{target, nodeMachine("cp-1", false, "10.0.0.11")}
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
-	member := fake.NewClientBuilder().WithScheme(scheme).Build()
+	member := pinnedWorkloadBuilder(scheme).Build()
 	endpoint := hungClient(scheme)
 	members := &fakeMembers{clients: map[string]client.Client{"10.0.0.11": member}}
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme,
 		WorkloadClientFactory: staticWorkloadClient(endpoint), MemberClientFactory: members.factory}
 
 	// First pass: the request is written through the member.
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, vipKCP(), haCluster(), machines, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedVIPKCP(), haCluster(), machines, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	g.Expect(leaveCM(g, member)).To(HaveKeyWithValue("cp-0", etcdLeaveRequestedValue))
@@ -273,7 +273,7 @@ func TestReconcileMemberLeave_MemberAnswersWhileEndpointHangs(t *testing.T) {
 	g.Expect(member.Get(context.Background(), leaveConfigMapKey, cm)).To(Succeed())
 	cm.Data["cp-0"] = etcdLeftValue
 	g.Expect(member.Update(context.Background(), cm)).To(Succeed())
-	done, err = r.reconcileMemberLeave(context.Background(), log.Log, vipKCP(), haCluster(), machines, got)
+	done, err = r.reconcileMemberLeave(context.Background(), log.Log, pinnedVIPKCP(), haCluster(), machines, got)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeTrue())
 	assertHookGone(g, mgmt, "cp-0")
@@ -287,12 +287,12 @@ func TestReconcileMemberLeave_TriesTheNextMember(t *testing.T) {
 	target := leavingMachine("cp-0", nil, "10.0.0.10")
 	machines := []*clusterv1.Machine{target, nodeMachine("cp-1", false, "10.0.0.11"), nodeMachine("cp-2", false, "10.0.0.12")}
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target).Build()
-	first, second := hungClient(scheme), fake.NewClientBuilder().WithScheme(scheme).Build()
+	first, second := hungClient(scheme), pinnedWorkloadBuilder(scheme).Build()
 	members := &fakeMembers{clients: map[string]client.Client{"10.0.0.11": first, "10.0.0.12": second}}
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme,
 		WorkloadClientFactory: staticWorkloadClient(hungClient(scheme)), MemberClientFactory: members.factory}
 
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, vipKCP(), haCluster(), machines, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedVIPKCP(), haCluster(), machines, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	g.Expect(members.dialed).To(Equal([]string{"10.0.0.11", "10.0.0.12"}))
@@ -312,7 +312,7 @@ func TestReconcileMemberLeave_NoApiserverAnswersKeepsHook(t *testing.T) {
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme,
 		WorkloadClientFactory: staticWorkloadClient(hungClient(scheme)), MemberClientFactory: members.factory}
 
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, vipKCP(), haCluster(), machines, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedVIPKCP(), haCluster(), machines, target)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	g.Expect(err.Error()).To(And(ContainSubstring("member 10.0.0.11"), ContainSubstring("member 10.0.0.12"), ContainSubstring("endpoint")))
@@ -329,12 +329,12 @@ func TestReconcileMemberLeave_EndpointIsTheLastResort(t *testing.T) {
 	target := leavingMachine("cp-0", nil, "10.244.0.10")
 	machines := []*clusterv1.Machine{target, nodeMachine("cp-1", false, "10.244.0.11")}
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target).Build()
-	endpoint := fake.NewClientBuilder().WithScheme(scheme).Build()
+	endpoint := pinnedWorkloadBuilder(scheme).Build()
 	members := &fakeMembers{} // every member fails
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme,
 		WorkloadClientFactory: staticWorkloadClient(endpoint), MemberClientFactory: members.factory}
 
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k0sKCP(), haCluster(), machines, target)
+	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), haCluster(), machines, target)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(done).To(BeFalse())
 	g.Expect(members.dialed).To(Equal([]string{"10.244.0.11"}))
@@ -354,12 +354,12 @@ func TestReconcileMemberLeave_NeverDialsTheLeaverOrTheEndpointHost(t *testing.T)
 		nodeMachine("cp-2", false, "10.0.0.12"),
 	}
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target).Build()
-	leaver := fake.NewClientBuilder().WithScheme(scheme).Build()
+	leaver := pinnedWorkloadBuilder(scheme).Build()
 	members := &fakeMembers{clients: map[string]client.Client{"10.0.0.10": leaver, testEndpointHost: leaver, testVIP: leaver}}
 	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme,
 		WorkloadClientFactory: staticWorkloadClient(hungClient(scheme)), MemberClientFactory: members.factory}
 
-	_, err := r.reconcileMemberLeave(context.Background(), log.Log, vipKCP(), haCluster(), machines, target)
+	_, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedVIPKCP(), haCluster(), machines, target)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(members.dialed).To(Equal([]string{"10.0.0.11", "10.0.0.12"}))
 	assertNoLeaveCM(g, leaver)

@@ -1,5 +1,56 @@
 # Upgrading Kairos CAPI Provider
 
+## Next release (after v0.2.0)
+
+### Behaviour changes to expect
+
+- **Control-plane `spec.hostname` is validated.** A new or changed
+  `spec.hostname` on a control-plane `KairosConfig` must be a lowercase
+  DNS-1123 label (at most 63 characters of `a-z`, `0-9` and `-`) without
+  `{{`, and a `KairosControlPlane` refuses to create Machines from a
+  referenced `KairosConfigTemplate` whose hostname breaks that rule (Warning
+  event `InvalidControlPlaneHostname`). Existing objects are unaffected until
+  the field is changed, and worker configs are not checked.
+- **New control-plane Machines get random names**, `<kcp-name>-<5
+  characters>`, in place of `-0`, `-1`, `-2`. Nothing to do on the upgrade;
+  see [the section below](#control-plane-machine-names-are-random-and-never-reused).
+
+### Control-plane Machine names are random and never reused
+
+New control-plane Machines are named `<kcp-name>-<5 random characters>`, as
+the upstream kubeadm control plane names them, in place of `<kcp-name>-0`,
+`-1`, `-2`. Their `KairosConfig` and infrastructure Machine have the same name,
+and so, by default, do the node's hostname, its Node, and its etcd member. The
+old names gave the next Machine the highest index plus one, so deleting the
+newest Machine handed its name to its replacement. The new names always pass
+the control-plane hostname rule above: dots in the `KairosControlPlane` name
+become dashes, and a name longer than 57 characters is shortened. See
+[HIGH_AVAILABILITY.md — Control-plane Machine names](HIGH_AVAILABILITY.md#control-plane-machine-names).
+
+There is no action to take on the upgrade:
+
+- Existing Machines keep their names until they are replaced, and a control
+  plane can have both kinds of name at once.
+- The controller orders control-plane Machines by creation time, never by
+  name, so which Machine is the init node and which one a scale-down removes
+  is unchanged.
+
+Update anything of your own that expects a numbered name, such as scripts that
+look up `<kcp-name>-0`, dashboards, or alert rules. Find a cluster's
+control-plane Machines by label instead:
+
+```bash
+kubectl get machines -n <cluster-namespace> \
+  -l cluster.x-k8s.io/cluster-name=<cluster>,cluster.x-k8s.io/control-plane \
+  --sort-by=.metadata.creationTimestamp
+```
+
+A failed control-plane Machine create now deletes the `KairosConfig` and
+infrastructure Machine it made for that attempt; earlier releases left them
+in place and reused them on the next attempt. A leftover `<kcp-name>-<n>`
+`KairosConfig` from an earlier release that has no Machine is not adopted. You
+can delete it.
+
 ## v0.1.3 → v0.1.4
 
 Full release notes: [v0.1.4](release-notes/v0.1.4.md).

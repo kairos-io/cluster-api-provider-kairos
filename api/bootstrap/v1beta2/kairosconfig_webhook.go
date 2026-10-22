@@ -91,13 +91,39 @@ var _ admission.Validator[*KairosConfig] = &kairosConfigValidator{}
 // ValidateCreate implements admission.Validator[*KairosConfig].
 func (*kairosConfigValidator) ValidateCreate(_ context.Context, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate create", "name", r.Name)
-	return r.warnings(), r.validate()
+	return r.warnings(), r.validateWith(r.validateHostname())
 }
 
 // ValidateUpdate implements admission.Validator[*KairosConfig].
-func (*kairosConfigValidator) ValidateUpdate(_ context.Context, _, r *KairosConfig) (admission.Warnings, error) {
+//
+// spec.hostname is checked only when the update changes it: objects created
+// before the check existed keep whatever hostname they have through
+// unrelated updates (status, labels, finalizers).
+func (*kairosConfigValidator) ValidateUpdate(_ context.Context, old, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate update", "name", r.Name)
-	return r.warnings(), r.validate()
+	var hostErrs field.ErrorList
+	if old == nil || old.Spec.Hostname != r.Spec.Hostname {
+		hostErrs = r.validateHostname()
+	}
+	return r.warnings(), r.validateWith(hostErrs)
+}
+
+// validateHostname checks spec.hostname with NodeHostnameErrors, on
+// control-plane configs only (spec.role, which the KairosControlPlane always
+// sets to control-plane). Only control-plane nodes are matched to a k0s etcd
+// member by their hostname; a worker's hostname is never used that way, and
+// rejecting uppercase or FQDN worker hostnames would break MachineDeployment
+// scale-ups from existing worker templates. An empty hostname is valid: the
+// node is then named after its Machine.
+func (r *KairosConfig) validateHostname() field.ErrorList {
+	if r.Spec.Hostname == "" || r.Spec.Role != "control-plane" {
+		return nil
+	}
+	var errs field.ErrorList
+	for _, msg := range NodeHostnameErrors(r.Spec.Hostname) {
+		errs = append(errs, field.Invalid(field.NewPath("spec", "hostname"), r.Spec.Hostname, msg))
+	}
+	return errs
 }
 
 // ValidateDelete implements admission.Validator[*KairosConfig].
@@ -179,7 +205,13 @@ func (r *KairosConfig) validateSecretRefNamespaces() field.ErrorList {
 
 // validate performs validation on the KairosConfig spec
 func (r *KairosConfig) validate() error {
-	var allErrs field.ErrorList
+	return r.validateWith(nil)
+}
+
+// validateWith is validate, reporting extra (checks that depend on the
+// admission operation) together with its own errors.
+func (r *KairosConfig) validateWith(extra field.ErrorList) error {
+	allErrs := append(field.ErrorList{}, extra...)
 
 	// Validate role
 	if r.Spec.Role != "control-plane" && r.Spec.Role != "worker" {

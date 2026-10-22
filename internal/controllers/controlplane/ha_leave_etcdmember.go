@@ -80,7 +80,8 @@ const (
 var etcdMemberGVK = schema.GroupVersionKind{Group: "etcd.k0sproject.io", Version: "v1beta1", Kind: "EtcdMember"}
 
 // delegateMemberLeave runs once the leave of target has timed out without an
-// ack. conn and connErr are what connectForLeave returned. The result has the
+// ack. nodeName is the member's name in the workload cluster (leaveNodeName);
+// conn and connErr are what connectForLeave returned. The result has the
 // meaning reconcileMemberLeave's has.
 //
 //   - Nothing answered: stamp the start of this phase, and keep the hook
@@ -95,14 +96,13 @@ var etcdMemberGVK = schema.GroupVersionKind{Group: "etcd.k0sproject.io", Version
 //   - Otherwise: stamp, record the member ID, set spec.leave if it is not
 //     set, and remove the hook once k0s reports Joined=False. After
 //     etcdMemberLeaveCap, the old timeout path.
-func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, target *clusterv1.Machine, conn leaveConn, connErr error) (bool, error) {
-	nodeName := target.Status.NodeRef.Name
+func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, target *clusterv1.Machine, nodeName string, conn leaveConn, connErr error) (bool, error) {
 	if connErr != nil {
 		if err := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); err != nil {
 			return false, err
 		}
 		if etcdMemberLeaveCapped(target) {
-			return true, r.abandonMemberLeave(ctx, log, kcp, target, "no workload apiserver answered")
+			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "no workload apiserver answered")
 		}
 		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)
 	}
@@ -112,22 +112,22 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 	if err := conn.client.Get(ctx, client.ObjectKey{Name: nodeName}, member); err != nil {
 		switch {
 		case meta.IsNoMatchError(err):
-			return true, r.abandonMemberLeave(ctx, log, kcp, target, "the cluster has no EtcdMember API")
+			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "the cluster has no EtcdMember API")
 		case apierrors.IsNotFound(err):
-			return true, r.abandonMemberLeave(ctx, log, kcp, target, "the cluster has no EtcdMember for the node")
+			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "the cluster has no EtcdMember for the node")
 		}
 		if serr := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); serr != nil {
 			return false, serr
 		}
 		if etcdMemberLeaveCapped(target) {
-			return true, r.abandonMemberLeave(ctx, log, kcp, target, "its EtcdMember could not be read")
+			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "its EtcdMember could not be read")
 		}
 		return false, fmt.Errorf("etcd-leave: read EtcdMember %s via %s: %w", nodeName, conn.via, err)
 	}
 	if owner := etcdMemberPeerOwner(member, machines, target); owner != "" {
 		log.Info("etcd-leave: EtcdMember named after the node has another Machine's peer address; not touching it",
 			"machine", target.Name, "node", nodeName, "peerOwner", owner)
-		return true, r.abandonMemberLeave(ctx, log, kcp, target, fmt.Sprintf("its EtcdMember has the peer address of Machine %q", owner))
+		return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, fmt.Sprintf("its EtcdMember has the peer address of Machine %q", owner))
 	}
 
 	// k0s removes the member by status.memberID. The ID seen at the first
@@ -138,12 +138,12 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 	if !ok {
 		log.Info("etcd-leave: EtcdMember named after the node reports no member ID; not touching it",
 			"machine", target.Name, "node", nodeName)
-		return true, r.abandonMemberLeave(ctx, log, kcp, target, "its EtcdMember reports no member ID")
+		return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "its EtcdMember reports no member ID")
 	}
 	if recorded, set := target.Annotations[etcdMemberLeaveMemberIDAnnotation]; set && recorded != memberID {
 		log.Info("etcd-leave: EtcdMember named after the node has a different member ID than first seen; not touching it",
 			"machine", target.Name, "node", nodeName, "recordedMemberID", recorded, "memberID", memberID)
-		return true, r.abandonMemberLeave(ctx, log, kcp, target, "its EtcdMember now describes a different etcd member")
+		return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "its EtcdMember now describes a different etcd member")
 	}
 	if err := r.annotateOnce(ctx, target, map[string]string{
 		etcdMemberLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339),
@@ -160,7 +160,7 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 		// inspected above.
 		if err := conn.client.Patch(ctx, member, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			if etcdMemberLeaveCapped(target) {
-				return true, r.abandonMemberLeave(ctx, log, kcp, target, "spec.leave could not be set on its EtcdMember")
+				return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "spec.leave could not be set on its EtcdMember")
 			}
 			return false, fmt.Errorf("etcd-leave: set spec.leave on EtcdMember %s via %s: %w", nodeName, conn.via, err)
 		}
@@ -174,10 +174,10 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 
 	if etcdMemberJoinedStatus(member) == k0sEtcdMemberNotJoined {
 		log.Info("etcd-leave: k0s reports the member is not in etcd; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
-		return true, r.removeEtcdLeaveHook(ctx, target)
+		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 	if etcdMemberLeaveCapped(target) {
-		return true, r.abandonMemberLeave(ctx, log, kcp, target, fmt.Sprintf("k0s did not report its member gone within %s", etcdMemberLeaveCap))
+		return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, fmt.Sprintf("k0s did not report its member gone within %s", etcdMemberLeaveCap))
 	}
 	log.Info("etcd-leave: waiting for k0s to remove the etcd member", "machine", target.Name, "node", nodeName, "via", conn.via)
 	return false, nil
@@ -185,16 +185,16 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 
 // abandonMemberLeave is the old timeout path: warn that the member may be
 // left in etcd, and remove the hook so the delete proceeds. why says what
-// the KCP could not do, for the log and the event.
-func (r *KairosControlPlaneReconciler) abandonMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine, why string) error {
-	nodeName := target.Status.NodeRef.Name
+// the KCP could not do, for the log and the event. nodeName is the member's
+// name in the workload cluster (leaveNodeName).
+func (r *KairosControlPlaneReconciler) abandonMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine, nodeName, why string) error {
 	log.Info("etcd-leave: timed out waiting for node ack; removing hook (etcd member may be orphaned)",
 		"machine", target.Name, "node", nodeName, "timeout", memberLeaveTimeout, "reason", why)
 	if r.Recorder != nil {
 		r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberLeaveTimedOut",
 			"Control-plane node %q did not leave etcd within %s and %s; proceeding with deletion — the etcd member may need manual removal", nodeName, memberLeaveTimeout, why)
 	}
-	return r.removeEtcdLeaveHook(ctx, target)
+	return r.removeEtcdLeaveHook(ctx, kcp, target)
 }
 
 // etcdMemberLeaveCapped reports whether the KCP first tried to hand the leave
@@ -236,6 +236,12 @@ func etcdMemberPeerOwner(member *unstructured.Unstructured, machines []*clusterv
 // hexadecimal etcd member ID.
 func etcdMemberID(member *unstructured.Unstructured) (string, bool) {
 	raw, _, _ := unstructured.NestedString(member.Object, "status", "memberID")
+	return canonicalMemberID(raw)
+}
+
+// canonicalMemberID returns raw as a canonical etcd member ID (lowercase
+// hex), and false when it is empty, zero or not hexadecimal.
+func canonicalMemberID(raw string) (string, bool) {
 	if raw == "" {
 		return "", false
 	}

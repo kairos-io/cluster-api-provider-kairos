@@ -18,6 +18,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/go-logr/logr"
@@ -93,6 +94,10 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 		var joinTokenID string
 		if role == bootstrapv1beta2.ControlPlaneRoleJoin {
 			admission, err := r.admitJoiner(ctx, log, kcp, cluster, machines)
+			if errors.Is(err, errWorkloadIdentityChanged) {
+				log.Info("Holding back rollout surge machine: the workload cluster identity changed", "reason", err.Error())
+				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to evaluate init machine joinability: %w", err)
 			}
@@ -102,7 +107,10 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 			}
 			joinTokenID = admission.k0sJoinTokenID
 		}
-		if err := r.createControlPlaneMachine(ctx, log, kcp, cluster, r.nextMachineIndex(machines, kcp.Name), role, joinTokenID); err != nil {
+		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, role, joinTokenID); err != nil {
+			if errors.Is(err, errWorkloadIdentityChanged) {
+				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
 		}
 		return ctrl.Result{}, nil
@@ -122,12 +130,20 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 			log.Info("Holding back outdated-machine rollout — etcd quorum would break", "machine", target.Name, "reason", reason)
 			return ctrl.Result{RequeueAfter: joinerGateRequeueAfter}, nil
 		}
+		// ADR 0015 PR-2: never delete a member on the word of a cluster the KCP
+		// did not pin.
+		if res, proceed := r.identityPreflight(ctx, log, kcp, cluster, "outdated-machine rollout"); !proceed {
+			return res, nil
+		}
 		// k3s embedded etcd has no supported member-remove (KD-5d); warn that
 		// the member will linger. For k0s the etcd-leave sweep drives a clean
 		// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
 		r.warnIfK3sEtcdLimitation(kcp, target)
 		log.Info("Deleting outdated control plane machine", "machine", target.Name)
-		if err := r.Delete(ctx, target); err != nil {
+		if err := r.deleteControlPlaneMachine(ctx, kcp, target); err != nil {
+			if errors.Is(err, errWorkloadIdentityChanged) {
+				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
 		}
 		return ctrl.Result{}, nil
