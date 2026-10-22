@@ -157,6 +157,19 @@ While a removal is in progress it is recorded in the `controlplane.cluster.x-k8s
 
 **KD-51:** etcd health/leave signals are node-self-reported over vanilla RBAC, so a compromised control-plane node can forge them. Not a privilege escalation (a compromised node already has cluster-admin-equivalent access) and it cannot force an unsafe deletion — quorum-safety is decided independently of any node signal. A forged signal can only self-downgrade the clean-leave/health guarantee.
 
+## A refused k0s joiner (ADR 0015)
+
+A k0s control-plane joiner checks that it really joined a cluster. If the live `k0scontroller` was started with its join token but `k0s etcd member-list` shows only the joiner itself, the node has bootstrapped a cluster of its own (it shares the CA, so TLS cannot tell). It then stops k0s, never sets its providerID, and refuses every later start.
+
+**Recognise it:**
+- The Machine never gets a NodeRef, and the rollout or scale-up stalls on it.
+- On the node, `/var/lib/k0s/.kairos-join-refused` exists, `systemctl status k0scontroller` shows the start refused, and the journal has `kairos-join-guard: REFUSED`.
+- A joiner whose confirmation passed has `/var/lib/k0s/.kairos-join-confirmed` instead.
+
+**Fix:** delete the Machine. Do not remove the marker or start k0s by hand on that node; the replacement joins as a fresh VM. If the failed join left an unstarted etcd member behind, the replacement may stall with `Peer URLs already exists`: remove that member on a surviving control-plane node with `k0s etcd leave --peer-address <ip>` (the empty-name entry in `k0s etcd member-list`).
+
+**Do not** delete or replace all of the older control-plane members while a joiner is still unconfirmed (no `.kairos-join-confirmed`). Until it is confirmed you cannot tell whether it joined the real cluster.
+
 ## Day-2: workload cluster identity and the freeze
 
 An HA control plane pins the identity of the workload cluster it manages, and freezes control-plane membership changes if a workload API server ever answers as a different cluster (ADR 0015). The identity is the UID of the workload `kube-system` Namespace, stored on the `KairosControlPlane` in the `controlplane.cluster.x-k8s.io/workload-cluster-uid` annotation. The full rules (when it is pinned, what is checked, the annotations) are in [API_REFERENCE.md — Workload cluster identity](API_REFERENCE.md#workload-cluster-identity).
