@@ -154,14 +154,16 @@ func (r controllerRole) leaderElectionID() string {
 // predicates select on, so a selector-scoped cache would still hold them.
 // Not caching them at all is what removes the resident copy.
 //
-// This costs a GET per read on paths that run per reconcile. It does NOT remove
-// every resident copy: three controllers still call Watches on corev1.Secret
-// (kairosconfig_controller.go, kairoscontrolplane_controller.go), and Watches
-// builds its informer on mgr.GetCache() directly, which Client.Cache.DisableFor
-// does not reach. So the manager still caches Secrets through those watches, and
-// the role still needs watch on secrets — without it the reflector's WATCH is
-// refused and it falls back to re-LISTing every Secret in scope on a timer,
-// which is strictly worse. Narrowing those three watches is kairos-io/kairos#5499.
+// This costs a GET per read on paths that run per reconcile. It covers the
+// client read path only: Watches builds its informer on mgr.GetCache() directly,
+// which Client.Cache.DisableFor does not reach. The three Secret watches
+// (kairosconfig_controller.go, kairoscontrolplane_controller.go) are therefore
+// registered with builder.OnlyMetadata, so their informers hold
+// PartialObjectMetadata, and managerOptions installs stripSecretCachePayload to
+// remove the two ObjectMeta fields that can still carry a Secret body
+// (kairos-io/kairos#5499). The role still needs list and watch on secrets for
+// those metadata informers: without watch the reflector falls back to
+// re-LISTing every Secret in scope.
 var uncachedTypes = []client.Object{&corev1.Secret{}}
 
 // managerOptions builds the options ctrl.NewManager is called with. It is the
@@ -198,6 +200,24 @@ func managerOptions(role controllerRole, metricsAddr, probeAddr string, enableLe
 				watchNamespace: {},
 			},
 		}
+	}
+	// Secret cache hygiene. The Secret watches are metadata-only, so the cache
+	// holds PartialObjectMetadata and never the Secret body — but ObjectMeta
+	// still carries two things that can hold the body anyway:
+	//
+	//   - managedFields, which is pure bookkeeping for anything we do here;
+	//   - the kubectl.kubernetes.io/last-applied-configuration annotation,
+	//     which is the full serialised object, data included, for any Secret
+	//     created with `kubectl apply`.
+	//
+	// Strip both before the object is committed to the cache. Keyed by
+	// corev1.Secret: the cache resolves ByObject entries by GVK, and a
+	// PartialObjectMetadata for v1/Secret resolves to the same GVK, so this
+	// reaches the metadata informers. Set after the watch-scope branch above,
+	// which replaces opts.Cache; ByObject.Namespaces is left nil so it inherits
+	// DefaultNamespaces.
+	opts.Cache.ByObject = map[client.Object]cache.ByObject{
+		&corev1.Secret{}: {Transform: stripSecretCachePayload},
 	}
 	return opts
 }
@@ -314,23 +334,6 @@ func main() {
 	}
 
 	mgrOptions := managerOptions(role, metricsAddr, probeAddr, enableLeaderElection, watchNamespace, watchSingle)
-
-	// Secret cache hygiene. The three Secret watches are metadata-only, so the
-	// cache holds PartialObjectMetadata and never the Secret body — but
-	// ObjectMeta still carries two things that can hold the body anyway:
-	//
-	//   - managedFields, which is pure bookkeeping for anything we do here;
-	//   - the kubectl.kubernetes.io/last-applied-configuration annotation,
-	//     which is the full serialised object, data included, for any Secret
-	//     created with `kubectl apply`.
-	//
-	// Strip both before the object is committed to the cache. Keyed by
-	// corev1.Secret: the cache resolves ByObject entries by GVK, and a
-	// PartialObjectMetadata for v1/Secret resolves to the same GVK, so this
-	// reaches the metadata informers.
-	mgrOptions.Cache.ByObject = map[client.Object]cache.ByObject{
-		&corev1.Secret{}: {Transform: stripSecretCachePayload},
-	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {

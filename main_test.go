@@ -329,3 +329,24 @@ func TestStripSecretCachePayload_NoAnnotations(t *testing.T) {
 		t.Errorf("transform created an annotations map where there was none: %v", got.Annotations)
 	}
 }
+
+// TestManagerOptions_SecretTransformInstalled asserts the manager the provider
+// actually starts installs stripSecretCachePayload on v1/Secret, in every role
+// and both watch scopes. The single-namespace branch replaces opts.Cache, so an
+// assignment made before it would be silently lost.
+func TestManagerOptions_SecretTransformInstalled(t *testing.T) {
+	for _, role := range []controllerRole{roleAll, roleBootstrap, roleControlPlane} {
+		for _, watchSingle := range []bool{false, true} {
+			opts := managerOptions(role, ":8080", ":8081", false, "capi-kairos-system", watchSingle)
+			found := false
+			for obj, byObj := range opts.Cache.ByObject {
+				if _, ok := obj.(*corev1.Secret); ok && byObj.Transform != nil {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("role %v watchSingle=%v: no Secret cache transform installed", role, watchSingle)
+			}
+		}
+	}
+}
