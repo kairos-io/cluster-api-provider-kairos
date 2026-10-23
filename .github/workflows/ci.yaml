@@ -27,7 +27,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
         # The job restores its own module and build caches with
         # actions/cache below; setup-go's built-in cache on the same
         # paths double-restores ("Cannot open: File exists").
@@ -89,7 +89,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
 
     # kubeadm --dry-run creates /etc/kubernetes/tmp on the host whatever the
     # test root is, and the runner user cannot create /etc/kubernetes itself.
@@ -113,7 +113,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
         # The job restores its own module and build caches with
         # actions/cache below; setup-go's built-in cache on the same
         # paths double-restores ("Cannot open: File exists").
@@ -154,7 +154,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
         # The job restores its own module and build caches with
         # actions/cache below; setup-go's built-in cache on the same
         # paths double-restores ("Cannot open: File exists").
@@ -197,7 +197,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
         # The job restores its own module and build caches with
         # actions/cache below; setup-go's built-in cache on the same
         # paths double-restores ("Cannot open: File exists").
@@ -240,7 +240,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
         # The job restores its own module and build caches with
         # actions/cache below; setup-go's built-in cache on the same
         # paths double-restores ("Cannot open: File exists").
@@ -286,7 +286,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26.4'
+        go-version: '1.27.3'
         # The job restores its own module and build caches with
         # actions/cache below; setup-go's built-in cache on the same
         # paths double-restores ("Cannot open: File exists").
