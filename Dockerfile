@@ -7,7 +7,7 @@
 # pinning a single platform's manifest would break the linux/arm64 half of the
 # release build. Keep the tag alongside it for readability, and let Renovate
 # move the digest.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:5cb67f19c5e7994dcb80c074f7cfca8aeeada45bbdca035f73df269cefdcce61 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
