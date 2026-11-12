@@ -17,14 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.27.3'
@@ -39,9 +36,11 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
+        # Keyed on the Go version setup-go installed: another toolchain's
+        # build cache is no use, and a key that already exists is never saved.
+        key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.26.0-
+          ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
     - name: Download dependencies
       run: go mod download
@@ -103,14 +102,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.27.3'
@@ -125,9 +121,11 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
+        # Keyed on the Go version setup-go installed: another toolchain's
+        # build cache is no use, and a key that already exists is never saved.
+        key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.26.0-
+          ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
     - name: Install controller-gen
       run: |
@@ -144,14 +142,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.27.3'
@@ -166,9 +161,11 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
+        # Keyed on the Go version setup-go installed: another toolchain's
+        # build cache is no use, and a key that already exists is never saved.
+        key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.26.0-
+          ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
     - name: Install controller-gen
       run: |
@@ -187,14 +184,13 @@ jobs:
 
   test-envtest:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ['1.26']  # go.mod requires go 1.26
+    env:
+      GOTOOLCHAIN: local
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.27.3'
@@ -211,9 +207,11 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
+        # Keyed on the Go version setup-go installed: another toolchain's
+        # build cache is no use, and a key that already exists is never saved.
+        key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.26.0-
+          ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
     - name: Install envtest tools
       run: |
@@ -238,6 +236,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.27.3'
@@ -252,9 +251,11 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
+        # Keyed on the Go version setup-go installed: another toolchain's
+        # build cache is no use, and a key that already exists is never saved.
+        key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.26.0-
+          ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
     - name: Cache pinned e2e CLIs (kubectl, kind, clusterctl, virtctl)
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -276,14 +277,11 @@ jobs:
     needs: [test, verify-generate, verify-manifests]
     env:
       GOTOOLCHAIN: local
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ['1.26']  # go.mod requires go 1.26
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.27.3'
@@ -298,9 +296,11 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-1.26.0-${{ hashFiles('**/go.sum') }}
+        # Keyed on the Go version setup-go installed: another toolchain's
+        # build cache is no use, and a key that already exists is never saved.
+        key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-1.26.0-
+          ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-
 
     - name: Download dependencies
       run: go mod download
