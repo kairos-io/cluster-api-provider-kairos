@@ -15,7 +15,7 @@ require (
 	k8s.io/apiextensions-apiserver v0.35.4
 	k8s.io/apimachinery v0.35.4
 	k8s.io/client-go v0.35.4
-	k8s.io/cluster-bootstrap v0.35.4
+	k8s.io/cluster-bootstrap v0.37.2
 	k8s.io/utils v0.0.0-20261023123148-ca04ba58ecab
 	sigs.k8s.io/cluster-api v1.13.4
 	sigs.k8s.io/controller-runtime v0.23.3
