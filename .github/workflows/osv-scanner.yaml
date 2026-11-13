@@ -47,7 +47,7 @@ jobs:
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
       # Both reusable workflows default scan-args to "-r ./"; this is that plus an
-      # explicit --config, so the ignore in osv-scanner.toml is applied rather
+      # explicit --config, so any ignore in osv-scanner.toml is applied rather
       # than left to the scanner's config discovery. It is passed to the base
       # scan and the head scan alike.
       scan-args: |-

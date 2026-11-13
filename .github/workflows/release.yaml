@@ -189,6 +189,11 @@ jobs:
           # hidden as a preview.
           prerelease: ${{ contains(github.ref_name, '-') }}
           draft: false
+          # Every path below is a release asset clusterctl or a user downloads. The
+          # action's default is to warn and publish without a file it cannot find,
+          # which would ship a release missing its components or checksums; fail
+          # the job instead.
+          fail_on_unmatched_files: true
           files: |
             dist/bootstrap-components.yaml
             dist/control-plane-components.yaml
