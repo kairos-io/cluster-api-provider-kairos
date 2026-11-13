@@ -70,7 +70,7 @@
       ]
     },
     {
-      "description": "Cluster API and the Kubernetes client libraries move together: sigs.k8s.io/cluster-api vN is built against one k8s.io/* minor and one controller-runtime minor, and mixing them breaks the v1beta2 contract. The k8s.io staging modules (api, apimachinery, client-go, cluster-bootstrap, ...) are released in lockstep, so every one this module requires directly belongs here. Group them so a bump is reviewed as the single decision it is, never as separate automerged patches.",
+      "description": "Cluster API and the Kubernetes client libraries move together: sigs.k8s.io/cluster-api vN is built against one k8s.io/* minor and one controller-runtime minor, and mixing them breaks the v1beta2 contract. The k8s.io staging modules (api, apimachinery, client-go, cluster-bootstrap, ...) are released in lockstep, so every one this module requires directly belongs here. Their minor and major bumps are grouped and held for approval so each is reviewed as the single decision it is; patch releases stay on the patch automerge rule above.",
       "groupName": "Cluster API and Kubernetes libraries",
       "matchManagers": [
         "gomod"
