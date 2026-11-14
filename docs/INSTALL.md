@@ -6,7 +6,7 @@ run with `clusterctl` v1.13.4 against a fresh kind management cluster
 flat-manifest path was run as an in-place upgrade on a k0s management cluster
 with CAPI v1.12.2. The "Registering the Kairos fleet infrastructure
 provider" section below documents `cluster-api-provider-kairos-fleet`
-v0.1.3's own `clusterctl.yaml` entry; it has not been re-verified by
+v0.1.4's own `clusterctl.yaml` entry; it has not been re-verified by
 running `clusterctl init --infrastructure kairos-fleet` in this repository's
 CI — see [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md) for the same
 caveat. Do not use fleet provider `v0.1.0-beta.1`: it crash-loops on a real
@@ -79,7 +79,7 @@ providers:
 ```
 
 Point `url` at a specific tag instead of `latest` to pin a version, for
-example `.../releases/v0.1.3/infrastructure-components.yaml` — the same URL
+example `.../releases/v0.1.4/infrastructure-components.yaml`, the same URL
 shape described above, with no `download/` segment.
 Do not pin `v0.1.0-beta.1`: that release crash-loops on a real management
 cluster and is not clusterctl-installable. Fleet claims already-enrolled

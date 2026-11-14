@@ -59,7 +59,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | CAPV | v1.11.x+ |
 | CAPK | KubeVirt v1.9.x / CAPK v0.1.x |
 | CAPM3 | v1.13+; BMO/Ironic v0.13+ |
-| kairos-fleet | v0.1.0+ (`cluster-api-provider-kairos-fleet`); v0.1.2+ recommended, since its shipped cluster template could not create workers before that. AuroraBoot — do not use fleet v0.1.0-beta.1, it crash-loops on a real management cluster |
+| kairos-fleet | v0.1.0+ (`cluster-api-provider-kairos-fleet`); v0.1.4+ recommended: it fixes machines stuck in `Terminating` (AuroraBoot unreachable, or after `clusterctl move` or a restore) and a refused reboot leaving a machine on `WaitingForNodeRejoin` forever, and v0.1.2 fixed a shipped cluster template that could not create workers. Requires an AuroraBoot fleet. Do not use fleet v0.1.0-beta.1: it crash-loops on a real management cluster |
 | k0s | ~v1.36.1+k0s |
 | k3s | ~v1.36.1+k3s1 |
 | kubeadm (workers only) | The kubeadm and kubelet version the node image ships; it must equal `Machine.spec.version` exactly. The control plane (Kamaji or `KubeadmControlPlane`) is run outside this provider |
