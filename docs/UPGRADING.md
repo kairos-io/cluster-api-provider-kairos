@@ -1,5 +1,15 @@
 # Upgrading Kairos CAPI Provider
 
+## Any version: providers registered as `kairos` in `clusterctl.yaml`
+
+The provider is registered upstream as `kairos-io`, and the install docs now
+use that name. An existing install keeps the name it was installed under, and
+`clusterctl upgrade` reads the provider's repository from the configuration
+entry with that recorded name. Keep your `name: "kairos"` entries to upgrade it
+as before. To switch to `kairos-io`, run `clusterctl delete` with the old name,
+then `clusterctl init` with the new one; see
+[INSTALL.md: Existing installs registered as `kairos`](INSTALL.md#existing-installs-registered-as-kairos).
+
 ## v0.2.0 → v0.2.1
 
 ### Behaviour changes to expect
@@ -14,6 +24,19 @@
 - **New control-plane Machines get random names**, `<kcp-name>-<5
   characters>`, in place of `-0`, `-1`, `-2`. Nothing to do on the upgrade;
   see [the section below](#control-plane-machine-names-are-random-and-never-reused).
+
+- **Pre-seed the workload identity pin on existing HA clusters.** Existing HA
+  control planes are pinned on the first reconcile after the upgrade, to
+  whatever cluster answers then. To be sure that is the right one, verify the
+  `kube-system` UID through every control-plane member and set the pin
+  annotation by hand before upgrading; a pre-set pin is never replaced. See
+  [Before upgrading an existing HA cluster](HIGH_AVAILABILITY.md#before-upgrading-an-existing-ha-cluster).
+- **While a control plane is frozen**, anything that waits on the Cluster
+  being `Ready` or `Available` (GitOps health checks, for example) holds.
+  That is intended, and worker joins continue. See the
+  [runbook](HIGH_AVAILABILITY.md#runbook-workloadclusteridentitychanged).
+- **The k0s join guard reaches only control-plane members created after the
+  upgrade.** Bootstrap data is not re-rendered.
 
 ### Control-plane Machine names are random and never reused
 
@@ -50,6 +73,70 @@ infrastructure Machine it made for that attempt; earlier releases left them
 in place and reused them on the next attempt. A leftover `<kcp-name>-<n>`
 `KairosConfig` from an earlier release that has no Machine is not adopted. You
 can delete it.
+
+## v0.1.5 → v0.2.0
+
+Full release notes: [v0.2.0](release-notes/v0.2.0.md). Upgrade with
+`clusterctl upgrade` (both providers), or re-apply the flat manifest for
+v0.2.0. `metadata.yaml` now lists the 0.2 series, with the same v1beta2
+contract.
+
+### Behaviour changes to expect
+
+- **Node pushes need a management CA.** By default, nodes verify the
+  management API against the controller's in-cluster CA. If nodes reach the
+  management API through a load balancer or proxy that CA does not cover, set
+  `KAIROS_MANAGEMENT_API_CA_FILE` on the bootstrap provider. Without a usable
+  CA, a control-plane `KairosConfig` reports
+  `BootstrapReady=False(ManagementCAUnavailable)` and no userdata is rendered.
+  See [Node-to-management pushes are now TLS-verified](#node-to-management-pushes-are-now-tls-verified).
+- **Nodes booted before the upgrade** keep their old bootstrap data. Their next
+  push is refused once (403) because their Role was narrowed; they pick up the
+  new behaviour when they are replaced. See
+  [Node-push RBAC narrows to patch-only, and the push target moves to a staging Secret](#node-push-rbac-narrows-to-patch-only-and-the-push-target-moves-to-a-staging-secret).
+- **Existing `<cluster>-kubeconfig` Secrets are revalidated**, and rebuilt or
+  left in place as described in
+  [Kubeconfig Secrets are adopted and canonicalized](#kubeconfig-secrets-are-adopted-and-canonicalized).
+- **Control-plane workload operations wait for the CA pin**, including the k0s
+  etcd leave and join-token issuance. The first reconcile after the upgrade may
+  requeue once.
+- **kubeadm workers** (new in this release) refuse a control plane whose
+  kubeconfig uses file paths, exec or auth-provider plugins, or several
+  contexts. `KubeadmControlPlane` and Kamaji publish self-contained
+  kubeconfigs and are unaffected.
+
+## v0.1.4 → v0.1.5
+
+Full release notes: [v0.1.5](release-notes/v0.1.5.md). Upgrade with
+`clusterctl upgrade` (both providers), or re-apply the flat manifest for
+v0.1.5.
+
+- **Nodes keep the bootstrap data they were created with.** The API
+  certificate SAN fix (#163), the kube-vip change (#182) and the
+  etcd-leave responder change (#183) reach only control-plane members created
+  after the upgrade, for example by a rollout. The control-plane changes
+  (#166, #181) apply at once. On a k0s HA cluster created with v0.1.4 or
+  earlier, replace the joiners before the first control-plane node; see
+  [HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md#fixed-in-v015-k0s-ha-rollouts-on-clusters-created-with-v014-or-earlier).
+- **A Machine already stuck in `Deleting`** at the etcd-leave hook recovers
+  after the upgrade. On members created before v0.1.5, Cluster API's own drain
+  can still wait on the old VIP holder. If the Machine stays at
+  `DrainingNode`, set `KairosControlPlane.spec.machineTemplate.nodeDrainTimeout`
+  (for example `2m`); if it then waits at volume detach, set
+  `spec.deletion.nodeVolumeDetachTimeoutSeconds` (for example `60`) on that
+  Machine.
+- **A joining member stuck on an old token** (Machine `Provisioned`, no Node)
+  does not recover on its own: delete that Machine, and a new one gets a token
+  from the control plane.
+- **kube-vip reaches the API server on loopback.** Members created after the
+  upgrade need the API server listening on `127.0.0.1:6443`, which is the k0s
+  and k3s default. A custom API server port, or a bind address that excludes
+  loopback, leaves the VIP down.
+- **The first rollout after the upgrade** can restart kube-vip a few times
+  while old and new members disagree on its spec. Each restart is a VIP
+  failover of a few seconds.
+- First control-plane nodes created by v0.1.4 or earlier keep a leftover
+  `/tmp/kairos-jointoken-push.log`. It is no longer used and can be deleted.
 
 ## v0.1.3 → v0.1.4
 
@@ -102,16 +189,6 @@ Drop the `download/` segment. A `clusterctl` provider `url` has the form
 or `releases/<tag>/...` to pin a version. The `download/` form works only until
 `clusterctl` falls back to the GitHub API, for example on a rate-limited or
 proxied network. See [INSTALL.md](INSTALL.md).
-
-### If you registered the providers as `kairos` in `clusterctl.yaml`
-
-The provider is registered upstream as `kairos-io`, and the install docs now
-use that name. An existing install keeps the name it was installed under, and
-`clusterctl upgrade` reads the provider's repository from the configuration
-entry with that recorded name. Keep your `name: "kairos"` entries to upgrade it
-as before. To switch to `kairos-io`, run `clusterctl delete` with the old name,
-then `clusterctl init` with the new one; see
-[INSTALL.md: Existing installs registered as `kairos`](INSTALL.md#existing-installs-registered-as-kairos).
 
 ### Upgrade
 

@@ -2,7 +2,7 @@
 
 Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.3.
 
-Kubeadm worker support (`distribution: kubeadm`, `spec.kubeadm`, `status.bootstrapTokenID`, and the `UnsupportedDistribution` reason) is on `main` and is not in v0.1.4. It is planned for v0.2.0. The v0.1.4 CRDs serve none of it.
+Kubeadm worker support (`distribution: kubeadm`, `spec.kubeadm`, `status.bootstrapTokenID`, and the `UnsupportedDistribution` reason) shipped in v0.2.0. The v0.1.x CRDs serve none of it.
 
 This document provides a reference for all Custom Resource Definitions (CRDs) provided by the Kairos CAPI Provider. See [Install guide](INSTALL.md) for development install. Quickstarts: [CAPD](QUICKSTART_CAPD.md), [CAPV](QUICKSTART_CAPV.md), [CAPK](QUICKSTART_CAPK.md), [CAPM3](QUICKSTART_CAPM3.md). Joining Kairos workers to a Kamaji or `KubeadmControlPlane` control plane: [Kubeadm workers](KUBEADM_WORKERS.md).
 

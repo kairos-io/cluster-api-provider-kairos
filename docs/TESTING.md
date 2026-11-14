@@ -6,7 +6,7 @@ See [Install guide](INSTALL.md) for development install.
 
 ## Prerequisites
 
-- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.2.1 release image is built with Go 1.26.10.
 
 ## Unit tests
 
@@ -105,6 +105,6 @@ Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3,
 | Fleet | k0s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 | Fleet | k3s | Supported: control plane + worker `MachineDeployment`, validated on real hardware (Hadron v4.1.2, Kubernetes v1.36.1) | Not exercised |
 
-**Not in v0.1.4; planned for v0.2.0.** On `main`, kubeadm workers (`distribution: kubeadm`, see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. They are covered by unit and envtest tests only: the envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. No end-to-end run against a live Kamaji or `KubeadmControlPlane` cluster has been done.
+kubeadm workers (`distribution: kubeadm`, since v0.2.0; see [Kubeadm workers](KUBEADM_WORKERS.md)) are not in the table above. The envtest suite drives the worker join against a real API server with a stand-in control-plane kind and a fake workload cluster. For v0.2.0 the path was also validated live with Kamaji, in three configurations, and with an upstream `KubeadmControlPlane` on KubeVirt (join, trust checks and DNS); there is no automated end-to-end run against either.
 
 Hadron is the musl-libc-based next-generation Kairos OS; it is exercised alongside standard (glibc) Kairos images to confirm compatibility with both targets.
