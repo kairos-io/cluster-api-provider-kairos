@@ -1,55 +1,45 @@
 # ============================================================================
 # Fleet Sample: k3s Control Plane + Worker on Kairos OS
-# (Kairos fleet / AuroraBoot infrastructure provider)
+# (KairosFleetMachine infrastructure)
 # ============================================================================
 #
-# This manifest provisions one control-plane machine plus a 1-replica worker
-# MachineDeployment on nodes CLAIMED from an already-enrolled AuroraBoot
-# fleet, via the Kairos fleet infrastructure provider
-# (cluster-api-provider-kairos-fleet, clusterctl name `kairos-fleet`). This
-# provider does not create VMs or provision bare metal itself: it claims a
-# node that is already enrolled with AuroraBoot, hands it a bootstrap
-# cloud-config, and reboots it. See ADR 0008 and docs/QUICKSTART_FLEET.md.
+# This manifest creates one control-plane machine plus a 1-replica worker
+# MachineDeployment, using the Kairos bootstrap and control-plane providers
+# with KairosFleetMachine infrastructure. The control plane clones the
+# KairosFleetMachineTemplate into a KairosFleetMachine per Machine. See
+# docs/QUICKSTART_FLEET.md.
 #
-# k3s is the reference / most-exercised fleet distribution. k0s is also
-# supported and newer; see kairos_cluster_k0s_with_workers.yaml in this
-# directory for the k0s variant (identical shape; only distribution and
-# version fields differ). k3s has no k0sSingleNode equivalent — k3s single-node
-# mode already accepts worker joins by default; see
-# kairos_cluster_k0s_single_node.yaml for the standalone-node case, which is
-# k0s-only.
+# For the k0s variant see kairos_cluster_k0s_with_workers.yaml in this
+# directory (same shape; only the distribution, version and worker-token
+# fields differ). k3s has no k0sSingleNode equivalent: a single-node k3s
+# control plane already accepts worker joins. kairos_cluster_k0s_single_node.yaml
+# shows the standalone-node case, which is k0s only.
 #
 # PREREQUISITES (all must be satisfied before applying this manifest):
 #
 #   1. Cluster API core v1.13.4+ installed on the management cluster.
 #
-#   2. The Kairos bootstrap and control-plane providers (this repo) and the
-#      Kairos fleet infrastructure provider installed:
-#        clusterctl init --bootstrap kairos --control-plane kairos \
-#          --infrastructure kairos-fleet
-#      See docs/QUICKSTART_FLEET.md and docs/INSTALL.md.
+#   2. The Kairos bootstrap and control-plane providers (this repo) installed
+#      as described in docs/INSTALL.md, plus the Kairos fleet infrastructure
+#      provider that serves the KairosFleetCluster, KairosFleetMachine and
+#      KairosFleetMachineTemplate kinds.
 #
-#   3. An AuroraBoot instance reachable from the management cluster, with:
-#        - an admin bearer token
-#        - at least one enrolled, unclaimed node in the "control-plane" group
-#        - at least one enrolled, unclaimed node in the "workers" group
+#   3. The KairosFleetCluster and KairosFleetMachineTemplate objects below
+#      (and any Secret they reference) belong to the Kairos fleet
+#      infrastructure provider. Fill them in as that provider requires.
+#      Values marked TODO must be supplied by you.
 #
-#   4. A control-plane endpoint (host:port) that you manage: a kube-vip VIP,
-#      a load balancer, or a DNS name, pointed at the control-plane node once
-#      it is up. This provider does NOT allocate or discover the endpoint
-#      (ADR 0008) — you must know it before the node is claimed, the same
-#      sharp edge as CAPM3's DHCP-reservation requirement.
+#   4. Control-plane nodes must be able to reach the management cluster's API
+#      server: they push their kubeconfig to a staging Secret there. Set
+#      KAIROS_MANAGEMENT_API_OVERRIDE on the bootstrap provider's Deployment
+#      to a URL the nodes can reach; see docs/INSTALL.md, "Set the URL the
+#      nodes push to".
 #
-#   5. The AuroraBoot admin-token Secret, created OUT OF BAND. Never put the
-#      token in a manifest that gets committed to version control:
+#   5. A strong user password. The Secret at the top of this file holds a
+#      placeholder; replace it before applying (see the comment on it).
 #
-#        kubectl create namespace default    # if it does not already exist
-#        kubectl create secret generic auroraboot-admin-token \
-#          --namespace default \
-#          --from-literal=token="$AURORABOOT_ADMIN_TOKEN"
-#
-#      $AURORABOOT_ADMIN_TOKEN should come from your own secret store or
-#      shell environment, not a hard-coded value.
+#   6. A worker join token Secret (fleet-demo-k3s-token below). The
+#      placeholder value must be replaced; see the comment on it.
 #
 # APPLY:
 #   kubectl apply -f config/samples/fleet/kairos_cluster_k3s_with_workers.yaml
@@ -57,24 +47,22 @@
 # ============================================================================
 #
 # SCOPE: a single control-plane machine (replicas: 1) plus a worker
-# MachineDeployment — fleet's validated topology. Fleet HA
-# (KairosControlPlane.spec.replicas: 3 or 5) is mechanically reachable but is
-# NOT exercised on fleet — no fleet HA sample is shipped (ADR 0008, "HA scope
-# (decision)"). See docs/HIGH_AVAILABILITY.md.
+# MachineDeployment, the validated topology. HA (KairosControlPlane
+# spec.replicas: 3 or 5) is not exercised with KairosFleetMachine
+# infrastructure and no HA sample is shipped. See docs/HIGH_AVAILABILITY.md.
 #
-# NO install: block anywhere below. AuroraBoot nodes are already enrolled and
-# installed; the bootstrap cloud-config is staged to the node's existing
-# /oem overlay and applied on reboot, not used to install a new OS. This is
-# the same reasoning as the CAPM3 whole-disk path — do not add an install:
-# block to either KairosConfigTemplate in this file.
+# NO install: block anywhere below. The rendered cloud-config is applied to a
+# node that already runs Kairos; do not add an install: block to a
+# KairosConfigTemplate in this file.
 #
 # ============================================================================
 
-# IMPORTANT: replace `password:` below with a strong value before applying.
-# `openssl rand -base64 32` generates a suitable value. Inline userPassword
-# in KairosConfig is deprecated; this Secret pattern is the recommended way
-# to provide it. Both KairosConfigTemplates (control plane and worker) below
-# reference this Secret.
+# IMPORTANT: replace `password:` below with a strong value before applying
+# (`openssl rand -base64 32` generates one), or delete this document and
+# create the Secret out of band instead. Do not set userPassword inline in a
+# KairosConfig; userPasswordSecretRef is the supported form. Both
+# KairosConfigTemplates (control plane and worker) below reference this
+# Secret.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -90,9 +78,8 @@ metadata:
   name: fleet-demo
   namespace: default
 spec:
-  # Optional: adjust to match your CNI/service-network configuration. These
-  # are the fleet template's own defaults; omit this block entirely to use
-  # your CNI's defaults instead.
+  # Optional: adjust to match your CNI/service-network configuration, or omit
+  # this block entirely to use your CNI's defaults.
   clusterNetwork:
     pods:
       cidrBlocks:
@@ -108,10 +95,8 @@ spec:
     apiGroup: controlplane.cluster.x-k8s.io
     kind: KairosControlPlane
     name: fleet-demo-control-plane
-  # Do NOT set spec.controlPlaneEndpoint here. Set it ONLY on
-  # KairosFleetCluster.spec.controlPlaneEndpoint below — CAPI core copies
-  # that value down into this field once KairosFleetCluster reports it.
-  # Setting it in both places risks the two drifting out of sync.
+  # spec.controlPlaneEndpoint is left unset here. Until it is populated the
+  # KairosControlPlane reports WaitingForInfrastructureControlPlaneEndpoint.
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
 kind: KairosFleetCluster
@@ -119,21 +104,13 @@ metadata:
   name: fleet-demo
   namespace: default
 spec:
-  # Operator-supplied; the provider does not allocate or discover it. Use a
-  # kube-vip VIP, a load balancer, or a DNS name you manage, pointed at the
-  # control-plane node once it is up. KairosFleetCluster does not report
-  # Provisioned until this is set, and KairosControlPlane stalls with
-  # Available=False(WaitingForInfrastructureControlPlaneEndpoint) until it
-  # does.
+  # TODO: fill in as the Kairos fleet infrastructure provider requires.
   controlPlaneEndpoint:
     host: "TODO-CONTROL-PLANE-ENDPOINT-HOST"
     port: 6443
+  # TODO: the remaining values below are the fleet infrastructure provider's.
   auroraboot:
-    # Base URL of the AuroraBoot fleet API.
     url: "https://auroraboot.example.com:8080"
-    # References the Secret created in prerequisite step 5 above. Must exist
-    # in this namespace with a non-empty "token" key before this
-    # KairosFleetCluster reconciles successfully.
     adminTokenSecretRef:
       name: auroraboot-admin-token
 ---
@@ -143,14 +120,13 @@ metadata:
   name: fleet-demo-control-plane
   namespace: default
 spec:
-  # Single control-plane only. Fleet HA (replicas: 3/5) is unexercised — see
-  # the header comment above and docs/HIGH_AVAILABILITY.md. Do not set
-  # spec.ha.vip here: it is unnecessary for a single control-plane node and
-  # setHAConditions is a no-op at replicas <= 1.
+  # Single control plane only. HA (replicas: 3/5) is not exercised with this
+  # infrastructure; see docs/HIGH_AVAILABILITY.md. spec.ha.vip is not set
+  # because it is unnecessary for a single control-plane node.
   replicas: 1
   version: "v1.34.3+k3s3"
-  # Explicit is recommended: an explicit value here always wins over the
-  # KairosConfigTemplate's distribution, removing any ambiguity.
+  # An explicit value here always wins over the KairosConfigTemplate's
+  # distribution. Keep it equal to the template and to your Kairos image.
   distribution: k3s
   machineTemplate:
     infrastructureRef:
@@ -169,9 +145,7 @@ metadata:
 spec:
   template:
     spec:
-      # AuroraBoot group this machine is claimed from. Must have at least one
-      # enrolled, unclaimed node, or the KairosFleetMachine stays
-      # WaitingForCapacity.
+      # TODO: fill in as the Kairos fleet infrastructure provider requires.
       group: control-plane
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
@@ -185,7 +159,7 @@ spec:
       role: control-plane
       distribution: k3s
       kubernetesVersion: "v1.34.3+k3s3"
-      # NO install: block — see the header comment above.
+      # No install: block; see the header comment above.
       userName: kairos
       # Password comes from the Secret defined at the top of this file.
       # Alternative: set sshPublicKey: and omit userPasswordSecretRef.
@@ -200,7 +174,7 @@ spec:
 ---
 # k3s workers join the control-plane server using this token. Create it out
 # of band (e.g. `k3s token create` on the control-plane node, or reuse the
-# server's node-token from /var/lib/rancher/k3s/server/node-token) — do not
+# server's node-token from /var/lib/rancher/k3s/server/node-token). Do not
 # commit a real token to version control.
 apiVersion: v1
 kind: Secret
@@ -249,8 +223,7 @@ metadata:
 spec:
   template:
     spec:
-      # AuroraBoot group worker machines are claimed from. Must have at
-      # least one enrolled, unclaimed node per desired worker replica.
+      # TODO: fill in as the Kairos fleet infrastructure provider requires.
       group: workers
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
@@ -264,7 +237,7 @@ spec:
       role: worker
       distribution: k3s
       kubernetesVersion: "v1.34.3+k3s3"
-      # NO install: block — see the header comment above.
+      # No install: block; see the header comment above.
       k3sTokenSecretRef:
         name: fleet-demo-k3s-token
         key: token

@@ -13,7 +13,7 @@ HA control planes need a stable endpoint that survives the loss of any one node.
 
 - **CAPV and CAPM3**: configure a kube-vip virtual IP via `spec.ha.vip`. `Cluster.spec.controlPlaneEndpoint.host` must equal `spec.ha.vip.address` — CAPI core copies the InfraCluster's endpoint into `Cluster.spec.controlPlaneEndpoint`, and every node and kubeconfig targets that value.
 - **CAPK**: do not set `spec.ha.vip`. CAPK provisions its own LoadBalancer Service and reflects its IP into the control-plane endpoint; a kube-vip VIP alongside it would produce a conflicting ARP announcement. CAPK k0s HA has one further requirement the provider cannot supply — the Kairos image must carry a k0s start gate, or the control plane deadlocks below quorum. See [QUICKSTART_CAPK.md — k0s HA: the image start gate](QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate).
-- **Fleet (Kairos fleet / AuroraBoot)**: the control-plane endpoint is operator-supplied on `KairosFleetCluster.spec.controlPlaneEndpoint` (a kube-vip VIP, load balancer, or DNS name you manage) — the provider allocates and discovers nothing. **HA (`replicas: 3`/`5`) is not yet exercised on fleet: single control-plane only today.** No fleet HA sample is shipped (ADR 0008). See [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md).
+- **`KairosFleetMachine` infrastructure**: the `KairosControlPlane` takes its endpoint from `Cluster.spec.controlPlaneEndpoint`, which Cluster API core copies from the `KairosFleetCluster`; until it is set the control plane reports `WaitingForInfrastructureControlPlaneEndpoint`. **HA (`replicas: 3`/`5`) is not exercised on this infrastructure: single control plane only today.** No HA sample is shipped for it. See [docs/QUICKSTART_FLEET.md](QUICKSTART_FLEET.md).
 - **CAPD**: dev-only; HA is not exercised.
 
 ```yaml
@@ -41,7 +41,7 @@ See the [CAPV HA quickstart walkthrough](QUICKSTART_CAPV.md#high-availability-3-
 ## Known issue: k0s HA rollouts on v0.1.4
 
 Affects k0s HA control planes on every infrastructure provider except CAPK
-(CAPV, CAPM3, the Kairos fleet provider, and the generic path), in v0.1.4 and
+(CAPV, CAPM3, `KairosFleetMachine`, and the generic path), in v0.1.4 and
 earlier. k3s and CAPK are not affected.
 
 In these releases only the first control-plane node puts the control-plane
@@ -181,7 +181,7 @@ While frozen:
 - `Ready`, `Available` and `EtcdHealthy` are `False` (Error) with reason `WorkloadClusterIdentityChanged`, and a Warning event `WorkloadClusterIdentityChanged` names the pinned UID, the UID read, and where it was read from;
 - the controller creates and deletes no control-plane Machine and removes no etcd-leave hook, so a k0s Machine deleted by you or a MachineHealthCheck stays at its pre-terminate hook, its VM and etcd data intact;
 - the controller writes nothing to the workload cluster (no etcd-leave request, no join token, no orphan etcd-member removal);
-- anything that waits on the Cluster being `Ready` or `Available` (GitOps health checks, the fleet provider) holds too, which is intended;
+- anything that waits on the Cluster being `Ready` or `Available` (GitOps health checks) holds too, which is intended;
 - deleting the whole cluster still works.
 
 The freeze is sticky on purpose: it never clears by itself, because the two clusters can keep answering in turn. A wrong edit to the pin annotation also freezes the control plane.

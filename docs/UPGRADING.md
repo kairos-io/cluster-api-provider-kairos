@@ -230,12 +230,6 @@ stop k0s starting during the install boot. See
 mechanism, the failure signature, and how to verify your image has it. The fix
 is image-side, so upgrading the provider does not supply it.
 
-### If you use the Kairos fleet provider
-
-Fleet provider v0.1.2 is recommended alongside this release: before it, the
-cluster template it ships could not create worker machines at all. See its own
-[release notes](https://github.com/kairos-io/cluster-api-provider-kairos-fleet/blob/main/docs/release-notes/v0.1.2.md).
-
 ---
 
 ## v0.1.0-alpha.1 → v0.1.0-alpha.2
