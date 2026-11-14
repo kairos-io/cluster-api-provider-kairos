@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), provider v0.1.3.
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), and the CRDs, API types, webhooks and controllers of provider v0.2.1 (main at e87fa97). Checked field by field: every spec and status field of the four CRDs, defaults, enums, validation rules, condition types and reasons, annotations, labels, events, YAML examples, and links. Not re-verified line by line: the HA runbook prose under [Workload cluster identity](#workload-cluster-identity) and [k0s etcd leave and orphan members](#k0s-etcd-leave-and-orphan-members) (checked against the annotation names, timeouts, reasons and events in the controller only), and the static-IP guidance under [Writing files to nodes](#writing-files-to-nodes).
 
 Kubeadm worker support (`distribution: kubeadm`, `spec.kubeadm`, `status.bootstrapTokenID`, and the `UnsupportedDistribution` reason) shipped in v0.2.0. The v0.1.x CRDs serve none of it.
 
@@ -31,43 +31,46 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 |-------|------|----------|---------|-------------|
 | `role` | `string` | No | `"worker"` | Node role: `"control-plane"` or `"worker"`. `distribution: kubeadm` accepts `"worker"` only; the validating webhook rejects `"control-plane"`. |
 | `distribution` | `string` | No | `"k0s"` | Kubernetes distribution: `"k0s"`, `"k3s"`, or `"kubeadm"`. `kubeadm` joins a Kairos worker to an existing kubeadm control plane (Kamaji `KamajiControlPlane` or `KubeadmControlPlane`) and is worker-only. `KairosControlPlane.spec.distribution` does not accept `kubeadm`. See [kubeadm workers](#kubeadm-workers). |
-| `kubernetesVersion` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). For k0s and k3s the value is informational — the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. For `distribution: kubeadm` the version that must match the image is `Machine.spec.version`, not this field; keep the two equal and use the plain upstream form (for example `"v1.36.1"`). |
-| `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. What single-node mode renders is distribution- and infrastructure-specific: for k3s it enables cluster-init mode on every infrastructure provider; for k0s on CAPK it renders `--single`; for k0s on the generic / CAPV / CAPM3 / fleet render path it renders `--enable-worker` by default, or `--single` when `k0sSingleNode` is also `true` (see `k0sSingleNode` below). Tracked as a deprecation candidate in KD-39. |
+| `kubernetesVersion` | `string` | Yes | None | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). For k0s and k3s the value is informational: the actual version is pinned in the Kairos image at build time and cannot be changed by this field. See KD-24. For `distribution: kubeadm` the version that must match the image is `Machine.spec.version`, not this field; keep the two equal and use the plain upstream form (for example `"v1.36.1"`). |
+| `singleNode` | `bool` | No | `false` | Signals single-node mode to the cloud-config renderer. The KairosControlPlane controller derives this from `replicas==1`, so manual overrides are typically unnecessary. What single-node mode renders is distribution- and infrastructure-specific: the k3s templates do not read it (k3s renders `--cluster-init` only for `controlPlaneRole: init`); for k0s on CAPK it renders `--single`; for k0s on the generic / CAPV / CAPM3 / fleet render path it renders `--enable-worker` by default, or `--single` when `k0sSingleNode` is also `true` (see `k0sSingleNode` below). Marked deprecated in the Go type and tracked for removal in a future API version (KD-39); `controlPlaneRole` is the replacement. |
 | `k0sSingleNode` | `*bool` | No | `false` | For a single-node k0s control plane (`singleNode: true`, `distribution: k0s`) on the generic / CAPV / CAPM3 / fleet render path, selects which k0s single-node flag is rendered. `false` (the default) renders `--enable-worker`: a joinable, schedulable controller that runs workloads itself and accepts worker joins, so a control-plane-plus-worker cluster works out of the box. `true` renders `--single`: a standalone all-in-one node that refuses all joins ("cannot join into a single node cluster") — use this only for a node that will never gain workers. Ignored by k3s and by worker/join nodes, and has no effect on CAPK, which always renders `--single` for single-node k0s. |
 | `userName` | `string` | No | `"kairos"` | Username for the default OS user. |
-| `userPassword` | `string` | No | — | Password for the default OS user, specified inline. Inline values are stored in the resource and visible to anyone with read access to KairosConfig objects. Prefer `userPasswordSecretRef`. At least one of `userPassword`, `userPasswordSecretRef`, `sshPublicKey`, or `githubUser` must be set; the validating webhook enforces this. If both `userPassword` and `userPasswordSecretRef` are set, `userPasswordSecretRef` takes precedence. |
-| `userPasswordSecretRef` | `UserPasswordSecretReference` | No | — | Reference to a Secret containing the OS user password. The Secret must have a key matching `userPasswordSecretRef.key` (default: `"password"`). Preferred over inline `userPassword`. |
+| `userPassword` | `string` | No | None | Password for the default OS user, specified inline. Inline values are stored in the resource and visible to anyone with read access to KairosConfig objects. Prefer `userPasswordSecretRef`. At least one of `userPassword`, `userPasswordSecretRef`, `sshPublicKey`, or `githubUser` must be set; the validating webhook enforces this. If both `userPassword` and `userPasswordSecretRef` are set, `userPasswordSecretRef` takes precedence. |
+| `userPasswordSecretRef` | `UserPasswordSecretReference` | No | None | Reference to a Secret containing the OS user password. The Secret must have a key matching `userPasswordSecretRef.key` (default: `"password"`). Preferred over inline `userPassword`. |
 | `userGroups` | `[]string` | No | `["admin"]` | Groups for the default OS user. |
-| `githubUser` | `string` | No | — | GitHub username for SSH key access. The Kairos image fetches the user's public keys from `https://github.com/<githubUser>.keys` at boot. |
-| `sshPublicKey` | `string` | No | — | Raw SSH public key (alternative to `githubUser`). |
-| `serverAddress` | `string` | No | — | Kubernetes API server address for worker nodes to join (e.g., `"https://10.0.0.1:6443"`). |
-| `token` | `string` | No | — | Generic join token for worker nodes (inline). Prefer `tokenSecretRef`. |
-| `tokenSecretRef` | `ObjectReference` | No | — | Reference to a Secret containing a generic join token. |
-| `workerToken` | `string` | No | — | k0s worker join token, inline. Prefer `workerTokenSecretRef`. If both are set, `workerTokenSecretRef` takes precedence. |
-| `workerTokenSecretRef` | `WorkerTokenSecretReference` | No | — | Reference to a Secret containing the k0s worker join token. Required for k0s workers; prefer this over inline `workerToken`. |
-| `k3sToken` | `string` | No | — | k3s join token, inline. Prefer `k3sTokenSecretRef`. If both are set, `k3sTokenSecretRef` takes precedence. |
-| `k3sTokenSecretRef` | `WorkerTokenSecretReference` | No | — | Reference to a Secret containing the k3s join token. Required for k3s workers; prefer this over inline `k3sToken`. |
-| `caCertHashes` | `[]string` | No | — | Reserved; not implemented. The value is accepted and stored, but no controller reads it and it is rendered into no cloud-config, so setting it does not pin the join to a CA. Setting it produces an admission warning. Neither distribution can consume it: a k0s worker joins with the bundle `k0s token create` produces, which already carries the cluster CA, and a k3s agent takes no CA-hash flag. To get k3s to validate the server, pass the server's full node-token (`K10<hash>::server:<password>`) as `k3sToken` / `k3sTokenSecretRef`. See kairos-io/kairos#4937. |
-| `caCertSecretRef` | `ObjectReference` | No | — | Reserved; not implemented. The reference is accepted and stored, but no controller reads the Secret and its contents reach no node. Setting it produces an admission warning. Use `files` to place a CA certificate on the node. See kairos-io/kairos#4937. |
-| `hostname` | `string` | No | — | Hostname to set on the node inside the VM. Takes precedence over `hostnamePrefix` when both are set. On control-plane configs (`role: control-plane`) it must be a lowercase DNS-1123 label (at most 63 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit) with no `{{` template markup: the control plane finds the node's k0s etcd member by this name. Enforced on create, and on update only when the field changes, so existing objects keep their value. Worker configs are not checked. A `KairosControlPlane` applies the same rule to the `KairosConfigTemplate` it references: it emits a Warning event `InvalidControlPlaneHostname` and creates no control-plane Machine from a template that breaks it. |
-| `hostnamePrefix` | `string` | No | `"metal-"` | Prefix for the auto-generated hostname. The final hostname is `{hostnamePrefix}{4-char-machine-id}`. |
-| `dnsServers` | `[]string` | No | — | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). |
-| `podCIDR` | `string` | No | — | Pod network CIDR for k0s. Uses k0s defaults when unset. |
-| `serviceCIDR` | `string` | No | — | Service network CIDR for k0s. Uses k0s defaults when unset. |
-| `primaryIP` | `string` | No | — | Overrides the detected node IP used for TLS certificate SANs and endpoint configuration (sets `KAIROS_PRIMARY_IP`). Useful in KubeVirt environments where the detected IP is a pod network address rather than the VM's accessible address. |
-| `install` | `InstallConfig` | No | — | Controls Kairos OS installation to disk. Required when using the 2-disk installer pattern (see `config/samples/capk/`). |
-| `files` | `[]File` | No | — | Files to write on the node via the cloud-config `write_files:` list. Rendered on all distributions and all infrastructure providers. At most 32 entries; each file content is limited to 32 KiB. See [File](#file) for the sub-type and [Writing files to nodes](#writing-files-to-nodes) for usage guidance and the static-IP caveat. |
-| `manifests` | `[]Manifest` | No | — | Kubernetes manifests placed in the distribution's auto-apply directory. k0s: `/var/lib/k0s/manifests/{name}/{file}`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/{file}`. Applied automatically by the distribution at cluster startup. |
-| `preCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
-| `postCommands` | `[]string` | No | — | Reserved; not yet rendered into the cloud-config. |
+| `githubUser` | `string` | No | None | GitHub username for SSH key access. The Kairos image fetches the user's public keys from `https://github.com/<githubUser>.keys` at boot. |
+| `sshPublicKey` | `string` | No | None | Raw SSH public key (alternative to `githubUser`). |
+| `serverAddress` | `string` | No | None | Kubernetes API server address for worker nodes to join (e.g., `"https://10.0.0.1:6443"`). A k3s worker needs this or a populated `Cluster.spec.controlPlaneEndpoint`; rendering fails without either. |
+| `token` | `string` | No | None | Generic join token for worker nodes (inline). Lowest precedence: used only when none of `workerTokenSecretRef`, `workerToken`, `tokenSecretRef` (and, for k3s, `k3sTokenSecretRef`, `k3sToken`) yields a token. The validating webhook still requires a k0s worker to set `workerToken` or `workerTokenSecretRef` and a k3s worker to set one of the four k3s or worker token fields, so this field alone does not satisfy admission. Prefer `workerTokenSecretRef` or `k3sTokenSecretRef`. |
+| `tokenSecretRef` | `ObjectReference` | No | None | Reference to a Secret containing a generic join token. Only `name` is used: the Secret is read from the owning Cluster's namespace (any `namespace` in the reference is ignored), and the token is read from the `token` key, or the `value` key if `token` is absent. Same precedence and admission caveat as `token`. |
+| `workerToken` | `string` | No | None | k0s worker join token, inline. Also accepted for k3s workers, after `k3sTokenSecretRef` and `k3sToken`. Prefer `workerTokenSecretRef`. If both are set, `workerTokenSecretRef` takes precedence. |
+| `workerTokenSecretRef` | `WorkerTokenSecretReference` | No | None | Reference to a Secret containing the k0s worker join token. A k0s worker must set this or `workerToken`; the validating webhook rejects a worker with neither. Prefer this over inline `workerToken`. |
+| `k3sToken` | `string` | No | None | k3s join token, inline. Prefer `k3sTokenSecretRef`. If both are set, `k3sTokenSecretRef` takes precedence. |
+| `k3sTokenSecretRef` | `WorkerTokenSecretReference` | No | None | Reference to a Secret containing the k3s join token. A k3s worker must set one of `k3sToken`, `k3sTokenSecretRef`, `workerToken` or `workerTokenSecretRef`; the validating webhook rejects a worker with none. Prefer this over inline `k3sToken`. For k3s HA joiners the control plane sets it to the shared server token Secret. |
+| `controlPlaneRole` | `string` | No | None | Set by the `KairosControlPlane` controller on each control-plane Machine's config; do not set it directly. One of `single`, `init` or `join`: `single` for a `replicas: 1` control plane, `init` for the first node of an HA control plane, `join` for every later HA node. Unset is treated as `single`. Ignored on worker roles. |
+| `controlPlaneJoinTokenSecretRef` | `WorkerTokenSecretReference` | No | None | Set by the `KairosControlPlane` controller; do not set it directly. Reference to the Secret holding the k0s controller-role join token that an HA `join` node uses. k0s only; k3s HA joiners use `k3sTokenSecretRef`. There is no inline form. |
+| `controlPlaneVIP` | `ControlPlaneVIP` | No | None | Set by the `KairosControlPlane` controller; do not set it directly. A copy of `KairosControlPlane.spec.ha.vip` that the renderer uses to emit the kube-vip manifest on HA control-plane nodes (`init` and `join` roles on non-CAPK infrastructure). See [ControlPlaneVIP](#controlplanevip). |
+| `caCertHashes` | `[]string` | No | None | Reserved; not implemented. The value is accepted and stored, but no controller reads it and it is rendered into no cloud-config, so setting it does not pin the join to a CA. Setting it produces an admission warning. Neither distribution can consume it: a k0s worker joins with the bundle `k0s token create` produces, which already carries the cluster CA, and a k3s agent takes no CA-hash flag. To get k3s to validate the server, pass the server's full node-token (`K10<hash>::server:<password>`) as `k3sToken` / `k3sTokenSecretRef`. See kairos-io/kairos#4937. |
+| `caCertSecretRef` | `ObjectReference` | No | None | Reserved; not implemented. The reference is accepted and stored, but no controller reads the Secret and its contents reach no node. Setting it produces an admission warning. Use `files` to place a CA certificate on the node. See kairos-io/kairos#4937. |
+| `hostname` | `string` | No | None | Hostname to set on the node inside the VM. When unset, the controller renders the owning Machine's name as the hostname. On control-plane configs (`role: control-plane`) it must be a lowercase DNS-1123 label (at most 63 characters of `a-z`, `0-9` and `-`, starting and ending with a letter or digit) with no `{{` template markup: the control plane finds the node's k0s etcd member by this name. Enforced on create, and on update only when the field changes, so existing objects keep their value. Worker configs are not checked. A `KairosControlPlane` applies the same rule to the `KairosConfigTemplate` it references: it emits a Warning event `InvalidControlPlaneHostname` and creates no control-plane Machine from a template that breaks it. |
+| `hostnamePrefix` | `string` | No | `"metal-"` | Prefix for a generated hostname of the form `{hostnamePrefix}{4-char-machine-id}`. In practice not used: the controller always renders `hostname`, or the owning Machine's name when `hostname` is unset, and that value takes precedence over the prefix. |
+| `dnsServers` | `[]string` | No | None | DNS resolvers configured for early boot, before cluster DNS is ready (useful for pulling CNI images). |
+| `podCIDR` | `string` | No | None | Pod network CIDR for k0s. Uses k0s defaults when unset. Rendered by the k0s templates only; ignored for k3s and kubeadm. |
+| `serviceCIDR` | `string` | No | None | Service network CIDR for k0s. Uses k0s defaults when unset. Rendered by the k0s templates only; ignored for k3s and kubeadm. |
+| `primaryIP` | `string` | No | None | Overrides the detected node IP used for TLS certificate SANs and endpoint configuration (sets `KAIROS_PRIMARY_IP`). Useful in KubeVirt environments where the detected IP is a pod network address rather than the VM's accessible address. |
+| `install` | `InstallConfig` | No | None | Controls Kairos OS installation to disk. Required when using the 2-disk installer pattern (see `config/samples/capk/`). |
+| `files` | `[]File` | No | None | Files to write on the node via the cloud-config `write_files:` list. Rendered on all distributions and all infrastructure providers. At most 32 entries; each file content is limited to 32 KiB. The admission webhook and the CRD schema reject violations. See [File](#file) for the sub-type and [Writing files to nodes](#writing-files-to-nodes) for usage guidance and the static-IP caveat. |
+| `manifests` | `[]Manifest` | No | None | Kubernetes manifests placed in the distribution's auto-apply directory. k0s: `/var/lib/k0s/manifests/{name}/{file}`. k3s: `/var/lib/rancher/k3s/server/manifests/{name}/{file}`. Applied automatically by the distribution at cluster startup, on control-plane nodes only. Not rendered for `distribution: kubeadm`. |
+| `preCommands` | `[]string` | No | None | Reserved; not yet rendered into the cloud-config. |
+| `postCommands` | `[]string` | No | None | Reserved; not yet rendered into the cloud-config. |
 | `pause` | `bool` | No | `false` | When `true`, pauses reconciliation of this KairosConfig. A paused Cluster pauses it as well; see [Pause](#pause). |
-| `kubeadm` | `KubeadmConfig` | No | — | kubeadm-specific inputs for a worker join. Honoured only when `distribution` is `kubeadm` and `role` is `worker`; ignored for k0s and k3s. All fields are optional. See [KubeadmConfig](#kubeadmconfig). |
+| `kubeadm` | `KubeadmConfig` | No | None | kubeadm-specific inputs for a worker join. Honoured only when `distribution` is `kubeadm` and `role` is `worker`; ignored for k0s and k3s. All fields are optional. See [KubeadmConfig](#kubeadmconfig). |
 
 #### UserPasswordSecretReference
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `name` | `string` | Yes | — | Name of the Secret. |
+| `name` | `string` | Yes | None | Name of the Secret. |
 | `key` | `string` | No | `"password"` | Key within the Secret that contains the password. |
 | `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. It must be the KairosConfig's own namespace: a different one is rejected by the validating webhook and refused by the controller, because the value it points at is copied into the bootstrap Secret beside the KairosConfig. |
 
@@ -75,9 +78,19 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `name` | `string` | Yes | — | Name of the Secret. |
+| `name` | `string` | Yes | None | Name of the Secret. |
 | `key` | `string` | No | `"token"` | Key within the Secret containing the token. |
 | `namespace` | `string` | No | Same as KairosConfig | Namespace of the Secret. It must be the KairosConfig's own namespace: a different one is rejected by the validating webhook and refused by the controller, because the value it points at is copied into the bootstrap Secret beside the KairosConfig. |
+
+#### ControlPlaneVIP
+
+`spec.controlPlaneVIP`. Controller-set copy of `KairosControlPlane.spec.ha.vip`; see [KubeVIPConfig](#kubevipconfig) for the meaning of each field.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `address` | `string` | Yes | None | Virtual IP address or DNS hostname for the control-plane endpoint. 1 to 253 characters. |
+| `interface` | `string` | Yes | None | Linux network interface on which kube-vip advertises the VIP. 1 to 15 characters matching `^[a-zA-Z][a-zA-Z0-9._-]{0,14}$`. |
+| `mode` | `string` | No | `"ARP"` | `"ARP"` or `"BGP"`. |
 
 #### InstallConfig
 
@@ -91,10 +104,10 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | `string` | Yes | Absolute path where the file is written on the node. Must begin with `/`. Must not contain `..` path segments. |
-| `content` | `string` | Yes | File content. Multi-line strings are accepted. Maximum 32 KiB (32768 bytes). |
-| `permissions` | `string` | No | File mode in octal notation. Accepts 3-digit or 4-digit forms; the leading digit encodes setuid (4), setgid (2), and sticky (1) bits. Examples: `"0644"`, `"0750"`, `"4755"`. |
-| `owner` | `string` | No | File owner in `user:group` format (e.g., `"root:root"`). The group portion including the colon is optional. |
+| `path` | `string` | Yes | Absolute path where the file is written on the node. Must begin with `/` (CRD pattern `^/`). Must not contain `..` path segments (webhook). |
+| `content` | `string` | Yes | File content. Multi-line strings are accepted. Maximum 32768 bytes (32 KiB); enforced by the CRD schema. |
+| `permissions` | `string` | No | File mode in octal notation. Must match `^0?[0-7]{3,4}$`: three or four octal digits, with an optional leading `0`. In the four-digit form the leading digit encodes setuid (4), setgid (2), and sticky (1) bits. Examples: `"644"`, `"0644"`, `"0750"`, `"4755"`. |
+| `owner` | `string` | No | File owner in `user` or `user:group` format (e.g., `"root:root"`). Each part must match `[a-z_][a-z0-9_-]*`: lowercase letters, digits, `_` and `-`, starting with a letter or `_`. The group portion including the colon is optional. |
 
 #### Manifest
 
@@ -110,7 +123,7 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `joinConfiguration` | `JoinConfiguration` | No | — | The kubeadm `JoinConfiguration` for the worker join. The schema is the `JoinConfiguration` of Cluster API's kubeadm bootstrap provider (`bootstrap.cluster.x-k8s.io/v1beta2`); every field is optional. The controller sets or overwrites `nodeRegistration.name` (the Machine name, unless you set it), `discovery.bootstrapToken` (the minted token, the control-plane endpoint, and the cluster CA hash), and `discovery.file` (cleared); it adds the `node.cluster.x-k8s.io/uninitialized:NoSchedule` taint to `nodeRegistration.taints` and keeps any taints you set. All other fields pass through. Do not set `controlPlane`: control-plane joins are not supported in this release. Secret-bearing and trust-weakening fields are rejected at admission; see [Admission refusals](KUBEADM_WORKERS.md#admission-refusals). |
+| `joinConfiguration` | `JoinConfiguration` | No | None | The kubeadm `JoinConfiguration` for the worker join. The schema is the `JoinConfiguration` of Cluster API's kubeadm bootstrap provider (`bootstrap.cluster.x-k8s.io/v1beta2`); every field is optional. The controller sets or overwrites `nodeRegistration.name` (the Machine name, unless you set it), `discovery.bootstrapToken` (the minted token, the control-plane endpoint, and the cluster CA hash), and `discovery.file` (cleared); it adds the `node.cluster.x-k8s.io/uninitialized:NoSchedule` taint to `nodeRegistration.taints` and keeps any taints you set. All other fields pass through. Do not set `controlPlane`: control-plane joins are not supported in this release. Secret-bearing and trust-weakening fields are rejected at admission; see [Admission refusals](KUBEADM_WORKERS.md#admission-refusals). |
 
 ### Status Fields
 
@@ -120,9 +133,9 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 | `dataSecretName` | `*string` | Name of the Secret containing the bootstrap cloud-config. |
 | `initialization.dataSecretCreated` | `bool` | v1beta2 contract field: `true` when the bootstrap Secret has been created. |
 | `bootstrapTokenID` | `string` | Non-secret ID (the six-character prefix) of the kubeadm bootstrap token this KairosConfig uses. The token Secret in the workload cluster is `kube-system/bootstrap-token-<id>`. Every render of the bootstrap data reuses this token, and the controller extends its expiry while the Machine has no `nodeRef`; it is revoked and cleared once the Machine has one, or when the KairosConfig is deleted. See [Token lifetime](KUBEADM_WORKERS.md#token-lifetime-and-failed-joins). The secret half of the token is never stored in `spec` or `status`. Empty for k0s and k3s, for a kubeadm worker that has not yet minted a token, and after revocation. |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) and, for control-plane roles, [Waiting for the kubeconfig push target](#waiting-for-the-kubeconfig-push-target) and [Management API CA unavailable](#management-api-ca-unavailable) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
+| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `BootstrapReady`, `DataSecretAvailable`. All three are `True` (no reason) once the bootstrap Secret is written. See [Waiting for cluster infrastructure](#waiting-for-cluster-infrastructure) and, for control-plane roles, [Waiting for the kubeconfig push target](#waiting-for-the-kubeconfig-push-target) and [Management API CA unavailable](#management-api-ca-unavailable) for the reasons these carry before the bootstrap Secret is written, and [kubeadm workers](#kubeadm-workers) for the reasons a kubeadm worker adds. |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
-| `failureReason` | `string` | Short machine-readable string indicating the last failure reason. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
+| `failureReason` | `string` | Short machine-readable string indicating the last failure reason. The controller sets only `BootstrapDataSecretGenerationFailed`. Cleared automatically when the next reconcile succeeds; a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable description of the last failure. Cleared automatically on the next successful reconcile. If non-empty, check the owning Machine's events for context. |
 
 ### Waiting for cluster infrastructure
@@ -165,9 +178,15 @@ Requirements that surface as API behavior:
   equal the kubeadm version in the node image exactly.
 - The owner must be a `MachineDeployment`; a `MachinePool` owner is refused.
 - The webhook rejects, on a kubeadm `KairosConfig`: `role: control-plane`, an inline
-  bootstrap token, `unsafeSkipCAVerification`, `discovery.file`, any `{{` in
-  `spec.kubeadm`, and a `nodeRegistration.name` that is not a DNS-1123 subdomain.
-  It runs on `KairosConfig`, not on `KairosConfigTemplate`.
+  bootstrap token (`discovery.bootstrapToken.token`), an inline
+  `discovery.tlsBootstrapToken`, `unsafeSkipCAVerification`, `discovery.file`, a
+  `joinConfiguration.controlPlane` section, any `{{` in `spec.kubeadm`, a
+  `nodeRegistration.name` that is not a DNS-1123 subdomain, and a
+  `patches.directory` that is not a clean absolute path under `/etc/kubernetes/`
+  (and not `/etc/kubernetes/manifests` or below it). It runs on `KairosConfig`,
+  not on `KairosConfigTemplate`: no admission webhook is registered for
+  `KairosConfigTemplate`, so a template carrying these values is accepted and the
+  `KairosConfig` created from it is rejected.
 - The control-plane kinds a worker may join are `KubeadmControlPlane` and
   `KamajiControlPlane`. The operator can add kinds with the manager flag
   `--kubeadm-extra-controlplane-kinds` (see
@@ -314,6 +333,8 @@ spec:
 
 `KairosConfigTemplate` is a template for creating `KairosConfig` resources. Used by `MachineDeployment` and `KairosControlPlane` to create per-machine bootstrap configurations.
 
+No admission webhook is registered for `KairosConfigTemplate`: only the CRD schema is enforced when a template is applied. The `KairosConfig` webhook rules (credential requirement, worker tokens, `files` and `kubeadm` checks, Secret namespace checks) apply when a `KairosConfig` is created from the template, so an invalid template is accepted and the failure appears later. The one exception is `spec.template.spec.hostname` on a control-plane template, which the `KairosControlPlane` checks; see the `hostname` row.
+
 ### Spec Fields
 
 | Field | Type | Required | Description |
@@ -362,14 +383,14 @@ spec:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `replicas` | `*int32` | No | `1` | Number of control plane machines. One of `1`, `3`, or `5` — the validating webhook rejects even counts (they provide the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance). `1` configures a single-node control plane. `3` or `5` configure a highly-available control plane; set `ha.vip` for infrastructure providers that do not supply a load-balanced endpoint (CAPV, CAPM3, CAPD). |
-| `version` | `string` | Yes | — | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. Changing it on an HA control plane replaces the control-plane Machines one at a time. On a single-node control plane it replaces nothing, because a replacement would start a separate, empty cluster; see [MachinesUpToDate condition](#machinesuptodate-condition). |
-| `distribution` | `string` | No | `"k0s"` | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. `"kubeadm"` is not accepted: it is rejected at admission, and a referenced `KairosConfigTemplate` with `distribution: kubeadm` sets `Ready` and `Available` to `False` with reason `UnsupportedDistribution` (see [kubeadm workers](#kubeadm-workers)). k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d — see [Multi-Node Control Planes](#multi-node-control-planes)). |
-| `machineTemplate` | `KairosControlPlaneMachineTemplate` | Yes | — | Template for creating control plane Machines. |
-| `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | — | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
-| `rolloutStrategy` | `RolloutStrategy` | No | — | Strategy for rolling out updates. |
-| `ha` | `HAConfig` | No | — | High-availability configuration, used when `replicas` is `3` or `5`. Ignored when `replicas` is `1`; setting it on a single-node control plane produces a non-blocking admission warning. See [HAConfig](#haconfig). |
-| `sshFallback` | `SSHFallback` | No | — | Opt-in SSH-pull fallback for retrieving the workload-cluster kubeconfig when the in-VM node-push path is unreachable (typically air-gapped deployments). Off by default. See [SSHFallback](#sshfallback). |
+| `replicas` | `*int32` | No | `1` | Number of control plane machines. One of `1`, `3`, or `5`. The CRD schema enforces a minimum of `1` and a maximum of `5`; the validating webhook rejects even counts (they provide the same etcd fault tolerance as the next-lower odd count while raising the quorum requirement) and values above `5` (beyond 5 members the quorum cost outweighs the added fault tolerance). `1` configures a single-node control plane. `3` or `5` configure a highly-available control plane; set `ha.vip` for infrastructure providers that do not supply a load-balanced endpoint (CAPV, CAPM3, CAPD). |
+| `version` | `string` | Yes | None | Kubernetes version string (e.g., `"v1.34.1+k0s.1"`). Informational; the actual k8s version is pinned in the Kairos image. Changing it on an HA control plane replaces the control-plane Machines one at a time. On a single-node control plane it replaces nothing, because a replacement would start a separate, empty cluster; see [MachinesUpToDate condition](#machinesuptodate-condition). |
+| `distribution` | `string` | No | None | Kubernetes distribution for this control plane: `"k0s"` or `"k3s"`. There is no CRD default and the `KairosControlPlane` webhook does not default it. When unset, the controller copies `spec.template.spec.distribution` from the referenced `KairosConfigTemplate` into this field (that field defaults to `k0s`), and uses `k0s` for that reconcile if the template does not exist yet. An explicit value wins over the template, and a Warning event `DistributionOverride` is emitted when the template names a different one. On a `KairosControlPlaneTemplate` the webhook does default an empty value to `k0s`. `"kubeadm"` is not accepted: it is rejected at admission, and a referenced `KairosConfigTemplate` with `distribution: kubeadm` sets `Ready` and `Available` to `False` with reason `UnsupportedDistribution` (see [kubeadm workers](#kubeadm-workers)). k0s is the fully-supported HA distribution; k3s HA bring-up is supported but replacing a k3s control-plane node afterward leaves an orphaned etcd member requiring manual cleanup (KD-5d, see [Multi-Node Control Planes](#multi-node-control-planes)). |
+| `machineTemplate` | `KairosControlPlaneMachineTemplate` | Yes | None | Template for creating control plane Machines. |
+| `kairosConfigTemplate` | `KairosConfigTemplateReference` | Yes | None | Reference to a `KairosConfigTemplate` that provides the bootstrap configuration for each Machine. |
+| `rolloutStrategy` | `RolloutStrategy` | No | None | Strategy for rolling out updates. |
+| `ha` | `HAConfig` | No | None | High-availability configuration, used when `replicas` is `3` or `5`. Ignored when `replicas` is `1`; setting it on a single-node control plane produces a non-blocking admission warning. See [HAConfig](#haconfig). |
+| `sshFallback` | `SSHFallback` | No | None | Opt-in SSH-pull fallback for retrieving the workload-cluster kubeconfig when the in-VM node-push path is unreachable (typically air-gapped deployments). Off by default. See [SSHFallback](#sshfallback). |
 
 #### KairosControlPlaneMachineTemplate
 
@@ -394,13 +415,13 @@ The `namespace` field is not part of this reference. The namespace defaults to t
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | `string` | No | `"RollingUpdate"` | Strategy type. Currently only `"RollingUpdate"` is accepted. |
-| `rollingUpdate` | `RollingUpdate` | No | — | Rolling update configuration. |
+| `rollingUpdate` | `RollingUpdate` | No | None | Rolling update configuration. |
 
 #### RollingUpdate
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `maxSurge` | `*int32` | No | Maximum number of machines that can be created above the desired count during a rollout. |
+| `maxSurge` | `*int32` | No | Maximum number of machines that can be created above the desired count during a rollout. Defaults to `1` when unset. |
 
 #### HAConfig
 
@@ -412,8 +433,8 @@ The `namespace` field is not part of this reference. The namespace defaults to t
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `address` | `string` | Yes | — | The virtual IP address or DNS hostname for the control-plane endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname (max 253 characters). For `mode: ARP`, must be an IP address reachable on the same L2 segment as the control-plane nodes. Must equal the host portion of the InfraCluster's `controlPlaneEndpoint` (e.g., `VSphereCluster.spec.controlPlaneEndpoint.host`) so that CAPI core copies the correct address into `Cluster.spec.controlPlaneEndpoint`. This cross-object match is not enforced at admission — a mismatch will not be rejected, but the cluster endpoint will point at the wrong address. |
-| `interface` | `string` | Yes | — | The Linux network interface name on which kube-vip advertises the VIP (e.g., `"eth0"`, `"ens192"`, `"bond0"`). Must be 1-15 characters, starting with a letter, followed by letters, digits, dots, underscores, or hyphens. Verify the interface name against your Kairos image with `ip link` before setting this field. |
+| `address` | `string` | Yes | None | The virtual IP address or DNS hostname for the control-plane endpoint. Must be a valid IPv4 address, IPv6 address, or RFC-1123 hostname (max 253 characters). For `mode: ARP`, must be an IP address reachable on the same L2 segment as the control-plane nodes. Must equal the host portion of the InfraCluster's `controlPlaneEndpoint` (e.g., `VSphereCluster.spec.controlPlaneEndpoint.host`) so that CAPI core copies the correct address into `Cluster.spec.controlPlaneEndpoint`. This cross-object match is not enforced at admission: a mismatch will not be rejected, but the cluster endpoint will point at the wrong address. |
+| `interface` | `string` | Yes | None | The Linux network interface name on which kube-vip advertises the VIP (e.g., `"eth0"`, `"ens192"`, `"bond0"`). Must be 1-15 characters, starting with a letter, followed by letters, digits, dots, underscores, or hyphens. Verify the interface name against your Kairos image with `ip link` before setting this field. |
 | `mode` | `string` | No | `"ARP"` | VIP advertisement mode: `"ARP"` (L2, requires the control-plane nodes to share an L2 segment) or `"BGP"` (L3, requires a BGP peer; intended for routed bare-metal fabrics). |
 
 #### SSHFallback
@@ -423,8 +444,8 @@ Opt-in escape hatch for retrieving the workload-cluster kubeconfig by SSH when t
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `enabled` | `bool` | No | `false` | Toggles the SSH fallback path. When `false`, the controller never opens an SSH connection regardless of any other field in this block. When `true`, `identitySecretRef` and `knownHostsSecretRef` are required — the validating webhook rejects `enabled: true` with either unset. |
-| `identitySecretRef` | `SSHFallbackSecretReference` | Required when `enabled: true` | — | Reference to a Secret containing the SSH private key used to authenticate to the workload node. Must contain a key named `ssh-privatekey` (matches the `kubernetes.io/ssh-auth` Secret convention) unless overridden via `key`. The matching public key must already be installed on the node via `KairosConfig.spec.sshPublicKey` / `githubUser` — this provider does not push it. |
-| `knownHostsSecretRef` | `SSHFallbackSecretReference` | Required when `enabled: true` | — | Reference to a Secret containing one or more OpenSSH `known_hosts` lines. The controller verifies the workload node's offered host key against this set before any data is exchanged. **There is no trust-on-first-use path** — a node whose host key is not in this Secret is refused. Defaults to the `known_hosts` key unless overridden via `key`. |
+| `identitySecretRef` | `SSHFallbackSecretReference` | Required when `enabled: true` | None | Reference to a Secret containing the SSH private key used to authenticate to the workload node. Must contain a key named `ssh-privatekey` (matches the `kubernetes.io/ssh-auth` Secret convention) unless overridden via `key`. The matching public key must already be installed on the node via `KairosConfig.spec.sshPublicKey` / `githubUser` — this provider does not push it. |
+| `knownHostsSecretRef` | `SSHFallbackSecretReference` | Required when `enabled: true` | None | Reference to a Secret containing one or more OpenSSH `known_hosts` lines. The controller verifies the workload node's offered host key against this set before any data is exchanged. **There is no trust-on-first-use path**: a node whose host key is not in this Secret is refused. Defaults to the `known_hosts` key unless overridden via `key`. |
 | `user` | `string` | No | `"kairos"` | SSH login user. Must be a Kairos OS user with read access to the distribution's admin-kubeconfig file. Validated against a POSIX-username pattern at admission; shell-metacharacter values are rejected. |
 | `port` | `int32` | No | `22` | SSH port on the workload node. Must be between `1` and `65535`. |
 | `activateAfter` | `Duration` | No | `"15m"` | Elapsed time since `KubeconfigReady` first went `False(WaitingForNodePush)` after which the SSH fallback becomes eligible to run. Must be strictly greater than the controller's internal node-push timeout (10 minutes) — the webhook rejects a value at or below that bound, because the fallback is meant to fire after the Info-to-Warning escalation on `KubeconfigReady`, not before it. |
@@ -433,7 +454,7 @@ Opt-in escape hatch for retrieving the workload-cluster kubeconfig by SSH when t
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `name` | `string` | Yes | — | Name of the Secret. |
+| `name` | `string` | Yes | None | Name of the Secret. |
 | `key` | `string` | No | `ssh-privatekey` for `identitySecretRef`, `known_hosts` for `knownHostsSecretRef` | Key within the Secret that contains the value. |
 | `namespace` | `string` | No | Same as `KairosControlPlane` | Namespace of the Secret. Cross-namespace references are rejected by the validating webhook in this release. |
 
@@ -443,18 +464,20 @@ Cross-field validation (enforced by the validating webhook, not expressible as k
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `initialized` | `bool` | `true` when the first control plane Machine is ready and the control plane is functional. |
+| `initialized` | `bool` | `true` once at least one control-plane Machine has a `nodeRef`, or the `<cluster>-kubeconfig` Secret holds a non-empty kubeconfig. Once set it is not cleared. |
 | `initialization.controlPlaneInitialized` | `*bool` | v1beta2 contract field. `true` when the control plane has been initialized and can accept requests. |
-| `readyReplicas` | `int32` | Number of control plane Machines that are ready. |
+| `readyReplicas` | `int32` | Number of control plane Machines that have a `nodeRef`. Always present, including when `0`. |
 | `replicas` | `int32` | Total number of control plane Machines across all states. |
-| `updatedReplicas` | `int32` | Number of Machines running the desired version. |
-| `unavailableReplicas` | `int32` | Number of Machines that are unavailable (not ready or being deleted). |
-| `conditions` | `[]Condition` | Standard CAPI conditions: `Ready`, `Available`, `Initialized`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). See [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). `Ready`, `Available` and `EtcdHealthy` are `False` with reason `WorkloadClusterIdentityChanged` while control-plane membership changes are frozen; see [Workload cluster identity](#workload-cluster-identity). |
+| `availableReplicas` | `int32` | Number of control plane Machines that have a `nodeRef`, are in the `Running` phase, and are not being deleted. |
+| `updatedReplicas` | `int32` | Number of Machines whose `spec.version` equals `KairosControlPlane.spec.version`. |
+| `unavailableReplicas` | `int32` | Desired replica count (`spec.replicas`) minus `availableReplicas`, never below `0`. |
+| `version` | `string` | `spec.version`, copied once at least one control-plane Machine has a `nodeRef`; empty before that. Cluster API core's MachineSet preflight check `ControlPlaneIsStable` reads it before creating worker Machines. |
+| `conditions` | `[]Condition` | Conditions `Ready`, `Available`, `KubeconfigReady`, `MachinesUpToDate`, `ControlPlaneJoined` (HA only), `EtcdHealthy` (HA only). There is no `Initialized` condition; use `status.initialized`. See [Ready and Available conditions](#ready-and-available-conditions), [ControlPlaneJoined condition](#controlplanejoined-condition), [EtcdHealthy condition](#etcdhealthy-condition) and [MachinesUpToDate condition](#machinesuptodate-condition) below. `Ready` and `Available` are `False` with reason `UnsupportedDistribution` when the effective distribution is `kubeadm`; see [kubeadm workers](#kubeadm-workers). `Ready`, `Available` and `EtcdHealthy` are `False` with reason `WorkloadClusterIdentityChanged` while control-plane membership changes are frozen; see [Workload cluster identity](#workload-cluster-identity). |
 | `observedGeneration` | `int64` | Most recent generation observed by the controller. |
-| `failureReason` | `string` | Short machine-readable failure indicator. Cleared automatically when the next reconcile succeeds — a non-empty value indicates an ongoing failure, not a terminal one. |
+| `failureReason` | `string` | Short machine-readable failure indicator. The controller sets only `ControlPlaneInitializationFailed` and `UnsupportedDistribution`. Cleared automatically when the next reconcile succeeds; a non-empty value indicates an ongoing failure, not a terminal one. |
 | `failureMessage` | `string` | Human-readable failure description. Cleared automatically on the next successful reconcile. If non-empty, check KairosControlPlane events and owned Machine events for context. |
 | `selector` | `string` | Label selector string identifying control plane Machines. |
-| `lastNodePushObserved` | `*Time` | Timestamp at which the control-plane controller first observed that the workload-cluster kubeconfig Secret was absent on the node-push path (alpha-2+). Cleared once the Secret is present and `KubeconfigReady` condition transitions to `True`. Used to escalate condition severity from `Info` to `Warning` after 10 minutes — not a terminal state. |
+| `lastNodePushObserved` | `*Time` | Timestamp at which the control-plane controller first observed that the workload-cluster kubeconfig Secret was absent on the node-push path. Cleared once the Secret is present and `KubeconfigReady` condition transitions to `True`. Used to escalate condition severity from `Info` to `Warning` after 10 minutes, not a terminal state. |
 
 ### Example
 
@@ -503,19 +526,41 @@ spec:
 
 See the full worked sample at `config/samples/capv/kairos_cluster_k0s_ha.yaml` and the [CAPV HA quickstart](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane).
 
+### Ready and Available conditions
+
+`Ready` and `Available` are set together on every reconcile. When `status.initialized` is `true` both are `True` (no reason), except that `Ready` is `False` with `WaitingForMachinesReady` while no Machine has a `nodeRef` yet. Until then they carry one of these reasons:
+
+| Condition | Status | Reason | Meaning |
+|-----------|--------|--------|---------|
+| `Ready`, `Available` | `False` (Info) | `WaitingForInfrastructureControlPlaneEndpoint` | `Cluster.spec.controlPlaneEndpoint` is not set. The message names the InfraCluster field to set for each provider. |
+| `Ready`, `Available` | `False` (Info) | `WaitingForMachines` | The endpoint is set and the control plane is not yet initialized. |
+| `Ready` | `False` (Info) | `WaitingForMachinesReady` | The control plane is initialized but no Machine has a `nodeRef` yet. `Available` stays `True`. |
+| `Ready`, `Available` | `False` (Warning) | `ControlPlaneInitializationFailed` | Reconciling the control-plane Machines returned an error; the cause is in `status.failureMessage`. |
+| `Available` | `False` (Warning) | `WaitingForVIPOrExternalEndpoint` | An HA control plane (`replicas` of `3` or `5`) on non-CAPK infrastructure has neither `spec.ha.vip` nor a populated control-plane endpoint. Guidance only; it does not block reconciliation. |
+| `Ready`, `Available` | `False` (Warning) | `UnsupportedDistribution` | The effective distribution is `kubeadm`. See [kubeadm workers](#kubeadm-workers). |
+| `Ready`, `Available` | `False` (Error) | `WorkloadClusterIdentityChanged` | Control-plane membership changes are frozen. See [Workload cluster identity](#workload-cluster-identity). |
+
+### ControlPlaneJoined condition
+
+Set for HA control planes only (`replicas` is `3` or `5`).
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `True` | None | `status.readyReplicas` is at least `spec.replicas`. |
+| `False` (Info) | `ControlPlaneJoining` | Fewer members than desired have joined; the message reads `n/N control-plane members joined`. |
+
 ### EtcdHealthy condition
 
 Surfaced on `KairosControlPlane.status.conditions` for HA control planes only (`replicas` is `3` or `5`); absent for single-node control planes.
 
 | Status | Reason | Meaning |
 |--------|--------|---------|
-| `True` | `EtcdHealthy` | All desired etcd members report healthy and voting. |
-| `False` (Info) | `EtcdQuorumDegraded` | Quorum still holds, but fewer than all desired members are healthy and voting. |
-| `False` (Warning) | `EtcdQuorumAtRisk` | The healthy+voting member count is at or below the `(N/2)+1` quorum minimum — one more member loss breaks quorum. Also covers the bring-up window before any member has reported. |
-| `False` (Info) | `WaitingForEtcdMember` | The init node has not yet reported a healthy voting etcd member. |
+| `True` | None | All desired etcd members report healthy and voting. |
+| `False` (Info) | `EtcdQuorumDegraded` | Quorum still holds with margin (the healthy+voting count is above the quorum minimum), but fewer than all desired members are healthy and voting. |
+| `False` (Warning) | `EtcdQuorumAtRisk` | The healthy+voting member count is at or below the `(N/2)+1` quorum minimum (integer division); one more member loss breaks quorum. Also covers the bring-up window before any member has reported. |
 | `False` (Error) | `WorkloadClusterIdentityChanged` | A workload API server answered with a different cluster identity than the one pinned on this `KairosControlPlane`. Control-plane membership changes are frozen until an operator re-pins. `Ready` and `Available` carry the same reason. This overrides every other `EtcdHealthy` state, and is also set on a control plane that has been scaled down to one replica after it was pinned. See [Workload cluster identity](#workload-cluster-identity). |
 
-The condition is derived from a per-cluster, node-reported etcd-status Secret (see [Security Considerations](#security-considerations) for the trust model of this signal). The controller uses this condition, together with the desired replica count, to refuse control-plane Machine deletions that would drop etcd below the quorum minimum — this quorum-safety decision is made independently of, and before, any single node's self-reported signal.
+If the etcd-status Secret cannot be read, the condition is left unchanged for that reconcile. The condition is derived from a per-cluster, node-reported etcd-status Secret (see [Security Considerations](#security-considerations) for the trust model of this signal). The controller uses this condition, together with the desired replica count, to refuse control-plane Machine deletions that would drop etcd below the quorum minimum, this quorum-safety decision is made independently of, and before, any single node's self-reported signal.
 
 ### MachinesUpToDate condition
 
@@ -523,7 +568,7 @@ Reports whether every control-plane Machine runs `spec.version`.
 
 | Status | Reason | Meaning |
 |--------|--------|---------|
-| `True` | — | No control-plane Machine is outdated. |
+| `True` | None | No control-plane Machine is outdated. |
 | `False` (Info) | `RollingOut` | Outdated Machines are being replaced, one at a time. A replacement is added and must register a Node before an outdated Machine is removed, and the rollout waits while any control-plane Machine is still being deleted. |
 | `False` (Warning) | `SingleNodeRolloutUnsupported` | A single-node control plane (`replicas: 1`) has a Machine whose version differs from `spec.version`. The Machine is left unchanged: it runs the whole cluster, so a replacement would start a separate, empty cluster. Set `spec.version` back to the version the Machine runs to clear the condition. |
 
@@ -611,7 +656,7 @@ The control-plane controller creates and owns the staging Secret; a control-plan
 | `True` | `KubeconfigReadyViaSSHFallback` | Same as above, but the content arrived through the opt-in SSH fallback path rather than node-push. |
 | `False` (Info → Warning) | `WaitingForNodePush` | No usable kubeconfig has been published yet. Severity escalates from Info to Warning once the wait exceeds the node-push timeout (10 minutes). See [Air-gapped fallback (SSHFallback)](QUICKSTART_CAPV.md#air-gapped-fallback-sshfallback) if the node cannot reach the management API server. |
 | `False` (Warning) | `NodePushRejected` | A candidate kubeconfig — the one staged by a node, or the one already in the contract Secret — failed a structural or credential-shape check. The message names the failing rule, never any kubeconfig content. Whatever the contract Secret already held is left unchanged. Correct the source of the candidate (redeploy the affected node, or inspect its staging Secret); it is re-evaluated on the next reconcile. |
-| `False` (Warning) | `NodePushCAMismatch` | A candidate kubeconfig presents a different certificate authority than the one already pinned for this cluster (see [Annotations](#annotations) below). The contract Secret's previous content, if any, is left in place; the controller refuses to publish the mismatched candidate until an operator re-pins. See the runbook below. |
+| `False` (Warning) | `NodePushCAMismatch` | A candidate kubeconfig presents a different certificate authority than the one already pinned for this cluster (see [Annotations](#annotations) below). If the candidate was staged by a node, the contract Secret's previous content is left in place and the candidate is not published. If the mismatching content is already in the contract Secret, the controller empties the Secret's value in place (the object is kept, not deleted) and emits a Warning event. Either way it publishes nothing from a mismatched CA until an operator re-pins. See the runbook below. |
 | `False` (Warning) | `KubeconfigSecretNotOwned` | A Secret named `<cluster>-kubeconfig` exists but is neither controlled by this `KairosControlPlane` nor eligible for adoption, and `Cluster.spec.controlPlaneRef` does not point at this `KairosControlPlane` either. The controller has no authority over a Secret belonging to a different cluster (or predating this one) and does not touch its content. Delete the Secret so the controller can publish its own. |
 | `False` (Warning) | `KubeconfigCertificateExpired` | The published kubeconfig's inline client certificate is outside its validity window. Its content is left in place — expiry does not clear a working Secret — but a client built from it will fail authentication. A control-plane Machine replacement, or an SSH-fallback fetch, refreshes the certificate. |
 | `False` (Info) | `SSHFallbackDialing` | The SSH fallback path is dialing the workload node. |
@@ -641,7 +686,7 @@ Two annotations on `KairosControlPlane` control the certificate-authority pin us
 
 | Annotation | Set by | Purpose |
 |---|---|---|
-| `controlplane.cluster.x-k8s.io/kubeconfig-ca-pin` | Controller only | The certificate-authority fingerprint of the first kubeconfig the controller accepted for this cluster. Every later candidate must present the same CA or it is refused with `NodePushCAMismatch`. Do not set this by hand; the controller manages it and overwrites it on the next accepted publish. |
+| `controlplane.cluster.x-k8s.io/kubeconfig-ca-pin` | Controller only | The certificate-authority fingerprint of the first kubeconfig the controller accepted for this cluster. Every later candidate must present the same CA or it is refused with `NodePushCAMismatch`. Set by the controller on the first accepted publish and never rewritten. Do not set it by hand: a value that differs from the CA the nodes present makes every candidate fail with `NodePushCAMismatch`. Remove it, or use `kubeconfig-repin`, to re-pin. |
 | `controlplane.cluster.x-k8s.io/kubeconfig-repin` | Operator | Set to `"true"` to clear the stored CA pin (both annotations are removed) and let the controller re-pin from the next candidate it accepts. This is the sanctioned way past a `NodePushCAMismatch`. The controller consumes the annotation once — you do not need to remove it yourself. |
 
 **Runbook: `NodePushCAMismatch`.**
@@ -660,6 +705,41 @@ Two annotations on `KairosControlPlane` control the certificate-authority pin us
 3. On the next reconcile the controller drops the stored pin and accepts the next candidate's CA as the new pin. `KubeconfigReady` returns to `True` (or to `False(WaitingForNodePush)` if no candidate is available yet).
 4. If the change is not expected, do not re-pin. Replace the affected control-plane node instead.
 
+### Other labels and annotations set by the controllers
+
+None of these is meant to be set by hand.
+
+| Key | Kind | On | Meaning |
+|-----|------|----|---------|
+| `controlplane.cluster.x-k8s.io/secret-type` | Label | Controller-managed Secrets in the management cluster | Marks the Secret so the controllers' watches match it by label. Values: `kubeconfig-push` (`<cluster>-kubeconfig-push`), `control-plane-join-token` (`<cluster>-control-plane-join-token`), `etcd-status` (`<cluster>-etcd-status`). |
+| `controllers.cluster.x-k8s.io/kubeconfig-source` | Annotation | `<cluster>-kubeconfig` Secret | Where the published content came from: `node-push`, `adopted` (an existing Secret the controller adopted), or `ssh-fallback`. Drives the `KubeconfigReady` reason. |
+| `controlplane.cluster.x-k8s.io/k0s-join-token-id` | Annotation | The k0s join-token Secret and each join `KairosConfig` | The public ID of the k0s controller-join token minted for that joiner. The bootstrap controller renders a k0s join only when the two IDs match. |
+| `bootstrap.cluster.x-k8s.io/kairosconfig-uid` | Label | kubeadm bootstrap-token Secrets in the workload cluster | UID of the `KairosConfig` the token belongs to. |
+| `controlplane.cluster.x-k8s.io/status-initialized-timestamp` | Annotation | `Cluster` | Timestamp written when the control plane first reports `status.initialized`, to prompt the Cluster controller to reconcile. |
+
+### KairosControlPlane events
+
+Warning events are not conditions and are not retained for long; read them with `kubectl describe kairoscontrolplane <name>`.
+
+| Reason | Type | Meaning |
+|--------|------|---------|
+| `DistributionOverride` | Warning | An explicit `spec.distribution` differs from the referenced `KairosConfigTemplate`'s; the explicit value is used. |
+| `InvalidControlPlaneHostname` | Warning | The referenced `KairosConfigTemplate` sets a `hostname` a control-plane node cannot use; no Machine is created from it. |
+| `StagingKubeconfigNotOwned`, `StagingKubeconfigImmutable` | Warning | The staging Secret was changed by something other than the controller; see [KubeconfigReady condition](#kubeconfigready-condition). |
+| `WaitingForNodePush`, `NodePushCAMismatch` | Warning | Emitted, with the same text as the condition message, when the controller empties a non-empty `<cluster>-kubeconfig` Secret in place (the Secret is kept). The other `KubeconfigReady` reasons set a condition only. |
+| `SSHFallbackOK` | Normal | An SSH fallback fetch succeeded. |
+| `SSHFallbackMisconfigured`, `SSHFallbackHostKeyMismatch`, `SSHFallbackAuthFailed`, `SSHFallbackDialTimeout`, `SSHFallbackDialRefused`, `SSHFallbackRemoteFileMissing`, `SSHFallbackPayloadInvalid`, `SSHFallbackWriteFailed` | Warning | The categorized outcome of a failed SSH fallback attempt. |
+| `K0sJoinTokenMinted` | Normal | A k0s controller-join token was issued for the next control-plane member. |
+| `K0sJoinTokenNoLiveMember`, `K0sJoinTokenLegacy`, `K0sJoinTokenServerUnavailable`, `K0sJoinTokenMissing`, `K0sJoinTokenExtensionCapped` | Warning | A k0s joiner cannot get or keep a usable join token. Each message names the Machine and the remedy: delete the Machine or let a `MachineHealthCheck` replace it. |
+| `EtcdMemberLeaveDelegated` | Normal | A leaving node did not acknowledge its etcd leave in time; the controller asked k0s to remove the member. |
+| `EtcdMemberLeaveTimedOut` | Warning | The etcd-leave wait expired and the deletion proceeded; the etcd member may be orphaned. |
+| `EtcdMemberRemoveUnsupportedForK3s` | Warning | A k3s control-plane Machine is being removed from an HA control plane; k3s has no supported member-remove (KD-5d). |
+| `EtcdOrphanMemberLeaveRequested` | Normal | An etcd member with no control-plane Machine was handed to k0s for removal. |
+| `EtcdOrphanMemberRemovalBlocked` | Warning | An orphan etcd member was not removed because member names do not match the Machines, or removal would break quorum. |
+| `WorkloadClusterIdentityPinned` | Normal | The workload cluster identity was pinned. |
+| `WorkloadClusterIdentityChanged` | Warning | The identity check failed; membership changes are frozen. |
+| `WorkloadClusterIdentityFreezeCleared` | Normal | The pin annotation changed and the freeze was cleared. |
+
 ---
 
 ## KairosControlPlaneTemplate
@@ -670,7 +750,7 @@ Two annotations on `KairosControlPlane` control the certificate-authority pin us
 
 `KairosControlPlaneTemplate` is a template for creating `KairosControlPlane` resources. Intended for use with ClusterClass (planned; not yet exercised in samples).
 
-Its validating webhook applies the same rules as the `KairosControlPlane` webhook, against the nested spec, so a template that would produce an invalid control plane is rejected when it is staged rather than when a cluster is created from it. Rules that compare against a namespace, `sshFallback` Secret references and `machineTemplate.infrastructureRef`, read the `KairosControlPlaneTemplate`'s own namespace, which is the namespace a stamped `KairosControlPlane` lives in.
+Its validating webhook applies the same rules as the `KairosControlPlane` webhook, against the nested spec, so a template that would produce an invalid control plane is rejected when it is staged rather than when a cluster is created from it. Its defaulting webhook sets `replicas` to `1` and, unlike the `KairosControlPlane` webhook, sets an empty `distribution` to `k0s`, so a control plane stamped from the template carries an explicit `k0s` that overrides the distribution of its `KairosConfigTemplate`; set `distribution` in the template when you use `k3s`. Rules that compare against a namespace, `sshFallback` Secret references and `machineTemplate.infrastructureRef`, read the `KairosControlPlaneTemplate`'s own namespace, which is the namespace a stamped `KairosControlPlane` lives in.
 
 ### Spec Fields
 
@@ -683,7 +763,7 @@ Its validating webhook applies the same rules as the `KairosControlPlane` webhoo
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `metadata` | `ObjectMeta` | No | Metadata to apply to created `KairosControlPlane` resources. |
-| `spec` | `KairosControlPlaneSpec` | Yes | Spec applied to created `KairosControlPlane` resources. See [KairosControlPlane Spec](#spec-fields-1). |
+| `spec` | `KairosControlPlaneSpec` | Yes | Spec applied to created `KairosControlPlane` resources. See [KairosControlPlane Spec](#spec-fields-2). |
 
 ---
 
@@ -723,10 +803,10 @@ Tracked as KD-23 (persistence injection) and KD-34 (in-place upgrade persistence
 - At most 32 files per `KairosConfig`.
 - Content maximum: 32 KiB (32768 bytes) per file.
 - `path` must be absolute (begin with `/`) and must not contain `..` segments.
-- `permissions` must be a 3- or 4-digit octal string. 4-digit modes encode setuid/setgid/sticky: `"4755"` is valid. Leave unset to use the image default (typically `"0644"`).
-- `owner` must follow `user:group` POSIX convention. The group portion is optional (`"root"` is valid as well as `"root:root"`).
+- `permissions` must match `^0?[0-7]{3,4}$`: a 3- or 4-digit octal string with an optional leading `0`. 4-digit modes encode setuid/setgid/sticky: `"4755"` is valid. Leave unset to use the image default (typically `"0644"`).
+- `owner` must match `^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$`. The group portion is optional (`"root"` is valid as well as `"root:root"`); uppercase letters are rejected.
 
-The validating webhook rejects entries that violate path, permissions, or owner constraints. Validation errors appear in `KairosConfig.status.failureMessage`.
+The CRD schema (`path` pattern, `content` length, `permissions` and `owner` patterns, at most 32 entries) and the validating webhook (`..` segments and the same patterns) reject entries that violate these constraints. The error is returned by the API server when the `KairosConfig` is applied. A `KairosConfigTemplate` is not checked by the webhook, only by the CRD schema, so a `..` segment in a template is rejected only when the `KairosConfig` created from it is.
 
 ### Example
 
@@ -801,18 +881,18 @@ At least one of the following must be set on every `KairosConfig` (enforced by t
 For `KairosConfig` with `role: worker`:
 
 - **k0s**: Set `workerToken` or `workerTokenSecretRef`. `workerTokenSecretRef` is preferred.
-- **k3s**: Set `k3sToken` or `k3sTokenSecretRef`. `k3sTokenSecretRef` is preferred.
+- **k3s**: Set `k3sToken` or `k3sTokenSecretRef` (or `workerToken` / `workerTokenSecretRef`). `k3sTokenSecretRef` is preferred.
 - **kubeadm**: Set no token. The controller mints a short-lived bootstrap token in the workload cluster; an inline token in `spec.kubeadm.joinConfiguration` is rejected by the webhook.
 
-The controller fails reconciliation if no token is provided for a k0s or k3s worker.
+The validating webhook rejects a k0s or k3s worker that sets none of these. A k3s worker also accepts `workerToken` and `workerTokenSecretRef`. The legacy `token` and `tokenSecretRef` fields are read as a last resort but do not satisfy the webhook on their own.
 
 ### Single-Node Mode
 
 When `KairosControlPlane.spec.replicas == 1`, the controller automatically sets `KairosConfig.spec.singleNode = true` on the created control-plane Machine's config. Setting it manually on a `KairosConfigTemplate` is unnecessary when managed by `KairosControlPlane`.
 
-`singleNode` decides *whether* single-node mode applies; for k0s, `k0sSingleNode` separately decides *which* k0s flag single-node mode renders:
+`singleNode` decides *whether* single-node mode applies to k0s; `k0sSingleNode` separately decides *which* k0s flag single-node mode renders:
 
-- **k3s**, on every infrastructure provider: `singleNode` enables single-node cluster-init mode. `k0sSingleNode` has no effect.
+- **k3s**, on every infrastructure provider: the k3s templates do not read `singleNode` or `k0sSingleNode`. A single-node k3s control plane renders no HA arguments; `--cluster-init` appears only for `controlPlaneRole: init`.
 - **k0s on CAPK**: `singleNode` renders `--single`, unconditionally. `k0sSingleNode` has no effect.
 - **k0s on the generic / CAPV / CAPM3 / fleet render path**: `singleNode` alone renders `--enable-worker` — a joinable, schedulable controller, so a control-plane-plus-worker cluster works with no further configuration. Setting `k0sSingleNode: true` renders `--single` instead: a standalone all-in-one node that refuses all worker joins. Use `k0sSingleNode: true` only for a node that is meant to stay standalone forever.
 
