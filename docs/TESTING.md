@@ -91,7 +91,7 @@ After the cluster is `Available=true`, drain a node via `kubectl drain <node> --
 
 ## Supported configurations (v0.1.0)
 
-Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3, for both k0s and k3s. CAPD is dev-only (single-node); HA is not exercised on CAPD. CAPD is tested via unit/envtest rather than a live e2e run. Fleet (Kairos fleet / AuroraBoot) supports a single control plane plus a worker `MachineDeployment`; HA is not exercised on fleet.
+Single-node and 3-node HA control planes are supported on CAPK, CAPV, and CAPM3, for both k0s and k3s. CAPD is dev-only (single-node); HA is not exercised on CAPD. CAPD is tested via unit/envtest rather than a live e2e run. `KairosFleetMachine` infrastructure supports a single control plane plus a worker `MachineDeployment`; HA is not exercised on it.
 
 | Infrastructure | Distribution | Single-node | HA (3-node) |
 |---|---|---|---|

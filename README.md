@@ -20,13 +20,13 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 **Latest release**: [`v0.1.4`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.4) — pre-1.0; API surface may still change before v1.0.
 
-Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal), plus single-control-plane clusters with the Kairos fleet infrastructure provider (AuroraBoot-claimed nodes; ADR 0008, maintained in the repository's internal decision records). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPK k0s HA additionally requires a Kairos image carrying a k0s start gate, which this project does not publish — see [the CAPK quickstart](docs/QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate). CAPD is dev-only; HA is not exercised on CAPD. Fleet HA is not yet exercised — fleet is single-control-plane only today. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
+Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal), plus single-control-plane clusters on `KairosFleetMachine` infrastructure (the Kairos fleet infrastructure provider's machine kind). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPK k0s HA additionally requires a Kairos image carrying a k0s start gate, which this project does not publish; see [the CAPK quickstart](docs/QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate). CAPD is dev-only; HA is not exercised on CAPD. HA is not exercised on `KairosFleetMachine` infrastructure: single control plane only today. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
 
 Read the [v0.1.4 release notes](docs/release-notes/v0.1.4.md) before installing, and the [v0.1.0 release notes](docs/release-notes/v0.1.0.md) if you are coming from before v0.1.0. If you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place.
 
 **Not in v0.1.4; planned for v0.2.0.** On `main`, `KairosConfig` also accepts `distribution: kubeadm` to join Kairos **worker** nodes to a control plane that this provider does not run: a Kamaji `KamajiControlPlane` or a Cluster API `KubeadmControlPlane`. `KairosControlPlane` supports `k0s` and `k3s` only; this provider does not create kubeadm control planes. You supply the CNI and a node image that ships kubeadm, kubelet, and containerd at the exact workload Kubernetes version. This path is covered by unit and envtest tests and has not yet been validated against a live Kamaji or `KubeadmControlPlane` cluster. See [Kubeadm workers](docs/KUBEADM_WORKERS.md).
 
-The control plane provider is no longer limited to a fixed provider allowlist: any infrastructure provider that implements the standard CAPI `<Kind>MachineTemplate` contract works through a generic clone path, verified end-to-end against Beskar7 (a bare-metal provider outside the list above). CAPD, CAPV, CAPK, CAPM3, and the Kairos fleet provider remain the first-class path — HA support, worked samples, and a quickstart — because they carry behavior the generic path cannot infer (e.g. KubeVirt's cloud-init volume handling); other CAPI-conformant providers get the generic path with no dedicated sample or quickstart yet.
+The control plane provider is no longer limited to a fixed provider allowlist: any infrastructure provider that implements the standard CAPI `<Kind>MachineTemplate` contract works through a generic clone path, verified end-to-end against Beskar7 (a bare-metal provider outside the list above). CAPD, CAPV, CAPK, CAPM3, and `KairosFleetMachine` remain the first-class path (HA support, worked samples, and a quickstart) because they carry behavior the generic path cannot infer (e.g. KubeVirt's cloud-init volume handling); other CAPI-conformant providers get the generic path with no dedicated sample or quickstart yet.
 
 ## Install (released version)
 
@@ -59,7 +59,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | CAPV | v1.11.x+ |
 | CAPK | KubeVirt v1.9.x / CAPK v0.1.x |
 | CAPM3 | v1.13+; BMO/Ironic v0.13+ |
-| kairos-fleet | v0.1.0+ (`cluster-api-provider-kairos-fleet`); v0.1.2+ recommended, since its shipped cluster template could not create workers before that. AuroraBoot — do not use fleet v0.1.0-beta.1, it crash-loops on a real management cluster |
+| Kairos fleet infrastructure provider | `KairosFleetMachine` and `KairosFleetMachineTemplate` at `infrastructure.cluster.x-k8s.io/v1alpha1`; control plane plus worker `MachineDeployment` (single control plane) |
 | k0s | ~v1.36.1+k0s |
 | k3s | ~v1.36.1+k3s1 |
 | kubeadm (workers only) | The kubeadm and kubelet version the node image ships; it must equal `Machine.spec.version` exactly. The control plane (Kamaji or `KubeadmControlPlane`) is run outside this provider |
@@ -83,7 +83,7 @@ Management-cluster support is the full Cluster API v1.13 band (v1.30-v1.36); v1.
 - [CAPV (vSphere)](docs/QUICKSTART_CAPV.md)
 - [CAPK (KubeVirt)](docs/QUICKSTART_CAPK.md)
 - [Metal3 (bare metal)](docs/QUICKSTART_CAPM3.md)
-- [Fleet (AuroraBoot-claimed nodes)](docs/QUICKSTART_FLEET.md)
+- [KairosFleetMachine infrastructure](docs/QUICKSTART_FLEET.md)
 
 ## Development
 
