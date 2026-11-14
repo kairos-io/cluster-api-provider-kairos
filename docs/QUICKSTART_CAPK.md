@@ -85,7 +85,7 @@ What this does:
 Options:
 
 - `KUBEVIRT_USE_EMULATION=false` — disable KVM emulation (requires `/dev/kvm` on the host).
-- `CAPK_VERSION=v0.1.x` — pin a specific CAPK version.
+- `CAPK_VERSION=v0.11.x`: pin a specific CAPK version.
 
 The control-plane API is exposed via a LoadBalancer Service named `<cluster>-control-plane-lb`. MetalLB or equivalent must be installed in the kind cluster. `kubevirt-env` installs MetalLB as part of its setup.
 
@@ -169,7 +169,7 @@ This walkthrough uses the flat manifest (`kubectl apply -f kairos-capi-provider.
   - A LoadBalancer implementation (MetalLB or equivalent)
 - Kairos CAPI provider installed:
   ```bash
-  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
+  kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.2.1/kairos-capi-provider.yaml
   ```
 - A Kairos image uploaded to CDI as a DataVolume named `kairos-rootdisk` (for k0s) or `kairos-k3s-rootdisk` (for k3s) in namespace `default`. The image must be a Kairos live-installer image — not a pre-installed disk image.
 

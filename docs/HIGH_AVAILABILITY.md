@@ -38,26 +38,32 @@ Worked samples:
 
 See the [CAPV HA quickstart walkthrough](QUICKSTART_CAPV.md#high-availability-3-node-k0s-control-plane) for the full procedure.
 
-## Known issue: k0s HA rollouts on v0.1.4
+## Fixed in v0.1.5: k0s HA rollouts on clusters created with v0.1.4 or earlier
 
-Affects k0s HA control planes on every infrastructure provider except CAPK
+Affected k0s HA control planes on every infrastructure provider except CAPK
 (CAPV, CAPM3, `KairosFleetMachine`, and the generic path), in v0.1.4 and
-earlier. k3s and CAPK are not affected.
+earlier. k3s and CAPK were not affected.
 
-In these releases only the first control-plane node puts the control-plane
-endpoint in its API server certificate. The nodes that join after it do not.
-Creating the cluster works. But when the first node is removed, for example during a rollout after a `spec.version` change,
-the VIP moves to a joiner, and every client that checks the certificate
-against the endpoint fails. That includes the management cluster. The rollout
-then stops at the first node, with a `KairosControlPlane` message such as:
+In those releases only the first control-plane node put the control-plane
+endpoint in its API server certificate. The nodes that joined after it did
+not. Creating the cluster worked. But when the first node was removed, for
+example during a rollout after a `spec.version` change, the VIP moved to a
+joiner, and every client that checks the certificate against the endpoint
+failed, including the management cluster. The rollout then stopped at the
+first node, with a `KairosControlPlane` message such as:
 
 ```text
 failed to reconcile etcd member leave for <cluster>-cp-0: ... tls: failed to verify certificate: x509: certificate is valid for ..., not <endpoint>
 ```
 
-The fix renders the endpoint into every control-plane member's certificate,
-and ships in the next release. Until then, avoid changes that replace the first
-control-plane node of an affected cluster.
+v0.1.5 renders the endpoint into the API server certificate SANs of every
+k0s control-plane member (#163). The SANs are part of a member's
+bootstrap data, and members keep the bootstrap data they were created with,
+so on a cluster created with v0.1.4 or earlier the members that joined before
+the upgrade still lack the endpoint. Replace those joiners first, so that
+their replacements are created with the fix, and replace the first
+control-plane node last. See the
+[v0.1.5 release notes](release-notes/v0.1.5.md).
 
 A second issue affects the same k0s clusters, CAPK included. The token that new
 control-plane members join with is created once, by the first control-plane
