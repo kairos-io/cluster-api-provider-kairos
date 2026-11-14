@@ -158,7 +158,7 @@ make test-kubevirt     # run the full scripted flow
 
 For users with an existing management cluster that already has KubeVirt, CDI, CAPI, and CAPK installed.
 
-This walkthrough uses the flat manifest (`kubectl apply -f kairos-capi-provider.yaml`, below). `clusterctl init --bootstrap kairos --control-plane kairos` is also supported as of this release; see [docs/INSTALL.md: Path 1](INSTALL.md#path-1---clusterctl-recommended). Do not run both against the same management cluster: the two install paths are mutually exclusive (see [docs/INSTALL.md](INSTALL.md#path-1-and-path-2-are-mutually-exclusive)).
+This walkthrough uses the flat manifest (`kubectl apply -f kairos-capi-provider.yaml`, below). `clusterctl init --bootstrap kairos-io --control-plane kairos-io` is also supported as of this release; see [docs/INSTALL.md: Path 1](INSTALL.md#path-1---clusterctl-recommended). Do not run both against the same management cluster: the two install paths are mutually exclusive (see [docs/INSTALL.md](INSTALL.md#path-1-and-path-2-are-mutually-exclusive)).
 
 ### Prerequisites
 

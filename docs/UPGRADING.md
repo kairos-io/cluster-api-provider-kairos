@@ -103,6 +103,16 @@ or `releases/<tag>/...` to pin a version. The `download/` form works only until
 `clusterctl` falls back to the GitHub API, for example on a rate-limited or
 proxied network. See [INSTALL.md](INSTALL.md).
 
+### If you registered the providers as `kairos` in `clusterctl.yaml`
+
+The provider is registered upstream as `kairos-io`, and the install docs now
+use that name. An existing install keeps the name it was installed under, and
+`clusterctl upgrade` reads the provider's repository from the configuration
+entry with that recorded name. Keep your `name: "kairos"` entries to upgrade it
+as before. To switch to `kairos-io`, run `clusterctl delete` with the old name,
+then `clusterctl init` with the new one; see
+[INSTALL.md: Existing installs registered as `kairos`](INSTALL.md#existing-installs-registered-as-kairos).
+
 ### Upgrade
 
 `clusterctl upgrade`, or re-applying the flat manifest, is enough:
@@ -489,7 +499,7 @@ it as an uninstall-old / install-new operation, not an in-place re-apply:
 | | Flat install (unchanged) | clusterctl providers (new) |
 | --- | --- | --- |
 | Namespace | `kairos-capi-system` | `capi-kairos-bootstrap-system` (bootstrap), `capi-kairos-control-plane-system` (control plane) |
-| `cluster.x-k8s.io/provider` label | `kairos` | `bootstrap-kairos`, `control-plane-kairos` |
+| `cluster.x-k8s.io/provider` label | `kairos` | `bootstrap-kairos-io`, `control-plane-kairos-io` |
 
 `Deployment.spec.selector` and `ClusterRoleBinding.roleRef` are immutable, and
 the namespaces differ, so applying the clusterctl components over an existing

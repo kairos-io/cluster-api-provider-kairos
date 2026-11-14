@@ -12,7 +12,7 @@ Three install paths: `clusterctl` (recommended), the released flat artifact (`ku
 
 Use this for a `clusterctl`-managed management cluster, and for the closest match to upstream Cluster API tooling and documentation.
 
-Per ADR 0007, this provider packages as two `clusterctl` providers built from one container image: a **bootstrap provider** (namespace `capi-kairos-bootstrap-system`, label `bootstrap-kairos`) and a **control-plane provider** (namespace `capi-kairos-control-plane-system`, label `control-plane-kairos`). A release publishes `bootstrap-components.yaml`, `control-plane-components.yaml`, and a shared `metadata.yaml`, all digest-pinned to the release image.
+Per ADR 0007, this provider packages as two `clusterctl` providers built from one container image: a **bootstrap provider** (namespace `capi-kairos-bootstrap-system`, label `bootstrap-kairos-io`) and a **control-plane provider** (namespace `capi-kairos-control-plane-system`, label `control-plane-kairos-io`). A release publishes `bootstrap-components.yaml`, `control-plane-components.yaml`, and a shared `metadata.yaml`, all digest-pinned to the release image.
 
 ### Prerequisites
 
@@ -24,15 +24,15 @@ Per ADR 0007, this provider packages as two `clusterctl` providers built from on
 
 ### Register the provider
 
-This provider is not yet in the upstream `clusterctl` provider list, so add it explicitly to your `clusterctl` configuration:
+The provider is registered upstream as `kairos-io`, both a bootstrap and a control-plane provider. `clusterctl` v1.15 and later (first in v1.15.0-beta.0) knows `kairos-io` built in, and needs no configuration. `clusterctl` v1.13 and v1.14 do not, so add it explicitly to your `clusterctl` configuration:
 
 ```yaml
 # ~/.cluster-api/clusterctl.yaml (or pass --config <path> to clusterctl)
 providers:
-  - name: "kairos"
+  - name: "kairos-io"
     url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/bootstrap-components.yaml"
     type: "BootstrapProvider"
-  - name: "kairos"
+  - name: "kairos-io"
     url: "https://github.com/kairos-io/cluster-api-provider-kairos/releases/latest/control-plane-components.yaml"
     type: "ControlPlaneProvider"
 ```
@@ -60,14 +60,21 @@ release`.
 ### Install
 
 ```bash
-clusterctl init --bootstrap kairos --control-plane kairos
+clusterctl init --bootstrap kairos-io --control-plane kairos-io
 ```
 
 To also initialize your infrastructure provider in the same call, add `--infrastructure <provider>` (`docker`, `vsphere`, `kubevirt`, `metal3`; see the matching quickstart in [Next steps](#next-steps) for provider-specific setup):
 
 ```bash
-clusterctl init --bootstrap kairos --control-plane kairos --infrastructure docker
+clusterctl init --bootstrap kairos-io --control-plane kairos-io --infrastructure docker
 ```
+
+#### Existing installs registered as `kairos`
+
+Earlier versions of this guide registered the providers under the name `kairos`. `clusterctl` records an installed provider under the name used at install time, and `clusterctl upgrade` and `clusterctl delete` look the provider up by that recorded name. An install made as `kairos` stays `kairos` until you reinstall it:
+
+- To keep upgrading it, leave the two `name: "kairos"` entries in your `clusterctl.yaml` and use `clusterctl upgrade plan` and `clusterctl upgrade apply` as before. `clusterctl upgrade apply` reads the provider's repository from the configuration entry with the recorded name, so removing the `kairos` entries breaks the upgrade. Such an install carries the labels `bootstrap-kairos` and `control-plane-kairos`.
+- To switch to `kairos-io`, delete and reinitialize: `clusterctl delete --bootstrap kairos --control-plane kairos`, then the `clusterctl init` command above. `clusterctl delete` keeps the provider namespaces and the CRDs unless you pass `--include-namespace` or `--include-crd`, so existing `KairosConfig` and `KairosControlPlane` objects remain. Do not pass those flags: `--include-crd` deletes every object of the provider's kinds. Both providers are unavailable between the delete and the init.
 
 ### Verify
 
@@ -77,12 +84,12 @@ kubectl get pods -n capi-kairos-control-plane-system
 kubectl get providers -A
 ```
 
-Expected: Deployment `capi-kairos-bootstrap-controller-manager` in `capi-kairos-bootstrap-system` and Deployment `capi-kairos-control-plane-controller-manager` in `capi-kairos-control-plane-system`, both `Available`, plus a `bootstrap-kairos` and a `control-plane-kairos` entry in clusterctl's provider inventory.
+Expected: Deployment `capi-kairos-bootstrap-controller-manager` in `capi-kairos-bootstrap-system` and Deployment `capi-kairos-control-plane-controller-manager` in `capi-kairos-control-plane-system`, both `Available`, plus a `bootstrap-kairos-io` and a `control-plane-kairos-io` entry in clusterctl's provider inventory.
 
 ### Uninstall
 
 ```bash
-clusterctl delete --bootstrap kairos --control-plane kairos
+clusterctl delete --bootstrap kairos-io --control-plane kairos-io
 ```
 
 ---
@@ -116,7 +123,7 @@ Use this if you want a single `kubectl apply -f` without configuring `clusterctl
 kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
 ```
 
-This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
+This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos-io` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
 
 ### Verify
 
@@ -152,7 +159,7 @@ kubectl delete validatingwebhookconfiguration <stale-name>
 
 ## Path 1 and Path 2 are mutually exclusive
 
-Do not install both on the same management cluster. They use different namespaces (`capi-kairos-bootstrap-system` / `capi-kairos-control-plane-system` for Path 1, `kairos-capi-system` for Path 2) and different `cluster.x-k8s.io/provider` label values (`bootstrap-kairos` / `control-plane-kairos` for Path 1, `kairos` for Path 2). Deployment selectors and ClusterRoleBinding roleRefs are immutable, so installing the second path on a cluster already running the first does not upgrade or replace it. It runs a second, independent set of controllers and webhooks watching the same CRDs, which is unsupported and can produce conflicting webhook admission decisions. If you need to move an existing installation from one path to the other, see [docs/UPGRADING.md](UPGRADING.md).
+Do not install both on the same management cluster. They use different namespaces (`capi-kairos-bootstrap-system` / `capi-kairos-control-plane-system` for Path 1, `kairos-capi-system` for Path 2) and different `cluster.x-k8s.io/provider` label values (`bootstrap-kairos-io` / `control-plane-kairos-io` for Path 1, `kairos` for Path 2). Deployment selectors and ClusterRoleBinding roleRefs are immutable, so installing the second path on a cluster already running the first does not upgrade or replace it. It runs a second, independent set of controllers and webhooks watching the same CRDs, which is unsupported and can produce conflicting webhook admission decisions. If you need to move an existing installation from one path to the other, see [docs/UPGRADING.md](UPGRADING.md).
 
 ---
 

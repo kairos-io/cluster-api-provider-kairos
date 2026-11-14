@@ -34,7 +34,7 @@ The control plane provider is no longer limited to a fixed provider allowlist: a
 
 The provider ships two ways; pick one per management cluster, they are mutually exclusive:
 
-- **clusterctl (recommended)**: register the provider, then run `clusterctl init --bootstrap kairos --control-plane kairos`.
+- **clusterctl (recommended)**: on clusterctl v1.13 or v1.14, register the provider as `kairos-io` first (clusterctl v1.15 knows it built in), then run `clusterctl init --bootstrap kairos-io --control-plane kairos-io`.
 - **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml`.
 
 See the [install guide](docs/INSTALL.md) for provider registration, the full procedure for both paths, and why they cannot be mixed on one management cluster.
