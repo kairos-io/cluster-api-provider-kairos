@@ -467,19 +467,30 @@ func TestReconcileMachines_DistributionHold(t *testing.T) {
 	})
 
 	t.Run("the leave sweep still runs", func(t *testing.T) {
+		// A k0s member an operator deleted, held at CAPI's pre-terminate
+		// hook, with a pinned workload cluster that answers. The hold must
+		// not stop its leave: the request is written before the hold returns.
 		g := NewWithT(t)
 		scheme := machineMetaScheme(g)
-		kcp := guardKCP("k0s", 3)
-		m, kc := guardMachine(kcp, "cp-0", "k3s", time.Hour)
+		kcp := pinned(guardKCP("k3s", 3))
+		m, kc := guardMachine(kcp, "cp-0", "k0s", time.Hour)
 		m.Annotations = map[string]string{etcdLeaveHookAnnotation(): ""}
 		m.Finalizers = []string{"test.kairos.io/hold"}
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(m, kc).Build()
+		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: "cp-0"}
+		atPreTerminateHook(m)
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(m, kc).WithStatusSubresource(&clusterv1.Machine{}).Build()
 		g.Expect(c.Delete(context.Background(), m)).To(Succeed())
-		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+		wc := pinnedWorkloadBuilder(scheme).Build()
+		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
 
 		_, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true))
 		g.Expect(err).NotTo(HaveOccurred())
-		assertHookGone(g, c, "cp-0")
+		cm := &corev1.ConfigMap{}
+		g.Expect(wc.Get(context.Background(), types.NamespacedName{Name: etcdLeaveConfigMapName, Namespace: etcdLeaveConfigMapNamespace}, cm)).To(Succeed())
+		g.Expect(cm.Data).To(HaveKeyWithValue("cp-0", etcdLeaveRequestedValue), "the etcd leave progresses while membership changes are held")
+		got := &clusterv1.Machine{}
+		g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "cp-0", Namespace: "default"}, got)).To(Succeed())
+		g.Expect(hasEtcdLeaveHook(got)).To(BeTrue())
 	})
 }
 
