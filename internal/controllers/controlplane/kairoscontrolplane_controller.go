@@ -1045,8 +1045,9 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 // When a generated name is already taken, a new one is tried.
 //
 // After the Machine is created it waits for the cache to show it, so the next
-// reconcile cannot miss it and create one more. If that wait fails, the
-// Machine is returned with the error, and nothing is deleted.
+// reconcile cannot miss it and create one more, and then its KairosConfig, so
+// the next reconcile reads what the Machine runs (ADR 0016). If either wait
+// fails, the Machine is returned with the error, and nothing is deleted.
 //
 // It refuses while the workload identity is frozen (ADR 0015 PR-2): every
 // control-plane create goes through here, so the freeze holds even for a
@@ -1080,7 +1081,10 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 		machine, err := r.createControlPlaneMachineNamed(ctx, log, kcp, cluster, guard.effective, name, role, joinTokenID)
 		if err == nil {
 			log.Info("Created control plane machine", "machine", name, "role", role)
-			return machine, waitForMachineInCache(ctx, r.Client, machine)
+			if err := waitForMachineInCache(ctx, r.Client, machine); err != nil {
+				return machine, err
+			}
+			return machine, waitForKairosConfigInCache(ctx, r.Client, machine)
 		}
 		if !errors.Is(err, errControlPlaneNameTaken) || attempt >= controlPlaneMachineNameAttempts {
 			return nil, err

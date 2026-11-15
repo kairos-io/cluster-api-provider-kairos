@@ -521,3 +521,69 @@ func TestCreateControlPlaneMachine_CacheWaitTimeoutKeepsTheMachine(t *testing.T)
 	g.Expect(configs).To(ConsistOf(m.Name))
 	g.Expect(infra).To(ConsistOf(m.Name))
 }
+
+// kairosConfigGetsFailing returns a client whose KairosConfig reads fail with
+// err for the first misses reads (every read when misses < 0), and counts
+// them in *gets.
+func kairosConfigGetsFailing(g *WithT, misses int, err error, gets *int) client.Client {
+	return fake.NewClientBuilder().WithScheme(machineMetaScheme(g)).WithObjects(machineMetaInfraTemplate()).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*bootstrapv1beta2.KairosConfig); ok {
+				*gets++
+				if misses < 0 || *gets <= misses {
+					return err
+				}
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		}}).Build()
+}
+
+// TestCreateControlPlaneMachine_WaitsForTheKairosConfigInTheCache: after the
+// Machine, the create also waits until the cache shows its KairosConfig, so
+// the next reconcile reads what the new Machine runs (ADR 0016) instead of
+// finding no vote and holding the control plane as "unknown".
+func TestCreateControlPlaneMachine_WaitsForTheKairosConfigInTheCache(t *testing.T) {
+	g := NewWithT(t)
+	misses, gets := 3, 0
+	notFound := apierrors.NewNotFound(bootstrapv1beta2.GroupVersion.WithResource("kairosconfigs").GroupResource(), "x")
+	c := kairosConfigGetsFailing(g, misses, notFound, &gets)
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: c.Scheme()}
+
+	m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(m).NotTo(BeNil())
+	g.Expect(gets).To(Equal(misses+1), "the create returns once a read sees the KairosConfig")
+}
+
+// TestCreateControlPlaneMachine_KairosConfigCacheWaitFailureKeepsTheMachine:
+// when the KairosConfig wait fails, by running out or on another read error,
+// it is handled like a failed Machine wait: the Machine is returned with the
+// error and nothing is deleted.
+func TestCreateControlPlaneMachine_KairosConfigCacheWaitFailureKeepsTheMachine(t *testing.T) {
+	orig := machineCacheWaitBackoff
+	t.Cleanup(func() { machineCacheWaitBackoff = orig })
+	machineCacheWaitBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 3}
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"never in the cache", apierrors.NewNotFound(bootstrapv1beta2.GroupVersion.WithResource("kairosconfigs").GroupResource(), "x")},
+		{"read error", errors.New("injected cache read failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			gets := 0
+			c := kairosConfigGetsFailing(g, -1, tc.err, &gets)
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: c.Scheme()}
+
+			m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+			g.Expect(err).To(MatchError(SatisfyAll(ContainSubstring("KairosConfig"), ContainSubstring("not in the cache yet"))))
+			g.Expect(m).NotTo(BeNil())
+			configs, infra, machines := objectNames(g, c)
+			g.Expect(machines).To(ConsistOf(m.Name))
+			g.Expect(configs).To(ConsistOf(m.Name))
+			g.Expect(infra).To(ConsistOf(m.Name))
+		})
+	}
+}

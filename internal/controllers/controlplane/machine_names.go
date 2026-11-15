@@ -31,6 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 )
 
 // Control-plane Machine names (ADR 0015 PR-4, maintainer decision OQ-6).
@@ -137,9 +139,33 @@ var machineCacheWaitBackoff = wait.Backoff{
 // (WaitForObjectsToBeAddedToTheCache after createMachine).
 func waitForMachineInCache(ctx context.Context, c client.Client, m *clusterv1.Machine) error {
 	key := client.ObjectKeyFromObject(m)
+	if err := waitForObjectInCache(ctx, c, key, func() client.Object { return &clusterv1.Machine{} }); err != nil {
+		return fmt.Errorf("control-plane Machine %s was created but is not in the cache yet: %w", key, err)
+	}
+	return nil
+}
+
+// waitForKairosConfigInCache waits until the client's reads return the
+// KairosConfig the Machine just created names. The next reconcile reads what
+// each control-plane Machine runs from its KairosConfig (ADR 0016); a Machine
+// whose KairosConfig the cache does not show yet has no vote, and as the only
+// Machine it would make the distribution unknown and hold the control plane
+// for a pass. Same wait, same backoff as waitForMachineInCache.
+func waitForKairosConfigInCache(ctx context.Context, c client.Client, m *clusterv1.Machine) error {
+	key := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}
+	if err := waitForObjectInCache(ctx, c, key, func() client.Object { return &bootstrapv1beta2.KairosConfig{} }); err != nil {
+		return fmt.Errorf("KairosConfig %s of control-plane Machine %s was created but is not in the cache yet: %w", key, m.Name, err)
+	}
+	return nil
+}
+
+// waitForObjectInCache polls c for key with machineCacheWaitBackoff until a
+// read succeeds. NotFound is retried; any other read error ends the wait and
+// is returned, as is the backoff's own error when it runs out.
+func waitForObjectInCache(ctx context.Context, c client.Client, key client.ObjectKey, newObj func() client.Object) error {
 	var lastErr error
 	err := wait.ExponentialBackoffWithContext(ctx, machineCacheWaitBackoff, func(ctx context.Context) (bool, error) {
-		lastErr = c.Get(ctx, key, &clusterv1.Machine{})
+		lastErr = c.Get(ctx, key, newObj())
 		switch {
 		case lastErr == nil:
 			return true, nil
@@ -153,7 +179,7 @@ func waitForMachineInCache(ctx context.Context, c client.Client, m *clusterv1.Ma
 		if lastErr != nil && !apierrors.IsNotFound(lastErr) {
 			err = lastErr
 		}
-		return fmt.Errorf("control-plane Machine %s was created but is not in the cache yet: %w", key, err)
+		return err
 	}
 	return nil
 }
