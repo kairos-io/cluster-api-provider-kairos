@@ -225,7 +225,6 @@ func TestKairosControlPlaneTemplate_Default_FillsDefaults(t *testing.T) {
 	tmpl := newValidKCPTemplate()
 	// Wipe defaults so Default() has work to do.
 	tmpl.Spec.Template.Spec.Replicas = nil
-	tmpl.Spec.Template.Spec.Distribution = ""
 	tmpl.Spec.Template.Spec.SSHFallback = &SSHFallback{
 		Enabled:             true,
 		KnownHostsSecretRef: &SSHFallbackSecretReference{Name: "kh"},
@@ -240,9 +239,6 @@ func TestKairosControlPlaneTemplate_Default_FillsDefaults(t *testing.T) {
 	if tmpl.Spec.Template.Spec.Replicas == nil || *tmpl.Spec.Template.Spec.Replicas != 1 {
 		t.Errorf("Replicas not defaulted to 1: %v", tmpl.Spec.Template.Spec.Replicas)
 	}
-	if tmpl.Spec.Template.Spec.Distribution != "k0s" {
-		t.Errorf("Distribution not defaulted to k0s: %q", tmpl.Spec.Template.Spec.Distribution)
-	}
 	s := tmpl.Spec.Template.Spec.SSHFallback
 	if s.User != "kairos" {
 		t.Errorf("SSHFallback.User not defaulted to kairos: %q", s.User)
@@ -252,6 +248,38 @@ func TestKairosControlPlaneTemplate_Default_FillsDefaults(t *testing.T) {
 	}
 	if s.ActivateAfter == nil {
 		t.Errorf("SSHFallback.ActivateAfter not defaulted: nil")
+	}
+}
+
+// TestKairosControlPlaneTemplate_Default_DoesNotSetDistribution mirrors
+// TestKairosControlPlane_Default_DoesNotSetDistribution for the template. A
+// KairosControlPlane stamped from a KairosControlPlaneTemplate copies
+// spec.template.spec.distribution verbatim, and the KCP controller inherits the
+// KairosConfigTemplate's distribution only when that value is empty. A k0s
+// default here made every ClusterClass control plane override a k3s
+// KairosConfigTemplate. The defaulter MUST leave an unset value empty and
+// preserve an explicit one.
+func TestKairosControlPlaneTemplate_Default_DoesNotSetDistribution(t *testing.T) {
+	// Unset stays unset.
+	tmpl := newValidKCPTemplate()
+	tmpl.Spec.Template.Spec.Distribution = ""
+	if err := (&kairosControlPlaneTemplateDefaulter{}).Default(context.Background(), tmpl); err != nil {
+		t.Fatalf("Default() returned error: %v", err)
+	}
+	if got := tmpl.Spec.Template.Spec.Distribution; got != "" {
+		t.Errorf("Default() set spec.template.spec.distribution to %q; expected it to stay empty so a stamped KairosControlPlane inherits the KairosConfigTemplate's distribution", got)
+	}
+
+	// Explicit values are preserved verbatim.
+	for _, dist := range []string{"k0s", "k3s"} {
+		tmpl := newValidKCPTemplate()
+		tmpl.Spec.Template.Spec.Distribution = dist
+		if err := (&kairosControlPlaneTemplateDefaulter{}).Default(context.Background(), tmpl); err != nil {
+			t.Fatalf("Default() returned error: %v", err)
+		}
+		if got := tmpl.Spec.Template.Spec.Distribution; got != dist {
+			t.Errorf("Default() changed explicit distribution %q to %q; expected unchanged", dist, got)
+		}
 	}
 }
 

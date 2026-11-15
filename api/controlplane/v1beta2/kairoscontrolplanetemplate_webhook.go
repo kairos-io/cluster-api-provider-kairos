@@ -65,10 +65,13 @@ func (*kairosControlPlaneTemplateDefaulter) Default(_ context.Context, r *Kairos
 		s.Replicas = &replicas
 	}
 
-	// Distribution default — mirrors KCP.Default().
-	if s.Distribution == "" {
-		s.Distribution = "k0s"
-	}
+	// NOTE: spec.template.spec.distribution is intentionally NOT defaulted,
+	// mirroring KCP.Default(). A KairosControlPlane stamped from this template
+	// (ClusterClass topology) copies the value verbatim, and the KCP
+	// controller only inherits the KairosConfigTemplate's distribution when
+	// spec.distribution is empty. Defaulting it to k0s here would stamp an
+	// explicit k0s onto every such KCP and silently override a k3s
+	// distribution set only on the KairosConfigTemplate.
 
 	// SSHFallback default — shared helper with KCP, defined in
 	// kairoscontrolplane_webhook.go. The helper is a no-op on nil
