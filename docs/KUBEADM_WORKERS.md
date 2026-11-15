@@ -375,11 +375,16 @@ A kubeadm control plane run by this provider is not supported in this release.
 
 - `KairosControlPlane.spec.distribution` accepts `k0s` and `k3s` only. An explicit
   `kubeadm` is rejected at admission.
-- If `spec.distribution` is empty and the referenced `KairosConfigTemplate` has
-  `distribution: kubeadm`, the `KairosControlPlane` creates no Machines. Its
-  `Ready` and `Available` conditions become `False` (Warning) with reason
-  `UnsupportedDistribution`, and `status.failureReason` is
-  `UnsupportedDistribution`. Point it at a k0s or k3s template.
+- A referenced `KairosConfigTemplate` with `distribution: kubeadm` is refused
+  whatever `spec.distribution` says, including an explicit `k0s` or `k3s`. The
+  `KairosControlPlane` holds control-plane membership changes: it creates and
+  deletes no control-plane Machine. `Ready` becomes `False` (Warning) with reason
+  `UnsupportedDistribution`. If no control-plane Machine exists, `Available` also
+  becomes `False` and `status.failureReason` is `UnsupportedDistribution`. If
+  Machines exist, `Available` and the failure fields are left alone and
+  `MachinesUpToDate` carries the reason, so a serving control plane is not reported
+  unavailable. The control plane is reconciled again about once a minute. Point it
+  at a k0s or k3s template.
 - A kubeadm worker cannot join a Kairos-managed k0s or k3s control plane. A
   `KairosControlPlane` is trusted by the worker join only when its distribution is
   kubeadm, which cannot happen in this release.
