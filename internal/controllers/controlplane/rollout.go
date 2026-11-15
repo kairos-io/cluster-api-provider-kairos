@@ -138,7 +138,7 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 		// k3s embedded etcd has no supported member-remove (KD-5d); warn that
 		// the member will linger. For k0s the etcd-leave sweep drives a clean
 		// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
-		r.warnIfK3sEtcdLimitation(kcp, target)
+		r.warnIfK3sEtcdLimitation(ctx, kcp, target)
 		log.Info("Deleting outdated control plane machine", "machine", target.Name)
 		if err := r.deleteControlPlaneMachine(ctx, kcp, target); err != nil {
 			if errors.Is(err, errWorkloadIdentityChanged) {
