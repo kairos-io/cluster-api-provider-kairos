@@ -48,7 +48,11 @@ type rolloutPlan struct {
 // plain scale-up and scale-down paths in reconcileMachines do not wait for a
 // replacement to join, so letting control fall through to them during a rollout
 // removed an old member while its replacement was still booting.
-func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine, plan rolloutPlan) (ctrl.Result, error) {
+//
+// guard is passed through to the create and delete, which refuse while it
+// holds membership changes (ADR 0016); reconcileMachines does not call this
+// while it holds.
+func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, guard distributionGuard, machines []*clusterv1.Machine, plan rolloutPlan) (ctrl.Result, error) {
 	currentReplicas := int32(len(machines))
 
 	// A single-node control plane cannot be rolled out by replacement. Its one
@@ -107,9 +111,13 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 			}
 			joinTokenID = admission.k0sJoinTokenID
 		}
-		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, role, joinTokenID); err != nil {
+		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, guard, role, joinTokenID); err != nil {
 			if errors.Is(err, errWorkloadIdentityChanged) {
 				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
+			if errors.Is(err, errDistributionHeld) {
+				log.Info("Holding back rollout surge machine", "reason", err.Error())
+				return ctrl.Result{RequeueAfter: distributionHoldRequeueAfter}, nil
 			}
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine during rollout: %w", err)
 		}
@@ -140,9 +148,13 @@ func (r *KairosControlPlaneReconciler) reconcileRollout(ctx context.Context, log
 		// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
 		r.warnIfK3sEtcdLimitation(ctx, kcp, target)
 		log.Info("Deleting outdated control plane machine", "machine", target.Name)
-		if err := r.deleteControlPlaneMachine(ctx, kcp, target); err != nil {
+		if err := r.deleteControlPlaneMachine(ctx, kcp, guard, target); err != nil {
 			if errors.Is(err, errWorkloadIdentityChanged) {
 				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
+			if errors.Is(err, errDistributionHeld) {
+				log.Info("Holding back outdated-machine rollout", "machine", target.Name, "reason", err.Error())
+				return ctrl.Result{RequeueAfter: distributionHoldRequeueAfter}, nil
 			}
 			return ctrl.Result{}, fmt.Errorf("failed to delete outdated control plane machine: %w", err)
 		}

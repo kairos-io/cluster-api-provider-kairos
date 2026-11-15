@@ -57,7 +57,7 @@ func TestReconcileMachines_RolloutReplacesTheOldestByCreationNotByName(t *testin
 			rolloutEtcdStatus(cluster, oldest, old0, old1, joined)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	names, _ := remainingMachines(g, c)
@@ -83,7 +83,7 @@ func TestReconcileMachines_ScaleDownRemovesTheNewestByCreationNotByName(t *testi
 			rolloutEtcdStatus(cluster, m9, mRand, m1, newest)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	err = c.Get(context.Background(), types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, &clusterv1.Machine{})
@@ -105,7 +105,7 @@ func TestReconcileMachines_ScaleUpCreatesOneMachineNamedLikeItsConfigAndInfra(t 
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	machines := &clusterv1.MachineList{}

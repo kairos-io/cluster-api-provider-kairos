@@ -335,7 +335,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 			Spec: clusterv1.MachineSpec{
 				ClusterName:       clusterName,
 				Version:           kcp.Spec.Version,
-				Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+				Bootstrap:         controlPlaneBootstrap(t, ctx, c, kcp, clusterName, name, "k0s"),
 				InfrastructureRef: testMachineInfraRef("infra-" + name),
 			},
 		}

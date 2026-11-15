@@ -943,7 +943,7 @@ func TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending(t *testing.T) {
 	run := func(objs ...client.Object) ctrl.Result {
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: workload}
-		res, err := r.reconcileMachines(context.Background(), logr.Discard(), kcp, cluster)
+		res, err := r.reconcileMachines(context.Background(), logr.Discard(), kcp, cluster, guardFor(kcp))
 		g.Expect(err).NotTo(HaveOccurred())
 		return res
 	}
@@ -1071,7 +1071,7 @@ func TestAdmitJoiner_K0sStampsTheIssuedTokenOnTheJoinConfig(t *testing.T) {
 	g.Expect(admission.admitted).To(BeTrue(), admission.reason)
 	g.Expect(admission.k0sJoinTokenID).To(MatchRegexp(`^[a-z0-9]{6}$`))
 
-	created, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster,
+	created, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster, guardFor(e.kcp),
 		bootstrapv1beta2.ControlPlaneRoleJoin, admission.k0sJoinTokenID)
 	g.Expect(err).NotTo(HaveOccurred())
 	kc := &bootstrapv1beta2.KairosConfig{}
@@ -1114,7 +1114,7 @@ func TestCreateControlPlaneMachine_RetryAfterAFailedCreateStampsTheCurrentToken(
 	g.Expect(e.mgmt.Create(context.Background(), fleetMachineTemplate())).To(Succeed())
 	e.kcp.Spec.MachineTemplate.InfrastructureRef = fleetTemplateRef()
 
-	_, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster,
+	_, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster, guardFor(e.kcp),
 		bootstrapv1beta2.ControlPlaneRoleJoin, "midmid")
 	g.Expect(err).To(HaveOccurred())
 	configs := &bootstrapv1beta2.KairosConfigList{}
@@ -1123,7 +1123,7 @@ func TestCreateControlPlaneMachine_RetryAfterAFailedCreateStampsTheCurrentToken(
 	g.Expect(configs.Items[0].Name).To(Equal("kcp-1"))
 
 	failMachineCreate = false
-	created, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster,
+	created, err := e.r.createControlPlaneMachine(context.Background(), e.logs.logger(), e.kcp, e.cluster, guardFor(e.kcp),
 		bootstrapv1beta2.ControlPlaneRoleJoin, "newnew")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(created.Name).NotTo(Equal("kcp-1"))

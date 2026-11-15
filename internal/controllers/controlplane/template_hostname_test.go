@@ -56,7 +56,7 @@ func TestControlPlaneTemplateHostname(t *testing.T) {
 			r.reportControlPlaneTemplateHostname(context.Background(), log.Log, kcp)
 			g.Expect(rec.Events).To(Receive(ContainSubstring("Warning " + invalidControlPlaneHostnameReason)))
 
-			created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+			created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 			g.Expect(err).To(MatchError(ContainSubstring("lowercase DNS-1123 label")))
 			g.Expect(created).To(BeNil())
 			// Names are random (ADR 0015 PR-4): check that nothing at all was

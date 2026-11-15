@@ -112,13 +112,15 @@ func hasEtcdLeaveHook(m *clusterv1.Machine) bool {
 // distributionOf returns the effective distribution for a KCP, defaulting the
 // empty value to k0s (mirrors createControlPlaneMachine).
 //
-// The controller resolves + persists spec.distribution early in Reconcile (see
-// resolveEffectiveDistribution + the resolve block in Reconcile), so by the time
-// any of the machine-create / etcd-leave paths call distributionOf the field is
-// already populated with the inherited-or-explicit value. The k0s fallback here
-// is the last-resort default used only when the referenced KairosConfigTemplate
-// has not been observed yet (the template read failed / does not exist), in which
-// case a later reconcile resolves it.
+// The controller writes an empty spec.distribution early in Reconcile
+// (reconcileDistribution, ADR 0016): from the control-plane Machines when they
+// agree, from the KairosConfigTemplate when there are none. Membership changes
+// are held while spec disagrees with the Machines, so every machine-create,
+// join and orphan path that calls distributionOf after the hold sees the value
+// the Machines run. The k0s fallback here is the last-resort default used only
+// when nothing could be written (no Machines and a template that is missing
+// or sets no distribution), in which case a later reconcile writes it. The
+// etcd leave does not use it: it reads the leaving Machine's KairosConfig.
 func distributionOf(kcp *controlplanev1beta2.KairosControlPlane) string {
 	if kcp.Spec.Distribution == "" {
 		return "k0s"
@@ -153,11 +155,11 @@ func (r *KairosControlPlaneReconciler) resolveEffectiveDistribution(ctx context.
 }
 
 // shouldStampEtcdLeaveHook decides whether a newly-created control-plane Machine
-// gets the etcd-leave pre-terminate hook: only k0s init/join members. Single-node
-// has no etcd cluster to leave; k3s embedded etcd has no supported member-remove
-// (KD-5d), so neither is hooked.
-func shouldStampEtcdLeaveHook(kcp *controlplanev1beta2.KairosControlPlane, role bootstrapv1beta2.ControlPlaneRole) bool {
-	if distributionOf(kcp) != "k0s" {
+// built with distribution gets the etcd-leave pre-terminate hook: only k0s
+// init/join members. Single-node has no etcd cluster to leave; k3s embedded
+// etcd has no supported member-remove (KD-5d), so neither is hooked.
+func shouldStampEtcdLeaveHook(distribution string, role bootstrapv1beta2.ControlPlaneRole) bool {
+	if distribution != "k0s" {
 		return false
 	}
 	return role == bootstrapv1beta2.ControlPlaneRoleInit || role == bootstrapv1beta2.ControlPlaneRoleJoin

@@ -56,6 +56,10 @@ const (
 	// while outdated machines are being replaced one at a time; False(Warning,
 	// SingleNodeRolloutUnsupportedReason) when a single-node control plane has
 	// an outdated machine, which is left unchanged rather than replaced.
+	// False(Warning, DistributionMismatchReason or UnsupportedDistributionReason)
+	// while control-plane Machines exist and membership changes are held because
+	// of the distribution (ADR 0016). updatedReplicas still counts by version
+	// only.
 	MachinesUpToDateCondition = "MachinesUpToDate"
 )
 
@@ -254,18 +258,47 @@ const (
 	WaitingForInfrastructureControlPlaneEndpointReason = "WaitingForInfrastructureControlPlaneEndpoint"
 
 	// UnsupportedDistributionReason is the False(Warning) reason on the
-	// KairosControlPlane AvailableCondition and ReadyCondition when the effective
-	// distribution is one the control-plane provider does not support. The only
-	// case today is `kubeadm`: ADR 0010 ships kubeadm as a bootstrap (worker-join)
-	// distribution in P1, while a kubeadm KairosControlPlane is deferred to P2, so
-	// the KCP enum stays [k0s, k3s]. The validating webhook already refuses an
-	// explicit `spec.distribution: kubeadm`; this reason covers the inherit path,
-	// where a KairosControlPlane references a KairosConfigTemplate whose
-	// distribution is kubeadm. The controller MUST surface this as a condition
-	// rather than persist kubeadm into spec.distribution — the webhook would reject
-	// that write on every reconcile, producing an error loop.
+	// KairosControlPlane ReadyCondition when the effective distribution is one
+	// the control-plane provider does not support. The only case today is
+	// `kubeadm`: ADR 0010 ships kubeadm as a bootstrap (worker-join)
+	// distribution in P1, while a kubeadm KairosControlPlane is deferred to P2,
+	// so the KCP enum stays [k0s, k3s]. The validating webhook already refuses
+	// an explicit `spec.distribution: kubeadm`; this reason covers a
+	// KairosControlPlane that references a KairosConfigTemplate whose
+	// distribution is kubeadm, whatever spec.distribution says, and an explicit
+	// kubeadm that bypassed the webhook. The controller MUST surface this as a
+	// condition rather than persist kubeadm into spec.distribution — the webhook
+	// would reject that write on every reconcile, producing an error loop.
+	//
+	// It holds membership changes like DistributionMismatchReason (ADR 0016).
+	// With no control-plane Machines, AvailableCondition is False with this
+	// reason too and failureReason/failureMessage are set. With Machines, it is
+	// set on MachinesUpToDateCondition instead and Available is left alone.
 	//
 	// Resolution: point the KairosControlPlane at a k0s or k3s KairosConfigTemplate,
 	// or wait for P2's kubeadm control-plane support.
 	UnsupportedDistributionReason = "UnsupportedDistribution"
+
+	// DistributionMismatchReason is the False(Warning) reason on ReadyCondition
+	// and MachinesUpToDateCondition while control-plane Machines exist and
+	// spec.distribution does not match what they run (ADR 0016): their
+	// KairosConfigs disagree with each other, none of them can be read, or they
+	// agree on a distribution other than spec.distribution. The controller
+	// stamps each node's distribution on its KairosConfig when it creates the
+	// Machine, and a node never changes distribution, so a changed
+	// spec.distribution cannot be acted on.
+	//
+	// While it is set the controller creates and deletes no control-plane
+	// Machine, mints and extends no join token and removes no orphan etcd
+	// member. Status, the kubeconfig, metadata propagation and the etcd leave
+	// of a Machine an operator deleted carry on, and AvailableCondition is not
+	// changed: the control plane still serves.
+	//
+	// Resolution: set spec.distribution back to what the Machines run, or
+	// remove it so the controller writes that value back, on the
+	// KairosControlPlane or its KairosControlPlaneTemplate. When the Machines
+	// disagree, do the same, then delete the Machines that run the other
+	// distribution; the controller never deletes them on its own. Changing a
+	// cluster's distribution needs a new Cluster.
+	DistributionMismatchReason = "DistributionMismatch"
 )

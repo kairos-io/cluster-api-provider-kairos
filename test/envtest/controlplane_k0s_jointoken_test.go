@@ -141,6 +141,7 @@ func publishForeignKubernetesSlice(t *testing.T, ctx context.Context, wc client.
 func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsName, clusterName, kcpName string, kubeconfig []byte, addrs ...string) {
 	t.Helper()
 	g := NewWithT(t)
+	kcp := getKCP(g, ctx, c, nsName, kcpName)
 	initMachine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      kcpName + "-0",
@@ -150,13 +151,13 @@ func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsN
 				clusterv1.MachineControlPlaneLabel: "",
 			},
 			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(getKCP(g, ctx, c, nsName, kcpName), controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
+				*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
 			},
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName:       clusterName,
 			Version:           "v1.30.0+k0s.0",
-			Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+			Bootstrap:         controlPlaneBootstrap(t, ctx, c, kcp, clusterName, kcpName+"-0", "k0s"),
 			InfrastructureRef: testMachineInfraRef("infra"),
 		},
 	}

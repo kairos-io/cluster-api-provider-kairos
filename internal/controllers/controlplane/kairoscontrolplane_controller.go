@@ -358,78 +358,42 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// Resolve + persist the effective distribution BEFORE any machine creation
-	// or etcd-leave logic, so every downstream call to distributionOf(kcp) —
-	// createControlPlaneMachine, the join gate, the etcd-leave handshake — sees
-	// the resolved value without threading it through call signatures.
-	//
-	// Precedence: an explicit spec.distribution wins; otherwise inherit
-	// spec.template.spec.distribution from the referenced KairosConfigTemplate;
-	// otherwise fall back to k0s (applied downstream by distributionOf). We only
-	// PERSIST when we can actually resolve an inherited value — a missing template
-	// (or one without a distribution) leaves the field empty for this reconcile
-	// (distributionOf falls back to k0s) and a later reconcile resolves it once
-	// the template exists, rather than persisting a guessed k0s.
-	// Defence in depth for an explicit kubeadm distribution. The validating
-	// webhook refuses spec.distribution=kubeadm on a KairosControlPlane (the KCP
-	// enum stays [k0s, k3s] until P2, ADR 0010), but a webhook is not always in the
-	// path (not yet installed, failurePolicy, direct etcd writes). Surface a clear
-	// condition and stop, rather than carrying kubeadm into the machine-create path.
-	if kcp.Spec.Distribution == kcpUnsupportedDistributionKubeadm {
-		return r.refuseKubeadmControlPlane(ctx, log, kcp,
-			"spec.distribution is kubeadm")
+	// ADR 0016: the control plane's distribution follows its Machines. Read
+	// what the KCP-owned Machines run from their KairosConfigs, write an empty
+	// spec.distribution (from the Machines when they agree, from the
+	// KairosConfigTemplate when there are none), and decide whether membership
+	// changes are held: kubeadm in spec or the template, or Machines that are
+	// mixed, unknown or disagree with spec. This replaces the old resolve-and-
+	// persist step and both kubeadm refusals. It runs BEFORE any machine
+	// creation or etcd-leave logic, so every later distributionOf(kcp) sees
+	// the written value. The hold itself is applied in reconcileMachines and
+	// the conditions in markDistributionConditions below.
+	guard, err := r.reconcileDistribution(ctx, log, kcp, cluster)
+	if err != nil {
+		if apierrors.IsConflict(err) {
+			// Another writer changed the KCP after this reconcile read it, and
+			// the optimistic lock kept their edit. Their change re-enqueues the
+			// KCP; this is the backstop.
+			log.Info("The KairosControlPlane changed while spec.distribution was being written; retrying")
+			return ctrl.Result{RequeueAfter: distributionWriteConflictRequeueAfter}, nil
+		}
+		return ctrl.Result{}, err
 	}
-
-	if kcp.Spec.Distribution == "" {
-		inherited, rerr := r.resolveEffectiveDistribution(ctx, kcp)
-		if rerr != nil {
-			return ctrl.Result{}, rerr
+	if guard.wroteSpec {
+		// Re-anchor the status patch helper against the post-Patch state so
+		// the deferred Patch on early-exit paths still produces a clean diff.
+		patchHelper, err = patch.NewHelper(kcp, r.Client)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-		// A KairosConfigTemplate whose distribution is kubeadm cannot be adopted by
-		// a control plane in P1. Persisting kubeadm into spec.distribution would be
-		// rejected by the KCP webhook on every reconcile — an error loop — so refuse
-		// with a condition instead and leave spec.distribution empty. (ADR 0010 P1
-		// item 2: "a KCP referencing a kubeadm KairosConfigTemplate must be refused
-		// with a clear condition, not an error loop".)
-		if inherited == kcpUnsupportedDistributionKubeadm {
-			return r.refuseKubeadmControlPlane(ctx, log, kcp,
-				fmt.Sprintf("KairosConfigTemplate %q has distribution kubeadm", kcp.Spec.KairosConfigTemplate.Name))
-		}
-		if inherited != "" {
-			// Persist with a dedicated MergeFrom patch, separate from the status
-			// patch helper, so this spec write is not folded into a status patch
-			// (never mix spec + status writes on the same object in one Reconcile).
-			base := kcp.DeepCopy()
-			kcp.Spec.Distribution = inherited
-			if err := r.Patch(ctx, kcp, client.MergeFrom(base)); err != nil {
-				return ctrl.Result{}, fmt.Errorf("persist inherited spec.distribution: %w", err)
-			}
-			log.Info("Inherited spec.distribution from KairosConfigTemplate",
-				"distribution", inherited, "template", kcp.Spec.KairosConfigTemplate.Name)
-			// Re-anchor the status patch helper against the post-Patch state so
-			// the deferred Patch on early-exit paths still produces a clean diff.
-			patchHelper, err = patch.NewHelper(kcp, r.Client)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			kcp.Status.ObservedGeneration = kcp.Generation
-		}
-	} else if r.Recorder != nil {
-		// An explicit spec.distribution is authoritative but MAY conflict with a
-		// distribution set only on the KairosConfigTemplate. Surface the override
-		// so operators are not surprised the template value was ignored.
-		if tmplDist, rerr := r.resolveEffectiveDistribution(ctx, kcp); rerr == nil &&
-			tmplDist != "" && tmplDist != kcp.Spec.Distribution {
-			r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "DistributionOverride",
-				"spec.distribution=%s overrides KairosConfigTemplate distribution=%s", kcp.Spec.Distribution, tmplDist)
-		}
+		kcp.Status.ObservedGeneration = kcp.Generation
 	}
 
 	// Reconcile control plane machines. machinesResult carries a requeue when
 	// the HA joiner-sequencing gate is holding back the next join machine
 	// (ADR 0005 Phase 3) — it is applied at the end of Reconcile so status is
 	// still refreshed while we wait for the init machine to become joinable.
-	machinesResult, err := r.reconcileMachines(ctx, log, kcp, cluster)
+	machinesResult, err := r.reconcileMachines(ctx, log, kcp, cluster, guard)
 	if err != nil {
 		// Use "%s" as format string and pass error as argument to satisfy linter
 		conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.ControlPlaneInitializationFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
@@ -536,6 +500,13 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// warning, and etcd health.
 	r.setHAConditions(ctx, kcp, cluster, endpointReady)
 
+	// ADR 0016 D5: while membership changes are held because of the
+	// distribution, Ready is False, and so is MachinesUpToDate (with Machines)
+	// or Available plus the failure fields (without). Runs after the status
+	// math above and before the identity freeze, so a freeze wins Ready. The
+	// matching events are emitted once this status is persisted, below.
+	markDistributionConditions(kcp, guard)
+
 	// ADR 0015 PR-2: while the workload identity is frozen, Ready, Available
 	// and EtcdHealthy are False whatever the nodes report. Runs last so no condition
 	// above can report the control plane healthy while the KCP may be looking at
@@ -558,6 +529,12 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to update KCP status: %w", err)
 	}
+
+	// ADR 0016 D5: announce entering or leaving the hold only now that the
+	// Ready reason the next reconcile de-duplicates against is persisted. A
+	// reconcile that read a stale cached KCP sees the old Ready reason, but
+	// its status update conflicts first, so it emits nothing.
+	r.recordDistributionEvents(log, kcp, guard)
 
 	log.Info("Successfully updated KCP status",
 		"initialized", kcp.Status.Initialized,
@@ -582,28 +559,6 @@ func (r *KairosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// other paths above leave it zero-valued, so this is a no-op outside the HA
 	// gate case.
 	return machinesResult, nil
-}
-
-// refuseKubeadmControlPlane surfaces a clear, non-looping refusal when the
-// effective distribution of a KairosControlPlane is kubeadm (ADR 0010 P1 item 2).
-// It marks Available/Ready False(Warning) with UnsupportedDistributionReason,
-// latches the failure fields, flushes status, and returns without a requeue — it
-// never writes kubeadm into spec.distribution (which the webhook would reject on
-// every pass, an error loop). A later spec/template edit re-enqueues through the
-// normal watches. reason is a short human-readable cause for the condition message.
-func (r *KairosControlPlaneReconciler) refuseKubeadmControlPlane(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, reason string) (ctrl.Result, error) {
-	msg := fmt.Sprintf("kubeadm is not supported on a KairosControlPlane in this release (%s); "+
-		"kubeadm is a worker-join distribution only. "+
-		"Use a k0s or k3s KairosConfigTemplate for the control plane.", reason)
-	log.Info("Refusing kubeadm KairosControlPlane", "reason", reason)
-	conditions.MarkFalse(kcp, clusterv1.ReadyCondition, controlplanev1beta2.UnsupportedDistributionReason, clusterv1.ConditionSeverityWarning, "%s", msg)
-	conditions.MarkFalse(kcp, controlplanev1beta2.AvailableCondition, controlplanev1beta2.UnsupportedDistributionReason, clusterv1.ConditionSeverityWarning, "%s", msg)
-	kcp.Status.FailureReason = controlplanev1beta2.UnsupportedDistributionReason
-	kcp.Status.FailureMessage = msg
-	if updateErr := r.Status().Update(ctx, kcp); updateErr != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to update KCP status: %w", updateErr)
-	}
-	return ctrl.Result{}, nil
 }
 
 // findClusterForControlPlane searches for a Cluster that references this KairosControlPlane
@@ -642,7 +597,11 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 	return nil, nil
 }
 
-func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (result ctrl.Result, retErr error) {
+// reconcileMachines runs every control-plane Machine action. guard is what
+// reconcileDistribution decided this reconcile (ADR 0016): while it is held,
+// metadata, the identity gate and the etcd-leave sweep still run, and every
+// membership change after them waits.
+func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, guard distributionGuard) (result ctrl.Result, retErr error) {
 	// While a k0s joiner is pending, come back at least every
 	// k0sJoinTokenRecheckInterval so its join token is extended before it lapses
 	// (ADR 0013). Without this, a pending last joiner (machines == replicas)
@@ -747,6 +706,20 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		}
 	}
 
+	// ADR 0016 D3: while spec.distribution disagrees with what the Machines
+	// run, or kubeadm is involved, hold every membership change below: the
+	// join-token Secret and the k0s token, orphan etcd-member removal, and
+	// every create and delete. The sweep above has already progressed the
+	// leave of any Machine an operator deleted; that leave decides from the
+	// Machine's own KairosConfig (D4). Like the identity hold, this returns a
+	// requeue, not an error, so status is still refreshed. There is no
+	// KairosConfigTemplate watch, so the requeue is what notices a template fix.
+	if guard.held() {
+		log.Info("Holding control-plane membership changes: the distribution does not match the control-plane Machines",
+			"reason", guard.reason, "spec", guard.spec, "template", guard.template, "observed", guard.observed.String())
+		return ctrl.Result{RequeueAfter: distributionHoldRequeueAfter}, nil
+	}
+
 	// HA: ensure the per-cluster join-token Secret exists before any joiner is
 	// created (ADR 0005 Phase 3). For k3s the controller generates the shared
 	// server token up front; for k0s the Secret is created empty and the KCP
@@ -816,7 +789,7 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 	// it always returns: the scale paths below do not wait for a replacement to
 	// join, so falling through to them would remove a member early.
 	if len(plan.outdated) > 0 {
-		return r.reconcileRollout(ctx, log, kcp, cluster, machines, plan)
+		return r.reconcileRollout(ctx, log, kcp, cluster, guard, machines, plan)
 	}
 	conditions.MarkTrue(kcp, controlplanev1beta2.MachinesUpToDateCondition)
 
@@ -846,9 +819,13 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 			joinTokenID = admission.k0sJoinTokenID
 		}
 
-		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, role, joinTokenID); err != nil {
+		if _, err := r.createControlPlaneMachine(ctx, log, kcp, cluster, guard, role, joinTokenID); err != nil {
 			if errors.Is(err, errWorkloadIdentityChanged) {
 				return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+			}
+			if errors.Is(err, errDistributionHeld) {
+				log.Info("Holding back control-plane machine creation", "reason", err.Error())
+				return ctrl.Result{RequeueAfter: distributionHoldRequeueAfter}, nil
 			}
 			return ctrl.Result{}, fmt.Errorf("failed to create control plane machine: %w", err)
 		}
@@ -878,9 +855,13 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 			// `k0s etcd leave` while CAPI is paused at the pre-terminate hook.
 			r.warnIfK3sEtcdLimitation(ctx, kcp, target)
 			log.Info("Scaling down control plane machine", "machine", target.Name)
-			if err := r.deleteControlPlaneMachine(ctx, kcp, target); err != nil {
+			if err := r.deleteControlPlaneMachine(ctx, kcp, guard, target); err != nil {
 				if errors.Is(err, errWorkloadIdentityChanged) {
 					return ctrl.Result{RequeueAfter: workloadIdentityFrozenRequeueAfter}, nil
+				}
+				if errors.Is(err, errDistributionHeld) {
+					log.Info("Holding back control-plane scale-down", "machine", target.Name, "reason", err.Error())
+					return ctrl.Result{RequeueAfter: distributionHoldRequeueAfter}, nil
 				}
 				return ctrl.Result{}, fmt.Errorf("failed to delete control plane machine: %w", err)
 			}
@@ -1075,8 +1056,18 @@ func (r *KairosControlPlaneReconciler) initMachineJoinable(ctx context.Context, 
 // first attempt, so a frozen create makes nothing that needs cleaning up. The
 // same holds for the referenced KairosConfigTemplate's hostname (ADR 0015
 // PR-3): a template control-plane nodes cannot use is refused up front.
-func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) (*clusterv1.Machine, error) {
+//
+// guard is reconcileDistribution's decision (ADR 0016). The Machine is built
+// with guard.effective, never a value read again here, and the create is
+// refused, before anything exists, while membership changes are held, when
+// the KairosConfigTemplate is kubeadm, or when no distribution was decided.
+// The kubeadm check is repeated on the template read for the merge, in case
+// the template changed since the guard read it.
+func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, guard distributionGuard, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) (*clusterv1.Machine, error) {
 	if err := errIfIdentityFrozen(kcp, "create a control-plane Machine"); err != nil {
+		return nil, err
+	}
+	if err := guard.errIfCannotCreate(); err != nil {
 		return nil, err
 	}
 	// ADR 0015 PR-3: never stamp a control-plane config from a template whose
@@ -1088,7 +1079,7 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 	}
 	for attempt := 1; ; attempt++ {
 		name := newControlPlaneMachineName(kcp.Name)
-		machine, err := r.createControlPlaneMachineNamed(ctx, log, kcp, cluster, name, role, joinTokenID)
+		machine, err := r.createControlPlaneMachineNamed(ctx, log, kcp, cluster, guard.effective, name, role, joinTokenID)
 		if err == nil {
 			log.Info("Created control plane machine", "machine", name, "role", role)
 			return machine, waitForMachineInCache(ctx, r.Client, machine)
@@ -1101,11 +1092,11 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachine(ctx context.Con
 }
 
 // createControlPlaneMachineNamed is one attempt of createControlPlaneMachine
-// under machineName. It returns an error wrapping errControlPlaneNameTaken when
-// an object of that name already exists; it never adopts one.
-func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machineName string, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) (*clusterv1.Machine, error) {
+// under machineName, building the Machine with distribution. It returns an
+// error wrapping errControlPlaneNameTaken when an object of that name already
+// exists; it never adopts one.
+func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, distribution, machineName string, role bootstrapv1beta2.ControlPlaneRole, joinTokenID string) (*clusterv1.Machine, error) {
 	// Create KairosConfig
-	distribution := distributionOf(kcp)
 	kairosConfig := &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      machineName,
@@ -1136,6 +1127,12 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx contex
 		}
 		if err := r.Get(ctx, templateKey, template); err != nil {
 			return nil, fmt.Errorf("failed to get KairosConfigTemplate: %w", err)
+		}
+		// ADR 0016: never build a control-plane Machine from a kubeadm worker
+		// spec, whatever distribution would be stamped on it.
+		if template.Spec.Template.Spec.Distribution == kcpUnsupportedDistributionKubeadm {
+			return nil, fmt.Errorf("refusing to create a control-plane Machine: KairosConfigTemplate %q has distribution kubeadm: %w",
+				template.Name, errDistributionHeld)
 		}
 		// Merge template spec
 		kairosConfig.Spec = template.Spec.Template.Spec
@@ -1219,7 +1216,7 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx contex
 	// init/join are hooked — single-node has no etcd cluster and k3s has no
 	// supported member-remove (KD-5d). The empty annotation value is the CAPI
 	// convention for a hook awaiting external completion.
-	if shouldStampEtcdLeaveHook(kcp, role) {
+	if shouldStampEtcdLeaveHook(distribution, role) {
 		if machine.Annotations == nil {
 			machine.Annotations = map[string]string{}
 		}
@@ -1338,12 +1335,16 @@ func (r *KairosControlPlaneReconciler) selectMachineForDeletion(machines []*clus
 
 // deleteControlPlaneMachine is the KCP-initiated delete of one control-plane
 // Machine (rollout replacement and scale-down). It refuses while the workload
-// identity is frozen (ADR 0015 PR-2). Callers verify the identity first with
-// identityPreflight; this check keeps the freeze in force even for a caller
-// that did not. Whole-cluster teardown deletes through drainOwnedMachines and
-// is not affected.
-func (r *KairosControlPlaneReconciler) deleteControlPlaneMachine(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) error {
+// identity is frozen (ADR 0015 PR-2), and while guard holds membership
+// changes because of the distribution (ADR 0016). Callers check both first;
+// these checks keep them in force even for a caller that did not.
+// Whole-cluster teardown deletes through drainOwnedMachines and is not
+// affected.
+func (r *KairosControlPlaneReconciler) deleteControlPlaneMachine(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, guard distributionGuard, target *clusterv1.Machine) error {
 	if err := errIfIdentityFrozen(kcp, "delete control-plane Machine "+target.Name); err != nil {
+		return err
+	}
+	if err := guard.errIfHeld("delete control-plane Machine " + target.Name); err != nil {
 		return err
 	}
 	return r.Delete(ctx, target)

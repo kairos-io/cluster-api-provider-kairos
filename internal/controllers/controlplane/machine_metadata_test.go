@@ -117,7 +117,7 @@ func TestCreateControlPlaneMachine_PropagatesTemplateMetadata(t *testing.T) {
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(),
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp),
 		bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -149,7 +149,7 @@ func TestCreateControlPlaneMachine_InfraMachineKeepsTemplateMetadata(t *testing.
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(),
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp),
 		bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -231,7 +231,7 @@ func TestCreateControlPlaneMachine_EtcdHookWinsOverTemplateAnnotation(t *testing
 		WithObjects(machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(),
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp),
 		bootstrapv1beta2.ControlPlaneRoleInit, "")
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -384,7 +384,7 @@ func TestReconcileMachines_SweepsMachineMetadata(t *testing.T) {
 		WithObjects(machine, machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, machineMetaCluster())
+	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp))
 	g.Expect(err).NotTo(HaveOccurred())
 
 	got := &clusterv1.Machine{}

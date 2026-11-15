@@ -59,29 +59,28 @@ func TestEtcdLeaveHookAnnotation(t *testing.T) {
 }
 
 // TestShouldStampEtcdLeaveHook: only k0s init/join are hooked. Single-node has no
-// etcd cluster; k3s has no supported member-remove (KD-5d).
+// etcd cluster; k3s has no supported member-remove (KD-5d). The decision takes
+// the distribution the Machine is built with (the guard's effective value,
+// ADR 0016), which is never empty: an undecided distribution is not hooked,
+// and createControlPlaneMachine refuses to build with one.
 func TestShouldStampEtcdLeaveHook(t *testing.T) {
-	mk := func(dist string) *controlplanev1beta2.KairosControlPlane {
-		return &controlplanev1beta2.KairosControlPlane{Spec: controlplanev1beta2.KairosControlPlaneSpec{Distribution: dist}}
-	}
 	for _, tc := range []struct {
 		name string
-		kcp  *controlplanev1beta2.KairosControlPlane
+		dist string
 		role bootstrapv1beta2.ControlPlaneRole
 		want bool
 	}{
-		{"k0s init", mk("k0s"), bootstrapv1beta2.ControlPlaneRoleInit, true},
-		{"k0s join", mk("k0s"), bootstrapv1beta2.ControlPlaneRoleJoin, true},
-		{"k0s single", mk("k0s"), bootstrapv1beta2.ControlPlaneRoleSingle, false},
-		{"empty dist defaults k0s init", mk(""), bootstrapv1beta2.ControlPlaneRoleInit, true},
-		{"empty dist single", mk(""), bootstrapv1beta2.ControlPlaneRoleSingle, false},
-		{"k3s init", mk("k3s"), bootstrapv1beta2.ControlPlaneRoleInit, false},
-		{"k3s join", mk("k3s"), bootstrapv1beta2.ControlPlaneRoleJoin, false},
+		{"k0s init", "k0s", bootstrapv1beta2.ControlPlaneRoleInit, true},
+		{"k0s join", "k0s", bootstrapv1beta2.ControlPlaneRoleJoin, true},
+		{"k0s single", "k0s", bootstrapv1beta2.ControlPlaneRoleSingle, false},
+		{"k3s init", "k3s", bootstrapv1beta2.ControlPlaneRoleInit, false},
+		{"k3s join", "k3s", bootstrapv1beta2.ControlPlaneRoleJoin, false},
+		{"undecided init", "", bootstrapv1beta2.ControlPlaneRoleInit, false},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			g.Expect(shouldStampEtcdLeaveHook(tc.kcp, tc.role)).To(Equal(tc.want))
+			g.Expect(shouldStampEtcdLeaveHook(tc.dist, tc.role)).To(Equal(tc.want))
 		})
 	}
 }
