@@ -384,7 +384,7 @@ func TestReconcileMachines_SweepsMachineMetadata(t *testing.T) {
 		WithObjects(machine, machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp))
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, machineMetaCluster())
 	g.Expect(err).NotTo(HaveOccurred())
 
 	got := &clusterv1.Machine{}

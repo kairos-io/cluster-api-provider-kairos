@@ -163,7 +163,7 @@ func TestReconcileMachines_ScaleUpAfterDeletingTheNewestDoesNotReuseItsName(t *t
 
 	used := map[string]bool{}
 	for round := 0; round < 5; round++ {
-		_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
+		_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 		g.Expect(err).NotTo(HaveOccurred())
 		_, _, machines := objectNames(g, c)
 		g.Expect(machines).To(HaveLen(1))
@@ -197,7 +197,7 @@ func TestReconcileMachines_MixedNamesScaleUpAddsARandomNamedJoiner(t *testing.T)
 		WithObjects(init, joiner, machineMetaInfraTemplate(), rolloutEtcdStatus(cluster, init, joiner)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	_, _, machines := objectNames(g, c)
@@ -225,7 +225,7 @@ func TestReconcileMachines_MixedNamesScaleUpAddsARandomNamedJoiner(t *testing.T)
 	g.Expect(m.CreationTimestamp.IsZero()).To(BeFalse())
 
 	kcp.Spec.Replicas = ptrInt32(5)
-	res, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
+	res, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 	_, _, machines = objectNames(g, c)
@@ -249,13 +249,13 @@ func TestReconcileMachines_RolloutSurgeAddsOneRandomNamedMachine(t *testing.T) {
 		WithObjects(old0, old1, old2, machineMetaInfraTemplate(), rolloutEtcdStatus(cluster, old0, old1, old2)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	_, _, machines := objectNames(g, c)
 	g.Expect(machines).To(HaveLen(4))
 	g.Expect(machines).NotTo(ContainElement("test-kcp-3"))
 
-	_, err = r.reconcileMachines(context.Background(), log.Log, kcp, cluster, guardFor(kcp))
+	_, err = r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	_, _, machines = objectNames(g, c)
 	g.Expect(machines).To(HaveLen(4), "no second surge and no delete until the first surge machine joins")

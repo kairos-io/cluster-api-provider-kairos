@@ -273,6 +273,9 @@ type distributionGuard struct {
 	spec string
 	// observed is what the Machines run.
 	observed observedDistribution
+	// machines are the KCP-owned control-plane Machines observed was read
+	// from. reconcileMachines works on this list rather than listing again.
+	machines []*clusterv1.Machine
 	// templateName and template are the referenced KairosConfigTemplate and
 	// its distribution ("" when it sets none or does not exist).
 	templateName string
@@ -448,6 +451,7 @@ func (r *KairosControlPlaneReconciler) reconcileDistribution(ctx context.Context
 	if err != nil {
 		return g, fmt.Errorf("list control-plane Machines: %w", err)
 	}
+	g.machines = machines
 	if g.observed, err = r.observeDistribution(ctx, machines); err != nil {
 		return g, err
 	}

@@ -943,7 +943,7 @@ func TestReconcileMachines_RequeuesWhileAK0sJoinerIsPending(t *testing.T) {
 	run := func(objs ...client.Object) ctrl.Result {
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: workload}
-		res, err := r.reconcileMachines(context.Background(), logr.Discard(), kcp, cluster, guardFor(kcp))
+		res, err := r.reconcileMachinesListed(context.Background(), logr.Discard(), kcp, cluster)
 		g.Expect(err).NotTo(HaveOccurred())
 		return res
 	}

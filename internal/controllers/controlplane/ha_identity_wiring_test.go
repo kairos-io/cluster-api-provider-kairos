@@ -172,7 +172,7 @@ func newMembershipRun(g *WithT, sc membershipScenario, annotations map[string]st
 }
 
 func (m *membershipRun) reconcile() (time.Duration, error) {
-	res, err := m.r.reconcileMachines(context.Background(), log.Log, m.kcp, m.cluster, guardFor(m.kcp))
+	res, err := m.r.reconcileMachinesListed(context.Background(), log.Log, m.kcp, m.cluster)
 	return res.RequeueAfter, err
 }
 

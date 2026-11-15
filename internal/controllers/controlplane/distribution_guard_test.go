@@ -25,6 +25,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -54,6 +55,28 @@ func guardFor(kcp *controlplanev1beta2.KairosControlPlane) distributionGuard {
 // guardWith is an open guard that builds Machines with distribution.
 func guardWith(distribution string) distributionGuard {
 	return distributionGuard{effective: distribution, spec: distribution}
+}
+
+// listedGuard returns guard with the control-plane Machines kcp owns in r's
+// client, as reconcileDistribution lists them for reconcileMachines.
+func listedGuard(g Gomega, r *KairosControlPlaneReconciler, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, guard distributionGuard) distributionGuard {
+	machines, err := r.getControlPlaneMachines(context.Background(), kcp, cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	guard.machines = machines
+	return guard
+}
+
+// reconcileMachinesListed runs reconcileMachines the way Reconcile does for a
+// control plane that is not held: with an open guard carrying the Machines
+// the KCP owns, listed fresh on every call.
+func (r *KairosControlPlaneReconciler) reconcileMachinesListed(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (ctrl.Result, error) {
+	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list control plane machines: %w", err)
+	}
+	guard := guardFor(kcp)
+	guard.machines = machines
+	return r.reconcileMachines(ctx, log, kcp, cluster, guard)
 }
 
 // heldGuard is a guard holding membership changes with reason, as a
@@ -443,7 +466,7 @@ func TestReconcileMachines_DistributionHold(t *testing.T) {
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-		res, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true))
+		res, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), listedGuard(g, r, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true)))
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(res.RequeueAfter).To(Equal(distributionHoldRequeueAfter))
 		names, _ := remainingMachines(g, c)
@@ -461,7 +484,7 @@ func TestReconcileMachines_DistributionHold(t *testing.T) {
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-		res, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true))
+		res, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), listedGuard(g, r, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true)))
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(res.RequeueAfter).To(Equal(distributionHoldRequeueAfter))
 		names, deleting := remainingMachines(g, c)
@@ -470,7 +493,7 @@ func TestReconcileMachines_DistributionHold(t *testing.T) {
 
 		// The same control plane, not held, scales down: the hold is what
 		// stopped it.
-		_, err = r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), guardFor(kcp))
+		_, err = r.reconcileMachinesListed(context.Background(), log.Log, kcp, rolloutCluster())
 		g.Expect(err).NotTo(HaveOccurred())
 		names, _ = remainingMachines(g, c)
 		g.Expect(names).To(HaveLen(2))
@@ -493,7 +516,7 @@ func TestReconcileMachines_DistributionHold(t *testing.T) {
 		wc := pinnedWorkloadBuilder(scheme).Build()
 		r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
 
-		_, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true))
+		_, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster(), listedGuard(g, r, kcp, rolloutCluster(), heldGuard(controlplanev1beta2.DistributionMismatchReason, true)))
 		g.Expect(err).NotTo(HaveOccurred())
 		cm := &corev1.ConfigMap{}
 		g.Expect(wc.Get(context.Background(), types.NamespacedName{Name: etcdLeaveConfigMapName, Namespace: etcdLeaveConfigMapNamespace}, cm)).To(Succeed())

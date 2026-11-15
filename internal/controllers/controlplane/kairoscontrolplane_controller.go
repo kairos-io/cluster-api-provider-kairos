@@ -598,9 +598,10 @@ func (r *KairosControlPlaneReconciler) findClusterForControlPlane(ctx context.Co
 }
 
 // reconcileMachines runs every control-plane Machine action. guard is what
-// reconcileDistribution decided this reconcile (ADR 0016): while it is held,
-// metadata, the identity gate and the etcd-leave sweep still run, and every
-// membership change after them waits.
+// reconcileDistribution decided this reconcile (ADR 0016), and carries the
+// KCP-owned control-plane Machines it read, which this works on. While it is
+// held, metadata, the identity gate and the etcd-leave sweep still run, and
+// every membership change after them waits.
 func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, guard distributionGuard) (result ctrl.Result, retErr error) {
 	// While a k0s joiner is pending, come back at least every
 	// k0sJoinTokenRecheckInterval so its join token is extended before it lapses
@@ -623,11 +624,8 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		desiredReplicas = *kcp.Spec.Replicas
 	}
 
-	// List existing control plane machines
-	machines, err := r.getControlPlaneMachines(ctx, kcp, cluster)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list control plane machines: %w", err)
-	}
+	// The control-plane Machines reconcileDistribution listed this reconcile.
+	machines := guard.machines
 
 	// Sort machines by creation timestamp (oldest first) for stable operations.
 	// Names carry no order (ADR 0015 PR-4).
