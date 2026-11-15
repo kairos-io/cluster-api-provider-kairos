@@ -60,9 +60,11 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -85,13 +87,22 @@ const (
 	// distribution in an event or condition message.
 	distributionEventMachineLimit = 5
 
+	// distributionWriteErrorLimit caps, in bytes, the error text a failed
+	// spec.distribution write puts into an event and the condition message.
+	distributionWriteErrorLimit = 256
+
+	// distributionHeldSentence is what every hold message says is stopped.
+	distributionHeldSentence = " Control-plane Machines are not created or deleted, join tokens are not minted or extended, and " +
+		"orphan etcd members are not removed until this is fixed."
+
 	// Event reasons for the spec.distribution write and the end of a hold.
 	// The Warning event on entering a hold uses the verdict's condition
 	// reason.
-	distributionInheritedEventReason = "DistributionInherited"
-	distributionRestoredEventReason  = "DistributionRestored"
-	distributionResolvedEventReason  = "DistributionMismatchResolved"
-	distributionOverrideEventReason  = "DistributionOverride"
+	distributionInheritedEventReason   = "DistributionInherited"
+	distributionRestoredEventReason    = "DistributionRestored"
+	distributionResolvedEventReason    = "DistributionMismatchResolved"
+	distributionOverrideEventReason    = "DistributionOverride"
+	distributionWriteFailedEventReason = "DistributionWriteFailed"
 )
 
 // errDistributionHeld marks a control-plane Machine create or delete refused
@@ -274,6 +285,11 @@ type distributionGuard struct {
 	// wroteSpec reports that spec.distribution was written this reconcile, so
 	// the caller re-anchors its patch helper.
 	wroteSpec bool
+	// writeFailed, when set, is the (truncated) error of a spec.distribution
+	// write that failed for a reason other than a Conflict; pendingWrite is
+	// the value it tried to write. Either way the reconcile holds.
+	writeFailed  string
+	pendingWrite string
 	// previousReadyReason is Ready's reason as this reconcile found it, which
 	// the events are de-duplicated against.
 	previousReadyReason string
@@ -365,8 +381,7 @@ func distributionToWrite(template string, obs observedDistribution) (value, even
 // spec or the template, then Machines that are mixed, unknown or differ from
 // spec. reason is "" when nothing is held.
 func distributionVerdict(spec, templateName, template string, obs observedDistribution) (reason, message string) {
-	const held = " Control-plane Machines are not created or deleted, join tokens are not minted or extended, and " +
-		"orphan etcd members are not removed until this is fixed."
+	const held = distributionHeldSentence
 	switch {
 	case spec == kcpUnsupportedDistributionKubeadm:
 		return controlplanev1beta2.UnsupportedDistributionReason, kubeadmRefusalMessage("spec.distribution is kubeadm", obs)
@@ -420,8 +435,10 @@ func kubeadmRefusalMessage(cause string, obs observedDistribution) string {
 // reads what they run, reads the referenced KairosConfigTemplate, writes an
 // empty spec.distribution when D2 allows, and decides the verdict. It holds
 // nothing itself: reconcileMachines applies the hold and the status path the
-// conditions. An error is a management-cluster read failure, or the spec
-// write failing (a Conflict when another writer changed the KCP first).
+// conditions. An error is a management-cluster read failure, or a Conflict on
+// the spec write (another writer changed the KCP first). Any other write
+// failure leaves spec empty, emits a Warning and holds with
+// DistributionMismatch, so the etcd leave and status still run.
 func (r *KairosControlPlaneReconciler) reconcileDistribution(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster) (distributionGuard, error) {
 	g := distributionGuard{
 		templateName:        kcp.Spec.KairosConfigTemplate.Name,
@@ -444,14 +461,30 @@ func (r *KairosControlPlaneReconciler) reconcileDistribution(ctx context.Context
 		if value == "" {
 			break
 		}
-		if err := r.writeSpecDistribution(ctx, kcp, value); err != nil {
-			return g, fmt.Errorf("write spec.distribution: %w", err)
-		}
-		g.wroteSpec = true
 		from := fmt.Sprintf("the control-plane Machines (%s)", g.observed.describeMachines())
 		if source == distributionInheritedEventReason {
 			from = fmt.Sprintf("KairosConfigTemplate %q", g.templateName)
 		}
+		if err := r.writeSpecDistribution(ctx, kcp, value); err != nil {
+			// A Conflict means another writer won; the caller retries.
+			if apierrors.IsConflict(err) {
+				return g, fmt.Errorf("write spec.distribution: %w", err)
+			}
+			// Anything else (a webhook denial, RBAC, a validation error) would
+			// otherwise fail the reconcile on every pass, and with it the etcd
+			// leave and status. Keep spec empty, say why, and hold instead.
+			g.pendingWrite = value
+			g.writeFailed = truncateUTF8(err.Error(), distributionWriteErrorLimit)
+			log.Error(err, "Could not write the empty spec.distribution; holding control-plane membership changes",
+				"distribution", value, "source", source)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(kcp, corev1.EventTypeWarning, distributionWriteFailedEventReason,
+					"Could not set the empty spec.distribution to %s from %s: %s. Control-plane membership changes are held until it is written.",
+					value, from, g.writeFailed)
+			}
+			break
+		}
+		g.wroteSpec = true
 		log.Info("Wrote the empty spec.distribution", "distribution", value, "source", source, "template", g.templateName)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(kcp, corev1.EventTypeNormal, source, "spec.distribution was empty; set it to %s from %s", value, from)
@@ -466,7 +499,32 @@ func (r *KairosControlPlaneReconciler) reconcileDistribution(ctx context.Context
 	g.spec = kcp.Spec.Distribution
 	g.effective = distributionOf(kcp)
 	g.reason, g.message = distributionVerdict(g.spec, g.templateName, g.template, g.observed)
+	if g.writeFailed != "" {
+		// Hold even with no Machines: building one now would take the k0s
+		// fallback, not the value that could not be written.
+		g.reason = controlplanev1beta2.DistributionMismatchReason
+		g.message = fmt.Sprintf("spec.distribution is empty and could not be set to %s: %s.%s The controller retries "+
+			"on every reconcile; fix what refuses the write, or set spec.distribution yourself after confirming what "+
+			"the nodes actually run.", g.pendingWrite, g.writeFailed, distributionHeldSentence)
+	}
 	return g, nil
+}
+
+// truncateUTF8 returns s cut to at most limit bytes, on a rune boundary, with
+// "..." marking the cut. An error text from the apiserver can be long.
+func truncateUTF8(s string, limit int) string {
+	const ellipsis = "..."
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit - len(ellipsis)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + ellipsis
 }
 
 // writeSpecDistribution sets spec.distribution to value in its own merge

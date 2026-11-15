@@ -20,18 +20,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -618,4 +623,120 @@ func TestObserveDistribution_HookContradiction(t *testing.T) {
 			g.Expect(live.Spec.Distribution).To(Equal("k3s"))
 		})
 	}
+}
+
+// failKCPPatches makes every Patch of a KairosControlPlane fail with err.
+func failKCPPatches(err error) interceptor.Funcs {
+	return interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*controlplanev1beta2.KairosControlPlane); ok {
+				return err
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}
+}
+
+// longForbidden is a non-Conflict write error with a message far longer than
+// distributionWriteErrorLimit, ending in multi-byte runes.
+func longForbidden() error {
+	return apierrors.NewForbidden(controlplanev1beta2.GroupVersion.WithResource("kairoscontrolplanes").GroupResource(), "test-kcp",
+		errors.New(strings.Repeat("denied by policy ", 40)+strings.Repeat("é", 200)))
+}
+
+// TestReconcileDistribution_WriteFailureHolds: a spec.distribution write that
+// fails for a reason other than a Conflict does not fail the reconcile. spec
+// stays empty, a Warning event carries the error cut to a bounded length,
+// and the guard holds with DistributionMismatch, with or without Machines.
+func TestReconcileDistribution_WriteFailureHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		machines []string
+		wantTry  string
+	}{
+		{name: "no Machines: the template's value could not be written", wantTry: "k3s"},
+		{name: "Machines agree: their value could not be written", machines: []string{"k0s", "k0s"}, wantTry: "k0s"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := machineMetaScheme(g)
+			kcp := guardKCP("", 3)
+			objs := append([]client.Object{kcp, newDistTemplate("cfg-template", "default", "k3s")}, guardObjects(kcp, tc.machines...)...)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(failKCPPatches(longForbidden())).Build()
+			rec := record.NewFakeRecorder(10)
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, Recorder: rec}
+
+			live := &controlplanev1beta2.KairosControlPlane{}
+			g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(kcp), live)).To(Succeed())
+			guard, err := r.reconcileDistribution(context.Background(), log.Log, live, machineMetaCluster())
+			g.Expect(err).NotTo(HaveOccurred(), "a non-Conflict write failure holds instead of failing the reconcile")
+			g.Expect(guard.wroteSpec).To(BeFalse())
+			g.Expect(guard.held()).To(BeTrue())
+			g.Expect(guard.reason).To(Equal(controlplanev1beta2.DistributionMismatchReason))
+			g.Expect(guard.message).To(ContainSubstring("could not be set to " + tc.wantTry))
+			g.Expect(len(guard.writeFailed)).To(BeNumerically("<=", distributionWriteErrorLimit))
+			g.Expect(guard.writeFailed).To(HaveSuffix("..."))
+			g.Expect(live.Spec.Distribution).To(BeEmpty())
+			stored := &controlplanev1beta2.KairosControlPlane{}
+			g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(kcp), stored)).To(Succeed())
+			g.Expect(stored.Spec.Distribution).To(BeEmpty())
+
+			var event string
+			g.Expect(rec.Events).To(Receive(&event))
+			g.Expect(event).To(HavePrefix("Warning " + distributionWriteFailedEventReason))
+			g.Expect(event).To(ContainSubstring("denied by policy"))
+			g.Expect(event).To(ContainSubstring(guard.writeFailed))
+			g.Expect(rec.Events).NotTo(Receive())
+		})
+	}
+}
+
+// TestReconcile_DistributionWriteFailureHoldsAndReportsStatus drives the full
+// Reconcile: the write fails, the reconcile still finishes, persists the hold
+// on the conditions and requeues at the hold interval, and deletes nothing.
+func TestReconcile_DistributionWriteFailureHoldsAndReportsStatus(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newKCPTestScheme(t)
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: clusterv1.ClusterSpec{ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+			APIGroup: controlplanev1beta2.GroupVersion.Group, Kind: "KairosControlPlane", Name: "test-kcp",
+		}},
+	}
+	kcp := guardKCP("", 1)
+	objs := append([]client.Object{cluster, kcp, newDistTemplate("cfg-template", "default", "k3s")}, guardObjects(kcp, "k0s", "k0s")...)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+		WithStatusSubresource(&controlplanev1beta2.KairosControlPlane{}, &clusterv1.Cluster{}).
+		WithInterceptorFuncs(failKCPPatches(longForbidden())).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(20)}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(kcp)})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(distributionHoldRequeueAfter))
+
+	got := &controlplanev1beta2.KairosControlPlane{}
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(kcp), got)).To(Succeed())
+	g.Expect(got.Spec.Distribution).To(BeEmpty())
+	g.Expect(conditions.GetReason(got, clusterv1.ReadyCondition)).To(Equal(controlplanev1beta2.DistributionMismatchReason))
+	g.Expect(conditions.GetReason(got, controlplanev1beta2.MachinesUpToDateCondition)).To(Equal(controlplanev1beta2.DistributionMismatchReason))
+	g.Expect(got.Status.Replicas).To(Equal(int32(2)), "status still refreshes while held")
+	machines := &clusterv1.MachineList{}
+	g.Expect(c.List(context.Background(), machines, client.InNamespace("default"))).To(Succeed())
+	g.Expect(machines.Items).To(HaveLen(2), "the scale-down to one replica is held")
+}
+
+func TestTruncateUTF8(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(truncateUTF8("short", 10)).To(Equal("short"))
+	g.Expect(truncateUTF8("abcdefghij", 10)).To(Equal("abcdefghij"))
+	g.Expect(truncateUTF8("abcdefghijk", 10)).To(Equal("abcdefg..."))
+	// A two-byte rune straddling the cut is dropped whole, never split.
+	// "é" takes bytes 6 and 7, and the cut for limit 10 falls at byte 7.
+	out := truncateUTF8("abcdeféghijk", 10)
+	g.Expect(len(out)).To(BeNumerically("<=", 10))
+	g.Expect(utf8.ValidString(out)).To(BeTrue())
+	g.Expect(out).To(Equal("abcdef..."))
+	// A rune that ends right at the cut is kept.
+	g.Expect(truncateUTF8("abcdeéfghijk", 10)).To(Equal("abcdeé..."))
 }
