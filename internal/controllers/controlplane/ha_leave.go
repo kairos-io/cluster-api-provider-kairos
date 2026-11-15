@@ -94,6 +94,11 @@ const (
 	// ~15 minutes a requested leave gets (memberLeaveTimeout, then
 	// etcdMemberLeaveCap). Before ADR 0015 this phase had no bound (GT-15).
 	leaveUnreachableBound = memberLeaveTimeout + etcdMemberLeaveCap
+
+	// etcdLeaveHookContradictedEventReason is the Warning event reason for a
+	// hooked Machine whose KairosConfig records a distribution other than
+	// k0s (warnIfConfigContradictsHook).
+	etcdLeaveHookContradictedEventReason = "EtcdLeaveHookContradictsKairosConfig"
 )
 
 // etcdLeaveHookAnnotation is the full pre-terminate hook annotation key
@@ -270,12 +275,14 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // next join under the same name split the cluster (ADR 0015 PR-3).
 //
 // State machine:
-//  1. The Machine's own KairosConfig says it runs something other than k0s
-//     (should never happen: only k0s HA Machines are given the hook) → remove
-//     hook, done. spec.distribution is not consulted: it can change after
-//     the Machine was built, and a k0s member relabelled k3s must still leave
-//     etcd (ADR 0016 D4). A KairosConfig that is gone says nothing; the hook
-//     says k0s.
+//  1. The hook decides (ADR 0016 D4): only k0s init/join Machines are given
+//     it, so a Machine that carries it is treated as a k0s member and goes
+//     through the leave below. Neither spec.distribution, which can change
+//     after the Machine was built, nor the Machine's KairosConfig, which
+//     only a tampered or recreated object makes disagree with the hook, can
+//     release it without a leave. A KairosConfig that says otherwise gets a
+//     Warning event; the leave still runs, and every wait below is bounded,
+//     so a Machine that does not run k0s is released by the timeout path.
 //  2. Until a leave has been requested, wait (done=false, no workload
 //     traffic) while CAPI is still draining the Node or detaching its
 //     volumes (machineAtPreTerminate). Without a NodeRef CAPI goes there at
@@ -322,20 +329,10 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	if err := errIfIdentityFrozen(kcp, "progress the etcd leave of Machine "+target.Name); err != nil {
 		return false, err
 	}
-	// (1) Defensive: only k0s HA Machines are given the hook. Decide from the
-	// Machine's own KairosConfig, never from spec.distribution (ADR 0016 D4).
-	// A read error keeps the hook (fail-safe); a KairosConfig that is gone
-	// leaves the hook to speak, and it says k0s.
-	dist, found, err := r.machineDistribution(ctx, target)
-	if err != nil {
-		return false, err
-	}
-	if found && dist != "k0s" {
-		log.Info("etcd-leave: the Machine's KairosConfig is not k0s; removing the hook without a leave",
-			"machine", target.Name, "distribution", dist)
-		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
-	}
-
+	// (1) The hook decides (ADR 0016 D4): only k0s init/join Machines are
+	// given it, so the leave runs whatever the KairosConfig or
+	// spec.distribution say now. A contradicting KairosConfig is reported
+	// below, on the first pass that acts.
 	registered := target.Status.NodeRef.IsDefined()
 	nodeName, err := r.leaveNodeName(ctx, target)
 	if err != nil {
@@ -353,6 +350,12 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	if !requested && !machineAtPreTerminate(target) {
 		log.Info("etcd-leave: waiting for CAPI to finish with the node before the leave", "machine", target.Name, "node", nodeName)
 		return false, nil
+	}
+	// The first pass of this eviction cycle that acts: no leave requested and
+	// no unreachable phase stamped yet. Each of those is stamped once, so the
+	// warning below is emitted once per cycle, not on every requeue.
+	if _, unreachable := target.Annotations[etcdLeaveUnreachableSinceAnnotation]; !requested && !unreachable {
+		r.warnIfConfigContradictsHook(ctx, log, kcp, target)
 	}
 
 	// Find a workload apiserver that answers, and read the leave ConfigMap
@@ -440,6 +443,32 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	}
 	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName, "via", conn.via)
 	return false, nil
+}
+
+// warnIfConfigContradictsHook emits a Warning event when target carries the
+// k0s etcd-leave hook but its KairosConfig records another distribution. The
+// hook has only ever been stamped on k0s init/join Machines, so this means
+// the KairosConfig was changed or recreated after the Machine was built. It
+// is informational: the leave runs anyway (ADR 0016 D4), and a KairosConfig
+// that cannot be read is only logged, never a reason to hold the hook.
+func (r *KairosControlPlaneReconciler) warnIfConfigContradictsHook(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) {
+	dist, found, err := r.machineDistribution(ctx, target)
+	if err != nil {
+		log.Info("etcd-leave: could not read the Machine's KairosConfig to compare it with the hook; leaving anyway",
+			"machine", target.Name, "reason", err.Error())
+		return
+	}
+	if !found || dist == "k0s" {
+		return
+	}
+	log.Info("etcd-leave: the Machine's KairosConfig contradicts its k0s etcd-leave hook; running the k0s leave",
+		"machine", target.Name, "distribution", dist)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(kcp, corev1.EventTypeWarning, etcdLeaveHookContradictedEventReason,
+			"The KairosConfig of control-plane Machine %q says %s, but the Machine carries the k0s etcd-leave hook, which only k0s "+
+				"members are given; running the k0s etcd leave. If the node does not run k0s, the leave times out and the hook "+
+				"is removed. Check whether the KairosConfig was changed after the Machine was created.", target.Name, dist)
+	}
 }
 
 // machineAtPreTerminate reports whether CAPI's Machine controller has
