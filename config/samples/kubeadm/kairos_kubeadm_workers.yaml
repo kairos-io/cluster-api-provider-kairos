@@ -8,18 +8,18 @@
 # plane. For the full walkthrough, prerequisites, and troubleshooting, see
 # docs/KUBEADM_WORKERS.md.
 #
-# AVAILABILITY: not in v0.1.4. The kubeadm distribution is on main and is
-# planned for v0.2.0. The v0.1.4 CRDs accept only k0s and k3s, so applying this
-# file to a v0.1.4 install fails validation.
+# AVAILABILITY: since v0.2.0. The v0.1.x CRDs accept only k0s and k3s, so
+# applying this file to a v0.1.x install fails validation.
 #
-# SCOPE (on main):
+# SCOPE:
 #   - Workers only. distribution: kubeadm with role: control-plane is rejected on
 #     a KairosConfig at admission and again when the cloud-config is rendered
 #     (KairosConfigTemplate has no webhook, so a template is caught at render
 #     time), and a KairosControlPlane cannot use kubeadm at all.
 #   - MachineDeployment only. A MachinePool owner is refused.
-#   - Validated by unit and envtest tests. Not yet validated against a live
-#     Kamaji or KubeadmControlPlane cluster.
+#   - Validated live for v0.2.0 with Kamaji, in three configurations, and with
+#     an upstream KubeadmControlPlane on KubeVirt (join, trust checks and DNS),
+#     plus unit and envtest tests.
 #
 # PREREQUISITES:
 #   1. The Kairos CAPI provider is installed (docs/INSTALL.md).

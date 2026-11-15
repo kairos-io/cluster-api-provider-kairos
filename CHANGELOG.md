@@ -372,7 +372,8 @@ detail.
 ### Changed
 
 - Kubernetes v1.36 validated/recommended across the CAPI v1.13 management
-  band (v1.30-v1.36); CAPI core v1.13.3 → v1.13.4; Kairos v3.6.0+ → v4.1.2;
+  band (v1.32-v1.36; corrected 2026-11-14, this said v1.30-v1.36); CAPI core
+  v1.13.3 → v1.13.4; Kairos v3.6.0+ → v4.1.2;
   e2e stack moves to KubeVirt v1.9 / kindest/node v1.36.1 / k3s v1.36.1.
 
 ### Fixed

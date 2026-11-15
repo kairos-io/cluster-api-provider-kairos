@@ -18,15 +18,15 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 ## Status
 
-**Latest release**: [`v0.1.4`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.1.4) — pre-1.0; API surface may still change before v1.0.
+**Latest release**: [`v0.2.1`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.2.1). Pre-1.0: the API surface may still change before v1.0.
 
 Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal), plus single-control-plane clusters on `KairosFleetMachine` infrastructure (the Kairos fleet infrastructure provider's machine kind). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPK k0s HA additionally requires a Kairos image carrying a k0s start gate, which this project does not publish; see [the CAPK quickstart](docs/QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate). CAPD is dev-only; HA is not exercised on CAPD. HA is not exercised on `KairosFleetMachine` infrastructure: single control plane only today. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
 
-Read the [v0.1.4 release notes](docs/release-notes/v0.1.4.md) before installing, and the [v0.1.0 release notes](docs/release-notes/v0.1.0.md) if you are coming from before v0.1.0. If you run `clusterctl` on your management cluster, the Breaking Changes section is required reading: the `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place.
+Read the [v0.2.1 release notes](docs/release-notes/v0.2.1.md) before installing. To upgrade, follow every per-version section of the [upgrade guide](docs/UPGRADING.md) between your version and the target. The `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place; see the [install guide](docs/INSTALL.md) and [Moving from the flat install to clusterctl packaging](docs/UPGRADING.md#moving-from-the-flat-install-to-clusterctl-packaging).
 
-**Not in v0.1.4; planned for v0.2.0.** On `main`, `KairosConfig` also accepts `distribution: kubeadm` to join Kairos **worker** nodes to a control plane that this provider does not run: a Kamaji `KamajiControlPlane` or a Cluster API `KubeadmControlPlane`. `KairosControlPlane` supports `k0s` and `k3s` only; this provider does not create kubeadm control planes. You supply the CNI and a node image that ships kubeadm, kubelet, and containerd at the exact workload Kubernetes version. This path is covered by unit and envtest tests and has not yet been validated against a live Kamaji or `KubeadmControlPlane` cluster. See [Kubeadm workers](docs/KUBEADM_WORKERS.md).
+**kubeadm workers (since v0.2.0).** `KairosConfig` also accepts `distribution: kubeadm` to join Kairos **worker** nodes to a control plane that this provider does not run: a Kamaji `KamajiControlPlane` or a Cluster API `KubeadmControlPlane`. `KairosControlPlane` supports `k0s` and `k3s` only; this provider does not create kubeadm control planes. You supply the CNI and a node image that ships kubeadm, kubelet, and containerd at the exact workload Kubernetes version. The path was validated live for v0.2.0 with Kamaji, in three configurations, and with an upstream `KubeadmControlPlane` on KubeVirt (join, trust checks and DNS), and is tested with kubeadm v1.30 and v1.36. See [Kubeadm workers](docs/KUBEADM_WORKERS.md).
 
-The control plane provider is no longer limited to a fixed provider allowlist: any infrastructure provider that implements the standard CAPI `<Kind>MachineTemplate` contract works through a generic clone path, verified end-to-end against Beskar7 (a bare-metal provider outside the list above). CAPD, CAPV, CAPK, CAPM3, and `KairosFleetMachine` remain the first-class path (HA support, worked samples, and a quickstart) because they carry behavior the generic path cannot infer (e.g. KubeVirt's cloud-init volume handling); other CAPI-conformant providers get the generic path with no dedicated sample or quickstart yet.
+The control plane provider is no longer limited to a fixed provider allowlist: any infrastructure provider that implements the standard CAPI `<Kind>MachineTemplate` contract works through a generic clone path, verified end-to-end against Beskar7 (a bare-metal provider outside the list above). CAPD, CAPV, CAPK, CAPM3, and `KairosFleetMachine` remain the first-class path (worked samples and a quickstart for each, and HA on CAPK, CAPV and CAPM3) because they carry behavior the generic path cannot infer (e.g. KubeVirt's cloud-init volume handling); other CAPI-conformant providers get the generic path with no dedicated sample or quickstart yet.
 
 ## Install (released version)
 
@@ -35,7 +35,7 @@ The control plane provider is no longer limited to a fixed provider allowlist: a
 The provider ships two ways; pick one per management cluster, they are mutually exclusive:
 
 - **clusterctl (recommended)**: on clusterctl v1.13 or v1.14, register the provider as `kairos-io` first (clusterctl v1.15 knows it built in), then run `clusterctl init --bootstrap kairos-io --control-plane kairos-io`.
-- **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml`.
+- **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.2.1/kairos-capi-provider.yaml`.
 
 See the [install guide](docs/INSTALL.md) for provider registration, the full procedure for both paths, and why they cannot be mixed on one management cluster.
 
@@ -51,14 +51,14 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 
 | Component | Supported |
 | --- | --- |
-| Kubernetes (management) | v1.30 - v1.36 (v1.36 recommended) |
+| Kubernetes (management) | v1.32 - v1.36 (v1.36 recommended) |
 | Kubernetes (workload) | v1.30 - v1.36 |
 | Cluster API core | v1.13.4 (v1beta2 contract) |
 | controller-runtime | v0.23.3 |
-| CAPD | v1.8.x+ (dev only) |
-| CAPV | v1.11.x+ |
-| CAPK | KubeVirt v1.9.x / CAPK v0.1.x |
-| CAPM3 | v1.13+; BMO/Ironic v0.13+ |
+| CAPD | v1.13.x, released with Cluster API core (dev only) |
+| CAPV | v1.17.x |
+| CAPK | KubeVirt v1.7.x to v1.9.x / CAPK v0.11.x |
+| CAPM3 | v1.13+; BMO v0.13+ (validated with CAPM3 v1.13.0, BMO v0.13.0 and Ironic 38.1) |
 | Kairos fleet infrastructure provider | `KairosFleetMachine` and `KairosFleetMachineTemplate` at `infrastructure.cluster.x-k8s.io/v1alpha1`; control plane plus worker `MachineDeployment` (single control plane) |
 | k0s | ~v1.36.1+k0s |
 | k3s | ~v1.36.1+k3s1 |
@@ -66,7 +66,7 @@ Provide node credentials via `userPasswordSecretRef` (recommended) or `sshPublic
 | Kairos | v4.1.2 (standard and Hadron images) |
 | cert-manager | v1.15+ |
 
-Management-cluster support is the full Cluster API v1.13 band (v1.30-v1.36); v1.36 is the version validated in CI/envtest and recommended for new installs, not a hard floor. Workload Kubernetes version is whatever k0s/k3s ships in the Kairos image you deploy: `KairosConfig.spec.kubernetesVersion` / `KairosControlPlane.spec.version` are informational only and do not select or override it (see [API Reference](docs/API_REFERENCE.md)). The exception is `distribution: kubeadm`, where the node image's kubeadm version must equal `Machine.spec.version` exactly or the node refuses to join (see [Kubeadm workers](docs/KUBEADM_WORKERS.md)).
+Management-cluster support is the Cluster API v1.13 band, v1.32-v1.36 (v1.30 and v1.31 are workload-only in that band, and v1.36 needs Cluster API v1.13.1 or later); v1.36 is the version validated in CI/envtest and recommended for new installs, not a hard floor. Workload Kubernetes version is whatever k0s/k3s ships in the Kairos image you deploy: `KairosConfig.spec.kubernetesVersion` / `KairosControlPlane.spec.version` are informational only and do not select or override it (see [API Reference](docs/API_REFERENCE.md)). The exception is `distribution: kubeadm`, where the node image's kubeadm version must equal `Machine.spec.version` exactly or the node refuses to join (see [Kubeadm workers](docs/KUBEADM_WORKERS.md)).
 
 ## Documentation
 

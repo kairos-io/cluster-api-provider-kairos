@@ -40,7 +40,7 @@ providers:
 `clusterctl` discovers `metadata.yaml` next to each components file in the same GitHub release; it does not need its own entry in this file.
 
 Point `url` at a specific tag instead of `latest` to pin a version, for example
-`https://github.com/kairos-io/cluster-api-provider-kairos/releases/v0.1.4/bootstrap-components.yaml`.
+`https://github.com/kairos-io/cluster-api-provider-kairos/releases/v0.2.1/bootstrap-components.yaml`.
 
 A `clusterctl` provider `url` is not a browser download link: `clusterctl`
 parses it as
@@ -48,13 +48,13 @@ parses it as
 reads everything after `releases/` as the version. The
 `releases/download/<tag>/<file>` form that `kubectl apply -f` and `curl` use
 elsewhere in this guide is correct for them, but wrong here in both of its
-variants: `releases/download/v0.1.4/...` fails immediately with `release not
+variants: `releases/download/v0.2.1/...` fails immediately with `release not
 found for version download` (`clusterctl` reads the literal string `download`
 as the version), and `releases/latest/download/...` is the more dangerous case
 — it appears to work, because `clusterctl`'s fast path builds its own download
 URL from the file name alone, and only fails once it falls back to the GitHub
-API — on a failed direct download, under `GOPROXY=off`, or on a rate-limited or
-proxied network — with `failed to get file "metadata.yaml" from "v0.1.4"
+API (on a failed direct download, under `GOPROXY=off`, or on a rate-limited or
+proxied network) with `failed to get file "metadata.yaml" from "v0.2.1"
 release`.
 
 ### Install
@@ -120,7 +120,7 @@ Use this if you want a single `kubectl apply -f` without configuring `clusterctl
 ### Install
 
 ```bash
-kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
+kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.2.1/kairos-capi-provider.yaml
 ```
 
 This applies the all-in-one provider manifest: CRDs, RBAC, webhook configurations, and the controller Deployment in the `kairos-capi-system` namespace, labeled `cluster.x-k8s.io/provider: kairos`. It is not a `clusterctl` artifact. Do not run `clusterctl init --bootstrap kairos-io` against a management cluster installed this way; see [Path 1 and Path 2 are mutually exclusive](#path-1-and-path-2-are-mutually-exclusive).
@@ -142,7 +142,7 @@ Expected: one Deployment `kairos-capi-controller-manager` in `kairos-capi-system
 ### Uninstall
 
 ```bash
-kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.1.4/kairos-capi-provider.yaml
+kubectl delete -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.2.1/kairos-capi-provider.yaml
 ```
 
 **Re-install note**: if you are re-installing across a name-prefix change or a previous failed install, stale `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` objects from the previous install may point at a webhook Service that no longer exists. Delete them before re-installing:
@@ -169,7 +169,7 @@ Use this if you are hacking on the provider itself.
 
 ### Prerequisites
 
-- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.1.4 release image is built with Go 1.26.9.
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.2.1 release image is built with Go 1.26.10.
 - A Kubernetes cluster acting as the management cluster.
 - cert-manager and Cluster API core installed (same as Path 2).
 - `kubectl` configured to use the management cluster.
@@ -215,9 +215,8 @@ make uninstall
 
 ### `--kubeadm-extra-controlplane-kinds`
 
-Not in v0.1.4. This flag ships with the kubeadm worker distribution, which is
-planned for v0.2.0. A v0.1.4 manager given this flag refuses to start, with
-`flag provided but not defined`.
+Available since v0.2.0, with the kubeadm worker distribution. A v0.1.x manager
+given this flag refuses to start, with `flag provided but not defined`.
 
 Applies to the bootstrap manager only. It widens the set of control-plane kinds
 that a kubeadm worker (a `KairosConfig` with `distribution: kubeadm`) may join.
