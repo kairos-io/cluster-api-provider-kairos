@@ -25,9 +25,13 @@ package controlplane
 // the value is recomputed from the Machines each time.
 //
 //   - Observe (D1). none: no Machines. D: every readable KairosConfig says D.
-//     mixed: readable KairosConfigs disagree. unknown: Machines exist but none
-//     has a readable KairosConfig. A Machine whose KairosConfig is not found
-//     gets no vote.
+//     mixed: readable KairosConfigs disagree, or a Machine that is not being
+//     deleted carries the k0s etcd-leave hook while its KairosConfig says
+//     otherwise (conflicting evidence: only k0s members get the hook).
+//     unknown: Machines exist but none has a readable KairosConfig. A Machine
+//     whose KairosConfig is not found gets no vote. The value is what the
+//     KairosConfigs record, which is what the nodes rendered unless a
+//     KairosConfig was changed later; the messages say so.
 //   - Write (D2). An empty spec.distribution is written once: with the
 //     Machines' value when they agree, with the KairosConfigTemplate's value
 //     when there are no Machines, and never when the Machines are mixed or
@@ -103,7 +107,8 @@ const (
 	observedNone observedKind = iota
 	// observedAgreed: every readable KairosConfig records the same value.
 	observedAgreed
-	// observedMixed: readable KairosConfigs record different values.
+	// observedMixed: readable KairosConfigs record different values, or one
+	// contradicts its Machine's etcd-leave hook.
 	observedMixed
 	// observedUnknown: Machines exist but none has a readable KairosConfig.
 	observedUnknown
@@ -120,6 +125,10 @@ type observedDistribution struct {
 	byDistribution map[string][]string
 	// unread lists the Machines with no readable KairosConfig, sorted.
 	unread []string
+	// contradicted lists, sorted, the Machines not being deleted that carry
+	// the k0s etcd-leave hook while their KairosConfig records another
+	// distribution. Any of them makes the observed value mixed.
+	contradicted []string
 }
 
 // machinesExist reports whether the KCP owns any control-plane Machine.
@@ -156,6 +165,9 @@ func (o observedDistribution) describeMachines() string {
 	}
 	if len(o.unread) > 0 {
 		parts = append(parts, fmt.Sprintf("no readable KairosConfig (%s)", limitNames(o.unread)))
+	}
+	if len(o.contradicted) > 0 {
+		parts = append(parts, fmt.Sprintf("KairosConfig contradicts the k0s etcd-leave hook (%s)", limitNames(o.contradicted)))
 	}
 	if len(parts) == 0 {
 		return "none"
@@ -198,12 +210,30 @@ func summarizeObserved(byDistribution map[string][]string, unread []string) obse
 	return o
 }
 
+// withContradictions marks the Machines whose KairosConfig contradicts their
+// own etcd-leave hook. Any such Machine makes the observed value mixed: the
+// hook says k0s and the KairosConfig says otherwise, so neither can be taken
+// as what the control plane runs.
+func (o observedDistribution) withContradictions(names []string) observedDistribution {
+	if len(names) == 0 {
+		return o
+	}
+	o.contradicted = append([]string(nil), names...)
+	sort.Strings(o.contradicted)
+	o.kind = observedMixed
+	o.value = ""
+	return o
+}
+
 // observeDistribution reads what machines run from their KairosConfigs,
 // through the manager's cache (machineDistribution). A read error other than
-// NotFound is returned: the KCP must not guess.
+// NotFound is returned: the KCP must not guess. A Machine that is not being
+// deleted, carries the k0s etcd-leave hook and has a KairosConfig recording
+// another distribution is conflicting evidence and makes the value mixed; a
+// Machine being deleted votes by its KairosConfig only.
 func (r *KairosControlPlaneReconciler) observeDistribution(ctx context.Context, machines []*clusterv1.Machine) (observedDistribution, error) {
 	byDistribution := map[string][]string{}
-	var unread []string
+	var unread, contradicted []string
 	for _, m := range machines {
 		dist, found, err := r.machineDistribution(ctx, m)
 		if err != nil {
@@ -214,8 +244,11 @@ func (r *KairosControlPlaneReconciler) observeDistribution(ctx context.Context, 
 			continue
 		}
 		byDistribution[dist] = append(byDistribution[dist], m.Name)
+		if dist != "k0s" && hasEtcdLeaveHook(m) && m.DeletionTimestamp.IsZero() {
+			contradicted = append(contradicted, m.Name)
+		}
 	}
-	return summarizeObserved(byDistribution, unread), nil
+	return summarizeObserved(byDistribution, unread).withContradictions(contradicted), nil
 }
 
 // distributionGuard is what reconcileDistribution decided for this
@@ -346,22 +379,26 @@ func distributionVerdict(spec, templateName, template string, obs observedDistri
 		return "", ""
 	case observedMixed:
 		return controlplanev1beta2.DistributionMismatchReason, fmt.Sprintf(
-			"The control-plane Machines run different distributions: %s.%s Set spec.distribution to the distribution "+
-				"the cluster runs, or remove it, on the KairosControlPlane or its KairosControlPlaneTemplate, then delete "+
-				"the Machines that run another one; the controller does not delete them on its own.",
+			"The distributions recorded on the control-plane Machines' KairosConfigs disagree: %s.%s Confirm what "+
+				"each node actually runs, set spec.distribution to the distribution the cluster runs on the "+
+				"KairosControlPlane or its KairosControlPlaneTemplate, then delete the Machines whose nodes run "+
+				"another one; the controller does not delete them on its own.",
 			obs.describeMachines(), held)
 	case observedUnknown:
 		return controlplanev1beta2.DistributionMismatchReason, fmt.Sprintf(
-			"No control-plane Machine has a readable KairosConfig (%s), so the distribution they run is unknown.%s "+
-				"Check the KairosConfigs the Machines' spec.bootstrap.configRef names.",
+			"No control-plane Machine has a readable KairosConfig (%s), so no distribution is recorded for them.%s "+
+				"Check the KairosConfigs the Machines' spec.bootstrap.configRef names, and confirm what the nodes "+
+				"actually run.",
 			limitNames(obs.unread), held)
 	}
 	if spec != obs.value {
 		return controlplanev1beta2.DistributionMismatchReason, fmt.Sprintf(
-			"spec.distribution is %s, but the control-plane Machines run %s: %s.%s Set spec.distribution to %s, or "+
-				"remove it, on the KairosControlPlane or its KairosControlPlaneTemplate. Changing the distribution "+
-				"of a running control plane needs a new Cluster.",
-			displayDistribution(spec), obs.value, obs.describeMachines(), held, obs.value)
+			"spec.distribution is %s, but the control-plane Machines' KairosConfigs record %s: %s.%s The recorded "+
+				"value is what the nodes were built with unless a KairosConfig was changed since: confirm what the "+
+				"nodes actually run before you set spec.distribution to it, on the KairosControlPlane or its "+
+				"KairosControlPlaneTemplate. Removing spec.distribution writes the recorded value back. Changing the "+
+				"distribution of a running control plane needs a new Cluster.",
+			displayDistribution(spec), obs.value, obs.describeMachines(), held)
 	}
 	return "", ""
 }

@@ -212,11 +212,16 @@ func TestDistributionVerdict(t *testing.T) {
 		{name: "kubeadm template wins over a mismatch", spec: "k3s", template: "kubeadm", obs: agreed("k0s"),
 			wantReason: controlplanev1beta2.UnsupportedDistributionReason, wantMsg: "Control-plane Machines are not created or deleted"},
 		{name: "relabelled", spec: "k3s", template: "k3s", obs: agreed("k0s"),
-			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "spec.distribution is k3s, but the control-plane Machines run k0s"},
+			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "spec.distribution is k3s, but the control-plane Machines' KairosConfigs record k0s"},
+		{name: "relabelled: tells the operator to confirm what the nodes run", spec: "k3s", template: "k3s", obs: agreed("k0s"),
+			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "confirm what the nodes actually run before you set spec.distribution"},
 		{name: "empty spec the controller could not write", spec: "", obs: agreed("kubeadm"),
 			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "spec.distribution is <unset>"},
 		{name: "mixed", spec: "k0s", obs: summarizeObserved(map[string][]string{"k0s": {"a"}, "k3s": {"b"}}, nil),
-			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "run different distributions: k0s (a), k3s (b)"},
+			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "KairosConfigs disagree: k0s (a), k3s (b)"},
+		{name: "a KairosConfig contradicting its hook", spec: "k3s",
+			obs:        summarizeObserved(map[string][]string{"k3s": {"a", "b"}}, nil).withContradictions([]string{"b"}),
+			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "k3s (a, b), KairosConfig contradicts the k0s etcd-leave hook (b)"},
 		{name: "unknown", spec: "k0s", obs: summarizeObserved(nil, []string{"a"}),
 			wantReason: controlplanev1beta2.DistributionMismatchReason, wantMsg: "No control-plane Machine has a readable KairosConfig (a)"},
 	} {
@@ -560,4 +565,57 @@ func TestDeleteControlPlaneMachine_RefusesWhileHeld(t *testing.T) {
 	names, deleting := remainingMachines(g, c)
 	g.Expect(names).To(ConsistOf("cp-0"))
 	g.Expect(deleting).To(BeZero())
+}
+
+// TestObserveDistribution_HookContradiction is ADR 0016 D1/D2 as ruled after
+// review: a Machine that is not being deleted, carries the k0s etcd-leave
+// hook, and whose KairosConfig records another distribution is conflicting
+// evidence. The observed value is mixed even when every KairosConfig agrees,
+// so the controller holds and writes nothing. A Machine being deleted votes
+// by its KairosConfig only.
+func TestObserveDistribution_HookContradiction(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		deleting  bool
+		wantKind  observedKind
+		wantValue string
+	}{
+		{name: "running Machine with a contradicting KairosConfig: mixed", wantKind: observedMixed},
+		{name: "deleting Machine with a contradicting KairosConfig: votes by its KairosConfig", deleting: true,
+			wantKind: observedAgreed, wantValue: "k3s"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := machineMetaScheme(g)
+			kcp := guardKCP("", 3)
+			objs := guardObjects(kcp, "k3s", "k3s")
+			hooked, kc := guardMachine(kcp, "cp-hooked", "k3s", 30*time.Minute)
+			hooked.Annotations = map[string]string{etcdLeaveHookAnnotation(): ""}
+			hooked.Finalizers = []string{"test.kairos.io/hold"}
+			objs = append(objs, hooked, kc, newDistTemplate("cfg-template", "default", "k3s"), kcp)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			if tc.deleting {
+				g.Expect(c.Delete(context.Background(), hooked)).To(Succeed())
+			}
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+			live := &controlplanev1beta2.KairosControlPlane{}
+			g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(kcp), live)).To(Succeed())
+			guard, err := r.reconcileDistribution(context.Background(), log.Log, live, machineMetaCluster())
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(guard.observed.kind).To(Equal(tc.wantKind))
+			g.Expect(guard.observed.value).To(Equal(tc.wantValue))
+			if tc.wantKind == observedMixed {
+				g.Expect(guard.observed.contradicted).To(Equal([]string{"cp-hooked"}))
+				g.Expect(guard.reason).To(Equal(controlplanev1beta2.DistributionMismatchReason))
+				g.Expect(guard.message).To(ContainSubstring("KairosConfig contradicts the k0s etcd-leave hook (cp-hooked)"))
+				g.Expect(guard.wroteSpec).To(BeFalse(), "conflicting evidence: no spec write")
+				g.Expect(live.Spec.Distribution).To(BeEmpty())
+				return
+			}
+			g.Expect(guard.wroteSpec).To(BeTrue())
+			g.Expect(live.Spec.Distribution).To(Equal("k3s"))
+		})
+	}
 }

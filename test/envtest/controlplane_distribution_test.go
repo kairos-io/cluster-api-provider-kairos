@@ -313,7 +313,7 @@ func TestDistributionGuard(t *testing.T) {
 		d := env.build(t, "dist-e8", distFixture{spec: "k0s", template: "k0s", replicas: 3, machines: []string{"k0s", "k0s", "k3s"}})
 
 		g.Eventually(d.conditionMessage(clusterv1.ReadyCondition)).WithTimeout(distTimeout).WithPolling(distPolling).
-			Should(ContainSubstring("run different distributions"))
+			Should(ContainSubstring("KairosConfigs disagree"))
 		g.Expect(d.conditionReason(clusterv1.ReadyCondition)()).To(Equal(controlplanev1beta2.DistributionMismatchReason))
 		d.touch(g)
 		g.Consistently(func(g Gomega) { g.Expect(d.allMachines(g)).To(HaveLen(3)) }).
