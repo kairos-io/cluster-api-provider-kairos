@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -142,7 +143,12 @@ func (r *KairosControlPlaneReconciler) reconcileMachineMetadata(ctx context.Cont
 		if !machine.DeletionTimestamp.IsZero() {
 			continue
 		}
-		patchHelper := client.MergeFrom(machine.DeepCopy())
+		// The patch carries the resourceVersion read, so it applies only to
+		// the Machine as listed. One deleted since (whose owner may already
+		// have removed its own hook) conflicts instead of getting the
+		// template's annotations back.
+		original := machine.DeepCopy()
+		patchHelper := client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
 
 		changed := false
 		for k, v := range desiredLabels {
@@ -179,6 +185,13 @@ func (r *KairosControlPlaneReconciler) reconcileMachineMetadata(ctx context.Cont
 		}
 
 		if err := r.Patch(ctx, machine, patchHelper); err != nil {
+			if apierrors.IsConflict(err) {
+				// The Machine changed since it was listed. Its watch requeues
+				// this control plane, and the next pass sees it as it is now.
+				*machine = *original
+				log.V(4).Info("Control-plane Machine changed since it was listed; its metadata is synced on the next pass", "machine", machine.Name)
+				continue
+			}
 			return fmt.Errorf("failed to update metadata on machine %s: %w", machine.Name, err)
 		}
 		if len(cleared) > 0 {

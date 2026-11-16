@@ -264,3 +264,40 @@ func TestReconcileMachineMetadata_KeepsAPlantedHook(t *testing.T) {
 	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, got)).To(Succeed())
 	g.Expect(got.Annotations).To(Equal(map[string]string{etcdLeaveHookAnnotation(): ""}))
 }
+
+// TestReconcileMachineMetadata_StaleMachineIsLeftForTheNextPass: the patch
+// is pinned to the resourceVersion listed. A Machine changed since (here, by
+// another controller removing its own hook as the Machine's deletion began)
+// is not written: the other Machines are, nothing fails, and the in-memory
+// Machine is left as listed for the rest of the pass.
+func TestReconcileMachineMetadata_StaleMachineIsLeftForTheNextPass(t *testing.T) {
+	g := NewWithT(t)
+	scheme := machineMetaScheme(g)
+	kcp := machineMetaKCP("k0s", &clusterv1.ObjectMeta{Annotations: map[string]string{otherControllersHook: "", "example.com/owner": "platform-team"}})
+	stale := machineMetaMachine("test-kcp-0", nil, map[string]string{otherControllersHook: ""})
+	fresh := machineMetaMachine("test-kcp-1", nil, nil)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stale, fresh).Build()
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	listed := []*clusterv1.Machine{}
+	for _, name := range []string{"test-kcp-0", "test-kcp-1"} {
+		m := &clusterv1.Machine{}
+		g.Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, m)).To(Succeed())
+		listed = append(listed, m)
+	}
+	// After the List: the hook's owner removes it, as the deletion starts.
+	changed := listed[0].DeepCopy()
+	delete(changed.Annotations, otherControllersHook)
+	g.Expect(c.Update(context.Background(), changed)).To(Succeed())
+	asListed := listed[0].DeepCopy()
+
+	g.Expect(r.reconcileMachineMetadata(context.Background(), log.Log, kcp, machineMetaCluster(), listed)).To(Succeed())
+
+	got := &clusterv1.Machine{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-kcp-0", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Annotations).ToNot(HaveKey(otherControllersHook), "the removed hook is not put back")
+	g.Expect(got.Annotations).ToNot(HaveKey("example.com/owner"), "nothing is written to a Machine changed since the List")
+	g.Expect(listed[0]).To(Equal(asListed), "the in-memory Machine is left as listed")
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-kcp-1", Namespace: "default"}, got)).To(Succeed())
+	g.Expect(got.Annotations).To(HaveKeyWithValue("example.com/owner", "platform-team"), "the other Machines are still synced")
+}
