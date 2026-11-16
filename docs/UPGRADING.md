@@ -25,6 +25,13 @@ then `clusterctl init` with the new one; see
   that is already being deleted when you upgrade. Do not set the key in
   `machineTemplate.metadata`: it is not copied. See
   [HIGH_AVAILABILITY.md: A k0s Machine without a Node still leaves etcd](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement).
+- **The etcd leave checks every control-plane Machine of the Cluster**
+  (KD-93). Before, a leaving Machine's name and its `EtcdMember`'s peer
+  address were checked only against Machines this `KairosControlPlane` owns.
+  Control-plane Machines of the same Cluster with another owner, or none,
+  now count too, so a leave whose member may be theirs is released with
+  `EtcdMemberLeaveTimedOut` without being run. Nothing changes for a Cluster
+  whose control-plane Machines all belong to one `KairosControlPlane`.
 - **Two new Warning events.** `EtcdLeaveNodeNameContradictsKairosConfig`
   appears when a leaving Machine's `KairosConfig` renders another node name
   than the recorded one; the leave proceeds with the recorded name.
