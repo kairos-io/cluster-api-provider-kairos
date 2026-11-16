@@ -93,8 +93,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "The go directive, the CI go-version pins and the builder image are one decision, not three. Hold them for explicit approval: the ceiling is set by the tooling that has to parse the module, not by what Go has released.",
-      "groupName": "Go toolchain",
+      "description": "go.mod's go directive is the minimum Go the module requires, and its ceiling is set by the tooling that has to parse the module, not by what Go has released. Hold it for explicit approval. It stays out of the Go toolchain group below: Renovate holds a whole branch when any update in it needs approval, so a held directive bump would also hold the CI and builder bumps.",
       "matchManagers": [
         "gomod"
       ],
@@ -102,6 +101,19 @@
         "golang"
       ],
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "The Go that CI tests with (the go-version input of actions/setup-go, in ci.yaml and release.yaml) and the Go the image is built with (the golang builder image in the Dockerfile) are one decision: CI should test the Go that ships. Group them on one branch. Matched by manager, dep type and name rather than datasource, because Renovate has changed the datasource it uses for setup-go. The builder may run ahead of the go directive; builder >= directive is the invariant, not equality.",
+      "groupName": "Go toolchain",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "uses-with"
+      ],
+      "matchDepNames": [
+        "go"
+      ]
     },
     {
       "groupName": "Go toolchain",
