@@ -32,12 +32,13 @@ then `clusterctl init` with the new one; see
   now count too, so a leave whose member may be theirs is released with
   `EtcdMemberLeaveTimedOut` without being run. Nothing changes for a Cluster
   whose control-plane Machines all belong to one `KairosControlPlane`.
-- **A leave whose checks cannot be read is now released after ~15 minutes.**
-  When the control-plane Machines cannot be listed, or a node name the checks
-  need cannot be read from a `KairosConfig`, the leave of a Machine without a
-  Node used to be held for as long as the error lasted. It is now held for
-  the usual ~15 minutes and then released with `EtcdMemberLeaveTimedOut`,
-  without being handed to k0s, like every other etcd-leave wait.
+- **A leave whose checks cannot run is now released after ~15 minutes.**
+  The checks above now list the control-plane Machines of the Cluster. When
+  that listing fails, or a node name the checks need cannot be read from a
+  `KairosConfig`, the leave is held for the usual ~15 minutes and then
+  released with `EtcdMemberLeaveTimedOut`, without being handed to k0s, like
+  every other etcd-leave wait. Before, an unreadable node name held the leave
+  of a Machine without a Node for as long as the error lasted.
 - **Two new Warning events.** `EtcdLeaveNodeNameContradictsKairosConfig`
   appears when a leaving Machine's `KairosConfig` renders another node name
   than the recorded one; the leave proceeds with the recorded name.
