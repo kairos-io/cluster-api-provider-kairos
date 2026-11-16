@@ -655,6 +655,12 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 		return ctrl.Result{}, err
 	}
 
+	// KD-91: record the node name on Machines created before the record
+	// existed, so their etcd leave no longer depends on the KairosConfig. A
+	// metadata write, not a membership change, so it runs while frozen or held
+	// too. Never on a Machine being deleted, never fails the reconcile.
+	r.reconcileRenderedNodeNames(ctx, log, machines)
+
 	// ADR 0015 PR-2: before any membership action, make sure the KCP is acting
 	// on the workload cluster it pinned. This pins the kube-system UID on first
 	// contact (and on the first reconcile after an upgrade), rechecks it at most
@@ -1149,6 +1155,15 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx contex
 	// only when Role == "control-plane" (CPR-INV-1), which holds here.
 	r.applyControlPlaneHASpec(&kairosConfig.Spec, kcp, cluster, role)
 	log.Info("Assigned control-plane role", "role", role, "singleNode", kairosConfig.Spec.SingleNode)
+
+	// KD-91: the name the node will get, from the spec this create stamps,
+	// recorded on the Machine below. Refused before anything exists if it
+	// cannot name a node.
+	nodeName, err := nodeNameRecordFor(&kairosConfig.Spec, machineName)
+	if err != nil {
+		return nil, err
+	}
+
 	if joinTokenID != "" {
 		kairosConfig.Annotations = map[string]string{k0sJoinTokenIDAnnotation: joinTokenID}
 	}
@@ -1218,12 +1233,16 @@ func (r *KairosControlPlaneReconciler) createControlPlaneMachineNamed(ctx contex
 	// init/join are hooked — single-node has no etcd cluster and k3s has no
 	// supported member-remove (KD-5d). The empty annotation value is the CAPI
 	// convention for a hook awaiting external completion.
+	if machine.Annotations == nil {
+		machine.Annotations = map[string]string{}
+	}
 	if shouldStampEtcdLeaveHook(distribution, role) {
-		if machine.Annotations == nil {
-			machine.Annotations = map[string]string{}
-		}
 		machine.Annotations[etcdLeaveHookAnnotation()] = ""
 	}
+	// KD-91: every control-plane Machine records its node name, in the same
+	// Create as the hook. The etcd leave looks the member up by it, not by the
+	// KairosConfig, which can change or be gone by then.
+	machine.Annotations[renderedNodeNameAnnotation] = nodeName
 
 	if err := r.Create(ctx, machine); err != nil {
 		if apierrors.IsAlreadyExists(err) {

@@ -52,14 +52,28 @@ func controlPlaneMachineLabels(kcp *controlplanev1beta2.KairosControlPlane, clus
 	return out
 }
 
+// reservedMachineAnnotations are the Machine annotations only the controller
+// writes, one value per Machine. machineTemplate.metadata never copies them:
+// one template value on every Machine would overwrite each Machine's own.
+//
+// renderedNodeNameAnnotation is the node name the etcd leave looks the member
+// up by (KD-91).
+var reservedMachineAnnotations = map[string]bool{
+	renderedNodeNameAnnotation: true,
+}
+
 // controlPlaneMachineAnnotations returns the annotations from
-// machineTemplate.metadata. Unlike the labels there is nothing to force: the
-// etcd-leave pre-terminate hook is stamped by the caller afterwards, so it
-// wins over a template that spells the same key.
+// machineTemplate.metadata, without reservedMachineAnnotations. Unlike the
+// labels there is nothing to force: the etcd-leave pre-terminate hook and the
+// recorded node name are stamped by the caller afterwards, so they win over a
+// template that spells the same key.
 func controlPlaneMachineAnnotations(kcp *controlplanev1beta2.KairosControlPlane) map[string]string {
 	out := map[string]string{}
 	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
 		for k, v := range md.Annotations {
+			if reservedMachineAnnotations[k] {
+				continue
+			}
 			out[k] = v
 		}
 	}
@@ -76,7 +90,8 @@ func controlPlaneMachineAnnotations(kcp *controlplanev1beta2.KairosControlPlane)
 // may have added more. Replacing the maps wholesale, which upstream KCP can
 // afford because it recomputes a full desired Machine, would strip those.
 // Removing a key from the template therefore leaves it on Machines that
-// already carry it; docs/API_REFERENCE.md says so.
+// already carry it; docs/API_REFERENCE.md says so. reservedMachineAnnotations
+// are never carried (controlPlaneMachineAnnotations drops them).
 func (r *KairosControlPlaneReconciler) reconcileMachineMetadata(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) error {
 	desiredLabels := controlPlaneMachineLabels(kcp, cluster.Name)
 	desiredAnnotations := controlPlaneMachineAnnotations(kcp)

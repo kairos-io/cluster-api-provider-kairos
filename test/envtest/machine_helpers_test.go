@@ -68,6 +68,28 @@ func markClusterInfrastructureProvisioned(ctx context.Context, c client.Client, 
 	return lastErr
 }
 
+// setMachineStatus writes m.Status onto the Machine m names, through the
+// status subresource. The read-modify-write is retried: a control-plane
+// Machine fixture is created and then given its status, and the KCP may write
+// the Machine in between (it records the node name on every control-plane
+// Machine without one, KD-91), so the object Create returned can be stale. m
+// is updated to the stored object.
+func setMachineStatus(g *WithT, ctx context.Context, c client.Client, m *clusterv1.Machine) {
+	status := *m.Status.DeepCopy()
+	g.Eventually(func() error {
+		live := &clusterv1.Machine{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(m), live); err != nil {
+			return err
+		}
+		live.Status = status
+		if err := c.Status().Update(ctx, live); err != nil {
+			return err
+		}
+		live.DeepCopyInto(m)
+		return nil
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+}
+
 // controlPlaneBootstrap creates the KairosConfig that a KCP-owned
 // control-plane Machine fixture named name points at, recording distribution
 // as createControlPlaneMachine stamps it, and returns the Bootstrap that
@@ -76,6 +98,13 @@ func markClusterInfrastructureProvisioned(ctx context.Context, c client.Client, 
 // plane's distribution unknown, and the KCP then holds every membership
 // change, which would mask whatever gate a test means to exercise.
 func controlPlaneBootstrap(t *testing.T, ctx context.Context, c client.Client, kcp *controlplanev1beta2.KairosControlPlane, clusterName, name, distribution string) clusterv1.Bootstrap {
+	t.Helper()
+	return controlPlaneBootstrapWithHostname(t, ctx, c, kcp, clusterName, name, distribution, "")
+}
+
+// controlPlaneBootstrapWithHostname is controlPlaneBootstrap with
+// spec.hostname set on the KairosConfig.
+func controlPlaneBootstrapWithHostname(t *testing.T, ctx context.Context, c client.Client, kcp *controlplanev1beta2.KairosControlPlane, clusterName, name, distribution, hostname string) clusterv1.Bootstrap {
 	t.Helper()
 	NewWithT(t).Expect(c.Create(ctx, &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
@@ -93,6 +122,7 @@ func controlPlaneBootstrap(t *testing.T, ctx context.Context, c client.Client, k
 			Role:              "control-plane",
 			Distribution:      distribution,
 			KubernetesVersion: kcp.Spec.Version,
+			Hostname:          hostname,
 		},
 	})).To(Succeed())
 	return clusterv1.Bootstrap{ConfigRef: clusterv1.ContractVersionedObjectReference{

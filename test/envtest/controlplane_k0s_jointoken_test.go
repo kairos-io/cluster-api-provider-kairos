@@ -168,7 +168,7 @@ func makeK0sInitJoinable(t *testing.T, ctx context.Context, c client.Client, nsN
 		initMachine.Status.Addresses = append(initMachine.Status.Addresses,
 			clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
 	}
-	g.Expect(c.Status().Update(ctx, initMachine)).To(Succeed())
+	setMachineStatus(g, ctx, c, initMachine)
 
 	g.Expect(c.Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

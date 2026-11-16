@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -232,6 +233,8 @@ type k0sLeaveCluster struct {
 	leaverKey types.NamespacedName
 	// unregistered is k0sLeaveOptions.unregisteredLeaver.
 	unregistered bool
+	// hostname is k0sLeaveOptions.leaverHostname.
+	hostname string
 }
 
 const k0sLeaverIP = "10.11.0.10"
@@ -259,15 +262,42 @@ type k0sLeaveOptions struct {
 	extraMembers map[string]string
 	// recorder, when set, receives the KCP reconciler's events.
 	recorder record.EventRecorder
+	// leaverHostname is spec.hostname of the leaver's KairosConfig. An
+	// unregistered leaver's node, and its EtcdMember, go by it.
+	leaverHostname string
+	// extraMachines are more control-plane Machines of the KCP, without a
+	// NodeRef or addresses, created next to the leaver.
+	extraMachines []k0sExtraMachine
 }
 
-// leaverNode is the leaving node's name: its NodeRef name, or its Machine
-// name when it has no NodeRef.
+// k0sExtraMachine is a control-plane Machine without a NodeRef whose
+// KairosConfig sets spec.hostname to hostname.
+type k0sExtraMachine struct {
+	name, hostname string
+	annotations    map[string]string
+}
+
+// leaverNode is the leaving node's name: its NodeRef name, or, when it has
+// no NodeRef, its hostname, else its Machine name.
 func (k *k0sLeaveCluster) leaverNode() string {
-	if k.unregistered {
-		return k.leaverKey.Name
+	if !k.unregistered {
+		return "leaver-node"
 	}
-	return "leaver-node"
+	if k.hostname != "" {
+		return k.hostname
+	}
+	return k.leaverKey.Name
+}
+
+// deleteLeaverKairosConfig deletes the leaver's KairosConfig, as a
+// foreground delete of the Machine does before pre-terminate.
+func (k *k0sLeaveCluster) deleteLeaverKairosConfig(g *WithT) {
+	kc := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(k.c.Get(k.ctx, k.leaverKey, kc)).To(Succeed())
+	g.Expect(k.c.Delete(k.ctx, kc)).To(Succeed())
+	g.Eventually(func() bool {
+		return apierrors.IsNotFound(k.c.Get(k.ctx, k.leaverKey, &bootstrapv1beta2.KairosConfig{}))
+	}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
 }
 
 // startK0sLeaveClusterWith builds the cluster with opts.
@@ -289,7 +319,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	})
 	installK0sEtcdMemberCRD(t, cfg)
 	k := &k0sLeaveCluster{ctx: ctx, c: c, wc: envtestWorkloadClient(t, cfg), members: members, nsName: name, kcpName: name + "-kcp",
-		unregistered: opts.unregisteredLeaver}
+		unregistered: opts.unregisteredLeaver, hostname: opts.leaverHostname}
 	k.leaverKey = types.NamespacedName{Name: k.kcpName + "-0", Namespace: k.nsName}
 	clusterName := name + "-cluster"
 	haFixture(t, ctx, c, k.nsName, clusterName, k.kcpName, "k0s")
@@ -329,7 +359,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	// The Machines. The leaver holds the VIP; a keeper reports the endpoint
 	// host too. Neither address may ever be dialled.
 	kcp := getKCP(g, ctx, c, k.nsName, k.kcpName)
-	mk := func(name, node string, annotations map[string]string, addrs ...string) *clusterv1.Machine {
+	mk := func(name, node, hostname string, annotations map[string]string, addrs ...string) *clusterv1.Machine {
 		m := &clusterv1.Machine{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: name, Namespace: k.nsName,
@@ -341,7 +371,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 			Spec: clusterv1.MachineSpec{
 				ClusterName:       clusterName,
 				Version:           kcp.Spec.Version,
-				Bootstrap:         controlPlaneBootstrap(t, ctx, c, kcp, clusterName, name, "k0s"),
+				Bootstrap:         controlPlaneBootstrapWithHostname(t, ctx, c, kcp, clusterName, name, "k0s", hostname),
 				InfrastructureRef: testMachineInfraRef("infra-" + name),
 			},
 		}
@@ -355,7 +385,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 		for _, a := range addrs {
 			m.Status.Addresses = append(m.Status.Addresses, clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
 		}
-		g.Expect(c.Status().Update(ctx, m)).To(Succeed())
+		setMachineStatus(g, ctx, c, m)
 		return m
 	}
 	annotations := map[string]string{etcdLeaveHookKey: ""}
@@ -366,9 +396,12 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	if k.unregistered {
 		leaverNodeRef = ""
 	}
-	leaver := mk(k.leaverKey.Name, leaverNodeRef, annotations, k0sLeaverIP, vip)
-	mk(k.kcpName+"-1", "keeper-a", nil, "10.11.0.11", endpointHost)
-	mk(k.kcpName+"-2", "keeper-b", nil, "10.11.0.12")
+	leaver := mk(k.leaverKey.Name, leaverNodeRef, opts.leaverHostname, annotations, k0sLeaverIP, vip)
+	mk(k.kcpName+"-1", "keeper-a", "", nil, "10.11.0.11", endpointHost)
+	mk(k.kcpName+"-2", "keeper-b", "", nil, "10.11.0.12")
+	for _, x := range opts.extraMachines {
+		mk(x.name, "", x.hostname, x.annotations)
+	}
 	if !opts.keepLeaver {
 		g.Expect(c.Delete(ctx, leaver)).To(Succeed())
 	}

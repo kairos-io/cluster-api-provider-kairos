@@ -34,11 +34,12 @@ package controlplane
 //     being deleted, and every Machine registered with a healthy voting etcd
 //     report. Upstream also waits while any Machine is still provisioning,
 //     because the unexpected member may be that Machine's.
-//   - A member is expected when its name is any control-plane Machine's
-//     node name (leaveNodeName: the Node name, or the rendered hostname), or
-//     its peer address is one any control-plane Machine reports. Only a
-//     member that matches neither is an orphan. On CAPK the peer address is
-//     on a bridge NIC no Machine reports, so the name alone decides there.
+//   - A member is expected when its name is any of a control-plane
+//     Machine's node names (its Node name, the node name recorded on it at
+//     creation, and the hostname its KairosConfig renders), or its peer
+//     address is one any control-plane Machine reports. Only a member that
+//     matches neither is an orphan. On CAPK the peer address is on a bridge
+//     NIC no Machine reports, so the name alone decides there.
 //   - Only when quorum allows: after the removal, the healthy voting members
 //     (registered Machines whose node reports healthy and voting) must still
 //     be a majority of the members left, and of the desired replicas.
@@ -621,6 +622,10 @@ func (e expectedMembers) has(member *unstructured.Unstructured) bool {
 // which are every control-plane Machine of the cluster, whoever owns it
 // (clusterControlPlaneMachines): a Machine this KCP does not own still has a
 // member that must not be removed.
+//
+// Every name a Machine may go by counts: the recorded node name (KD-91), the
+// hostname its KairosConfig renders, and its Node name. Unlike the leave,
+// which needs one name, more names here only ever keep a member.
 func (r *KairosControlPlaneReconciler) expectedEtcdMembers(ctx context.Context, machines []*clusterv1.Machine) (expectedMembers, error) {
 	e := expectedMembers{names: map[string]bool{}, addrs: map[string]bool{}}
 	for _, m := range machines {
@@ -629,6 +634,9 @@ func (r *KairosControlPlaneReconciler) expectedEtcdMembers(ctx context.Context, 
 			return expectedMembers{}, err
 		}
 		e.names[rendered] = true
+		if recorded, ok := recordedNodeName(m); ok && recorded != "" {
+			e.names[recorded] = true
+		}
 		if m.Status.NodeRef.IsDefined() {
 			e.names[m.Status.NodeRef.Name] = true
 		}
