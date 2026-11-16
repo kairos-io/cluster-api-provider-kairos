@@ -6,7 +6,7 @@ See [Install guide](INSTALL.md) for development install.
 
 ## Prerequisites
 
-- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.2.1 release image is built with Go 1.26.10.
+- Go toolchain 1.26.4 or later (the `go` directive in `go.mod`). The v0.2.2 release image is built with Go 1.27.4.
 
 ## Unit tests
 

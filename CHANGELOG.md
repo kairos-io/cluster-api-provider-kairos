@@ -8,6 +8,61 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.2.2] - 2026-11-16
+
+A fix release for the v0.2 series. The main fix is for the control plane's
+distribution: a `KairosControlPlane` whose `spec.distribution` changed after
+its Machines existed could skip a departing k0s member's etcd leave and leave
+a voting etcd member behind. There is no CRD schema change; only the
+description of `spec.distribution` changes. Check each control plane's
+distribution before upgrading. See the
+[v0.2.2 release notes](docs/release-notes/v0.2.2.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md#v021--v022).
+
+### Fixed
+
+- **The control-plane distribution follows its Machines** (#223). The
+  `KairosConfig` of each control-plane Machine records what its node runs.
+  When Machines exist and `spec.distribution` differs from it, or they
+  disagree, or none can be read, the control plane creates and deletes no
+  control-plane Machines, mints or extends no join tokens and removes no
+  orphaned etcd members, with `Ready` False and reason `DistributionMismatch`. An empty
+  `spec.distribution` is written back from the Machines. A Machine carrying
+  the etcd-leave hook always runs the etcd leave. A change between two
+  non-empty values is admitted with a warning.
+- **A `kubeadm` `KairosConfigTemplate` is refused even with an explicit
+  `spec.distribution`** (#223), with reason `UnsupportedDistribution`.
+- **`KairosControlPlaneTemplate` no longer defaults `distribution` to `k0s`**
+  (#222), which overrode a `k3s` `KairosConfigTemplate` on every ClusterClass
+  control plane.
+- **k0s post-bootstrap no longer holds up the boot** (#155). Users and SSH
+  keys are applied without waiting for the join.
+
+### Security
+
+- **The image is built with Go 1.27.4**, which fixes GO-2026-6859
+  (CVE-2026-97054) in `net/http`. No package linked into the manager uses
+  `MaxBytesReader` or `MaxBytesHandler`, which the crash needs.
+- `golang.org/x/net` v0.62.0 (#209), `golang.org/x/crypto` v0.59.0 (#211) and
+  `go.opentelemetry.io/otel/trace` v1.47.0 (#214), for advisories that are not
+  reachable from the manager.
+- The release job keeps its token off disk, drops the unused QEMU step, and
+  fails when an asset is missing (#203, #213).
+
+### Changed
+
+- New events on the `KairosControlPlane`: `DistributionMismatch`,
+  `UnsupportedDistribution`, `DistributionMismatchResolved`,
+  `DistributionInherited`, `DistributionRestored`, `DistributionWriteFailed`
+  and `EtcdLeaveHookContradictsKairosConfig`.
+- A `KairosControlPlane` with an explicit `k0s` or `k3s` that references a
+  `kubeadm` `KairosConfigTemplate` stops creating and deleting Machines.
+- `KairosControlPlaneTemplate` objects created by v0.2.1 or earlier keep
+  `distribution: k0s`. Set it explicitly or remove it; removing it is now
+  safe.
+- The k0s post-bootstrap change reaches only Machines created after the
+  upgrade.
+
 ## [v0.2.1] - 2026-10-22
 
 A fix release for the v0.2 series. The main fix is for k0s control planes with
