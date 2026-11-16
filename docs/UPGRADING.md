@@ -35,9 +35,10 @@ then `clusterctl init` with the new one; see
   etcd leave** (KD-94). Before, the leave of a control-plane Machine with a
   Node ended, and its hook was removed, as soon as its node had no entry in
   `<cluster>-etcd-status`. Nodes write that entry once, at boot, and nothing
-  removes it, so it was missing only when the node never reported, reported
-  under a name other than its Node name, or the Secret was deleted or
-  recreated, and in each of those cases the member could still be voting.
+  removes it, so a missing entry never meant the member had left: it was
+  missing when, for example, the node never reported, reported under a name
+  other than its Node name, or the Secret was deleted or recreated, and the
+  member could still be voting.
   The leave now ends only when the node acks it, when k0s reports the member
   gone after the leave is handed to it, or with `EtcdMemberLeaveTimedOut`
   after the usual ~15 minutes. Expect the deletion of such a Machine to wait
