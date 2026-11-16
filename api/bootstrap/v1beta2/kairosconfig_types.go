@@ -663,8 +663,13 @@ type KairosConfigInitialization struct {
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready",description="Bootstrap ready"
 // +kubebuilder:printcolumn:name="DataSecretName",type="string",JSONPath=".status.dataSecretName",description="Secret containing bootstrap data"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || has(self.spec)",message="spec cannot be removed",reason=FieldValueForbidden,fieldPath=".spec"
 
 // KairosConfig is the Schema for the kairosconfigs API
+//
+// The spec cannot be removed once set: the transition rules on spec.role,
+// spec.distribution and spec.hostname run only when both the old and the new
+// spec exist.
 type KairosConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

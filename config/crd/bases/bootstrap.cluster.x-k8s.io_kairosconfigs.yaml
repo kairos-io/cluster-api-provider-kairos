@@ -31,7 +31,12 @@ spec:
     name: v1beta2
     schema:
       openAPIV3Schema:
-        description: KairosConfig is the Schema for the kairosconfigs API
+        description: |-
+          KairosConfig is the Schema for the kairosconfigs API
+
+          The spec cannot be removed once set: the transition rules on spec.role,
+          spec.distribution and spec.hostname run only when both the old and the new
+          spec exist.
         properties:
           apiVersion:
             description: |-
@@ -1262,6 +1267,11 @@ spec:
                 type: boolean
             type: object
         type: object
+        x-kubernetes-validations:
+        - fieldPath: .spec
+          message: spec cannot be removed
+          reason: FieldValueForbidden
+          rule: '!has(oldSelf.spec) || has(self.spec)'
     served: true
     storage: true
     subresources:

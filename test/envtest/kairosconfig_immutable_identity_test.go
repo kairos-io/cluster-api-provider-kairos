@@ -38,10 +38,11 @@ import (
 )
 
 // TestKairosConfigIdentityIsImmutable drives the CRD's transition rules on
-// KairosConfig.spec through a real apiserver (KD-88): role and distribution
-// cannot change once set, and a control-plane KairosConfig's hostname cannot
-// be set, changed or cleared after creation. envtest installs no webhooks, so
-// only CRD defaulting and CEL run here, which is where the rules live.
+// KairosConfig through a real apiserver (KD-88): role and distribution cannot
+// change once set, a control-plane KairosConfig's hostname cannot be set,
+// changed or cleared after creation, and the spec cannot be removed to get
+// past those rules. envtest installs no webhooks, so only CRD defaulting and
+// CEL run here, which is where the rules live: they hold without the webhook.
 func TestKairosConfigIdentityIsImmutable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -165,6 +166,18 @@ func TestKairosConfigIdentityIsImmutable(t *testing.T) {
 		expectForbidden(t, c.Patch(ctx, kc, patch), "spec.hostname")
 	})
 
+	t.Run("removing the spec is refused", func(t *testing.T) {
+		kc := create(t, controlPlane("k3s", "cp-a"))
+		expectForbidden(t, c.Patch(ctx, kc, client.RawPatch(types.MergePatchType, []byte(`{"spec":null}`))), "spec")
+		expectForbidden(t, c.Patch(ctx, kc, client.RawPatch(types.JSONPatchType, []byte(`[{"op":"remove","path":"/spec"}]`))), "spec")
+		live := stored(t, kc)
+		NewWithT(t).Expect(live.Spec.Role).To(Equal("control-plane"))
+		NewWithT(t).Expect(live.Spec.Hostname).To(Equal("cp-a"))
+		// The rule constrains spec only: status writes on the same object pass.
+		live.Status.Ready = true
+		NewWithT(t).Expect(c.Status().Update(ctx, live)).To(Succeed())
+	})
+
 	t.Run("demoting a control-plane config to reach its hostname is refused at the first step", func(t *testing.T) {
 		kc := create(t, controlPlane("k0s", "cp-a"))
 		expectForbidden(t, update(kc, func(kc *bootstrapv1beta2.KairosConfig) { kc.Spec.Role = "worker" }), "spec.role")
@@ -196,13 +209,21 @@ func TestKairosConfigIdentityIsImmutable(t *testing.T) {
 		g.Expect(update(live, func(kc *bootstrapv1beta2.KairosConfig) { kc.Finalizers = nil })).To(Succeed())
 	})
 
-	t.Run("status subresource update", func(t *testing.T) {
+	t.Run("status subresource update, with a spec change that is dropped", func(t *testing.T) {
 		g := NewWithT(t)
 		kc := create(t, controlPlane("k0s", "cp-a"))
 		kc.Status.Ready = true
 		kc.Status.DataSecretName = ptr.To("kc-data")
+		kc.Spec.Hostname = "cp-b"
 		g.Expect(c.Status().Update(ctx, kc)).To(Succeed())
-		g.Expect(stored(t, kc).Status.Ready).To(BeTrue())
+		live := stored(t, kc)
+		g.Expect(live.Status.Ready).To(BeTrue())
+		g.Expect(live.Spec.Hostname).To(Equal("cp-a"), "the status subresource ignores spec")
+	})
+
+	t.Run("an explicit empty hostname on a control-plane config without one", func(t *testing.T) {
+		kc := create(t, controlPlane("k0s", ""))
+		NewWithT(t).Expect(c.Patch(ctx, kc, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"hostname":""}}`)))).To(Succeed())
 	})
 
 	t.Run("a stored hostname the webhook would refuse stays updatable", func(t *testing.T) {
