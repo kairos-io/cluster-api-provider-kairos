@@ -103,7 +103,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "The Go that CI tests with (the go-version input of actions/setup-go, in ci.yaml and release.yaml) and the Go the image is built with (the golang builder image in the Dockerfile) are one decision: CI should test the Go that ships. Group them on one branch. Matched by manager, dep type and name rather than datasource, because Renovate has changed the datasource it uses for setup-go. The builder may run ahead of the go directive; builder >= directive is the invariant, not equality.",
+      "description": "The Go that CI tests with (the go-version input of actions/setup-go, in ci.yaml and release.yaml) and the Go the image is built with (the golang builder image in the Dockerfile) are one decision: CI should test the Go that ships. Group them on one branch. Matched by manager, dep type and name rather than datasource, so the rule keeps matching if Renovate changes the datasource it uses for setup-go. The builder may run ahead of the go directive; builder >= directive is the invariant, not equality.",
       "groupName": "Go toolchain",
       "matchManagers": [
         "github-actions"
