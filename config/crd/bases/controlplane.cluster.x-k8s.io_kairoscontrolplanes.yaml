@@ -70,12 +70,16 @@ spec:
                 description: |-
                   Distribution specifies the Kubernetes distribution to install.
 
-                  When left empty the controller resolves the effective distribution by
-                  inheriting spec.template.spec.distribution from the referenced
-                  KairosConfigTemplate; if the template does not specify one either, it
-                  defaults to k0s. An explicit value here always wins and overrides the
-                  template's distribution. There is intentionally NO CRD-level default so
-                  that "unset" (inherit) is distinguishable from an explicit "k0s".
+                  While no control-plane Machine exists, an empty value is set from
+                  spec.template.spec.distribution of the referenced KairosConfigTemplate
+                  (k0s is used if neither sets one), and an explicit value is used for
+                  the Machines the controller creates. Once Machines exist, the
+                  distribution their KairosConfigs record is what counts: an empty value
+                  is set from it, and a value that differs from it holds the control
+                  plane (Ready=False, reason DistributionMismatch) until it is set back or
+                  removed. Changing the distribution of a running control plane is not
+                  supported. There is intentionally NO CRD-level default so that "unset"
+                  is distinguishable from an explicit "k0s".
                 enum:
                 - k0s
                 - k3s
