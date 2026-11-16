@@ -356,6 +356,21 @@ func TestHA_K0sEtcdLeave_LegacyMachinesAreBackfilled(t *testing.T) {
 	})
 	defer teardown()
 	ctx, c := k.ctx, k.c
+	// The fixtures are created without a record and registered only after
+	// the Create, so a reconcile in between may already have recorded a
+	// keeper under the name its KairosConfig renders. Take the records off
+	// again now that every Machine is registered, as on Machines created
+	// before the record existed.
+	for _, name := range []string{k.leaverKey.Name, k.kcpName + "-1", k.kcpName + "-2"} {
+		g.Eventually(func() error {
+			m := &clusterv1.Machine{}
+			if err := c.Get(ctx, types.NamespacedName{Namespace: k.nsName, Name: name}, m); err != nil {
+				return err
+			}
+			delete(m.Annotations, renderedNodeNameKey)
+			return c.Update(ctx, m)
+		}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+	}
 	touchKCP(g, ctx, c, k.nsName, k.kcpName)
 
 	recordOf := func(name string) func() (string, error) {

@@ -385,7 +385,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 		for _, a := range addrs {
 			m.Status.Addresses = append(m.Status.Addresses, clusterv1.MachineAddress{Type: clusterv1.MachineInternalIP, Address: a})
 		}
-		g.Expect(c.Status().Update(ctx, m)).To(Succeed())
+		setMachineStatus(g, ctx, c, m)
 		return m
 	}
 	annotations := map[string]string{etcdLeaveHookKey: ""}

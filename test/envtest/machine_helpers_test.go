@@ -68,6 +68,28 @@ func markClusterInfrastructureProvisioned(ctx context.Context, c client.Client, 
 	return lastErr
 }
 
+// setMachineStatus writes m.Status onto the Machine m names, through the
+// status subresource. The read-modify-write is retried: a control-plane
+// Machine fixture is created and then given its status, and the KCP may write
+// the Machine in between (it records the node name on every control-plane
+// Machine without one, KD-91), so the object Create returned can be stale. m
+// is updated to the stored object.
+func setMachineStatus(g *WithT, ctx context.Context, c client.Client, m *clusterv1.Machine) {
+	status := *m.Status.DeepCopy()
+	g.Eventually(func() error {
+		live := &clusterv1.Machine{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(m), live); err != nil {
+			return err
+		}
+		live.Status = status
+		if err := c.Status().Update(ctx, live); err != nil {
+			return err
+		}
+		live.DeepCopyInto(m)
+		return nil
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+}
+
 // controlPlaneBootstrap creates the KairosConfig that a KCP-owned
 // control-plane Machine fixture named name points at, recording distribution
 // as createControlPlaneMachine stamps it, and returns the Bootstrap that

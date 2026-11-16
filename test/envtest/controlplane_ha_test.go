@@ -425,7 +425,7 @@ func TestHA_StatusMath_N3(t *testing.T) {
 		g.Expect(c.Create(ctx, m)).To(Succeed())
 		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: "node-" + string(rune('0'+i))}
 		m.Status.Phase = string(clusterv1.MachinePhaseRunning)
-		g.Expect(c.Status().Update(ctx, m)).To(Succeed())
+		setMachineStatus(g, ctx, c, m)
 	}
 
 	// Nudge a reconcile by touching the KCP annotations.

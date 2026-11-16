@@ -194,7 +194,7 @@ func TestHA_WorkloadIdentityChange_FreezesMembership(t *testing.T) {
 		g.Expect(c.Create(ctx, m)).To(Succeed())
 		m.Status.NodeRef = clusterv1.MachineNodeReference{Name: fmt.Sprintf("node-%d", i)}
 		m.Status.Phase = string(clusterv1.MachinePhaseRunning)
-		g.Expect(c.Status().Update(ctx, m)).To(Succeed())
+		setMachineStatus(g, ctx, c, m)
 	}
 	touchKCP(g, ctx, c, nsName, kcpName)
 	g.Consistently(func() string {
