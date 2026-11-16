@@ -32,18 +32,19 @@ then `clusterctl init` with the new one; see
   Machine without a Node is changed after its leave was requested; the leave
   is held until the name is restored or the usual time limit passes.
 - **A k0s member's absence from the etcd-status Secret no longer ends its
-  etcd leave** (KD-94). Before, the leave of a control-plane Machine with a
-  Node ended, and its hook was removed, as soon as its node had no entry in
-  `<cluster>-etcd-status`. Nodes write that entry once, at boot, and nothing
-  removes it, so a missing entry never meant the member had left: it was
-  missing when, for example, the node never reported, reported under a name
-  other than its Node name, or the Secret was deleted or recreated, and the
-  member could still be voting.
+  etcd leave** (KD-94). Before, once the leave of a control-plane Machine with
+  a Node was requested, it ended, and its hook was removed, as soon as the
+  node had no entry in `<cluster>-etcd-status`. Nodes write that entry once,
+  at boot, and nothing removes it, so a missing entry never meant the member
+  had left: it was missing when, for example, the node never reported,
+  reported under a name other than its Node name, or the Secret was deleted
+  or recreated, and the member could still be voting.
   The leave now ends only when the node acks it, when k0s reports the member
-  gone after the leave is handed to it, or with `EtcdMemberLeaveTimedOut`
-  after the usual ~15 minutes. Expect the deletion of such a Machine to wait
-  for one of those instead of finishing at once; other membership changes
-  wait with it.
+  not joined after the leave is handed to it, or with
+  `EtcdMemberLeaveTimedOut`: after ~5 minutes when k0s has no `EtcdMember`
+  to hand the leave to, and at the latest after ~15 minutes. Expect the
+  deletion of such a Machine to wait for one of those instead of finishing at
+  once; the rollout and the orphan-member cleanup wait with it.
 - **Do not edit `spec.hostname` on an existing control-plane `KairosConfig`.**
   Until the field becomes immutable, an edit made after the Machine is created
   and before its node has bootstrapped makes the recorded name differ from the
