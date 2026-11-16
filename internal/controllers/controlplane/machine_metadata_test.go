@@ -297,8 +297,8 @@ func TestReconcileMachineMetadata_ConvergesExistingMachines(t *testing.T) {
 
 // TestReconcileMachineMetadata_KeepsMetadataItDoesNotOwn: the merge is
 // additive because the etcd-leave hook and CAPI's own annotations live on the
-// same object. Stripping the hook off a terminating Machine would release a
-// member CAPI is holding for a clean `k0s etcd leave`.
+// same object. Stripping the hook off a Machine would let its deletion go on
+// without a clean `k0s etcd leave`.
 func TestReconcileMachineMetadata_KeepsMetadataItDoesNotOwn(t *testing.T) {
 	g := NewWithT(t)
 	scheme := machineMetaScheme(g)
@@ -307,18 +307,15 @@ func TestReconcileMachineMetadata_KeepsMetadataItDoesNotOwn(t *testing.T) {
 		Labels: map[string]string{"tier": "platform"},
 	})
 
-	now := metav1.Now()
-	terminating := machineMetaMachine("test-kcp-0",
+	hooked := machineMetaMachine("test-kcp-0",
 		map[string]string{"set-by-a-machinehealthcheck": "yes"},
 		map[string]string{etcdLeaveHookAnnotation(): ""})
-	terminating.DeletionTimestamp = &now
-	terminating.Finalizers = []string{"test.kairos.io/hold"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(terminating).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(hooked).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
 	g.Expect(r.reconcileMachineMetadata(context.Background(), log.Log, kcp, machineMetaCluster(),
-		[]*clusterv1.Machine{terminating.DeepCopy()})).To(Succeed())
+		[]*clusterv1.Machine{hooked.DeepCopy()})).To(Succeed())
 
 	got := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(),

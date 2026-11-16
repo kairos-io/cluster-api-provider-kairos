@@ -53,20 +53,36 @@ func controlPlaneMachineLabels(kcp *controlplanev1beta2.KairosControlPlane, clus
 }
 
 // reservedMachineAnnotations are the Machine annotations only the controller
-// writes, one value per Machine. machineTemplate.metadata never copies them:
-// one template value on every Machine would overwrite each Machine's own.
+// writes, and reads back as state. machineTemplate.metadata never copies them,
+// at create or onto existing Machines: one template value on every Machine
+// would overwrite each Machine's own, and the etcd leave would act on a value
+// it never wrote (KD-92).
 //
-// renderedNodeNameAnnotation is the node name the etcd leave looks the member
-// up by (KD-91).
+//   - renderedNodeNameAnnotation is the node name the etcd leave looks the
+//     member up by (KD-91).
+//   - The etcd-leave pre-terminate hook is stamped only on k0s HA Machines and
+//     removed once the leave is done. From the template it would hook k3s and
+//     single-node Machines, and be put back after each removal, so the
+//     deletion would never finish. Only this exact key is reserved: other
+//     pre-terminate hooks belong to other controllers.
+//   - The rest are the leave's own bookkeeping. A template-set
+//     etcdLeaveRequestedAtAnnotation, say, would make the leave of every
+//     Machine start as already requested: past CAPI's drain, without the
+//     write that clears a stale `left`, and with a backdated value straight
+//     to the delegation to k0s.
 var reservedMachineAnnotations = map[string]bool{
-	renderedNodeNameAnnotation: true,
+	renderedNodeNameAnnotation:           true,
+	etcdLeaveHookAnnotation():            true,
+	etcdLeaveRequestedAtAnnotation:       true,
+	etcdLeaveUnreachableSinceAnnotation:  true,
+	etcdMemberLeaveRequestedAtAnnotation: true,
+	etcdMemberLeaveMemberIDAnnotation:    true,
 }
 
 // controlPlaneMachineAnnotations returns the annotations from
 // machineTemplate.metadata, without reservedMachineAnnotations. Unlike the
 // labels there is nothing to force: the etcd-leave pre-terminate hook and the
-// recorded node name are stamped by the caller afterwards, so they win over a
-// template that spells the same key.
+// recorded node name are stamped by the caller afterwards, where they apply.
 func controlPlaneMachineAnnotations(kcp *controlplanev1beta2.KairosControlPlane) map[string]string {
 	out := map[string]string{}
 	if md := kcp.Spec.MachineTemplate.Metadata; md != nil {
@@ -80,9 +96,28 @@ func controlPlaneMachineAnnotations(kcp *controlplanev1beta2.KairosControlPlane)
 	return out
 }
 
+// leaveBookkeepingAnnotations are the etcd leave's own state on a Machine.
+// Only reconcileMemberLeave writes them, and the sweep runs it only on a
+// Machine being deleted, which is never undone. So on a Machine that is not
+// being deleted, any of them was set by someone else: by
+// machineTemplate.metadata before it was reserved (KD-92), or by hand.
+// reconcileMachineMetadata removes them there, so that the Machine's leave,
+// when it comes, starts from the beginning.
+//
+// The etcd-leave hook is not among them. The hook decides whether a Machine
+// gets a leave (ADR 0016 D4), so the controller never removes it from a
+// Machine that is not being deleted, whatever else says otherwise.
+var leaveBookkeepingAnnotations = []string{
+	etcdLeaveRequestedAtAnnotation,
+	etcdLeaveUnreachableSinceAnnotation,
+	etcdMemberLeaveRequestedAtAnnotation,
+	etcdMemberLeaveMemberIDAnnotation,
+}
+
 // reconcileMachineMetadata carries the current machineTemplate.metadata onto
 // the Machines that already exist, so editing a label on the control plane
-// reaches a running cluster instead of waiting for a rollout.
+// reaches a running cluster instead of waiting for a rollout, and removes
+// leaveBookkeepingAnnotations from them, in the same patch.
 //
 // The merge is additive on purpose. This controller does not own the whole
 // metadata of a Machine: the etcd-leave pre-terminate hook lives in the
@@ -92,11 +127,21 @@ func controlPlaneMachineAnnotations(kcp *controlplanev1beta2.KairosControlPlane)
 // Removing a key from the template therefore leaves it on Machines that
 // already carry it; docs/API_REFERENCE.md says so. reservedMachineAnnotations
 // are never carried (controlPlaneMachineAnnotations drops them).
+//
+// A Machine being deleted is left exactly as it is, as upstream KCP's
+// syncMachines leaves it but for the fields that affect its teardown (here
+// reconcileNodeDrainTimeout). Its labels and annotations no longer reach a
+// Node that is going away, and carrying them would put back what another
+// controller removed to let the deletion go on: its own pre-terminate or
+// pre-drain hook, for one (KD-92).
 func (r *KairosControlPlaneReconciler) reconcileMachineMetadata(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, cluster *clusterv1.Cluster, machines []*clusterv1.Machine) error {
 	desiredLabels := controlPlaneMachineLabels(kcp, cluster.Name)
 	desiredAnnotations := controlPlaneMachineAnnotations(kcp)
 
 	for _, machine := range machines {
+		if !machine.DeletionTimestamp.IsZero() {
+			continue
+		}
 		patchHelper := client.MergeFrom(machine.DeepCopy())
 
 		changed := false
@@ -120,6 +165,14 @@ func (r *KairosControlPlaneReconciler) reconcileMachineMetadata(ctx context.Cont
 			machine.Annotations[k] = v
 			changed = true
 		}
+		var cleared []string
+		for _, k := range leaveBookkeepingAnnotations {
+			if _, ok := machine.Annotations[k]; ok {
+				delete(machine.Annotations, k)
+				cleared = append(cleared, k)
+				changed = true
+			}
+		}
 
 		if !changed {
 			continue
@@ -127,6 +180,10 @@ func (r *KairosControlPlaneReconciler) reconcileMachineMetadata(ctx context.Cont
 
 		if err := r.Patch(ctx, machine, patchHelper); err != nil {
 			return fmt.Errorf("failed to update metadata on machine %s: %w", machine.Name, err)
+		}
+		if len(cleared) > 0 {
+			log.Info("Removed etcd-leave state from a control-plane Machine that is not being deleted; the controller writes it only during a deletion",
+				"machine", machine.Name, "annotations", cleared)
 		}
 		log.Info("Updated control plane machine metadata from machineTemplate", "machine", machine.Name)
 	}
