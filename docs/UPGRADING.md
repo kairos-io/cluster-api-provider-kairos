@@ -10,6 +10,33 @@ as before. To switch to `kairos-io`, run `clusterctl delete` with the old name,
 then `clusterctl init` with the new one; see
 [INSTALL.md: Existing installs registered as `kairos`](INSTALL.md#existing-installs-registered-as-kairos).
 
+## v0.2.2 → v0.2.3
+
+### Behaviour changes to expect
+
+- **Control-plane Machines record their node name.** Each control-plane
+  Machine now carries the annotation
+  `controlplane.cluster.x-k8s.io/rendered-node-name`, and the k0s etcd leave
+  of a Machine without a Node uses it instead of reading the Machine's
+  `KairosConfig` (KD-91). Existing control-plane Machines that are not being
+  deleted get the annotation on the first reconcile after the upgrade, one
+  patch per Machine; a Machine whose name cannot be determined, or is not a
+  lowercase DNS-1123 label, keeps the previous lookup, and so does a Machine
+  that is already being deleted when you upgrade. Do not set the key in
+  `machineTemplate.metadata`: it is not copied. See
+  [HIGH_AVAILABILITY.md: A k0s Machine without a Node still leaves etcd](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement).
+- **Two new Warning events.** `EtcdLeaveNodeNameContradictsKairosConfig`
+  appears when a leaving Machine's `KairosConfig` renders another node name
+  than the recorded one; the leave proceeds with the recorded name.
+  `EtcdLeaveNodeNameUnusable` appears when the recorded name of a leaving
+  Machine without a Node is changed after its leave was requested; the leave
+  is held until the name is restored or the usual time limit passes.
+- **Do not edit `spec.hostname` on an existing control-plane `KairosConfig`.**
+  Until the field becomes immutable, an edit made after the Machine is created
+  and before its node has bootstrapped makes the recorded name differ from the
+  node's real name, and that Machine's etcd leave can then be skipped.
+- A downgrade ignores the annotation and returns to the previous lookup.
+
 ## v0.2.1 → v0.2.2
 
 Full release notes: [v0.2.2](release-notes/v0.2.2.md). Upgrade with
