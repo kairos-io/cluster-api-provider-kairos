@@ -15,11 +15,14 @@
 #   - spec.replicas is 3 (or 5) on the KairosControlPlane — never 2 or 4; etcd
 #     quorum needs an odd member count.
 #   - spec.distribution is set EXPLICITLY on the KairosControlPlane and
-#     matches the KairosConfigTemplate. An explicit value here always wins;
-#     if left unset, the controller inherits spec.distribution from the
-#     referenced KairosConfigTemplate, falling back to k0s only if neither
-#     sets one. Setting it explicitly here is still recommended for clarity —
-#     the k3s HA sample in this directory does the same.
+#     matches the KairosConfigTemplate. An explicit value here is used for
+#     the Machines the controller creates; if left unset on a new cluster,
+#     the controller writes spec.distribution from the referenced
+#     KairosConfigTemplate, falling back to k0s only if neither sets one.
+#     Setting it explicitly here is still recommended for clarity; the k3s
+#     HA sample in this directory does the same. Once Machines exist,
+#     changing the value holds the control plane (Ready=False,
+#     DistributionMismatch).
 #   - spec.ha.vip declares the kube-vip VIP. Cluster.spec.controlPlaneEndpoint
 #     .host and Metal3Cluster.spec.controlPlaneEndpoint.host MUST both equal
 #     spec.ha.vip.address — this is the stable API endpoint every node and

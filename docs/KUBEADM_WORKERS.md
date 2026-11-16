@@ -1,6 +1,6 @@
 # Kubeadm Workers
 
-Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: v0.2.0.
+Last verified against: CAPI v1.13.4 (v1beta2 contract). Provider version: v0.2.0; the `UnsupportedDistribution` refusal of a `kubeadm` `KairosConfigTemplate` was re-checked for v0.2.2 (#223).
 
 Verification status, by control plane:
 
