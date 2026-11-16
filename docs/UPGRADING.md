@@ -31,11 +31,6 @@ then `clusterctl init` with the new one; see
   `EtcdLeaveNodeNameUnusable` appears when the recorded name of a leaving
   Machine without a Node is changed after its leave was requested; the leave
   is held until the name is restored or the usual time limit passes.
-- **Do not edit `spec.hostname` on an existing control-plane `KairosConfig`.**
-  Until the field becomes immutable, an edit made after the Machine is created
-  and before its node has bootstrapped makes the recorded name differ from the
-  node's real name, and that Machine's etcd leave can then be skipped.
-- A downgrade ignores the annotation and returns to the previous lookup.
 - **A k0s member's absence from the etcd-status Secret no longer ends its
   etcd leave** (KD-94). Before, the leave of a control-plane Machine with a
   Node ended, and its hook was removed, as soon as its node had no entry in
@@ -48,6 +43,11 @@ then `clusterctl init` with the new one; see
   after the usual ~15 minutes. Expect the deletion of such a Machine to wait
   for one of those instead of finishing at once; other membership changes
   wait with it.
+- **Do not edit `spec.hostname` on an existing control-plane `KairosConfig`.**
+  Until the field becomes immutable, an edit made after the Machine is created
+  and before its node has bootstrapped makes the recorded name differ from the
+  node's real name, and that Machine's etcd leave can then be skipped.
+- A downgrade ignores the annotation and returns to the previous lookup.
 
 ## v0.2.1 → v0.2.2
 
