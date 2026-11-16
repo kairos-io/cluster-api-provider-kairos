@@ -36,7 +36,8 @@ Before upgrading:
   upgrade, only replacing the Machine changes them.
 - Make sure tools that write `KairosConfig` objects directly, such as GitOps
   pipelines or scripts, send the stored `role`, `distribution` and, for
-  control-plane configs, `hostname`. Otherwise every sync is rejected.
+  control-plane configs, `hostname` (omit it where none is stored). Otherwise
+  every sync is rejected.
 
 List the stored values:
 
@@ -44,6 +45,8 @@ List the stored values:
 kubectl get kairosconfigs -A \
   -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,ROLE:.spec.role,DISTRIBUTION:.spec.distribution,HOSTNAME:.spec.hostname
 ```
+
+`<none>` in the `HOSTNAME` column means no hostname is stored.
 
 ### Behaviour changes to expect
 
