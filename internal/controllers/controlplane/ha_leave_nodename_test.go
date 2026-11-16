@@ -86,6 +86,27 @@ func TestLeaveNodeName(t *testing.T) {
 			machine: noNodeRef(nodeMachine("kcp-1", true)),
 			want:    "kcp-1",
 		},
+		{
+			name:    "no NodeRef: the record wins over spec.hostname",
+			machine: withRecord(withKairosConfigRef(noNodeRef(nodeMachine("kcp-1", true)), "kcp-1"), "cp-host"),
+			objs:    []client.Object{kairosConfigWithHostname("kcp-1", "elsewhere")},
+			want:    "cp-host",
+		},
+		{
+			name:    "no NodeRef, the KairosConfig is gone: the record, not the Machine name (KD-91)",
+			machine: withRecord(withKairosConfigRef(noNodeRef(nodeMachine("kcp-1", true)), "kcp-1"), "cp-host"),
+			want:    "cp-host",
+		},
+		{
+			name:    "the NodeRef wins over the record",
+			machine: withRecord(withKairosConfigRef(nodeMachine("kcp-1", true), "kcp-1"), "cp-host"),
+			want:    "kcp-1",
+		},
+		{
+			name:    "the record is returned as written; the leave checks it",
+			machine: withRecord(noNodeRef(nodeMachine("kcp-1", true)), "CP-Host"),
+			want:    "CP-Host",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)

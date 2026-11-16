@@ -77,6 +77,13 @@ func markClusterInfrastructureProvisioned(ctx context.Context, c client.Client, 
 // change, which would mask whatever gate a test means to exercise.
 func controlPlaneBootstrap(t *testing.T, ctx context.Context, c client.Client, kcp *controlplanev1beta2.KairosControlPlane, clusterName, name, distribution string) clusterv1.Bootstrap {
 	t.Helper()
+	return controlPlaneBootstrapWithHostname(t, ctx, c, kcp, clusterName, name, distribution, "")
+}
+
+// controlPlaneBootstrapWithHostname is controlPlaneBootstrap with
+// spec.hostname set on the KairosConfig.
+func controlPlaneBootstrapWithHostname(t *testing.T, ctx context.Context, c client.Client, kcp *controlplanev1beta2.KairosControlPlane, clusterName, name, distribution, hostname string) clusterv1.Bootstrap {
+	t.Helper()
 	NewWithT(t).Expect(c.Create(ctx, &bootstrapv1beta2.KairosConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -93,6 +100,7 @@ func controlPlaneBootstrap(t *testing.T, ctx context.Context, c client.Client, k
 			Role:              "control-plane",
 			Distribution:      distribution,
 			KubernetesVersion: kcp.Spec.Version,
+			Hostname:          hostname,
 		},
 	})).To(Succeed())
 	return clusterv1.Bootstrap{ConfigRef: clusterv1.ContractVersionedObjectReference{

@@ -99,6 +99,17 @@ const (
 	// hooked Machine whose KairosConfig records a distribution other than
 	// k0s (warnIfConfigContradictsHook).
 	etcdLeaveHookContradictedEventReason = "EtcdLeaveHookContradictsKairosConfig"
+
+	// etcdLeaveNodeNameContradictedEventReason is the Warning event reason for
+	// a leaving Machine without a NodeRef whose KairosConfig renders a node
+	// name other than the one recorded on the Machine
+	// (warnIfConfigContradictsNodeName, KD-91).
+	etcdLeaveNodeNameContradictedEventReason = "EtcdLeaveNodeNameContradictsKairosConfig"
+
+	// etcdLeaveNodeNameUnusableEventReason is the Warning event reason for a
+	// leaving Machine without a NodeRef whose node name stopped passing the
+	// name checks after its leave was requested (holdUnusableNodeName, KD-91).
+	etcdLeaveNodeNameUnusableEventReason = "EtcdLeaveNodeNameUnusable"
 )
 
 // etcdLeaveHookAnnotation is the full pre-terminate hook annotation key
@@ -268,11 +279,16 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // through the control-plane endpoint (connectForLeave, ADR 0014).
 //
 // The member is named by leaveNodeName: the Node name, or, for a Machine
-// without a NodeRef, the hostname the renderer gave its node. A Machine
-// without a NodeRef may still hold an etcd member: k0s joins etcd before the
-// Node registers, and the Machine gets its NodeRef later still. Releasing
-// such a Machine without a leave orphaned its member on 2026-10-17, and the
-// next join under the same name split the cluster (ADR 0015 PR-3).
+// without a NodeRef, the node name recorded on the Machine when it was
+// created (KD-91; a Machine from before the record, the hostname its
+// KairosConfig renders). A Machine without a NodeRef may still hold an etcd
+// member: k0s joins etcd before the Node registers, and the Machine gets its
+// NodeRef later still. Releasing such a Machine without a leave orphaned its
+// member on 2026-10-17, and the next join under the same name split the
+// cluster (ADR 0015 PR-3). The recorded name does not follow the
+// KairosConfig, so editing, deleting or recreating it, before or during the
+// leave, does not change which member leaves; a KairosConfig that disagrees
+// gets a Warning event and nothing else.
 //
 // State machine:
 //  1. The hook decides (ADR 0016 D4): only k0s init/join Machines are given
@@ -299,6 +315,10 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //     handshake below, with its member ID recorded.
 //  5. First request: write the leave-requested sentinel, stamp the
 //     first-request timestamp, requeue (done=false).
+//     Without a NodeRef, every pass after it re-checks the name before any
+//     workload traffic (unregisteredNameProblem): one that no longer passes
+//     is held (holdUnusableNodeName) for the same bound as the timeout path
+//     below, then the hook is removed with a warning, never delegated.
 //  6. Node acked `left` in the workload ConfigMap → remove hook, done.
 //  7. With a NodeRef only: member gone from etcd-status → remove hook, done.
 //     (A node that never registered may never have reported, so its absence
@@ -356,6 +376,26 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// warning below is emitted once per cycle, not on every requeue.
 	if _, unreachable := target.Annotations[etcdLeaveUnreachableSinceAnnotation]; !requested && !unreachable {
 		r.warnIfConfigContradictsHook(ctx, log, kcp, target)
+		if !registered {
+			r.warnIfConfigContradictsNodeName(ctx, log, kcp, target)
+		}
+	}
+
+	// (2c) Without a NodeRef, the name was checked on the first pass only,
+	// and is read again from the Machine on every pass (KD-91). Check it
+	// again before anything is read from or written to the workload cluster
+	// under it: the ack, the sentinel (which the node of that name acts on by
+	// itself) and the delegation to k0s. One that no longer passes is held,
+	// with no workload traffic at all, so a reverted change lets the leave
+	// finish.
+	if requested && !registered {
+		why, err := r.unregisteredNameProblem(ctx, machines, target, nodeName)
+		if err != nil {
+			return false, err
+		}
+		if why != "" {
+			return r.holdUnusableNodeName(ctx, log, kcp, target, nodeName, why)
+		}
 	}
 
 	// Find a workload apiserver that answers, and read the leave ConfigMap
@@ -468,6 +508,71 @@ func (r *KairosControlPlaneReconciler) warnIfConfigContradictsHook(ctx context.C
 			"The KairosConfig of control-plane Machine %q says %s, but the Machine carries the k0s etcd-leave hook, which only k0s "+
 				"members are given; running the k0s etcd leave. If the node does not run k0s, the leave times out and the hook "+
 				"is removed. Check whether the KairosConfig was changed after the Machine was created.", target.Name, dist)
+	}
+}
+
+// holdUnusableNodeName handles a pass, after the first leave request, on
+// which the node name of target (no NodeRef) no longer passes
+// unregisteredNameProblem for the reason why. Nothing is sent to the
+// workload cluster. It holds, with an EtcdLeaveNodeNameUnusable Warning on
+// each pass, for the bound the timeout path has: until memberLeaveTimeout
+// after the request, then until etcdMemberLeaveCap after
+// etcdMemberLeaveRequestedAtAnnotation (stamped here, or kept from a
+// delegation already begun). Then it removes the hook with a warning and
+// never hands the leave to k0s. A name that passes again lets the leave
+// carry on where it was.
+func (r *KairosControlPlaneReconciler) holdUnusableNodeName(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine, nodeName, why string) (bool, error) {
+	if leaveTimedOut(target) {
+		if err := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); err != nil {
+			return false, err
+		}
+		if etcdMemberLeaveCapped(target) {
+			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, why+" after its leave was requested")
+		}
+	}
+	log.Info("etcd-leave: the node name of a Machine without a NodeRef no longer passes the name checks; holding, nothing is sent to the workload cluster",
+		"machine", target.Name, "node", nodeName, "reason", why)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(kcp, corev1.EventTypeWarning, etcdLeaveNodeNameUnusableEventReason,
+			"The etcd leave of control-plane Machine %q, which has no Node, is held: %s after its leave was requested. Nothing is sent to "+
+				"the workload cluster until the name the leave was requested under is restored; after the usual time limit the hook is "+
+				"removed without a leave.", target.Name, why)
+	}
+	return false, fmt.Errorf("etcd-leave: Machine %s: %s after its leave was requested", target.Name, why)
+}
+
+// warnIfConfigContradictsNodeName emits a Warning event when target, which
+// has no NodeRef, records a node name (renderedNodeNameAnnotation) and its
+// KairosConfig renders another one. The KairosConfig was then edited or
+// recreated after the Machine was created. It is informational: the leave
+// uses the recorded name (KD-91), and a KairosConfig that is gone or cannot
+// be read is only logged, never a reason to hold or release the hook.
+func (r *KairosControlPlaneReconciler) warnIfConfigContradictsNodeName(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) {
+	recorded, ok := recordedNodeName(target)
+	if !ok {
+		return
+	}
+	kc, err := r.machineKairosConfig(ctx, target)
+	if err != nil {
+		log.Info("etcd-leave: could not read the Machine's KairosConfig to compare it with the recorded node name; using the recorded name",
+			"machine", target.Name, "reason", err.Error())
+		return
+	}
+	if kc == nil {
+		log.Info("etcd-leave: the Machine's KairosConfig is gone; using the recorded node name", "machine", target.Name, "node", recorded)
+		return
+	}
+	rendered := strings.ToLower(bootstrapv1beta2.RenderedHostname(&kc.Spec, target.Name))
+	if rendered == recorded {
+		return
+	}
+	log.Info("etcd-leave: the Machine's KairosConfig renders another node name than the one recorded; using the recorded name",
+		"machine", target.Name, "recorded", recorded, "kairosConfig", rendered)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(kcp, corev1.EventTypeWarning, etcdLeaveNodeNameContradictedEventReason,
+			"Control-plane Machine %q has no Node and records node name %q, but its KairosConfig now renders %q; the etcd leave "+
+				"uses the recorded name. Check whether the KairosConfig was edited or recreated after the Machine was created.",
+			target.Name, recorded, rendered)
 	}
 }
 

@@ -95,20 +95,20 @@ func leaveUnreachableExpired(m *clusterv1.Machine) bool {
 //   - Otherwise it may be a live member: record its member ID, so a later
 //     delegation acts on this member only, and proceed.
 func (r *KairosControlPlaneReconciler) inspectUnregisteredLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, target *clusterv1.Machine, nodeName string, conn leaveConn) (proceed, done bool, err error) {
-	// The lookup is only evidence when the rendered hostname is exactly the
-	// name the node goes by. One that is not a lowercase DNS-1123 label, or
-	// carries "{{" that Kairos expands at boot, may name another member on the
-	// node (an old KairosConfig the webhook check predates). Then "not found"
-	// proves nothing: hold for the bound, with no read and no write.
-	raw, err := r.renderedHostname(ctx, target)
+	// The lookup is only evidence when the name is exactly the one the node
+	// goes by. One that is not a lowercase DNS-1123 label, or carries "{{"
+	// that Kairos expands at boot, may name another member on the node. Then
+	// "not found" proves nothing: hold for the bound, with no read and no
+	// write.
+	raw, source, err := r.unregisteredLeaveName(ctx, target, nodeName)
 	if err != nil {
 		return false, false, err
 	}
 	if !bootstrapv1beta2.ValidNodeHostname(raw) {
-		log.Info("etcd-leave: the Machine has no NodeRef and its rendered hostname cannot be matched to an EtcdMember; holding until the bound",
+		log.Info("etcd-leave: the Machine has no NodeRef and its "+source+" cannot be matched to an EtcdMember; holding until the bound",
 			"machine", target.Name, "reasons", bootstrapv1beta2.NodeHostnameErrors(raw))
-		done, err := r.leaveUnreachable(ctx, log, kcp, target, nodeName, "its rendered hostname is not a lowercase DNS-1123 label",
-			fmt.Errorf("rendered hostname of Machine %s is not a lowercase DNS-1123 label", target.Name))
+		done, err := r.leaveUnreachable(ctx, log, kcp, target, nodeName, "its "+source+" is not a lowercase DNS-1123 label",
+			fmt.Errorf("%s of Machine %s is not a lowercase DNS-1123 label", source, target.Name))
 		return false, done, err
 	}
 
@@ -162,23 +162,93 @@ func (r *KairosControlPlaneReconciler) inspectUnregisteredLeave(ctx context.Cont
 	return true, false, nil
 }
 
+// unregisteredLeaveName returns the name a Machine without a NodeRef is left
+// under, as written, for the ValidNodeHostname check, and what it is. It is
+// the name recorded on the Machine (KD-91), which the KCP only ever writes
+// valid, so an invalid record was changed by hand. A Machine without a record
+// is checked on the hostname its KairosConfig renders, as written (an old
+// KairosConfig the webhook check predates); nodeName is that lowercased.
+func (r *KairosControlPlaneReconciler) unregisteredLeaveName(ctx context.Context, target *clusterv1.Machine, nodeName string) (raw, source string, err error) {
+	if _, recorded := recordedNodeName(target); recorded {
+		return nodeName, "recorded node name", nil
+	}
+	raw, err = r.renderedHostname(ctx, target)
+	return raw, "rendered hostname", err
+}
+
+// unregisteredNameProblem re-checks, on a pass after the first leave
+// request, the name a Machine without a NodeRef is being left under. That
+// name is read from the Machine (or, without a record, its KairosConfig) on
+// every pass, and inspectUnregisteredLeave checked it only on the first.
+// Without this, a name changed in between would have the ack read, the
+// leave-requested sentinel rewritten and the leave handed to k0s under
+// another node's name; that node's responder acts on the sentinel by itself.
+// It returns why the name can no longer be used, or "".
+func (r *KairosControlPlaneReconciler) unregisteredNameProblem(ctx context.Context, machines []*clusterv1.Machine, target *clusterv1.Machine, nodeName string) (string, error) {
+	raw, source, err := r.unregisteredLeaveName(ctx, target, nodeName)
+	if err != nil {
+		return "", err
+	}
+	if !bootstrapv1beta2.ValidNodeHostname(raw) {
+		return "its " + source + " is not a lowercase DNS-1123 label", nil
+	}
+	other, err := r.otherMachineWithNodeName(ctx, machines, target, nodeName)
+	if err != nil {
+		return "", err
+	}
+	if other != "" {
+		return fmt.Sprintf("Machine %q has the same node name", other), nil
+	}
+	return "", nil
+}
+
 // otherMachineWithNodeName returns the name of a Machine in machines, other
-// than target, whose member goes by nodeName (leaveNodeName), or "" when
-// there is none. A spec.hostname shared through the KairosConfigTemplate
-// gives every control-plane node the same name, and then an EtcdMember of
-// that name cannot be told apart.
+// than target, whose member may go by nodeName (otherMachineNodeNames), or
+// "" when there is none. A spec.hostname shared through the
+// KairosConfigTemplate gives every control-plane node the same name, and
+// then an EtcdMember of that name cannot be told apart.
+//
+// A missed collision is the dangerous side: the leave-requested sentinel is
+// keyed by name alone, and the node of that name acts on it by itself. A
+// false one costs an abandoned leave, a member the orphan cleanup removes
+// later. So every name the other Machine's node may have is counted (KD-91).
 func (r *KairosControlPlaneReconciler) otherMachineWithNodeName(ctx context.Context, machines []*clusterv1.Machine, target *clusterv1.Machine, nodeName string) (string, error) {
 	for _, m := range machines {
 		if m.Name == target.Name {
 			continue
 		}
-		name, err := r.leaveNodeName(ctx, m)
+		names, err := r.otherMachineNodeNames(ctx, m)
 		if err != nil {
 			return "", err
 		}
-		if name == nodeName {
-			return m.Name, nil
+		for _, name := range names {
+			if name == nodeName {
+				return m.Name, nil
+			}
 		}
 	}
 	return "", nil
+}
+
+// otherMachineNodeNames returns the names m's node may go by, for the
+// collision check. A registered Machine's node is the Node it registered:
+// its NodeRef name only. Without one it is both the name recorded on the
+// Machine and the hostname its KairosConfig renders (the Machine name when
+// the KairosConfig is gone): an edit made to the KairosConfig before the
+// node was bootstrapped gave the node the edited name, and nothing on the
+// management cluster tells that apart from an edit made after. A
+// KairosConfig that cannot be read is an error: the check fails closed.
+func (r *KairosControlPlaneReconciler) otherMachineNodeNames(ctx context.Context, m *clusterv1.Machine) ([]string, error) {
+	if m.Status.NodeRef.IsDefined() {
+		return []string{m.Status.NodeRef.Name}, nil
+	}
+	legacy, err := r.renderedNodeName(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	names := []string{legacy}
+	if recorded, ok := recordedNodeName(m); ok && recorded != "" && recorded != legacy {
+		names = append(names, recorded)
+	}
+	return names, nil
 }
