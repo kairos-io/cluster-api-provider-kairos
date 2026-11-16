@@ -18,11 +18,11 @@ This project provides two Cluster API (CAPI) providers for managing Kubernetes c
 
 ## Status
 
-**Latest release**: [`v0.2.1`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.2.1). Pre-1.0: the API surface may still change before v1.0.
+**Latest release**: [`v0.2.2`](https://github.com/kairos-io/cluster-api-provider-kairos/releases/tag/v0.2.2). Pre-1.0: the API surface may still change before v1.0.
 
 Supports single-node and highly-available k0s and k3s clusters with CAPD, CAPV, CAPK, and CAPM3 (Metal3 bare metal), plus single-control-plane clusters on `KairosFleetMachine` infrastructure (the Kairos fleet infrastructure provider's machine kind). HA control planes (`spec.replicas: 3` or `5`) are supported on CAPK, CAPV, and CAPM3 for both k0s and k3s. CAPK k0s HA additionally requires a Kairos image carrying a k0s start gate, which this project does not publish; see [the CAPK quickstart](docs/QUICKSTART_CAPK.md#k0s-ha-the-image-start-gate). CAPD is dev-only; HA is not exercised on CAPD. HA is not exercised on `KairosFleetMachine` infrastructure: single control plane only today. `KairosControlPlane.spec.replicas` accepts `1` (single-node), `3`, or `5`; even counts and values above `5` are webhook-rejected. See [High-Availability control planes](#high-availability-control-planes) below. k0s is the fully-supported HA distribution; k3s HA has a known day-2 limitation (KD-5d).
 
-Read the [v0.2.1 release notes](docs/release-notes/v0.2.1.md) before installing. To upgrade, follow every per-version section of the [upgrade guide](docs/UPGRADING.md) between your version and the target. The `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place; see the [install guide](docs/INSTALL.md) and [Moving from the flat install to clusterctl packaging](docs/UPGRADING.md#moving-from-the-flat-install-to-clusterctl-packaging).
+Read the [v0.2.2 release notes](docs/release-notes/v0.2.2.md) before installing. To upgrade, follow every per-version section of the [upgrade guide](docs/UPGRADING.md) between your version and the target. The `clusterctl` and flat-manifest install paths are mutually exclusive and cannot be swapped in place; see the [install guide](docs/INSTALL.md) and [Moving from the flat install to clusterctl packaging](docs/UPGRADING.md#moving-from-the-flat-install-to-clusterctl-packaging).
 
 **kubeadm workers (since v0.2.0).** `KairosConfig` also accepts `distribution: kubeadm` to join Kairos **worker** nodes to a control plane that this provider does not run: a Kamaji `KamajiControlPlane` or a Cluster API `KubeadmControlPlane`. `KairosControlPlane` supports `k0s` and `k3s` only; this provider does not create kubeadm control planes. You supply the CNI and a node image that ships kubeadm, kubelet, and containerd at the exact workload Kubernetes version. The path was validated live for v0.2.0 with Kamaji, in three configurations, and with an upstream `KubeadmControlPlane` on KubeVirt (join, trust checks and DNS), and is tested with kubeadm v1.30 and v1.36. See [Kubeadm workers](docs/KUBEADM_WORKERS.md).
 
@@ -35,7 +35,7 @@ The control plane provider is no longer limited to a fixed provider allowlist: a
 The provider ships two ways; pick one per management cluster, they are mutually exclusive:
 
 - **clusterctl (recommended)**: on clusterctl v1.13 or v1.14, register the provider as `kairos-io` first (clusterctl v1.15 knows it built in), then run `clusterctl init --bootstrap kairos-io --control-plane kairos-io`.
-- **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.2.1/kairos-capi-provider.yaml`.
+- **Flat manifest**: `kubectl apply -f https://github.com/kairos-io/cluster-api-provider-kairos/releases/download/v0.2.2/kairos-capi-provider.yaml`.
 
 See the [install guide](docs/INSTALL.md) for provider registration, the full procedure for both paths, and why they cannot be mixed on one management cluster.
 

@@ -10,6 +10,100 @@ as before. To switch to `kairos-io`, run `clusterctl delete` with the old name,
 then `clusterctl init` with the new one; see
 [INSTALL.md: Existing installs registered as `kairos`](INSTALL.md#existing-installs-registered-as-kairos).
 
+## v0.2.1 → v0.2.2
+
+Full release notes: [v0.2.2](release-notes/v0.2.2.md). Upgrade with
+`clusterctl upgrade` (both providers), or re-apply the flat manifest for
+v0.2.2. There is no CRD schema change; only the description of
+`spec.distribution` changes.
+
+### Check the control-plane distribution before upgrading
+
+From v0.2.2, a `KairosControlPlane` checks its `spec.distribution` against
+the distribution its control-plane Machines' `KairosConfig` objects record. A
+control plane is held right after the upgrade when Machines exist and:
+- its `spec.distribution` differs from what they record;
+- they record different distributions; or
+- none of their `KairosConfig` objects can be read.
+
+While held, `Ready` is False with reason `DistributionMismatch`, and the
+control plane creates and deletes no control-plane Machines (no scale-up,
+scale-down, rollout or remediation), mints or extends no join tokens, and
+removes no orphaned etcd members. A k0s member that is still joining when the
+hold starts does not get its join token extended, so its join can fail if the
+hold outlasts the token. A consistent control plane sees no change, and an
+empty `spec.distribution` gets its Machines' value written back.
+
+List both sides before upgrading. Control planes, by cluster:
+
+```bash
+kubectl get kairoscontrolplanes -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.cluster\.x-k8s\.io/cluster-name}{"\t"}{.metadata.name}{"\t"}{.spec.distribution}{"\n"}{end}'
+```
+
+Control-plane `KairosConfig` objects, by cluster:
+
+```bash
+kubectl get kairosconfigs -A -l cluster.x-k8s.io/control-plane \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.cluster\.x-k8s\.io/cluster-name}{"\t"}{.metadata.name}{"\t"}{.spec.distribution}{"\n"}{end}'
+```
+
+For each cluster, the last column of the second list should show one value,
+equal to the control plane's `spec.distribution` or with that field empty.
+Where it does not:
+- **`spec.distribution` differs:** set it back to what the `KairosConfig`
+  objects record, or remove it, on the `KairosControlPlane` or, for a
+  ClusterClass, on its `KairosControlPlaneTemplate`. The recorded value is
+  what the nodes were built with unless a `KairosConfig` was edited since:
+  confirm what the nodes run first.
+- **The `KairosConfig` objects disagree:** confirm what each node runs, set
+  `spec.distribution` to the distribution the cluster runs, then delete the
+  Machines whose nodes run the other one. The controller does not delete them
+  on its own.
+
+Changing the distribution of a running control plane is not supported: create
+a new Cluster.
+
+### Behaviour changes to expect
+
+- **New events on the `KairosControlPlane`.**
+  - A hold emits a Warning event with the hold's reason that names
+    `spec.distribution`, the template and the Machines per distribution, and
+    leaving it emits `DistributionMismatchResolved`.
+  - An empty `spec.distribution` written from the Machines emits
+    `DistributionRestored`; one written from the `KairosConfigTemplate`,
+    when there are no Machines, emits `DistributionInherited`.
+  - A failed write emits `DistributionWriteFailed`.
+  - A departing Machine whose `KairosConfig` contradicts its etcd-leave hook
+    emits `EtcdLeaveHookContradictsKairosConfig` and still runs the etcd
+    leave.
+
+  A held control plane rechecks every 60 seconds, so a fixed template is
+  picked up within a minute. See
+  [API_REFERENCE.md: KairosControlPlane events](API_REFERENCE.md#kairoscontrolplane-events).
+- **Changing `spec.distribution` between two non-empty values is admitted
+  with a warning**, not rejected. When Machines exist, the controller then
+  holds the control plane until the value is set back.
+- **A `kubeadm` `KairosConfigTemplate` is refused even with an explicit
+  `spec.distribution`.** A `KairosControlPlane` with an explicit `k0s` or
+  `k3s` that references one reports `Ready` False with reason
+  `UnsupportedDistribution` and creates and deletes no Machines. Before, it
+  built control-plane Machines from the kubeadm worker spec. Reference a
+  `k0s` or `k3s` `KairosConfigTemplate` instead.
+- **`KairosControlPlaneTemplate` no longer defaults `distribution` to `k0s`.**
+  A `KairosControlPlane` stamped from a template without the field leaves it
+  empty and takes the `KairosConfigTemplate`'s distribution. Templates created
+  by v0.2.1 or earlier keep the `distribution: k0s` they were stored with. Set
+  it to the distribution your control planes run, or remove it. Removing it
+  is safe from v0.2.2: Cluster API topology removes it from the existing
+  control planes too, and the controller writes back what their Machines run.
+- **k0s post-bootstrap no longer holds up the boot.** The post-bootstrap
+  units are started with `systemctl --no-block`, so users and SSH keys from
+  the same cloud-config are applied without waiting for the join. On CAPK k0s
+  control planes, the load-balancer SAN update no longer starts on the live
+  installer or in recovery. This reaches only Machines created after the
+  upgrade: bootstrap data is not re-rendered.
+
 ## v0.2.0 → v0.2.1
 
 ### Behaviour changes to expect

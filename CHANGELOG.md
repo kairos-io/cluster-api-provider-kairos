@@ -8,6 +8,246 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.2.2] - 2026-11-16
+
+A fix release for the v0.2 series. The main fix is for the control plane's
+distribution: a `KairosControlPlane` whose `spec.distribution` changed after
+its Machines existed could skip a departing k0s member's etcd leave and leave
+a voting etcd member behind. There is no CRD schema change; only the
+description of `spec.distribution` changes. Check each control plane's
+distribution before upgrading. See the
+[v0.2.2 release notes](docs/release-notes/v0.2.2.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md#v021--v022).
+
+### Fixed
+
+- **The control-plane distribution follows its Machines** (#223). The
+  `KairosConfig` of each control-plane Machine records what its node runs.
+  When Machines exist and `spec.distribution` differs from it, or they
+  disagree, or none can be read, the control plane creates and deletes no
+  control-plane Machines, mints or extends no join tokens and removes no
+  orphaned etcd members, with `Ready` False and reason `DistributionMismatch`. An empty
+  `spec.distribution` is written back from the Machines. A Machine carrying
+  the etcd-leave hook always runs the etcd leave. A change between two
+  non-empty values is admitted with a warning.
+- **A `kubeadm` `KairosConfigTemplate` is refused even with an explicit
+  `spec.distribution`** (#223), with reason `UnsupportedDistribution`.
+- **`KairosControlPlaneTemplate` no longer defaults `distribution` to `k0s`**
+  (#222), which overrode a `k3s` `KairosConfigTemplate` on every ClusterClass
+  control plane.
+- **k0s post-bootstrap no longer holds up the boot** (#155). Users and SSH
+  keys are applied without waiting for the join.
+
+### Security
+
+- **The image is built with Go 1.27.4**, which fixes GO-2026-6859
+  (CVE-2026-97054) in `net/http`. No package linked into the manager uses
+  `MaxBytesReader` or `MaxBytesHandler`, which the crash needs.
+- `golang.org/x/net` v0.62.0 (#209), `golang.org/x/crypto` v0.59.0 (#211) and
+  `go.opentelemetry.io/otel/trace` v1.47.0 (#214), for advisories that are not
+  reachable from the manager.
+- The release job keeps its token off disk, drops the unused QEMU step, and
+  fails when an asset is missing (#203, #213).
+
+### Changed
+
+- New events on the `KairosControlPlane`: `DistributionMismatch`,
+  `UnsupportedDistribution`, `DistributionMismatchResolved`,
+  `DistributionInherited`, `DistributionRestored`, `DistributionWriteFailed`
+  and `EtcdLeaveHookContradictsKairosConfig`.
+- A `KairosControlPlane` with an explicit `k0s` or `k3s` that references a
+  `kubeadm` `KairosConfigTemplate` stops creating and deleting Machines.
+- `KairosControlPlaneTemplate` objects created by v0.2.1 or earlier keep
+  `distribution: k0s`. Set it explicitly or remove it; removing it is now
+  safe.
+- The k0s post-bootstrap change reaches only Machines created after the
+  upgrade.
+
+## [v0.2.1] - 2026-10-22
+
+A fix release for the v0.2 series. The main fix is for k0s control planes with
+high availability: under a specific failure sequence, a joining k0s controller
+could start a new, empty cluster with the same CA instead of joining, and the
+original cluster was lost while every condition stayed True. This release
+closes that on the joining node and in the `KairosControlPlane`. There is no
+CRD schema change. Read the upgrade notes first: new control-plane Machine
+names, a validated control-plane hostname, and a workload identity pin to
+pre-seed on existing HA clusters. See the
+[v0.2.1 release notes](docs/release-notes/v0.2.1.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md#v020--v021).
+
+### Fixed
+
+- **A k0s control plane could be silently replaced by a new cluster** (#193,
+  #194, #195, #196).
+  - A joining k0s controller clears a half-written etcd database before it
+    starts, and if it finds it is the only etcd member it stops k0s and never
+    registers (#196).
+  - The `KairosControlPlane` pins the workload cluster's identity (its
+    `kube-system` namespace UID) and checks it before every membership change.
+    On a change it freezes, with reason `WorkloadClusterIdentityChanged`, and
+    only an operator can clear it (#193).
+  - A control-plane Machine without a Node now leaves etcd before it is
+    released, bounded at about 15 minutes, and etcd members that no Machine
+    accounts for are removed one at a time when quorum allows (#194).
+  - Control-plane Machine names are random and never reused (#195).
+- **Post-bootstrap no longer blocks boot** on kubeadm and k3s nodes, and the
+  providerID drop-ins are written atomically (#149).
+
+### Security
+
+- **The manager no longer keeps Secret bodies in memory** (#199). Secrets are
+  read live and watched by metadata only. RBAC is unchanged.
+- **The kubeadm worker path connects on demand** to a KubeadmControlPlane or
+  Kamaji cluster, instead of keeping a connection to each, and every request is
+  bounded by a 10s timeout (#200).
+- **Releases are gated on a whole-tree vulnerability scan** (osv-scanner
+  v2.7.0), which stops the release on an open advisory or an incomplete scan
+  (#197). Pull request scans compare against the base branch (#198).
+- **The image is built with Go 1.26.10**, fixing GO-2026-6809 (CVE-2026-111943)
+  in `crypto/x509`.
+
+### Changed
+
+- New control-plane Machines are named `<kcp-name>-<5 characters>`. Find
+  control-plane Machines by label, not by name.
+- A new or changed control-plane `spec.hostname` must be a lowercase DNS-1123
+  label without `{{`.
+- While a control plane is frozen, anything that waits on the Cluster being
+  `Ready` or `Available` holds. Worker joins continue.
+- Existing HA control planes are pinned on the first reconcile after the
+  upgrade. Pre-seed the pin annotation before upgrading; see
+  [Before upgrading an existing HA cluster](docs/HIGH_AVAILABILITY.md#before-upgrading-an-existing-ha-cluster).
+- The k0s join guard reaches only control-plane members created after the
+  upgrade.
+
+## [v0.2.0] - 2026-10-18
+
+The first release of the v0.2 series. It adds kubeadm workers, hardens how the
+provider handles workload-cluster kubeconfigs and how nodes talk to the
+management cluster, and carries every fix from v0.1.5. There is no CRD schema
+change, but some behaviour changes; see the
+[v0.2.0 release notes](docs/release-notes/v0.2.0.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md#v015--v020).
+
+### Added
+
+- **kubeadm workers** (#141, #148, #191). `spec.distribution: kubeadm` on a
+  `KairosConfig` or `KairosConfigTemplate` bootstraps a Kairos worker that
+  joins a control plane managed outside this provider with `kubeadm join`.
+  `KamajiControlPlane` and `KubeadmControlPlane` are supported out of the box;
+  other kinds can be allowed with `--kubeadm-extra-controlplane-kinds`.
+  `spec.kubeadm.joinConfiguration` customises the join. A kubeadm control plane
+  run by this provider, `MachinePool` workers and CNI installation are not in
+  scope. See [docs/KUBEADM_WORKERS.md](docs/KUBEADM_WORKERS.md).
+
+### Security
+
+- **Workload kubeconfigs are sanitized and pinned** (#190). Only the control
+  plane writes `<cluster>-kubeconfig`; nodes patch a staging Secret,
+  `<cluster>-kubeconfig-push`. Controllers accept only inline credentials and
+  an inline CA, and the CA is pinned on first use in the `kubeconfig-ca-pin`
+  annotation. A published kubeconfig that fails validation is emptied, and
+  `KubeconfigReady` reports `WaitingForNodePush`.
+- **Narrower node permissions** (#190). The node push token can only `patch`
+  two named, controller-created Secrets. Existing Roles are narrowed at
+  startup.
+- **Node-to-management calls verify TLS** (#190), with no insecure fallback.
+- `golang.org/x/crypto` v0.58.0 (#174).
+
+### Fixed
+
+- **A kubeadm worker that ran `kubeadm join` more than 15 minutes after its
+  first render failed** (#191). One token per worker is now reused, extended
+  until the node joins, and revoked afterwards.
+- **`kubeadm join` failed when the providerID patch was passed with `--patches`
+  next to `--config`** (#148). The patches directory is restricted at admission
+  to a path under `/etc/kubernetes/`.
+- The KCP's own template reference follows the same-namespace rule (#126).
+- Every fix in [v0.1.5](docs/release-notes/v0.1.5.md).
+
+### Changed
+
+- **Node pushes need a management CA.** If the management API is reached
+  through a load balancer or proxy the in-cluster CA does not cover, set
+  `KAIROS_MANAGEMENT_API_CA_FILE` on the bootstrap provider. Without a usable
+  CA, a control-plane `KairosConfig` reports
+  `BootstrapReady=False(ManagementCAUnavailable)`. See
+  [docs/UPGRADING.md](docs/UPGRADING.md#node-to-management-pushes-are-now-tls-verified).
+- Nodes booted before the upgrade keep their old bootstrap data, and their next
+  push is refused once (403) because their Role was narrowed.
+- Control-plane workload operations wait for the CA pin, so the first reconcile
+  after the upgrade may requeue once.
+- A kubeadm worker's control plane whose kubeconfig uses file paths, exec or
+  auth-provider plugins, or several contexts is refused.
+- `metadata.yaml` lists the 0.2 series, with the same v1beta2 contract.
+- Existing `<cluster>-kubeconfig` Secrets are revalidated on the first
+  control-plane reconcile after the upgrade. Check the `kubeconfig-ca-pin`
+  annotation on each `KairosControlPlane`.
+
+### Known issue
+
+- A k0s control-plane Machine that joined etcd but never got a Node reference
+  is removed without leaving etcd. See the
+  [v0.1.5 release notes](docs/release-notes/v0.1.5.md#known-issue) for the
+  workaround.
+
+## [v0.1.5] - 2026-10-17
+
+A fix release for the v0.1 series, for k0s control planes with high
+availability (`replicas` > 1 with a kube-vip VIP): three day-2 failures found
+while replacing control-plane members. There is no CRD schema change. See the
+[v0.1.5 release notes](docs/release-notes/v0.1.5.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md#v014--v015).
+
+### Fixed
+
+- **New k0s control-plane members now serve a certificate valid for the VIP**
+  (#163). Only the first node carried the control-plane endpoint in its API
+  SANs.
+- **No new member could join after the first node was replaced, or on a cluster
+  older than a day** (#166). The `KairosControlPlane` now mints one short-lived
+  join token per joining member through the workload API, pointed at a live
+  member. The first node no longer creates or pushes a token.
+- **Removing the member that holds the VIP stalled** (#181, #182, #183).
+  - The leave request and acknowledgement go through a member that is staying.
+    The leave starts after drain and volume detach, and after 5 minutes without
+    an acknowledgement the control plane asks k0s to remove the member.
+  - kube-vip elects its leader through its own node's API server, so a member
+    that lost etcd gives up the VIP.
+  - The node's leave responder bounds every call, retries the acknowledgement,
+    never runs a completed leave twice, and no longer acknowledges a failed
+    `k0s etcd leave`.
+
+### Security
+
+- `golang.org/x/crypto` v0.57.0 to v0.58.0 (#186), with `x/sync`, `x/sys`,
+  `x/term`, `x/text` and `x/tools`. Routine maintenance; `govulncheck` reports
+  nothing reachable at v0.57.0.
+- **The node-push Role narrows** (#166). Nodes no longer get access to the
+  control-plane join-token Secret.
+
+### Changed
+
+- New annotations written by the `KairosControlPlane`:
+  `controlplane.cluster.x-k8s.io/k0s-join-token-id`,
+  `controlplane.cluster.x-k8s.io/k0s-join-token-removed-at`,
+  `controlplane.cluster.x-k8s.io/etcd-member-leave-requested-at` and
+  `controlplane.cluster.x-k8s.io/etcd-member-leave-member-id`.
+- New events: `K0sJoinTokenMinted`, `K0sJoinTokenNoLiveMember`,
+  `K0sJoinTokenMissing`, `K0sJoinTokenServerUnavailable` and
+  `EtcdMemberLeaveDelegated`.
+- The kube-vip and responder changes (#182, #183) reach only control-plane
+  members created after the upgrade. kube-vip needs the API server on
+  `127.0.0.1:6443`.
+
+### Known issue
+
+- A control-plane Machine that joined etcd but never got a Node reference is
+  removed without leaving etcd. Before deleting a Machine with no
+  `status.nodeRef`, check `k0s etcd member-list` on a healthy member and remove
+  its member first. See the release notes for the steps.
+
 ## [v0.1.4] — 2026-10-15
 
 A fix release for the v0.1 series: ten control-plane and bootstrap fixes and

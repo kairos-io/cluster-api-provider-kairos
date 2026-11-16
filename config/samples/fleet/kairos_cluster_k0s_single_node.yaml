@@ -122,8 +122,10 @@ spec:
   # because it is unnecessary for a single control-plane node.
   replicas: 1
   version: "v1.34.1+k0s.1"
-  # An explicit value here always wins over the KairosConfigTemplate's
-  # distribution. Keep it equal to the template and to your Kairos image.
+  # An explicit value here is used for new Machines instead of the
+  # KairosConfigTemplate's distribution. Keep it equal to the template and to
+  # your Kairos image. Once Machines exist, changing it holds the control plane
+  # (Ready=False, DistributionMismatch).
   distribution: k0s
   machineTemplate:
     infrastructureRef:

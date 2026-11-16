@@ -1,6 +1,7 @@
 # Quick Start Guide - KairosFleetMachine infrastructure
 
-Last verified against: this repository's v0.2.1 code (read, not run),
+Last verified against: this repository's v0.2.1 code, and the changes merged
+for v0.2.2 (#155, #222, #223) (read, not run),
 Cluster API v1.13.4 (v1beta2 contract), Kairos v4.1.2, k3s and k0s. The
 steps below are not exercised end to end by this repository's CI. The
 recorded real-hardware validation of a control plane plus a worker
@@ -149,7 +150,7 @@ repository:
 spec:
   replicas: 1
   version: "v1.34.3+k3s3"
-  distribution: k3s     # explicit value wins over the template's
+  distribution: k3s     # keep equal to the template's and to the image
 
 # In KairosConfigTemplate:
 spec:
@@ -161,11 +162,15 @@ spec:
 ```
 
 - `KairosControlPlane.spec.distribution` is not defaulted by the CRD. When it
-  is empty the controller inherits the `KairosConfigTemplate`'s distribution,
-  and falls back to `k0s` if the template sets none. An explicit value always
-  wins and the controller emits a `DistributionOverride` warning event when
-  it differs from the template. Set it explicitly and keep it equal to the
-  template and to what your Kairos image ships.
+  is empty and no control-plane Machine exists yet, the controller writes the
+  `KairosConfigTemplate`'s distribution into it, and falls back to `k0s` if
+  the template sets none. An explicit value is used for new Machines and the
+  controller emits a `DistributionOverride` warning event when it differs from
+  the template. Set it explicitly and keep it equal to the template and to
+  what your Kairos image ships. Once Machines exist, the distribution their
+  `KairosConfig` objects record is what counts: if `spec.distribution` differs
+  from it, the control plane is held (see Troubleshooting). Changing the
+  distribution of a running cluster is not supported; create a new Cluster.
 - `version` and `kubernetesVersion` are informational for k0s and k3s. The
   Kubernetes version is whatever the Kairos image ships (KD-24;
   [API_REFERENCE.md](API_REFERENCE.md)).
@@ -274,7 +279,8 @@ fleet infrastructure provider, not by this repository.
 | `KairosControlPlane` is `Available=False` with reason `WaitingForInfrastructureControlPlaneEndpoint` | `Cluster.spec.controlPlaneEndpoint` is empty: the infrastructure provider has not published an endpoint for Cluster API core to copy down | Set the control-plane endpoint on the `KairosFleetCluster` as the fleet infrastructure provider requires (the `TODO` value in the sample). The samples leave `Cluster.spec.controlPlaneEndpoint` unset. |
 | `KubeconfigReady` stays `False` with reason `WaitingForNodePush` | The node cannot reach the management cluster's API server, or `KAIROS_MANAGEMENT_API_OVERRIDE` is unset and the node was given the in-cluster Service URL | Check the override and the TLS-verified path described in [INSTALL.md](INSTALL.md#management-api-tls-verification-and-the-ca-source): `curl --cacert /etc/kairos-capi/management-ca.crt https://<mgmt-api-server-host>:6443/api` from the node. If the path cannot be opened, enable `SSHFallback`. |
 | Workload `Node` has no `providerID`, or it does not match the Machine's `kairos-fleet://...` value | The node-side discovery did not run or found no usable phone-home credentials (missing file, or `node_id` not a UUID), or the distribution does not match the image | Read the node's journal for `fleet:` log lines. Confirm the phone-home agent has written `/usr/local/.kairos/phonehome-credentials.yaml` before k3s or k0s starts, and that the `KairosConfigTemplate` distribution matches the image. |
-| A `DistributionOverride` warning event appears on the `KairosControlPlane`, or k3s or k0s never starts on the node | `KairosControlPlane.spec.distribution` differs from the `KairosConfigTemplate`'s, or from the distribution the Kairos image ships; `spec.distribution` wins, so the control-plane cloud-config is rendered for it | Make `spec.distribution` and the template's `distribution` match each other and the image. |
+| A `DistributionOverride` warning event appears on the `KairosControlPlane`, or k3s or k0s never starts on the node | `KairosControlPlane.spec.distribution` differs from the `KairosConfigTemplate`'s, or from the distribution the Kairos image ships; `spec.distribution` is used for new Machines, so their cloud-config is rendered for it | Make `spec.distribution` and the template's `distribution` match each other and the image. |
+| `KairosControlPlane` is `Ready=False` with reason `DistributionMismatch`, and no control-plane Machine is created or deleted | Control-plane Machines exist and `spec.distribution` differs from the distribution their `KairosConfig` objects record, those objects disagree, or none can be read. The control plane creates and deletes no Machines and issues no join tokens until this is fixed | Read the condition message, which names the Machines per distribution. Set `spec.distribution` back to what the Machines run, or remove the field and the controller writes the recorded value back. If the Machines disagree, also delete the ones whose nodes run the other distribution; the controller does not delete them. Do not change the distribution of a running cluster: create a new Cluster. |
 | A worker Machine's bootstrap Secret is never created, and the bootstrap controller logs `failed to generate cloud-config` with a message about a missing worker token or join token | The worker `KairosConfigTemplate` has no join token | Add `workerTokenSecretRef` (k0s) or `k3sTokenSecretRef` (k3s) pointing at a Secret that exists. |
 
 ---

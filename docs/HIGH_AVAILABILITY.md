@@ -65,18 +65,17 @@ their replacements are created with the fix, and replace the first
 control-plane node last. See the
 [v0.1.5 release notes](release-notes/v0.1.5.md).
 
-A second issue affects the same k0s clusters, CAPK included. The token that new
-control-plane members join with is created once, by the first control-plane
-node. It points at that node's own address and expires 24 hours after it was
-created. A member created after the first node has been removed, or more than
-24 hours after the cluster was created, therefore cannot join. Its Machine
-stays `Provisioned` without a Node, and the `KairosControlPlane` keeps waiting
-for it to join. This affects rollouts, remediation and scale-up. A fix that
-has the control plane issue a fresh join token for each new member is being
-prepared for the next release. A member stuck this way does not recover on its
-own: after upgrading to that release, delete its Machine so that a replacement
-is created with a fresh token. The stuck Machine has no Node yet, so deleting
-it does not touch etcd.
+A second issue affected the same k0s clusters, CAPK included. Up to v0.1.4,
+the token that new control-plane members join with was created once, by the
+first control-plane node. It pointed at that node's own address and expired 24
+hours after it was created, so a member created after the first node had been
+removed, or more than 24 hours after the cluster was created, could not join.
+Its Machine stayed `Provisioned` without a Node, and the `KairosControlPlane`
+kept waiting for it to join, which stalled rollouts, remediation and scale-up.
+Since v0.1.5 (#166), the control plane issues a fresh join token for each new
+member, pointed at a live member. A member already stuck this way before the
+upgrade does not recover on its own: delete its Machine, and the replacement
+gets a token.
 
 ## Scale-up: joiners are created one at a time
 
