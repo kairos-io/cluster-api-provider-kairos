@@ -46,8 +46,14 @@ then `clusterctl init` with the new one; see
   Machine. A template hook made k3s and single-node Machines wait on a k0s
   etcd leave when deleted, and could be put back after the controller
   removed it. The other four made a later leave start as if it had already
-  been requested. If your template sets any of them, remove the entry; the
-  controller ignores it.
+  been requested. If your template sets any of them, remove the entry before
+  you upgrade; the controller ignores it from then on. A control-plane Machine
+  that is already being deleted when you upgrade keeps what the template gave
+  it, because Machines being deleted are left as they are (see below). Check
+  such Machines for these keys: a value equal to the one in your template was
+  put there by the template, and you can remove it with
+  `kubectl annotate machine -n <namespace> <machine-name> <key>-` so that the
+  Machine's etcd leave starts from the beginning.
 - **The etcd-leave annotations are removed from Machines that are not being
   deleted.** The controller writes them only during a deletion, so on the
   first reconcile after the upgrade it removes any of the four it finds on
