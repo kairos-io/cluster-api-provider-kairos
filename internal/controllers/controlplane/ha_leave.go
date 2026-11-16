@@ -312,7 +312,10 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //     one k0s reports Joined=False → remove hook, done. One whose peer
 //     address another Machine reports, or a name another Machine also
 //     renders → remove hook with a warning, nothing written. Otherwise the
-//     handshake below, with its member ID recorded.
+//     handshake below, with its member ID recorded. "Another Machine" is
+//     any control-plane Machine of the Cluster, whoever owns it
+//     (leaveGuardMachines, KD-93), and a guard that cannot read its input
+//     holds for the bound of its phase, then releases without a leave.
 //  5. First request: write the leave-requested sentinel, stamp the
 //     first-request timestamp, requeue (done=false).
 //     Without a NodeRef, every pass after it re-checks the name before any
@@ -359,6 +362,9 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 		return false, err
 	}
 	_, requested := target.Annotations[etcdLeaveRequestedAtAnnotation]
+	// The Machines the guards check target against: every control-plane
+	// Machine of the Cluster, listed once, when a guard first needs it (KD-93).
+	guardMachines := r.leaveGuardListFor(ctx, kcp, cluster, machines)
 
 	// (2b) Not before CAPI has finished with the Node. The drain and the volume
 	// detach go through the workload apiserver: once this member has left
@@ -389,9 +395,13 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// with no workload traffic at all, so a reverted change lets the leave
 	// finish.
 	if requested && !registered {
-		why, err := r.unregisteredNameProblem(ctx, machines, target, nodeName)
+		peers, err := guardMachines()
 		if err != nil {
-			return false, err
+			return r.holdUncheckableNodeName(ctx, log, kcp, target, nodeName, "the control-plane Machines could not be listed", err)
+		}
+		why, err := r.unregisteredNameProblem(ctx, peers, target, nodeName)
+		if err != nil {
+			return r.holdUncheckableNodeName(ctx, log, kcp, target, nodeName, "a node name could not be read", err)
 		}
 		if why != "" {
 			return r.holdUnusableNodeName(ctx, log, kcp, target, nodeName, why)
@@ -427,7 +437,11 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 			return r.leaveUnreachable(ctx, log, kcp, target, nodeName, "no workload apiserver answered", connErr)
 		}
 		if !registered {
-			if proceed, done, err := r.inspectUnregisteredLeave(ctx, log, kcp, machines, target, nodeName, conn); !proceed {
+			peers, err := guardMachines()
+			if err != nil {
+				return r.leaveUnreachable(ctx, log, kcp, target, nodeName, "the control-plane Machines could not be listed", err)
+			}
+			if proceed, done, err := r.inspectUnregisteredLeave(ctx, log, kcp, peers, target, nodeName, conn); !proceed {
 				return done, err
 			}
 		}
@@ -470,7 +484,7 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	// stuck node must not wedge deletion, and neither must an unreachable
 	// workload cluster.
 	if leaveTimedOut(target) {
-		return r.delegateMemberLeave(ctx, log, kcp, machines, target, nodeName, conn, connErr)
+		return r.delegateMemberLeave(ctx, log, kcp, guardMachines, target, nodeName, conn, connErr)
 	}
 	if connErr != nil {
 		return false, fmt.Errorf("etcd-leave: no workload apiserver answered: %w", connErr)
@@ -522,13 +536,8 @@ func (r *KairosControlPlaneReconciler) warnIfConfigContradictsHook(ctx context.C
 // never hands the leave to k0s. A name that passes again lets the leave
 // carry on where it was.
 func (r *KairosControlPlaneReconciler) holdUnusableNodeName(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine, nodeName, why string) (bool, error) {
-	if leaveTimedOut(target) {
-		if err := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); err != nil {
-			return false, err
-		}
-		if etcdMemberLeaveCapped(target) {
-			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, why+" after its leave was requested")
-		}
+	if done, bounded, err := r.boundNameHold(ctx, log, kcp, target, nodeName, why); bounded {
+		return done, err
 	}
 	log.Info("etcd-leave: the node name of a Machine without a NodeRef no longer passes the name checks; holding, nothing is sent to the workload cluster",
 		"machine", target.Name, "node", nodeName, "reason", why)
@@ -539,6 +548,40 @@ func (r *KairosControlPlaneReconciler) holdUnusableNodeName(ctx context.Context,
 				"removed without a leave.", target.Name, why)
 	}
 	return false, fmt.Errorf("etcd-leave: Machine %s: %s after its leave was requested", target.Name, why)
+}
+
+// holdUncheckableNodeName is holdUnusableNodeName for a pass on which the
+// name checks could not run at all: why says what could not be read, cause
+// is the error. It holds, with nothing sent to the workload cluster, for the
+// same bound, then removes the hook without a leave. It is logged, not
+// reported with EtcdLeaveNodeNameUnusable, whose advice to restore the name
+// does not apply.
+func (r *KairosControlPlaneReconciler) holdUncheckableNodeName(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine, nodeName, why string, cause error) (bool, error) {
+	if done, bounded, err := r.boundNameHold(ctx, log, kcp, target, nodeName, why+" to check its node name"); bounded {
+		return done, err
+	}
+	log.Info("etcd-leave: the node name of a Machine without a NodeRef could not be checked; holding, nothing is sent to the workload cluster",
+		"machine", target.Name, "node", nodeName, "reason", why, "error", cause.Error())
+	return false, fmt.Errorf("etcd-leave: Machine %s: %s: %w", target.Name, why, cause)
+}
+
+// boundNameHold applies the bound of a name hold after the first leave
+// request: from memberLeaveTimeout after the request it stamps
+// etcdMemberLeaveRequestedAtAnnotation (kept if a delegation already began),
+// and past etcdMemberLeaveCap from that stamp it removes the hook with a
+// warning, never handing the leave to k0s. bounded reports whether it decided
+// the pass; otherwise the caller holds.
+func (r *KairosControlPlaneReconciler) boundNameHold(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine, nodeName, why string) (done, bounded bool, err error) {
+	if !leaveTimedOut(target) {
+		return false, false, nil
+	}
+	if err := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); err != nil {
+		return false, true, err
+	}
+	if etcdMemberLeaveCapped(target) {
+		return true, true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, why+" after its leave was requested")
+	}
+	return false, false, nil
 }
 
 // warnIfConfigContradictsNodeName emits a Warning event when target, which
