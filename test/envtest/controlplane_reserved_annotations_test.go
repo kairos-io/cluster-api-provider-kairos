@@ -21,9 +21,6 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
@@ -32,27 +29,6 @@ const etcdLeaveUnreachableSinceKey = "controlplane.cluster.x-k8s.io/etcd-leave-u
 
 // otherControllersHookKey is a pre-terminate hook another controller owns.
 const otherControllersHookKey = clusterv1.PreTerminateDeleteHookAnnotationPrefix + "/backup-agent"
-
-// setLeaveValueFor plays the node's etcd-leave responder: it writes value for
-// node into the workload leave ConfigMap, creating the ConfigMap if needed.
-func (k *k0sLeaveCluster) setLeaveValueFor(g *WithT, node, value string) {
-	g.Eventually(func() error {
-		cm := &corev1.ConfigMap{}
-		err := k.wc.Get(k.ctx, types.NamespacedName{Namespace: "kube-system", Name: "kairos-etcd-leave"}, cm)
-		if apierrors.IsNotFound(err) {
-			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kairos-etcd-leave"}, Data: map[string]string{node: value}}
-			return k.wc.Create(k.ctx, cm)
-		}
-		if err != nil {
-			return err
-		}
-		if cm.Data == nil {
-			cm.Data = map[string]string{}
-		}
-		cm.Data[node] = value
-		return k.wc.Update(k.ctx, cm)
-	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
-}
 
 // TestHA_K0sEtcdLeave_TemplateCannotPlantTheLeaveState is KD-92.
 // machineTemplate.metadata sets the etcd-leave hook and every piece of the

@@ -439,6 +439,27 @@ func (k *k0sLeaveCluster) leaveRequestFor(node string) string {
 	return cm.Data[node]
 }
 
+// setLeaveValueFor plays the node's etcd-leave responder: it writes value for
+// node into the workload leave ConfigMap, creating the ConfigMap if needed.
+func (k *k0sLeaveCluster) setLeaveValueFor(g *WithT, node, value string) {
+	g.Eventually(func() error {
+		cm := &corev1.ConfigMap{}
+		err := k.wc.Get(k.ctx, types.NamespacedName{Namespace: "kube-system", Name: "kairos-etcd-leave"}, cm)
+		if apierrors.IsNotFound(err) {
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kairos-etcd-leave"}, Data: map[string]string{node: value}}
+			return k.wc.Create(k.ctx, cm)
+		}
+		if err != nil {
+			return err
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[node] = value
+		return k.wc.Update(k.ctx, cm)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+}
+
 // TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone is the
 // 2026-10-16 lab case after a controller upgrade: a k0s control-plane Machine
 // has been held at the etcd-leave hook for 20 minutes, its node never acked,
