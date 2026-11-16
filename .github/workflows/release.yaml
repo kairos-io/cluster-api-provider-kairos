@@ -30,9 +30,11 @@ jobs:
   # publish while an advisory is already open against an unchanged dependency,
   # with nothing red anywhere. Same scanner version and same --config as
   # osv-scanner.yaml, so the ignore list in osv-scanner.toml cannot fork between
-  # the two. The two pins are different SHAs of google/osv-scanner-action for
-  # the same release: osv-scanner.yaml pins the reusable workflow, this job pins
-  # the action that workflow itself calls. Bump them together.
+  # the two. Both files pin the google/osv-scanner-action commit the release tag
+  # points to: osv-scanner.yaml calls the reusable workflows at it, and this job
+  # calls the action at it. The reusable workflows call the action at an
+  # ancestor commit of the same release whose osv-scanner-action/ directory is
+  # identical. Bump them together.
   #
   # The scan reads the tagged tree, not main: the release is what ships, and
   # everything else about this workflow is already resolved at the tag. The
