@@ -36,6 +36,18 @@ then `clusterctl init` with the new one; see
   and before its node has bootstrapped makes the recorded name differ from the
   node's real name, and that Machine's etcd leave can then be skipped.
 - A downgrade ignores the annotation and returns to the previous lookup.
+- **A k0s member's absence from the etcd-status Secret no longer ends its
+  etcd leave** (KD-94). Before, the leave of a control-plane Machine with a
+  Node ended, and its hook was removed, as soon as its node had no entry in
+  `<cluster>-etcd-status`. Nodes write that entry once, at boot, and nothing
+  removes it, so it was missing only when the node never reported, reported
+  under a name other than its Node name, or the Secret was deleted or
+  recreated, and in each of those cases the member could still be voting.
+  The leave now ends only when the node acks it, when k0s reports the member
+  gone after the leave is handed to it, or with `EtcdMemberLeaveTimedOut`
+  after the usual ~15 minutes. Expect the deletion of such a Machine to wait
+  for one of those instead of finishing at once; other membership changes
+  wait with it.
 
 ## v0.2.1 → v0.2.2
 
