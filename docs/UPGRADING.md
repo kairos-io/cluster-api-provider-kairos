@@ -12,6 +12,39 @@ then `clusterctl init` with the new one; see
 
 ## v0.2.2 → v0.2.3
 
+### Check `KairosConfig` role, distribution and hostname before upgrading
+
+This release adds three validation rules to the `KairosConfig` CRD (KD-88).
+They arrive with `clusterctl upgrade` or the flat manifest, which update the
+CRD; a new controller image on its own does not carry them. After the
+upgrade, an update is rejected with `Forbidden` on the field when it:
+- changes `spec.role` or `spec.distribution` of any `KairosConfig`;
+- sets, changes or clears `spec.hostname` of a control-plane `KairosConfig`
+  (`role: control-plane`).
+
+A full-object update (`kubectl replace`, or any PUT) that omits `role` or
+`distribution` gets their defaults first, `worker` and `k0s`, and is rejected
+when the default differs from the stored value. Every other update works as
+before. Creating a `KairosConfig` is not affected, so `MachineSet` scale-ups,
+`clusterctl move` and restores from a backup keep working, and
+`KairosConfigTemplate` is not restricted. No stored object becomes invalid.
+To change one of these fields after the upgrade, replace the Machine.
+
+Before upgrading:
+- Revert any edit to these fields that you mean to revert, for example on a
+  `KairosConfig` that a v0.2.2 `DistributionMismatch` hold names. After the
+  upgrade, only replacing the Machine changes them.
+- Make sure tools that write `KairosConfig` objects directly, such as GitOps
+  pipelines or scripts, send the stored `role`, `distribution` and, for
+  control-plane configs, `hostname`. Otherwise every sync is rejected.
+
+List the stored values:
+
+```bash
+kubectl get kairosconfigs -A \
+  -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,ROLE:.spec.role,DISTRIBUTION:.spec.distribution,HOSTNAME:.spec.hostname
+```
+
 ### Behaviour changes to expect
 
 - **Control-plane Machines record their node name.** Each control-plane
@@ -59,10 +92,6 @@ then `clusterctl init` with the new one; see
   to hand the leave to, and at the latest after ~15 minutes. Expect the
   deletion of such a Machine to wait for one of those instead of finishing at
   once; the rollout and the orphan-member cleanup wait with it.
-- **Do not edit `spec.hostname` on an existing control-plane `KairosConfig`.**
-  Until the field becomes immutable, an edit made after the Machine is created
-  and before its node has bootstrapped makes the recorded name differ from the
-  node's real name, and that Machine's etcd leave can then be skipped.
 - A downgrade ignores the annotation and returns to the previous lookup.
 - **`machineTemplate.metadata` no longer copies the etcd-leave annotations**
   (KD-92). The etcd-leave pre-terminate hook
