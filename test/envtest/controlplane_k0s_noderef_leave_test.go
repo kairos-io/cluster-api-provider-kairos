@@ -248,12 +248,13 @@ func TestHA_K0sEtcdLeave_HostnameCollisionWithAnUnregisteredMachine(t *testing.T
 	g.Expect(leave).To(BeFalse())
 }
 
-// TestHA_K0sEtcdLeave_EditedHostnameOnARegisteredMachineIsNoCollision: a
-// registered keeper's KairosConfig is edited to render the leaver's node
-// name. A registered node goes by its Node name, so this is no collision and
-// the leave runs. Before the node name was recorded, the edit on any other
-// Machine's KairosConfig was read the same way (KD-91).
-func TestHA_K0sEtcdLeave_EditedHostnameOnARegisteredMachineIsNoCollision(t *testing.T) {
+// TestHA_K0sEtcdLeave_RecreatedHostnameOnARegisteredMachineIsNoCollision: a
+// registered keeper's KairosConfig is recreated to render the leaver's node
+// name (the hostname of a control-plane KairosConfig cannot be edited,
+// KD-88). A registered node goes by its Node name, so this is no collision and
+// the leave runs. Before the node name was recorded, a changed hostname on any
+// other Machine's KairosConfig was read the same way (KD-91).
+func TestHA_K0sEtcdLeave_RecreatedHostnameOnARegisteredMachineIsNoCollision(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -266,10 +267,9 @@ func TestHA_K0sEtcdLeave_EditedHostnameOnARegisteredMachineIsNoCollision(t *test
 	defer teardown()
 	node := k.leaverNode()
 
-	keeper := &bootstrapv1beta2.KairosConfig{}
-	g.Expect(k.c.Get(k.ctx, types.NamespacedName{Namespace: k.nsName, Name: k.kcpName + "-1"}, keeper)).To(Succeed())
-	keeper.Spec.Hostname = "cp-leaver"
-	g.Expect(k.c.Update(k.ctx, keeper)).To(Succeed())
+	recreateKairosConfig(g, k.ctx, k.c, types.NamespacedName{Namespace: k.nsName, Name: k.kcpName + "-1"}, func(kc *bootstrapv1beta2.KairosConfig) {
+		kc.Spec.Hostname = "cp-leaver"
+	})
 
 	k.setLeaverDeletingReason(g, clusterv1.MachineDeletingWaitingForPreTerminateHookReason)
 

@@ -6,7 +6,9 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -130,4 +132,32 @@ func controlPlaneBootstrapWithHostname(t *testing.T, ctx context.Context, c clie
 		Kind:     "KairosConfig",
 		Name:     name,
 	}}
+}
+
+// recreateKairosConfig deletes the KairosConfig at key and creates it again
+// under the same name, with its labels, annotations, owner references and
+// spec, after mutate. The role, distribution and control-plane hostname of a
+// stored KairosConfig cannot be updated (KD-88), so a test that needs a
+// KairosConfig to say something else replaces it, as an operator would have
+// to. It waits for the old object to be gone, which takes the bootstrap
+// controller's finalizer removal where that controller runs.
+func recreateKairosConfig(g *WithT, ctx context.Context, c client.Client, key types.NamespacedName, mutate func(*bootstrapv1beta2.KairosConfig)) {
+	old := &bootstrapv1beta2.KairosConfig{}
+	g.Expect(c.Get(ctx, key, old)).To(Succeed())
+	fresh := &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       old.Namespace,
+			Name:            old.Name,
+			Labels:          old.Labels,
+			Annotations:     old.Annotations,
+			OwnerReferences: old.OwnerReferences,
+		},
+		Spec: *old.Spec.DeepCopy(),
+	}
+	mutate(fresh)
+	g.Expect(c.Delete(ctx, old)).To(Succeed())
+	g.Eventually(func() bool {
+		return apierrors.IsNotFound(c.Get(ctx, key, &bootstrapv1beta2.KairosConfig{}))
+	}, 30*time.Second, 200*time.Millisecond).Should(BeTrue())
+	g.Expect(c.Create(ctx, fresh)).To(Succeed())
 }

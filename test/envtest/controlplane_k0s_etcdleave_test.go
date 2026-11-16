@@ -591,8 +591,8 @@ func TestHA_K0sEtcdLeave_StartsOnlyAtPreTerminate(t *testing.T) {
 
 // TestHA_K0sEtcdLeave_ContradictingKairosConfigStillLeaves is ADR 0016 D4 as
 // ruled after review: the etcd-leave hook decides. The leaving k0s member's
-// KairosConfig is changed to k3s after the Machine was built (only tampering
-// or a recreated object does that). The KCP does not release the hook on the
+// KairosConfig is recreated with k3s after the Machine was built (the field
+// cannot be edited, KD-88). The KCP does not release the hook on the
 // KairosConfig's word: once CAPI waits at the pre-terminate hook it writes the
 // leave request like for any k0s member, keeps the hook, and emits a Warning
 // that names the contradiction.
@@ -606,14 +606,9 @@ func TestHA_K0sEtcdLeave_ContradictingKairosConfigStillLeaves(t *testing.T) {
 	defer teardown()
 
 	// The leaver's KairosConfig now says k3s.
-	g.Eventually(func() error {
-		kc := &bootstrapv1beta2.KairosConfig{}
-		if err := k.c.Get(k.ctx, k.leaverKey, kc); err != nil {
-			return err
-		}
+	recreateKairosConfig(g, k.ctx, k.c, k.leaverKey, func(kc *bootstrapv1beta2.KairosConfig) {
 		kc.Spec.Distribution = "k3s"
-		return k.c.Update(k.ctx, kc)
-	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+	})
 	touchKCP(g, k.ctx, k.c, k.nsName, k.kcpName)
 	g.Consistently(func() map[string]string { return k.leaver(g).Annotations },
 		4*time.Second, 500*time.Millisecond).Should(HaveKey(etcdLeaveHookKey), "the KairosConfig alone never releases the hook")
