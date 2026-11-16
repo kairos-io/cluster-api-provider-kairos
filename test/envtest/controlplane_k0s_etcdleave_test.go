@@ -268,6 +268,9 @@ type k0sLeaveOptions struct {
 	// extraMachines are more control-plane Machines of the KCP, without a
 	// NodeRef or addresses, created next to the leaver.
 	extraMachines []k0sExtraMachine
+	// leaverUnreported: the leaver has a NodeRef but never reported into
+	// etcd-status.
+	leaverUnreported bool
 }
 
 // k0sExtraMachine is a control-plane Machine without a NodeRef whose
@@ -338,7 +341,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 		}
 		es.Data = map[string][]byte{}
 		reporters := []string{"keeper-a", "keeper-b"}
-		if !k.unregistered {
+		if !k.unregistered && !opts.leaverUnreported {
 			reporters = append(reporters, "leaver-node")
 		}
 		for _, n := range reporters {
@@ -437,6 +440,27 @@ func (k *k0sLeaveCluster) leaveRequestFor(node string) string {
 		return ""
 	}
 	return cm.Data[node]
+}
+
+// setLeaveValueFor plays the node's etcd-leave responder: it writes value for
+// node into the workload leave ConfigMap, creating the ConfigMap if needed.
+func (k *k0sLeaveCluster) setLeaveValueFor(g *WithT, node, value string) {
+	g.Eventually(func() error {
+		cm := &corev1.ConfigMap{}
+		err := k.wc.Get(k.ctx, types.NamespacedName{Namespace: "kube-system", Name: "kairos-etcd-leave"}, cm)
+		if apierrors.IsNotFound(err) {
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kairos-etcd-leave"}, Data: map[string]string{node: value}}
+			return k.wc.Create(k.ctx, cm)
+		}
+		if err != nil {
+			return err
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[node] = value
+		return k.wc.Update(k.ctx, cm)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 }
 
 // TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone is the
