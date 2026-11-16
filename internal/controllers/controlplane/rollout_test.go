@@ -140,7 +140,7 @@ func TestReconcileMachines_SingleNodeVersionBumpLeavesTheMachineAlone(t *testing
 	// Two passes: the destructive sequence took one pass to create the
 	// replacement and a second to delete the original.
 	for range 2 {
-		_, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster())
+		_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, rolloutCluster())
 		g.Expect(err).NotTo(HaveOccurred())
 	}
 
@@ -176,7 +176,7 @@ func TestReconcileMachines_HARolloutKeepsOldMembersWhileTheReplacementBoots(t *t
 			rolloutEtcdStatus(cluster, old0, old1, old2)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	res, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	res, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(res.RequeueAfter).To(BeNumerically(">", 0), "a held rollout must come back to check on the replacement")
 
@@ -210,7 +210,7 @@ func TestReconcileMachines_HARolloutRemovesTheOldestMemberOnceTheReplacementJoin
 			rolloutEtcdStatus(cluster, old0, old1, old2, joined)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	names, _ := remainingMachines(g, c)
@@ -244,7 +244,7 @@ func TestReconcileMachines_HARolloutWaitsForADeletingMemberToGo(t *testing.T) {
 			rolloutEtcdStatus(cluster, old0, leaving, old2, joined)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	res, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	res, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 
@@ -265,7 +265,7 @@ func TestReconcileMachines_MachinesUpToDateTrueWhenNothingIsOutdated(t *testing.
 		WithObjects(current, machineMetaInfraTemplate()).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, rolloutCluster())
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, rolloutCluster())
 	g.Expect(err).NotTo(HaveOccurred())
 
 	cond := machinesUpToDate(kcp)

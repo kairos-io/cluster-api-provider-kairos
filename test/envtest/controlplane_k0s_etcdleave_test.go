@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -256,6 +257,8 @@ type k0sLeaveOptions struct {
 	keepLeaver bool
 	// extraMembers are EtcdMembers (name → peer address) with no Machine.
 	extraMembers map[string]string
+	// recorder, when set, receives the KCP reconciler's events.
+	recorder record.EventRecorder
 }
 
 // leaverNode is the leaving node's name: its NodeRef name, or its Machine
@@ -274,6 +277,9 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	leaverAnnotations := opts.leaverAnnotations
 	members := &recordingMembers{dialed: map[string]bool{}}
 	ctx, c, cfg, _, teardown := startKCPEnvtest(t, func(r *controlplane.KairosControlPlaneReconciler, cfg *rest.Config) {
+		if opts.recorder != nil {
+			r.Recorder = opts.recorder
+		}
 		r.WorkloadClientFactory = func(context.Context, *clusterv1.Cluster) (client.Client, error) {
 			return nil, errors.New("the control-plane endpoint does not answer")
 		}
@@ -335,7 +341,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 			Spec: clusterv1.MachineSpec{
 				ClusterName:       clusterName,
 				Version:           kcp.Spec.Version,
-				Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+				Bootstrap:         controlPlaneBootstrap(t, ctx, c, kcp, clusterName, name, "k0s"),
 				InfrastructureRef: testMachineInfraRef("infra-" + name),
 			},
 		}
@@ -483,4 +489,44 @@ func TestHA_K0sEtcdLeave_StartsOnlyAtPreTerminate(t *testing.T) {
 		"the timeout clock starts at the request, not at the deletion")
 	g.Expect(got.Annotations).To(HaveKey(etcdLeaveHookKey))
 	g.Expect(k.members.addresses()).To(HaveEach(BeElementOf("10.11.0.11", "10.11.0.12")))
+}
+
+// TestHA_K0sEtcdLeave_ContradictingKairosConfigStillLeaves is ADR 0016 D4 as
+// ruled after review: the etcd-leave hook decides. The leaving k0s member's
+// KairosConfig is changed to k3s after the Machine was built (only tampering
+// or a recreated object does that). The KCP does not release the hook on the
+// KairosConfig's word: once CAPI waits at the pre-terminate hook it writes the
+// leave request like for any k0s member, keeps the hook, and emits a Warning
+// that names the contradiction.
+func TestHA_K0sEtcdLeave_ContradictingKairosConfigStillLeaves(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	g := NewWithT(t)
+	events := &recordingRecorder{}
+	k, teardown := startK0sLeaveClusterWith(t, "ha-k0s-leave-contra", k0sLeaveOptions{recorder: events})
+	defer teardown()
+
+	// The leaver's KairosConfig now says k3s.
+	g.Eventually(func() error {
+		kc := &bootstrapv1beta2.KairosConfig{}
+		if err := k.c.Get(k.ctx, k.leaverKey, kc); err != nil {
+			return err
+		}
+		kc.Spec.Distribution = "k3s"
+		return k.c.Update(k.ctx, kc)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+	touchKCP(g, k.ctx, k.c, k.nsName, k.kcpName)
+	g.Consistently(func() map[string]string { return k.leaver(g).Annotations },
+		4*time.Second, 500*time.Millisecond).Should(HaveKey(etcdLeaveHookKey), "the KairosConfig alone never releases the hook")
+
+	k.setLeaverDeletingReason(g, clusterv1.MachineDeletingWaitingForPreTerminateHookReason)
+	g.Eventually(func() string { return k.leaveRequestFor("leaver-node") },
+		30*time.Second, 500*time.Millisecond).Should(Equal("leave-requested"))
+	g.Expect(k.leaver(g).Annotations).To(HaveKey(etcdLeaveHookKey))
+	g.Eventually(func() []string { return events.all() }, 10*time.Second, 500*time.Millisecond).Should(ContainElement(SatisfyAll(
+		HavePrefix("Warning EtcdLeaveHookContradictsKairosConfig"),
+		ContainSubstring(k.leaverKey.Name),
+		ContainSubstring("says k3s"),
+	)))
 }

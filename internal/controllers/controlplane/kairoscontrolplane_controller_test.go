@@ -123,6 +123,7 @@ func TestCreateControlPlaneMachine_SingleNode(t *testing.T) {
 		log.Log,
 		kcp,
 		cluster,
+		guardFor(kcp),
 		bootstrapv1beta2.ControlPlaneRoleSingle,
 		"",
 	)
@@ -224,6 +225,7 @@ func TestCreateControlPlaneMachine_MultiNode(t *testing.T) {
 		log.Log,
 		kcp,
 		cluster,
+		guardFor(kcp),
 		bootstrapv1beta2.ControlPlaneRoleInit,
 		"",
 	)
@@ -437,10 +439,15 @@ func TestReconcile_FailureFieldsClearedOnSuccess(t *testing.T) {
 			Version:     "v1.30.0+k0s.0",
 		},
 	}
+	// The Machine's KairosConfig records k0s, as createControlPlaneMachine
+	// stamps it, so the distribution guard (ADR 0016) sees a consistent
+	// control plane and this stays the success path.
+	withKairosConfigRef(machine, machine.Name)
+	kairosConfig := kairosConfigFor(machine, "k0s")
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(cluster, kcp, machine).
+		WithObjects(cluster, kcp, machine, kairosConfig).
 		WithStatusSubresource(&controlplanev1beta2.KairosControlPlane{}, &clusterv1.Cluster{}).
 		Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
@@ -453,7 +460,12 @@ func TestReconcile_FailureFieldsClearedOnSuccess(t *testing.T) {
 	g.Expect(got.Status.FailureReason).To(BeEmpty(), "FailureReason should be cleared on successful reconcileMachines, regardless of ReadyReplicas (KD-14)")
 	g.Expect(got.Status.FailureMessage).To(BeEmpty(), "FailureMessage should be cleared on successful reconcileMachines, regardless of ReadyReplicas (KD-14)")
 	g.Expect(got.Status.ReadyReplicas).To(Equal(int32(0)), "ReadyReplicas should still be 0 since the Machine has no NodeRef -- proving the clear is unconditional")
-	g.Expect(got.Status.ObservedGeneration).To(Equal(int64(9)))
+	// The spec.distribution write may bump the generation; observedGeneration
+	// follows the generation the reconcile saw after that write.
+	g.Expect(got.Generation).To(BeNumerically(">=", 9))
+	g.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+	g.Expect(got.Spec.Distribution).To(Equal("k0s"), "the empty spec.distribution is written from the Machines (ADR 0016 D2)")
+	g.Expect(conditions.GetReason(got, clusterv1.ReadyCondition)).NotTo(Equal(controlplanev1beta2.DistributionMismatchReason))
 }
 
 // TestSecretWatchPredicate_FiltersByTypeAndClusterNameLabel verifies the

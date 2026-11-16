@@ -56,10 +56,12 @@ func newKCPWithTemplate(dist, templateName string) *controlplanev1beta2.KairosCo
 	}
 }
 
-// TestResolveEffectiveDistribution covers the inherit source: it returns the
+// TestResolveEffectiveDistribution covers the template read: it returns the
 // referenced template's distribution, "" when the template does not set one,
 // and "" (no error) when the template is absent so a later reconcile can
-// resolve once it exists.
+// resolve once it exists. reconcileDistribution inherits it only while the
+// control plane has no Machines (ADR 0016 D2), and refuses it when it is
+// kubeadm.
 func TestResolveEffectiveDistribution(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -130,9 +132,11 @@ func TestResolveEffectiveDistribution(t *testing.T) {
 	}
 }
 
-// TestDistributionOf_Fallback locks in the k0s fallback used by every
-// downstream path (machine create, join gate, etcd leave) when spec.distribution
-// is still empty — i.e. the template was not yet resolved this reconcile.
+// TestDistributionOf_Fallback locks in the k0s fallback the guard's effective
+// value, the join gate and the orphan cleanup use when spec.distribution is
+// still empty: no Machines and a template that is missing or sets none, so
+// reconcileDistribution wrote nothing this reconcile. The etcd leave does not
+// use it; it reads the leaving Machine's KairosConfig (ADR 0016 D4).
 func TestDistributionOf_Fallback(t *testing.T) {
 	g := NewWithT(t)
 
@@ -144,12 +148,18 @@ func TestDistributionOf_Fallback(t *testing.T) {
 		"explicit k0s must be returned verbatim")
 }
 
-// TestEffectiveDistribution_Precedence exercises the full resolution precedence
-// as the controller composes it: explicit KCP value wins over the template;
-// unset + template inherits; unset + no template falls back to k0s via
-// distributionOf. The explicit-wins arm asserts that resolveEffectiveDistribution
-// (the inherit source) is NOT consulted for the effective value when the KCP is
-// explicit — the controller only reads it to detect an override for the warning.
+// TestEffectiveDistribution_Precedence exercises the resolution precedence for
+// a control plane with no Machines yet, as the controller composes it: explicit
+// KCP value wins over the template; unset + template inherits; unset + no
+// template falls back to k0s via distributionOf. The explicit-wins arm asserts
+// that resolveEffectiveDistribution (the template read) is NOT consulted for
+// the effective value when the KCP is explicit — the controller reads it to
+// detect an override for the warning and a kubeadm template for the refusal.
+//
+// Once Machines exist, what they run comes first (ADR 0016): an unset value is
+// written from the Machines, not the template, and an explicit value that
+// differs from them holds membership changes (TestDistributionToWrite,
+// TestDistributionVerdict). The last arm pins that ordering.
 func TestEffectiveDistribution_Precedence(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newKCPTestScheme(t)
@@ -176,7 +186,9 @@ func TestEffectiveDistribution_Precedence(t *testing.T) {
 	inherited, err := rInherit.resolveEffectiveDistribution(context.Background(), inheritKCP)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(inherited).To(Equal("k3s"))
-	inheritKCP.Spec.Distribution = inherited // controller persists this
+	written, _ := distributionToWrite(inherited, observedDistribution{})
+	g.Expect(written).To(Equal("k3s"), "with no Machines the controller writes the template's value")
+	inheritKCP.Spec.Distribution = written
 	g.Expect(distributionOf(inheritKCP)).To(Equal("k3s"))
 
 	// No template object; KCP unset -> resolve yields "" and distributionOf
@@ -189,4 +201,13 @@ func TestEffectiveDistribution_Precedence(t *testing.T) {
 	g.Expect(resolved).To(BeEmpty())
 	g.Expect(fallbackKCP.Spec.Distribution).To(BeEmpty(), "no template -> nothing persisted")
 	g.Expect(distributionOf(fallbackKCP)).To(Equal("k0s"))
+
+	// Template says k3s; KCP unset; the Machines run k0s -> the Machines win.
+	machinesRunK0s := summarizeObserved(map[string][]string{"k0s": {"cp-0", "cp-1", "cp-2"}}, nil)
+	restored, source := distributionToWrite("k3s", machinesRunK0s)
+	g.Expect(restored).To(Equal("k0s"), "with Machines the controller writes what they run, not the template's value")
+	g.Expect(source).To(Equal(distributionRestoredEventReason))
+	// And an explicit k3s against those Machines is held, not acted on.
+	reason, _ := distributionVerdict("k3s", "cfg-template", "k3s", machinesRunK0s)
+	g.Expect(reason).To(Equal(controlplanev1beta2.DistributionMismatchReason))
 }

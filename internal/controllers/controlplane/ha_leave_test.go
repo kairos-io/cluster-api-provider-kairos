@@ -59,29 +59,28 @@ func TestEtcdLeaveHookAnnotation(t *testing.T) {
 }
 
 // TestShouldStampEtcdLeaveHook: only k0s init/join are hooked. Single-node has no
-// etcd cluster; k3s has no supported member-remove (KD-5d).
+// etcd cluster; k3s has no supported member-remove (KD-5d). The decision takes
+// the distribution the Machine is built with (the guard's effective value,
+// ADR 0016), which is never empty: an undecided distribution is not hooked,
+// and createControlPlaneMachine refuses to build with one.
 func TestShouldStampEtcdLeaveHook(t *testing.T) {
-	mk := func(dist string) *controlplanev1beta2.KairosControlPlane {
-		return &controlplanev1beta2.KairosControlPlane{Spec: controlplanev1beta2.KairosControlPlaneSpec{Distribution: dist}}
-	}
 	for _, tc := range []struct {
 		name string
-		kcp  *controlplanev1beta2.KairosControlPlane
+		dist string
 		role bootstrapv1beta2.ControlPlaneRole
 		want bool
 	}{
-		{"k0s init", mk("k0s"), bootstrapv1beta2.ControlPlaneRoleInit, true},
-		{"k0s join", mk("k0s"), bootstrapv1beta2.ControlPlaneRoleJoin, true},
-		{"k0s single", mk("k0s"), bootstrapv1beta2.ControlPlaneRoleSingle, false},
-		{"empty dist defaults k0s init", mk(""), bootstrapv1beta2.ControlPlaneRoleInit, true},
-		{"empty dist single", mk(""), bootstrapv1beta2.ControlPlaneRoleSingle, false},
-		{"k3s init", mk("k3s"), bootstrapv1beta2.ControlPlaneRoleInit, false},
-		{"k3s join", mk("k3s"), bootstrapv1beta2.ControlPlaneRoleJoin, false},
+		{"k0s init", "k0s", bootstrapv1beta2.ControlPlaneRoleInit, true},
+		{"k0s join", "k0s", bootstrapv1beta2.ControlPlaneRoleJoin, true},
+		{"k0s single", "k0s", bootstrapv1beta2.ControlPlaneRoleSingle, false},
+		{"k3s init", "k3s", bootstrapv1beta2.ControlPlaneRoleInit, false},
+		{"k3s join", "k3s", bootstrapv1beta2.ControlPlaneRoleJoin, false},
+		{"undecided init", "", bootstrapv1beta2.ControlPlaneRoleInit, false},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			g.Expect(shouldStampEtcdLeaveHook(tc.kcp, tc.role)).To(Equal(tc.want))
+			g.Expect(shouldStampEtcdLeaveHook(tc.dist, tc.role)).To(Equal(tc.want))
 		})
 	}
 }
@@ -173,31 +172,6 @@ func etcdStatusSecretForMembers(members ...string) *corev1.Secret {
 		ObjectMeta: metav1.ObjectMeta{Name: etcdStatusSecretName(testClusterName), Namespace: "default"},
 		Data:       data,
 	}
-}
-
-// TestReconcileMemberLeave_NonK0sRemovesHook: defensive — a non-k0s Machine that
-// somehow carries the hook is unblocked without a k0s-specific leave.
-func TestReconcileMemberLeave_NonK0sRemovesHook(t *testing.T) {
-	g := NewWithT(t)
-	scheme := haTestScheme(g)
-	target := hookedMachine("cp-0", "cp-0", nil)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target).Build()
-
-	factoryCalled := false
-	r := &KairosControlPlaneReconciler{
-		Client: c, Scheme: scheme,
-		WorkloadClientFactory: func(context.Context, *clusterv1.Cluster) (client.Client, error) {
-			factoryCalled = true
-			return nil, nil
-		},
-	}
-	k3s := k0sKCP()
-	k3s.Spec.Distribution = "k3s"
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, k3s, testCluster(), []*clusterv1.Machine{target}, target)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(done).To(BeTrue())
-	g.Expect(factoryCalled).To(BeFalse())
-	assertHookGone(g, c, "cp-0")
 }
 
 // TestReconcileMemberLeave_WritesRequestThenWaits: first entry writes the
@@ -369,29 +343,42 @@ func TestStripEtcdLeaveHooks_Teardown(t *testing.T) {
 	g.Expect(hasEtcdLeaveHook(gotForeign)).To(BeTrue(), "a Machine owned by a different KCP UID must be left alone")
 }
 
-// TestWarnIfK3sEtcdLimitation: the KD-5d warning fires for multi-replica k3s and
-// stays silent for k0s and for single-node.
+// TestWarnIfK3sEtcdLimitation: the KD-5d warning fires when the removed
+// Machine's own KairosConfig says k3s on a multi-replica control plane, and
+// stays silent for a k0s Machine, for single-node, and for a Machine whose
+// KairosConfig cannot be found. spec.distribution does not decide it (ADR 0016
+// D4): a k0s member of a control plane relabelled k3s leaves etcd cleanly and
+// gets no warning, and a k3s member of one relabelled k0s does get it.
 func TestWarnIfK3sEtcdLimitation(t *testing.T) {
-	target := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "default"}}
 	for _, tc := range []struct {
-		name     string
-		dist     string
-		replicas int32
-		wantEvt  bool
+		name       string
+		specDist   string
+		configDist string // "" = no KairosConfig object
+		replicas   int32
+		wantEvt    bool
 	}{
-		{"k3s HA warns", "k3s", 3, true},
-		{"k0s HA silent", "k0s", 3, false},
-		{"k3s single silent", "k3s", 1, false},
+		{"k3s HA warns", "k3s", "k3s", 3, true},
+		{"k0s HA silent", "k0s", "k0s", 3, false},
+		{"k3s single silent", "k3s", "k3s", 1, false},
+		{"k0s Machine under a k3s spec is silent", "k3s", "k0s", 3, false},
+		{"k3s Machine under a k0s spec warns", "k0s", "k3s", 3, true},
+		{"missing KairosConfig is silent", "k3s", "", 3, false},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
+			scheme := haTestScheme(g)
+			target := withKairosConfigRef(&clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "default"}}, "cp-0")
+			b := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target)
+			if tc.configDist != "" {
+				b = b.WithObjects(kairosConfigFor(target, tc.configDist))
+			}
 			rec := record.NewFakeRecorder(4)
-			r := &KairosControlPlaneReconciler{Recorder: rec}
+			r := &KairosControlPlaneReconciler{Client: b.Build(), Scheme: scheme, Recorder: rec}
 			kcp := &controlplanev1beta2.KairosControlPlane{Spec: controlplanev1beta2.KairosControlPlaneSpec{
-				Distribution: tc.dist, Replicas: ptr.To(tc.replicas),
+				Distribution: tc.specDist, Replicas: ptr.To(tc.replicas),
 			}}
-			r.warnIfK3sEtcdLimitation(kcp, target)
+			r.warnIfK3sEtcdLimitation(context.Background(), kcp, target)
 			if tc.wantEvt {
 				g.Expect(rec.Events).To(Receive(ContainSubstring("EtcdMemberRemoveUnsupportedForK3s")))
 			} else {

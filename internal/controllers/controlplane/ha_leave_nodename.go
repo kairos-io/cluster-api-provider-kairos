@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"strings"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
 	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
@@ -56,16 +54,12 @@ func (r *KairosControlPlaneReconciler) renderedNodeName(ctx context.Context, m *
 // renderedHostname is the hostname the renderer gives m's node, as written
 // (not lowercased): spec.hostname of its KairosConfig, else the Machine name.
 func (r *KairosControlPlaneReconciler) renderedHostname(ctx context.Context, m *clusterv1.Machine) (string, error) {
-	ref := m.Spec.Bootstrap.ConfigRef
-	if ref.Name == "" || ref.Kind != "KairosConfig" || ref.APIGroup != bootstrapv1beta2.GroupVersion.Group {
-		return m.Name, nil
+	kc, err := r.machineKairosConfig(ctx, m)
+	if err != nil {
+		return "", fmt.Errorf("read KairosConfig %s/%s of Machine %s for its node name: %w", m.Namespace, m.Spec.Bootstrap.ConfigRef.Name, m.Name, err)
 	}
-	kc := &bootstrapv1beta2.KairosConfig{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: m.Namespace, Name: ref.Name}, kc); err != nil {
-		if apierrors.IsNotFound(err) {
-			return m.Name, nil
-		}
-		return "", fmt.Errorf("read KairosConfig %s/%s of Machine %s for its node name: %w", m.Namespace, ref.Name, m.Name, err)
+	if kc == nil {
+		return m.Name, nil
 	}
 	return bootstrapv1beta2.RenderedHostname(&kc.Spec, m.Name), nil
 }

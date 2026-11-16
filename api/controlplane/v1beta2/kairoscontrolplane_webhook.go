@@ -18,6 +18,7 @@ package v1beta2
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"regexp"
 	"time"
@@ -127,9 +128,10 @@ func (*kairosControlPlaneValidator) ValidateCreate(_ context.Context, r *KairosC
 }
 
 // ValidateUpdate implements admission.Validator[*KairosControlPlane].
-func (*kairosControlPlaneValidator) ValidateUpdate(_ context.Context, _, r *KairosControlPlane) (admission.Warnings, error) {
+func (*kairosControlPlaneValidator) ValidateUpdate(_ context.Context, old, r *KairosControlPlane) (admission.Warnings, error) {
 	kairoscontrolplaneLog.Info("validate update", "name", r.Name)
-	return r.validateWithWarnings()
+	warnings, err := r.validateWithWarnings()
+	return append(warnings, warnDistributionChange(old, r)...), err
 }
 
 // ValidateDelete implements admission.Validator[*KairosControlPlane].
@@ -141,6 +143,39 @@ func (*kairosControlPlaneValidator) ValidateDelete(_ context.Context, r *KairosC
 // validateWithWarnings runs validate() and also collects non-blocking warnings.
 func (r *KairosControlPlane) validateWithWarnings() (admission.Warnings, error) {
 	return warnVIPOnSingleReplica(&r.Spec, "spec"), r.validate()
+}
+
+// warnDistributionChange warns, without rejecting, when an update changes
+// spec.distribution from one non-empty value to another (ADR 0016 D7). The
+// controller never changes the distribution existing control-plane Machines
+// run: it holds Machine creation and deletion while spec.distribution
+// disagrees with them, so the edit cannot take effect on a running control
+// plane.
+//
+// It is a warning, not a rejection, for three reasons. The webhook cannot
+// see the Machines, so it cannot tell a control plane that has none from one
+// that runs the old value. Removing the field and then setting the new value
+// would get around a rejection anyway. And CAPI topology applies the
+// KairosControlPlaneTemplate's spec to every control plane of a
+// ClusterClass, so a rejection would wedge TopologyReconciled on all of them.
+// Setting an unset value, or removing one, does not warn: the controller
+// fills an empty value from the Machines.
+//
+// It is pure: it reads only the two objects.
+func warnDistributionChange(old, r *KairosControlPlane) admission.Warnings {
+	if old == nil || r == nil {
+		return nil
+	}
+	from, to := old.Spec.Distribution, r.Spec.Distribution
+	if from == "" || to == "" || from == to {
+		return nil
+	}
+	return admission.Warnings{fmt.Sprintf(
+		"spec.distribution changed from %s to %s. The controller does not change the distribution of existing "+
+			"control-plane Machines: while they run another distribution than spec.distribution, it creates and "+
+			"deletes no control-plane Machine and reports Ready=False with reason DistributionMismatch. Set "+
+			"spec.distribution back to what the Machines run, or remove it; changing the distribution of a running "+
+			"control plane needs a new Cluster.", from, to)}
 }
 
 // warnVIPOnSingleReplica warns, without rejecting, when a VIP block is set on a

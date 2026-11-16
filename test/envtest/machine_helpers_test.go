@@ -2,11 +2,17 @@ package envtest
 
 import (
 	"context"
+	"testing"
 	"time"
 
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
+	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
 )
 
 // testMachineInfraRef returns a syntactically valid infrastructureRef for a
@@ -60,4 +66,38 @@ func markClusterInfrastructureProvisioned(ctx context.Context, c client.Client, 
 		return nil
 	}
 	return lastErr
+}
+
+// controlPlaneBootstrap creates the KairosConfig that a KCP-owned
+// control-plane Machine fixture named name points at, recording distribution
+// as createControlPlaneMachine stamps it, and returns the Bootstrap that
+// names it. The KCP reads what each of its Machines runs from that
+// KairosConfig (ADR 0016): a Machine with no readable one leaves the control
+// plane's distribution unknown, and the KCP then holds every membership
+// change, which would mask whatever gate a test means to exercise.
+func controlPlaneBootstrap(t *testing.T, ctx context.Context, c client.Client, kcp *controlplanev1beta2.KairosControlPlane, clusterName, name, distribution string) clusterv1.Bootstrap {
+	t.Helper()
+	NewWithT(t).Expect(c.Create(ctx, &bootstrapv1beta2.KairosConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: kcp.Namespace,
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:         clusterName,
+				clusterv1.MachineControlPlaneLabel: "",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane")),
+			},
+		},
+		Spec: bootstrapv1beta2.KairosConfigSpec{
+			Role:              "control-plane",
+			Distribution:      distribution,
+			KubernetesVersion: kcp.Spec.Version,
+		},
+	})).To(Succeed())
+	return clusterv1.Bootstrap{ConfigRef: clusterv1.ContractVersionedObjectReference{
+		APIGroup: bootstrapv1beta2.GroupVersion.Group,
+		Kind:     "KairosConfig",
+		Name:     name,
+	}}
 }

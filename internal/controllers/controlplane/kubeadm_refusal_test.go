@@ -21,57 +21,109 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	bootstrapv1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/bootstrap/v1beta2"
 	controlplanev1beta2 "github.com/kairos-io/cluster-api-provider-kairos/api/controlplane/v1beta2"
 )
 
-// TestRefuseKubeadmControlPlane asserts the P1 refusal path (ADR 0010 item 2):
-// a kubeadm KairosControlPlane is refused with a clear Available/Ready
-// False(Warning, UnsupportedDistribution) condition and latched failure fields,
-// and the refusal returns without a requeue and without ever writing kubeadm into
-// spec.distribution (which would loop against the webhook).
-func TestRefuseKubeadmControlPlane(t *testing.T) {
-	g := NewWithT(t)
-	scheme := newKCPTestScheme(t)
+// TestReconcile_RefusesKubeadm is the kubeadm refusal (ADR 0010 P1 item 2),
+// made unconditional by ADR 0016. A KairosControlPlane whose
+// KairosConfigTemplate is kubeadm is refused whatever spec.distribution says;
+// before ADR 0016 the check ran only when spec.distribution was empty, so an
+// explicit k0s or k3s built control-plane Machines from a kubeadm worker spec.
+// An explicit kubeadm that bypassed the webhook is refused too.
+//
+// With no Machines the refusal surface is today's: Ready and Available
+// False(Warning, UnsupportedDistribution) and the failure fields. With
+// Machines it holds like a mismatch: Ready and MachinesUpToDate, never
+// Available, and no failure fields. Either way nothing is created or deleted,
+// kubeadm is never written into spec.distribution (the webhook would reject it
+// on every pass), and the KCP comes back every 60s, since no
+// KairosConfigTemplate watch would notice a fix.
+func TestReconcile_RefusesKubeadm(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		spec         string
+		templateDist string
+		machines     []string
+	}{
+		{name: "empty spec, kubeadm template", spec: "", templateDist: "kubeadm"},
+		{name: "explicit k0s, kubeadm template", spec: "k0s", templateDist: "kubeadm"},
+		{name: "explicit k3s, kubeadm template", spec: "k3s", templateDist: "kubeadm"},
+		{name: "explicit kubeadm past the webhook", spec: "kubeadm", templateDist: "k0s"},
+		{name: "explicit k0s, kubeadm template, Machines exist", spec: "k0s", templateDist: "kubeadm", machines: []string{"k0s"}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := newKCPTestScheme(t)
 
-	kcp := newKCPWithTemplate("", "kubeadm-template")
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(kcp).
-		WithStatusSubresource(&controlplanev1beta2.KairosControlPlane{}).
-		Build()
-	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
+			cluster := &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+				Spec: clusterv1.ClusterSpec{ControlPlaneRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: controlplanev1beta2.GroupVersion.Group, Kind: "KairosControlPlane", Name: "test-kcp",
+				}},
+			}
+			kcp := guardKCP(tc.spec, 1)
+			objs := append([]client.Object{cluster, kcp, newDistTemplate("cfg-template", "default", tc.templateDist)},
+				guardObjects(kcp, tc.machines...)...)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+				WithStatusSubresource(&controlplanev1beta2.KairosControlPlane{}, &clusterv1.Cluster{}).Build()
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	res, err := r.refuseKubeadmControlPlane(context.Background(), log.Log, kcp,
-		`KairosConfigTemplate "kubeadm-template" has distribution kubeadm`)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(res.Requeue).To(BeFalse())
-	g.Expect(res.RequeueAfter).To(BeZero())
+			res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(kcp)})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(res.RequeueAfter).To(Equal(distributionHoldRequeueAfter))
 
-	// spec.distribution is never set to kubeadm (no error loop with the webhook).
-	g.Expect(kcp.Spec.Distribution).To(BeEmpty())
+			got := &controlplanev1beta2.KairosControlPlane{}
+			g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(kcp), got)).To(Succeed())
+			g.Expect(got.Spec.Distribution).To(Equal(tc.spec), "spec.distribution is never written while kubeadm is involved")
 
-	// Conditions + failure fields surface the refusal.
-	g.Expect(kcp.Status.FailureReason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
-	g.Expect(kcp.Status.FailureMessage).To(ContainSubstring("kubeadm is not supported on a KairosControlPlane"))
+			machines := &clusterv1.MachineList{}
+			g.Expect(c.List(context.Background(), machines, client.InNamespace("default"))).To(Succeed())
+			g.Expect(machines.Items).To(HaveLen(len(tc.machines)), "nothing is created or deleted")
+			configs := &bootstrapv1beta2.KairosConfigList{}
+			g.Expect(c.List(context.Background(), configs, client.InNamespace("default"))).To(Succeed())
+			g.Expect(configs.Items).To(HaveLen(len(tc.machines)), "no control-plane KairosConfig is stamped")
 
-	avail := conditions.Get(kcp, controlplanev1beta2.AvailableCondition)
-	g.Expect(avail).NotTo(BeNil())
-	g.Expect(string(avail.Status)).To(Equal("False"))
-	g.Expect(avail.Reason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
-	g.Expect(avail.Severity).To(Equal(clusterv1.ConditionSeverityWarning))
+			ready := conditions.Get(got, clusterv1.ReadyCondition)
+			g.Expect(ready).NotTo(BeNil())
+			g.Expect(ready.Status).To(Equal(corev1.ConditionFalse))
+			g.Expect(ready.Reason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
+			g.Expect(ready.Severity).To(Equal(clusterv1.ConditionSeverityWarning))
+			g.Expect(ready.Message).To(ContainSubstring("kubeadm is not supported on a KairosControlPlane"))
 
-	ready := conditions.Get(kcp, clusterv1.ReadyCondition)
-	g.Expect(ready).NotTo(BeNil())
-	g.Expect(ready.Reason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
+			if len(tc.machines) == 0 {
+				avail := conditions.Get(got, controlplanev1beta2.AvailableCondition)
+				g.Expect(avail).NotTo(BeNil())
+				g.Expect(avail.Status).To(Equal(corev1.ConditionFalse))
+				g.Expect(avail.Reason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
+				g.Expect(avail.Severity).To(Equal(clusterv1.ConditionSeverityWarning))
+				g.Expect(got.Status.FailureReason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
+				g.Expect(got.Status.FailureMessage).To(ContainSubstring("kubeadm is not supported on a KairosControlPlane"))
+				return
+			}
+			upToDate := conditions.Get(got, controlplanev1beta2.MachinesUpToDateCondition)
+			g.Expect(upToDate).NotTo(BeNil())
+			g.Expect(upToDate.Reason).To(Equal(controlplanev1beta2.UnsupportedDistributionReason))
+			g.Expect(conditions.GetReason(got, controlplanev1beta2.AvailableCondition)).NotTo(Equal(controlplanev1beta2.UnsupportedDistributionReason),
+				"a control plane with Machines is not reported unavailable for this")
+			g.Expect(got.Status.FailureReason).To(BeEmpty())
+			g.Expect(got.Status.FailureMessage).To(BeEmpty())
+		})
+	}
 }
 
-// TestResolveEffectiveDistribution_Kubeadm proves the inherit source reports a
-// kubeadm template verbatim, so the Reconcile guard (kcpUnsupportedDistributionKubeadm)
-// fires before the persist-and-loop path.
+// TestResolveEffectiveDistribution_Kubeadm proves the template read reports a
+// kubeadm template verbatim, so reconcileDistribution refuses it (ADR 0016
+// verdict 1) instead of writing it into spec.distribution.
 func TestResolveEffectiveDistribution_Kubeadm(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newKCPTestScheme(t)

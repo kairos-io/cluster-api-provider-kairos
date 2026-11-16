@@ -94,6 +94,11 @@ const (
 	// ~15 minutes a requested leave gets (memberLeaveTimeout, then
 	// etcdMemberLeaveCap). Before ADR 0015 this phase had no bound (GT-15).
 	leaveUnreachableBound = memberLeaveTimeout + etcdMemberLeaveCap
+
+	// etcdLeaveHookContradictedEventReason is the Warning event reason for a
+	// hooked Machine whose KairosConfig records a distribution other than
+	// k0s (warnIfConfigContradictsHook).
+	etcdLeaveHookContradictedEventReason = "EtcdLeaveHookContradictsKairosConfig"
 )
 
 // etcdLeaveHookAnnotation is the full pre-terminate hook annotation key
@@ -112,13 +117,15 @@ func hasEtcdLeaveHook(m *clusterv1.Machine) bool {
 // distributionOf returns the effective distribution for a KCP, defaulting the
 // empty value to k0s (mirrors createControlPlaneMachine).
 //
-// The controller resolves + persists spec.distribution early in Reconcile (see
-// resolveEffectiveDistribution + the resolve block in Reconcile), so by the time
-// any of the machine-create / etcd-leave paths call distributionOf the field is
-// already populated with the inherited-or-explicit value. The k0s fallback here
-// is the last-resort default used only when the referenced KairosConfigTemplate
-// has not been observed yet (the template read failed / does not exist), in which
-// case a later reconcile resolves it.
+// The controller writes an empty spec.distribution early in Reconcile
+// (reconcileDistribution, ADR 0016): from the control-plane Machines when they
+// agree, from the KairosConfigTemplate when there are none. Membership changes
+// are held while spec disagrees with the Machines, so every machine-create,
+// join and orphan path that calls distributionOf after the hold sees the value
+// the Machines run. The k0s fallback here is the last-resort default used only
+// when nothing could be written (no Machines and a template that is missing
+// or sets no distribution), in which case a later reconcile writes it. The
+// etcd leave does not use it: it reads the leaving Machine's KairosConfig.
 func distributionOf(kcp *controlplanev1beta2.KairosControlPlane) string {
 	if kcp.Spec.Distribution == "" {
 		return "k0s"
@@ -153,11 +160,11 @@ func (r *KairosControlPlaneReconciler) resolveEffectiveDistribution(ctx context.
 }
 
 // shouldStampEtcdLeaveHook decides whether a newly-created control-plane Machine
-// gets the etcd-leave pre-terminate hook: only k0s init/join members. Single-node
-// has no etcd cluster to leave; k3s embedded etcd has no supported member-remove
-// (KD-5d), so neither is hooked.
-func shouldStampEtcdLeaveHook(kcp *controlplanev1beta2.KairosControlPlane, role bootstrapv1beta2.ControlPlaneRole) bool {
-	if distributionOf(kcp) != "k0s" {
+// built with distribution gets the etcd-leave pre-terminate hook: only k0s
+// init/join members. Single-node has no etcd cluster to leave; k3s embedded
+// etcd has no supported member-remove (KD-5d), so neither is hooked.
+func shouldStampEtcdLeaveHook(distribution string, role bootstrapv1beta2.ControlPlaneRole) bool {
+	if distribution != "k0s" {
 		return false
 	}
 	return role == bootstrapv1beta2.ControlPlaneRoleInit || role == bootstrapv1beta2.ControlPlaneRoleJoin
@@ -268,7 +275,14 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 // next join under the same name split the cluster (ADR 0015 PR-3).
 //
 // State machine:
-//  1. Non-k0s carrying the hook (should never happen) → remove hook, done.
+//  1. The hook decides (ADR 0016 D4): only k0s init/join Machines are given
+//     it, so a Machine that carries it is treated as a k0s member and goes
+//     through the leave below. Neither spec.distribution, which can change
+//     after the Machine was built, nor the Machine's KairosConfig, which
+//     only a tampered or recreated object makes disagree with the hook, can
+//     release it without a leave. A KairosConfig that says otherwise gets a
+//     Warning event; the leave still runs, and every wait below is bounded,
+//     so a Machine that does not run k0s is released by the timeout path.
 //  2. Until a leave has been requested, wait (done=false, no workload
 //     traffic) while CAPI is still draining the Node or detaching its
 //     volumes (machineAtPreTerminate). Without a NodeRef CAPI goes there at
@@ -315,11 +329,10 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	if err := errIfIdentityFrozen(kcp, "progress the etcd leave of Machine "+target.Name); err != nil {
 		return false, err
 	}
-	// (1) Defensive: only k0s stamps the hook.
-	if distributionOf(kcp) != "k0s" {
-		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
-	}
-
+	// (1) The hook decides (ADR 0016 D4): only k0s init/join Machines are
+	// given it, so the leave runs whatever the KairosConfig or
+	// spec.distribution say now. A contradicting KairosConfig is reported
+	// below, on the first pass that acts.
 	registered := target.Status.NodeRef.IsDefined()
 	nodeName, err := r.leaveNodeName(ctx, target)
 	if err != nil {
@@ -337,6 +350,12 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	if !requested && !machineAtPreTerminate(target) {
 		log.Info("etcd-leave: waiting for CAPI to finish with the node before the leave", "machine", target.Name, "node", nodeName)
 		return false, nil
+	}
+	// The first pass of this eviction cycle that acts: no leave requested and
+	// no unreachable phase stamped yet. Each of those is stamped once, so the
+	// warning below is emitted once per cycle, not on every requeue.
+	if _, unreachable := target.Annotations[etcdLeaveUnreachableSinceAnnotation]; !requested && !unreachable {
+		r.warnIfConfigContradictsHook(ctx, log, kcp, target)
 	}
 
 	// Find a workload apiserver that answers, and read the leave ConfigMap
@@ -424,6 +443,32 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	}
 	log.Info("etcd-leave: awaiting node ack", "machine", target.Name, "node", nodeName, "via", conn.via)
 	return false, nil
+}
+
+// warnIfConfigContradictsHook emits a Warning event when target carries the
+// k0s etcd-leave hook but its KairosConfig records another distribution. The
+// hook has only ever been stamped on k0s init/join Machines, so this means
+// the KairosConfig was changed or recreated after the Machine was built. It
+// is informational: the leave runs anyway (ADR 0016 D4), and a KairosConfig
+// that cannot be read is only logged, never a reason to hold the hook.
+func (r *KairosControlPlaneReconciler) warnIfConfigContradictsHook(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) {
+	dist, found, err := r.machineDistribution(ctx, target)
+	if err != nil {
+		log.Info("etcd-leave: could not read the Machine's KairosConfig to compare it with the hook; leaving anyway",
+			"machine", target.Name, "reason", err.Error())
+		return
+	}
+	if !found || dist == "k0s" {
+		return
+	}
+	log.Info("etcd-leave: the Machine's KairosConfig contradicts its k0s etcd-leave hook; running the k0s leave",
+		"machine", target.Name, "distribution", dist)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(kcp, corev1.EventTypeWarning, etcdLeaveHookContradictedEventReason,
+			"The KairosConfig of control-plane Machine %q says %s, but the Machine carries the k0s etcd-leave hook, which only k0s "+
+				"members are given; running the k0s etcd leave. If the node does not run k0s, the leave times out and the hook "+
+				"is removed. Check whether the KairosConfig was changed after the Machine was created.", target.Name, dist)
+	}
 }
 
 // machineAtPreTerminate reports whether CAPI's Machine controller has
@@ -540,8 +585,12 @@ func (r *KairosControlPlaneReconciler) removeEtcdLeaveHook(ctx context.Context, 
 // member stays registered after the node is gone (KD-5d). No-op for k0s (which
 // removes members cleanly via the leave handshake) and for single-node (no etcd
 // cluster).
-func (r *KairosControlPlaneReconciler) warnIfK3sEtcdLimitation(kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) {
-	if r.Recorder == nil || distributionOf(kcp) == "k0s" {
+//
+// Like the leave decision, it reads what target runs from target's own
+// KairosConfig, not from spec.distribution (ADR 0016 D4). Best effort: a
+// KairosConfig that cannot be read, or is gone, emits nothing.
+func (r *KairosControlPlaneReconciler) warnIfK3sEtcdLimitation(ctx context.Context, kcp *controlplanev1beta2.KairosControlPlane, target *clusterv1.Machine) {
+	if r.Recorder == nil {
 		return
 	}
 	desired := int32(1)
@@ -549,6 +598,9 @@ func (r *KairosControlPlaneReconciler) warnIfK3sEtcdLimitation(kcp *controlplane
 		desired = *kcp.Spec.Replicas
 	}
 	if desired <= 1 {
+		return
+	}
+	if dist, found, err := r.machineDistribution(ctx, target); err != nil || !found || dist == "k0s" {
 		return
 	}
 	r.Recorder.Eventf(kcp, corev1.EventTypeWarning, "EtcdMemberRemoveUnsupportedForK3s",

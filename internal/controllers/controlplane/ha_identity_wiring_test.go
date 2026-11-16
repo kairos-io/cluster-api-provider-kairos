@@ -172,7 +172,7 @@ func newMembershipRun(g *WithT, sc membershipScenario, annotations map[string]st
 }
 
 func (m *membershipRun) reconcile() (time.Duration, error) {
-	res, err := m.r.reconcileMachines(context.Background(), log.Log, m.kcp, m.cluster)
+	res, err := m.r.reconcileMachinesListed(context.Background(), log.Log, m.kcp, m.cluster)
 	return res.RequeueAfter, err
 }
 
@@ -300,7 +300,7 @@ func TestCreateAndDeleteControlPlaneMachine_RefuseWhileFrozen(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machineMetaInfraTemplate(), victim).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleJoin, "")
+	created, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp), bootstrapv1beta2.ControlPlaneRoleJoin, "")
 	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeTrue())
 	g.Expect(created).To(BeNil())
 	// Names are random (ADR 0015 PR-4), so look for anything created, not for
@@ -310,7 +310,7 @@ func TestCreateAndDeleteControlPlaneMachine_RefuseWhileFrozen(t *testing.T) {
 	g.Expect(infra).To(BeEmpty())
 	g.Expect(machines).To(ConsistOf("test-kcp-0"))
 
-	err = r.deleteControlPlaneMachine(context.Background(), kcp, victim)
+	err = r.deleteControlPlaneMachine(context.Background(), kcp, guardFor(kcp), victim)
 	g.Expect(errors.Is(err, errWorkloadIdentityChanged)).To(BeTrue())
 	got := &clusterv1.Machine{}
 	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(victim), got)).To(Succeed())

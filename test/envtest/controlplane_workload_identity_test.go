@@ -171,9 +171,10 @@ func TestHA_WorkloadIdentityChange_FreezesMembership(t *testing.T) {
 	// Three joined, hooked k0s members.
 	kcp := getKCP(g, ctx, c, nsName, kcpName)
 	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("%s-%d", kcpName, i)
 		m := &clusterv1.Machine{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("%s-%d", kcpName, i),
+				Name:      name,
 				Namespace: nsName,
 				Labels: map[string]string{
 					clusterv1.ClusterNameLabel:         clusterName,
@@ -186,7 +187,7 @@ func TestHA_WorkloadIdentityChange_FreezesMembership(t *testing.T) {
 			Spec: clusterv1.MachineSpec{
 				ClusterName:       clusterName,
 				Version:           kcp.Spec.Version,
-				Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("placeholder")},
+				Bootstrap:         controlPlaneBootstrap(t, ctx, c, kcp, clusterName, name, "k0s"),
 				InfrastructureRef: testMachineInfraRef(fmt.Sprintf("infra-%d", i)),
 			},
 		}

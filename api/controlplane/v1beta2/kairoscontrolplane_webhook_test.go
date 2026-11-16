@@ -696,3 +696,93 @@ func TestKairosControlPlane_Validate_SingleNodeNoHAField(t *testing.T) {
 		t.Errorf("validateWithWarnings() returned %d warnings; expected 0 for clean single-node config", len(warnings))
 	}
 }
+
+// TestKairosControlPlane_ValidateUpdate_WarnsOnDistributionChange is ADR 0016
+// D7: an update that changes spec.distribution between two non-empty values
+// is admitted with a warning, never rejected, because the webhook cannot see
+// the Machines and a rejection would wedge CAPI topology. Setting an unset
+// value, removing one, or keeping it does not warn.
+func TestKairosControlPlane_ValidateUpdate_WarnsOnDistributionChange(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		from, to string
+		wantWarn bool
+	}{
+		{"k0s to k3s warns", "k0s", "k3s", true},
+		{"k3s to k0s warns", "k3s", "k0s", true},
+		{"unchanged does not warn", "k0s", "k0s", false},
+		{"setting an unset value does not warn", "", "k3s", false},
+		{"removing the value does not warn", "k3s", "", false},
+		{"unset stays unset", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := newValidKCP()
+			old.Spec.Distribution = tc.from
+			updated := newValidKCP()
+			updated.Spec.Distribution = tc.to
+
+			warnings, err := (&kairosControlPlaneValidator{}).ValidateUpdate(context.Background(), old, updated)
+			if err != nil {
+				t.Fatalf("ValidateUpdate() returned error %v; a distribution change must be a warning, not an error", err)
+			}
+			if !tc.wantWarn {
+				if len(warnings) != 0 {
+					t.Fatalf("ValidateUpdate() returned warnings %v; expected none", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("ValidateUpdate() returned %d warnings %v; expected exactly one", len(warnings), warnings)
+			}
+			for _, want := range []string{
+				"spec.distribution changed from " + tc.from + " to " + tc.to,
+				"DistributionMismatch",
+				"needs a new Cluster",
+			} {
+				if !strings.Contains(warnings[0], want) {
+					t.Errorf("warning %q does not contain %q", warnings[0], want)
+				}
+			}
+		})
+	}
+}
+
+// TestKairosControlPlane_ValidateUpdate_DistributionWarningKeepsOtherWarnings:
+// the distribution warning is added to the existing ones, not instead of them,
+// and a validation error is still returned with it.
+func TestKairosControlPlane_ValidateUpdate_DistributionWarningKeepsOtherWarnings(t *testing.T) {
+	old := newValidKCP()
+	updated := newValidKCP()
+	updated.Spec.Distribution = "k3s"
+	updated.Spec.HA = &HAConfig{VIP: &KubeVIPConfig{Address: "192.168.1.10", Interface: "eth0"}}
+
+	warnings, err := (&kairosControlPlaneValidator{}).ValidateUpdate(context.Background(), old, updated)
+	if err != nil {
+		t.Fatalf("ValidateUpdate() returned error %v", err)
+	}
+	if len(warnings) != 2 {
+		t.Fatalf("ValidateUpdate() returned %d warnings %v; expected the VIP warning and the distribution warning", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "spec.ha.vip") || !strings.Contains(warnings[1], "spec.distribution changed from k0s to k3s") {
+		t.Errorf("unexpected warnings %v", warnings)
+	}
+
+	invalid := updated.DeepCopy()
+	invalid.Spec.Replicas = ptr(int32(2))
+	invalid.Spec.HA = nil
+	warnings, err = (&kairosControlPlaneValidator{}).ValidateUpdate(context.Background(), old, invalid)
+	if err == nil {
+		t.Fatal("ValidateUpdate() returned nil error for replicas=2")
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.distribution changed") {
+		t.Errorf("ValidateUpdate() warnings %v; expected the distribution warning alongside the error", warnings)
+	}
+}
+
+// TestWarnDistributionChange_NilSafe: the helper tolerates a missing old
+// object.
+func TestWarnDistributionChange_NilSafe(t *testing.T) {
+	if w := warnDistributionChange(nil, newValidKCP()); w != nil {
+		t.Errorf("warnDistributionChange(nil, kcp) = %v; expected nil", w)
+	}
+}

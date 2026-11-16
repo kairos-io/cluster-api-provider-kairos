@@ -137,7 +137,7 @@ func TestCreateControlPlaneMachine_NamesAreRandomAndUnique(t *testing.T) {
 
 	seen := map[string]bool{}
 	for i := 0; i < 20; i++ {
-		m, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+		m, err := r.createControlPlaneMachine(context.Background(), log.Log, kcp, machineMetaCluster(), guardFor(kcp), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(m.Name).To(MatchRegexp(randomCPName.String()))
 		g.Expect(seen).NotTo(HaveKey(m.Name))
@@ -163,7 +163,7 @@ func TestReconcileMachines_ScaleUpAfterDeletingTheNewestDoesNotReuseItsName(t *t
 
 	used := map[string]bool{}
 	for round := 0; round < 5; round++ {
-		_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+		_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 		g.Expect(err).NotTo(HaveOccurred())
 		_, _, machines := objectNames(g, c)
 		g.Expect(machines).To(HaveLen(1))
@@ -197,7 +197,7 @@ func TestReconcileMachines_MixedNamesScaleUpAddsARandomNamedJoiner(t *testing.T)
 		WithObjects(init, joiner, machineMetaInfraTemplate(), rolloutEtcdStatus(cluster, init, joiner)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	_, _, machines := objectNames(g, c)
@@ -225,7 +225,7 @@ func TestReconcileMachines_MixedNamesScaleUpAddsARandomNamedJoiner(t *testing.T)
 	g.Expect(m.CreationTimestamp.IsZero()).To(BeFalse())
 
 	kcp.Spec.Replicas = ptrInt32(5)
-	res, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	res, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 	_, _, machines = objectNames(g, c)
@@ -249,13 +249,13 @@ func TestReconcileMachines_RolloutSurgeAddsOneRandomNamedMachine(t *testing.T) {
 		WithObjects(old0, old1, old2, machineMetaInfraTemplate(), rolloutEtcdStatus(cluster, old0, old1, old2)).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme, WorkloadClientFactory: withPinnedWorkload(scheme, kcp)}
 
-	_, err := r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err := r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	_, _, machines := objectNames(g, c)
 	g.Expect(machines).To(HaveLen(4))
 	g.Expect(machines).NotTo(ContainElement("test-kcp-3"))
 
-	_, err = r.reconcileMachines(context.Background(), log.Log, kcp, cluster)
+	_, err = r.reconcileMachinesListed(context.Background(), log.Log, kcp, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 	_, _, machines = objectNames(g, c)
 	g.Expect(machines).To(HaveLen(4), "no second surge and no delete until the first surge machine joins")
@@ -274,7 +274,7 @@ func TestCreateControlPlaneMachine_FailedInfraCreateDeletesTheKairosConfig(t *te
 		}}).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).To(MatchError(ContainSubstring("injected infra create failure")))
 	configs, infra, machines := objectNames(g, c)
 	g.Expect(configs).To(BeEmpty(), "the KairosConfig of the failed attempt is deleted")
@@ -296,7 +296,7 @@ func TestCreateControlPlaneMachine_FailedMachineCreateDeletesConfigAndInfra(t *t
 		}}).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).To(MatchError(ContainSubstring("injected Machine create failure")))
 	configs, infra, machines := objectNames(g, c)
 	g.Expect(configs).To(BeEmpty())
@@ -327,7 +327,7 @@ func TestCreateControlPlaneMachine_FailedCleanupIsReportedAndNotRetried(t *testi
 		}).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).To(MatchError(ContainSubstring("cleanup failed")))
 	g.Expect(err).To(MatchError(ContainSubstring("injected delete failure")))
 	g.Expect(errors.Is(err, errControlPlaneNameTaken)).To(BeFalse())
@@ -363,7 +363,7 @@ func TestCreateControlPlaneMachine_TakenNameIsRegenerated(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machineMetaInfraTemplate(), tc.foreign).Build()
 			r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-			m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+			m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(m.Name).To(Equal("test-kcp-bbbbb"))
 
@@ -400,7 +400,7 @@ func TestCreateControlPlaneMachine_GivesUpAfterBoundedNameAttempts(t *testing.T)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machineMetaInfraTemplate(), foreign).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	_, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(errors.Is(err, errControlPlaneNameTaken)).To(BeTrue())
 	_, infra, machines := objectNames(g, c)
 	g.Expect(infra).To(BeEmpty())
@@ -489,7 +489,7 @@ func TestCreateControlPlaneMachine_WaitsForTheMachineInTheCache(t *testing.T) {
 		}}).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(m).NotTo(BeNil())
 	g.Expect(gets).To(Equal(misses+1), "the create returns once a read sees the Machine")
@@ -513,11 +513,77 @@ func TestCreateControlPlaneMachine_CacheWaitTimeoutKeepsTheMachine(t *testing.T)
 		}}).Build()
 	r := &KairosControlPlaneReconciler{Client: c, Scheme: scheme}
 
-	m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
 	g.Expect(err).To(MatchError(ContainSubstring("not in the cache yet")))
 	g.Expect(m).NotTo(BeNil())
 	configs, infra, machines := objectNames(g, c)
 	g.Expect(machines).To(ConsistOf(m.Name))
 	g.Expect(configs).To(ConsistOf(m.Name))
 	g.Expect(infra).To(ConsistOf(m.Name))
+}
+
+// kairosConfigGetsFailing returns a client whose KairosConfig reads fail with
+// err for the first misses reads (every read when misses < 0), and counts
+// them in *gets.
+func kairosConfigGetsFailing(g *WithT, misses int, err error, gets *int) client.Client {
+	return fake.NewClientBuilder().WithScheme(machineMetaScheme(g)).WithObjects(machineMetaInfraTemplate()).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*bootstrapv1beta2.KairosConfig); ok {
+				*gets++
+				if misses < 0 || *gets <= misses {
+					return err
+				}
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		}}).Build()
+}
+
+// TestCreateControlPlaneMachine_WaitsForTheKairosConfigInTheCache: after the
+// Machine, the create also waits until the cache shows its KairosConfig, so
+// the next reconcile reads what the new Machine runs (ADR 0016) instead of
+// finding no vote and holding the control plane as "unknown".
+func TestCreateControlPlaneMachine_WaitsForTheKairosConfigInTheCache(t *testing.T) {
+	g := NewWithT(t)
+	misses, gets := 3, 0
+	notFound := apierrors.NewNotFound(bootstrapv1beta2.GroupVersion.WithResource("kairosconfigs").GroupResource(), "x")
+	c := kairosConfigGetsFailing(g, misses, notFound, &gets)
+	r := &KairosControlPlaneReconciler{Client: c, Scheme: c.Scheme()}
+
+	m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(m).NotTo(BeNil())
+	g.Expect(gets).To(Equal(misses+1), "the create returns once a read sees the KairosConfig")
+}
+
+// TestCreateControlPlaneMachine_KairosConfigCacheWaitFailureKeepsTheMachine:
+// when the KairosConfig wait fails, by running out or on another read error,
+// it is handled like a failed Machine wait: the Machine is returned with the
+// error and nothing is deleted.
+func TestCreateControlPlaneMachine_KairosConfigCacheWaitFailureKeepsTheMachine(t *testing.T) {
+	orig := machineCacheWaitBackoff
+	t.Cleanup(func() { machineCacheWaitBackoff = orig })
+	machineCacheWaitBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 3}
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"never in the cache", apierrors.NewNotFound(bootstrapv1beta2.GroupVersion.WithResource("kairosconfigs").GroupResource(), "x")},
+		{"read error", errors.New("injected cache read failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			gets := 0
+			c := kairosConfigGetsFailing(g, -1, tc.err, &gets)
+			r := &KairosControlPlaneReconciler{Client: c, Scheme: c.Scheme()}
+
+			m, err := r.createControlPlaneMachine(context.Background(), log.Log, machineMetaKCP("k3s", nil), machineMetaCluster(), guardWith("k3s"), bootstrapv1beta2.ControlPlaneRoleSingle, "")
+			g.Expect(err).To(MatchError(SatisfyAll(ContainSubstring("KairosConfig"), ContainSubstring("not in the cache yet"))))
+			g.Expect(m).NotTo(BeNil())
+			configs, infra, machines := objectNames(g, c)
+			g.Expect(machines).To(ConsistOf(m.Name))
+			g.Expect(configs).To(ConsistOf(m.Name))
+			g.Expect(infra).To(ConsistOf(m.Name))
+		})
+	}
 }
