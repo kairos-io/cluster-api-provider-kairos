@@ -51,7 +51,14 @@ spec:
           metadata:
             type: object
           spec:
-            description: KairosConfigSpec defines the desired state of KairosConfig
+            description: |-
+              Spec is the desired state of the KairosConfig.
+
+              spec.role and spec.distribution cannot change once set, and on a
+              control-plane KairosConfig spec.hostname cannot be set, changed or
+              cleared after creation: they record what the node runs and what it is
+              called. Replace the Machine to use other values. KairosConfigTemplate
+              is not restricted this way.
             properties:
               caCertHashes:
                 description: |-
@@ -1121,6 +1128,23 @@ spec:
             required:
             - kubernetesVersion
             type: object
+            x-kubernetes-validations:
+            - fieldPath: .role
+              message: field is immutable; replace the Machine to change it
+              reason: FieldValueForbidden
+              rule: '!has(oldSelf.role) || (has(self.role) && self.role == oldSelf.role)'
+            - fieldPath: .distribution
+              message: field is immutable; replace the Machine to change it
+              reason: FieldValueForbidden
+              rule: '!has(oldSelf.distribution) || (has(self.distribution) && self.distribution
+                == oldSelf.distribution)'
+            - fieldPath: .hostname
+              message: field is immutable on a control-plane KairosConfig, including
+                setting or clearing it; replace the Machine to change it
+              reason: FieldValueForbidden
+              rule: '!(has(oldSelf.role) && oldSelf.role == ''control-plane'') ||
+                (has(self.hostname) ? self.hostname : '''') == (has(oldSelf.hostname)
+                ? oldSelf.hostname : '''')'
           status:
             description: |-
               KairosConfigStatus defines the observed state of KairosConfig
