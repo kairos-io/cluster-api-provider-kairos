@@ -55,7 +55,7 @@ Check the stored values, and remove any etcd-leave annotation from
   Machines must be removed by hand; until then a k3s control plane holds with
   `DistributionMismatch`.
 
-## [v0.2.2] - 2026-11-16
+## [v0.2.2] - 2026-11-17
 
 A fix release for the v0.2 series. The main fix is for the control plane's
 distribution: a `KairosControlPlane` whose `spec.distribution` changed after
