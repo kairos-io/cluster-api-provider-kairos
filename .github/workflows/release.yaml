@@ -7,8 +7,11 @@ name: Release
 #      commit and version (make docker-buildx-release).
 #   3. Renders the all-in-one provider manifest (kustomize) against that image.
 #   4. Computes sha256 checksums.
-#   5. Publishes a GitHub release with the manifest + checksums attached, body
-#      taken from docs/release-notes/<tag>.md.
+#   5. Creates a draft GitHub release with the manifest + checksums attached,
+#      body taken from docs/release-notes/<tag>.md, checks the uploaded files
+#      against dist/ and the tag against the commit it built, and only then
+#      publishes it. A tag that already has a published release is refused
+#      before the image is built.
 #
 # Before any of that, the tag-gate job requires a vMAJOR.MINOR.PATCH[-PRERELEASE]
 # tag name on a commit that is on `main`, and docker-buildx-release refuses to
@@ -175,6 +178,11 @@ jobs:
     # on first use, without protection rules: in a fork dry run the release
     # then runs as before, with nothing to approve.
     environment: release
+    # Runs for the same tag do not overlap: two at once would upload to the
+    # same draft release and push the same image tag.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write  # create the GitHub release
       packages: write  # push to ghcr.io
@@ -190,9 +198,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job holds contents:write and packages:write, and nothing in it
-          # uses git credentials (the image tag comes from GITHUB_REF_NAME and
-          # the release is created through the action's token input). Keep the
-          # token off disk while the build tools and docker run.
+          # uses git credentials (the image tag comes from GITHUB_REF_NAME, and
+          # the release steps take the token through their own input or env).
+          # Keep the token out of the git config.
           persist-credentials: false
 
       - name: Build only the commit the gate checked
@@ -223,6 +231,26 @@ jobs:
             echo "::error::The release workflow requires a release-notes file per tag."
             exit 1
           fi
+
+      - name: Refuse a tag that is already released
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # This job does not change a published release, and stops here before
+          # it pushes the image tag again. GitHub returns a release by its tag
+          # only once it is published: a draft left by an earlier attempt
+          # answers 404, and the job goes on to upload to that draft.
+          if out="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.html_url' 2>&1)"; then
+            echo "::error::${GITHUB_REF_NAME} is already published at ${out}. Release a new version instead."
+            exit 1
+          fi
+          case "${out}" in
+            *"(HTTP 404)"*)
+              echo "${GITHUB_REF_NAME} has no published release yet." ;;
+            *)
+              echo "::error::Could not check for an existing release of ${GITHUB_REF_NAME}: ${out}"
+              exit 1 ;;
+          esac
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -294,7 +322,8 @@ jobs:
           echo "== leftover CA-injection placeholders (should be empty) =="
           grep -REn "CERT_NAMESPACE|CERT_NAME[^=]|SERVICE_NAME[^S]|SERVICE_NAMESPACE" dist/*.yaml || echo "(none)"
 
-      - name: Create GitHub release
+      - name: Create the GitHub release as a draft
+        id: gh-release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           name: ${{ github.ref_name }}
@@ -305,7 +334,13 @@ jobs:
           # as a full release so it surfaces as "Latest release" instead of being
           # hidden as a preview.
           prerelease: ${{ contains(github.ref_name, '-') }}
-          draft: false
+          # Every release, pre-release or not, is created as a draft and left one;
+          # the next step publishes it. With immutable releases GitHub accepts
+          # asset uploads only before a release is published, and with
+          # draft: false this action publishes a pre-release first and uploads to
+          # it after. A re-run of the job finds the draft by its tag and uploads
+          # to it again.
+          draft: true
           # Every path below is a release asset clusterctl or a user downloads. The
           # action's default is to warn and publish without a file it cannot find,
           # which would ship a release missing its components or checksums; fail
@@ -317,3 +352,66 @@ jobs:
             dist/metadata.yaml
             dist/kairos-capi-provider.yaml
             dist/sha256sums.txt
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.gh-release.outputs.id }}
+          GATED_COMMIT: ${{ needs.tag-gate.outputs.commit }}
+        run: |
+          set -o pipefail
+          # Once a release is published with immutable releases on, its files and
+          # tag can no longer change. Publish only a draft of this tag whose files
+          # are exactly the ones in dist/, compared by name and sha256 digest.
+          # A missing or mismatched file fails here and leaves the draft as it
+          # is; re-running the job uploads to the same draft and checks again.
+          if [[ ! "${RELEASE_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::The release step returned no release id ('${RELEASE_ID}'). Refusing to publish."
+            exit 1
+          fi
+          api="repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          release="$(gh api "${api}")"
+          tag="$(jq -r '.tag_name' <<<"${release}")"
+          draft="$(jq -r '.draft' <<<"${release}")"
+          if [ "${tag}" != "${GITHUB_REF_NAME}" ] || [ "${draft}" != "true" ]; then
+            echo "::error::Release ${RELEASE_ID} is not a draft of ${GITHUB_REF_NAME} (tag '${tag}', draft ${draft}). Refusing to publish."
+            exit 1
+          fi
+          expected="$(cd dist && sha256sum -- * | awk '{ print "sha256:" $1 "  " $2 }' | LC_ALL=C sort)"
+          uploaded="$(jq -r '.assets[] | "\(.digest)  \(.name)"' <<<"${release}" | LC_ALL=C sort)"
+          if [ -z "${expected}" ] || [ "${uploaded}" != "${expected}" ]; then
+            echo "::error::The draft's files differ from dist/. Refusing to publish."
+            echo "== dist/ (expected) =="
+            echo "${expected}"
+            echo "== draft release ${RELEASE_ID} =="
+            echo "${uploaded}"
+            exit 1
+          fi
+          # Publishing fixes the tag to the commit it names at that moment.
+          # Require that to be the commit the tag gate checked and this job
+          # built: a re-run builds the commit of the original push, wherever
+          # the tag points now. Annotated tags are followed to their commit.
+          obj="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type + " " + .object.sha')"
+          while [ "${obj%% *}" = "tag" ]; do
+            obj="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${obj#* }" --jq '.object.type + " " + .object.sha')"
+          done
+          if [ -z "${GATED_COMMIT}" ] || [ "${obj}" != "commit ${GATED_COMMIT}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} names '${obj}', not the commit this job built ('${GATED_COMMIT}'). Refusing to publish."
+            exit 1
+          fi
+          # The same request the release action makes when it publishes a draft
+          # itself. make_latest is left to GitHub's default, so a full release
+          # becomes "Latest release" and a pre-release does not, as before.
+          published="$(gh api -X PATCH "${api}" -F draft=false)"
+          # The response is the release as published. Fail if it is not this
+          # tag, is still a draft, or lists other files than the ones checked
+          # above.
+          now="$(jq -r '.assets[] | "\(.digest)  \(.name)"' <<<"${published}" | LC_ALL=C sort)"
+          state="$(jq -r '.tag_name + " " + (.draft | tostring)' <<<"${published}")"
+          if [ "${state}" != "${GITHUB_REF_NAME} false" ] || [ "${now}" != "${expected}" ]; then
+            echo "::error::Release ${RELEASE_ID} was published, but not as checked above (${state}). Check it before announcing the release."
+            echo "== published files =="
+            echo "${now}"
+            exit 1
+          fi
+          jq -r '"Published \(.html_url) (prerelease: \(.prerelease), immutable: \(.immutable))"' <<<"${published}"
