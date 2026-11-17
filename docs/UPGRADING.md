@@ -12,15 +12,21 @@ then `clusterctl init` with the new one; see
 
 ## v0.2.2 → v0.2.3
 
+Full release notes: [v0.2.3](release-notes/v0.2.3.md). Upgrade with
+`clusterctl upgrade` (both providers), or re-apply the flat manifest for
+v0.2.3. The `KairosConfig` CRD gains validation rules; no field is added or
+removed.
+
 ### Check `KairosConfig` role, distribution and hostname before upgrading
 
-This release adds three validation rules to the `KairosConfig` CRD (KD-88).
+This release adds four validation rules to the `KairosConfig` CRD (KD-88).
 They arrive with `clusterctl upgrade` or the flat manifest, which update the
 CRD; a new controller image on its own does not carry them. After the
 upgrade, an update is rejected with `Forbidden` on the field when it:
 - changes `spec.role` or `spec.distribution` of any `KairosConfig`;
 - sets, changes or clears `spec.hostname` of a control-plane `KairosConfig`
-  (`role: control-plane`).
+  (`role: control-plane`);
+- removes `spec`.
 
 A full-object update (`kubectl replace`, or any PUT) that omits `role` or
 `distribution` gets their defaults first, `worker` and `k0s`, and is rejected
@@ -61,6 +67,7 @@ kubectl get kairosconfigs -A \
   that is already being deleted when you upgrade. Do not set the key in
   `machineTemplate.metadata`: it is not copied. See
   [HIGH_AVAILABILITY.md: A k0s Machine without a Node still leaves etcd](HIGH_AVAILABILITY.md#day-2-etcd-health-and-quorum-safe-replacement).
+- A downgrade ignores the annotation and returns to the previous lookup.
 - **The etcd leave checks every control-plane Machine of the Cluster**
   (KD-93). Before, a leaving Machine's name and its `EtcdMember`'s peer
   address were checked only against Machines this `KairosControlPlane` owns.
@@ -76,11 +83,13 @@ kubectl get kairosconfigs -A \
   every other etcd-leave wait. Before, an unreadable node name held the leave
   of a Machine without a Node for as long as the error lasted.
 - **Two new Warning events.** `EtcdLeaveNodeNameContradictsKairosConfig`
-  appears when a leaving Machine's `KairosConfig` renders another node name
-  than the recorded one; the leave proceeds with the recorded name.
-  `EtcdLeaveNodeNameUnusable` appears when the recorded name of a leaving
-  Machine without a Node is changed after its leave was requested; the leave
-  is held until the name is restored or the usual time limit passes.
+  appears when the `KairosConfig` of a leaving Machine without a Node
+  renders another node name than the recorded one; the leave proceeds with the
+  recorded name. `EtcdLeaveNodeNameUnusable` appears when, after the leave of a
+  Machine without a Node was requested, its name is no longer a lowercase
+  DNS-1123 label, or another control-plane Machine of the Cluster may go by
+  it; the leave is held until the name is restored or the usual time limit
+  passes. Both are recorded on the `KairosControlPlane`.
 - **A k0s member's absence from the etcd-status Secret no longer ends its
   etcd leave** (KD-94). Before, once the leave of a control-plane Machine with
   a Node was requested, it ended, and its hook was removed, as soon as the
@@ -95,7 +104,6 @@ kubectl get kairosconfigs -A \
   to hand the leave to, and at the latest after ~15 minutes. Expect the
   deletion of such a Machine to wait for one of those instead of finishing at
   once; the rollout and the orphan-member cleanup wait with it.
-- A downgrade ignores the annotation and returns to the previous lookup.
 - **`machineTemplate.metadata` no longer copies the etcd-leave annotations**
   (KD-92). The etcd-leave pre-terminate hook
   (`pre-terminate.delete.hook.machine.cluster.x-k8s.io/kairos-etcd-leave`)

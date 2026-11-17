@@ -8,6 +8,53 @@ This project is pre-1.0. Alpha releases may include breaking changes; those are
 called out explicitly under **Breaking changes**. Per-scenario migration steps
 live in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [v0.2.3] - 2026-11-17
+
+A fix release for the v0.2 series. It hardens the k0s etcd leave that runs
+when a control-plane Machine is deleted, and makes a `KairosConfig`'s role,
+distribution and control-plane hostname impossible to change once it exists.
+The `KairosConfig` CRD gains validation rules; no field is added or removed.
+Check the stored values, and remove any etcd-leave annotation from
+`machineTemplate.metadata`, before upgrading. See the
+[v0.2.3 release notes](docs/release-notes/v0.2.3.md) and
+[docs/UPGRADING.md](docs/UPGRADING.md#v022--v023).
+
+### Fixed
+
+- **A `KairosConfig`'s `spec.role`, `spec.distribution` and, on a
+  control-plane config, `spec.hostname` cannot change after creation, and
+  `spec` cannot be removed** (#231). Validation rules in the CRD reject the
+  update with `Forbidden`; creates, other updates and `KairosConfigTemplate`
+  are not affected.
+- **The k0s etcd leave of a Machine without a Node uses a recorded node
+  name** (#225): the annotation
+  `controlplane.cluster.x-k8s.io/rendered-node-name`, set when the Machine is
+  created and backfilled on existing control-plane Machines that are not
+  being deleted, instead of a name worked out from the `KairosConfig` on every
+  pass.
+- **A member's absence from the `<cluster>-etcd-status` Secret no longer ends
+  its etcd leave** (#227).
+- **The etcd-leave checks see every control-plane Machine of the Cluster**,
+  whoever owns it, and a check that cannot run releases the leave after the
+  usual ~15 minutes (#228).
+- **`machineTemplate.metadata` no longer copies the etcd-leave hook or the
+  leave's state annotations**, and no longer reaches Machines being deleted
+  (#226).
+
+### Changed
+
+- New annotation on every control-plane Machine the controller creates:
+  `controlplane.cluster.x-k8s.io/rendered-node-name`. It is reserved, as are
+  the etcd-leave hook and the four etcd-leave state annotations, which the
+  controller removes from Machines that are not being deleted.
+- New Warning events on the `KairosControlPlane`:
+  `EtcdLeaveNodeNameContradictsKairosConfig` and `EtcdLeaveNodeNameUnusable`.
+- Deleting a k0s control-plane Machine whose etcd-status entry is missing now
+  waits for the node's ack, for k0s, or for `EtcdMemberLeaveTimedOut`.
+- An etcd-leave hook that a template put on k3s or single-node control-plane
+  Machines must be removed by hand; until then a k3s control plane holds with
+  `DistributionMismatch`.
+
 ## [v0.2.2] - 2026-11-16
 
 A fix release for the v0.2 series. The main fix is for the control plane's

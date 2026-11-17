@@ -1,6 +1,6 @@
 # API Reference
 
-Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), and the CRDs, API types, webhooks and controllers of provider v0.2.2 (main at f519ab8). Checked field by field at e87fa97, and again for the `distribution` changes merged since (#222, #223): every spec and status field of the four CRDs, defaults, enums, validation rules, condition types and reasons, annotations, labels, events, YAML examples, and links. Not re-verified line by line: the HA runbook prose under [Workload cluster identity](#workload-cluster-identity) and [k0s etcd leave and orphan members](#k0s-etcd-leave-and-orphan-members) (checked against the annotation names, timeouts, reasons and events in the controller only), and the static-IP guidance under [Writing files to nodes](#writing-files-to-nodes).
+Last verified against: Kairos v3.6.0+, CAPI v1.13.4 (v1beta2 contract), and the CRDs, API types, webhooks and controllers of provider v0.2.3 (main at e9edf43). Checked field by field at e87fa97, and again for the `distribution` changes merged since (#222, #223) and, since f519ab8, for the etcd-leave and `KairosConfig` immutability changes (#225 to #228, #231): the `rendered-node-name` annotation, the reserved Machine annotations, the etcd-leave events and reasons, the `KairosConfig` `role`, `distribution` and `hostname` rows, and the template sentence. The earlier checks covered every spec and status field of the four CRDs, defaults, enums, validation rules, condition types and reasons, annotations, labels, events, YAML examples, and links. Not re-verified line by line: the HA runbook prose under [Workload cluster identity](#workload-cluster-identity) and [k0s etcd leave and orphan members](#k0s-etcd-leave-and-orphan-members) (checked against the annotation names, timeouts, reasons and events in the controller only), and the static-IP guidance under [Writing files to nodes](#writing-files-to-nodes).
 
 Kubeadm worker support (`distribution: kubeadm`, `spec.kubeadm`, `status.bootstrapTokenID`, and the `UnsupportedDistribution` reason) shipped in v0.2.0. The v0.1.x CRDs serve none of it.
 
@@ -24,6 +24,8 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 **Kind:** `KairosConfig`
 
 `KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s. With `distribution: kubeadm` it bootstraps worker nodes only, joining them to a kubeadm control plane that this provider does not run (see [Kubeadm workers](KUBEADM_WORKERS.md)).
+
+Once a `KairosConfig` exists, the CRD rejects, with `Forbidden`, an update that removes `spec`, and the updates to `spec.role`, `spec.distribution` and, on a control-plane config, `spec.hostname` described in the rows below. Creating a `KairosConfig` and every other update are not affected.
 
 ### Spec Fields
 
