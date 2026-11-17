@@ -240,7 +240,8 @@ type k0sLeaveCluster struct {
 const k0sLeaverIP = "10.11.0.10"
 
 // startK0sLeaveCluster builds the cluster. leaverAnnotations are set on the
-// leaving Machine next to the etcd-leave hook, before it is deleted.
+// leaving Machine next to the etcd-leave hook, before it is deleted, except
+// the leave's own bookkeeping (leaveStateKeys), which is set after.
 func startK0sLeaveCluster(t *testing.T, name string, leaverAnnotations map[string]string) (*k0sLeaveCluster, func()) {
 	t.Helper()
 	return startK0sLeaveClusterWith(t, name, k0sLeaveOptions{leaverAnnotations: leaverAnnotations})
@@ -389,7 +390,12 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 		return m
 	}
 	annotations := map[string]string{etcdLeaveHookKey: ""}
+	leaveState := map[string]string{}
 	for key, v := range leaverAnnotations {
+		if leaveStateKeys[key] {
+			leaveState[key] = v
+			continue
+		}
 		annotations[key] = v
 	}
 	leaverNodeRef := "leaver-node"
@@ -405,7 +411,30 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	if !opts.keepLeaver {
 		g.Expect(c.Delete(ctx, leaver)).To(Succeed())
 	}
+	if len(leaveState) > 0 {
+		g.Eventually(func() error {
+			m := &clusterv1.Machine{}
+			if err := c.Get(ctx, k.leaverKey, m); err != nil {
+				return err
+			}
+			for key, v := range leaveState {
+				m.Annotations[key] = v
+			}
+			return c.Update(ctx, m)
+		}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+	}
 	return k, teardown
+}
+
+// leaveStateKeys are the etcd leave's own bookkeeping annotations. The KCP
+// writes them only on a Machine being deleted and removes them from any other
+// (KD-92), so startK0sLeaveClusterWith sets them on the leaver only once it
+// is deleted, as a leave in progress would have.
+var leaveStateKeys = map[string]bool{
+	etcdLeaveRequestedAtKey:       true,
+	etcdLeaveUnreachableSinceKey:  true,
+	etcdMemberLeaveRequestedAtKey: true,
+	etcdMemberLeaveMemberIDKey:    true,
 }
 
 func (k *k0sLeaveCluster) leaver(g *WithT) *clusterv1.Machine {
@@ -437,6 +466,27 @@ func (k *k0sLeaveCluster) leaveRequestFor(node string) string {
 		return ""
 	}
 	return cm.Data[node]
+}
+
+// setLeaveValueFor plays the node's etcd-leave responder: it writes value for
+// node into the workload leave ConfigMap, creating the ConfigMap if needed.
+func (k *k0sLeaveCluster) setLeaveValueFor(g *WithT, node, value string) {
+	g.Eventually(func() error {
+		cm := &corev1.ConfigMap{}
+		err := k.wc.Get(k.ctx, types.NamespacedName{Namespace: "kube-system", Name: "kairos-etcd-leave"}, cm)
+		if apierrors.IsNotFound(err) {
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kairos-etcd-leave"}, Data: map[string]string{node: value}}
+			return k.wc.Create(k.ctx, cm)
+		}
+		if err != nil {
+			return err
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[node] = value
+		return k.wc.Update(k.ctx, cm)
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 }
 
 // TestHA_K0sEtcdLeave_StuckLeaveEndsOnlyWhenK0sReportsTheMemberGone is the

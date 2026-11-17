@@ -649,8 +649,10 @@ func (r *KairosControlPlaneReconciler) reconcileMachines(ctx context.Context, lo
 
 	// Carry the current machineTemplate.metadata onto the Machines that already
 	// exist, so an edited label reaches a running cluster without a rollout.
-	// Runs before the etcd-leave sweep so a terminating Machine keeps its hook:
-	// the merge is additive and never removes an annotation.
+	// The merge is additive, and Machines being deleted are skipped, so it
+	// never touches the hook of a Machine the sweep below is leaving. On the
+	// other Machines it removes the etcd leave's bookkeeping, which only that
+	// sweep writes (KD-92).
 	if err := r.reconcileMachineMetadata(ctx, log, kcp, cluster, machines); err != nil {
 		return ctrl.Result{}, err
 	}

@@ -36,6 +36,44 @@ then `clusterctl init` with the new one; see
   and before its node has bootstrapped makes the recorded name differ from the
   node's real name, and that Machine's etcd leave can then be skipped.
 - A downgrade ignores the annotation and returns to the previous lookup.
+- **`machineTemplate.metadata` no longer copies the etcd-leave annotations**
+  (KD-92). The etcd-leave pre-terminate hook
+  (`pre-terminate.delete.hook.machine.cluster.x-k8s.io/kairos-etcd-leave`)
+  and `controlplane.cluster.x-k8s.io/etcd-leave-requested-at`,
+  `etcd-leave-unreachable-since`, `etcd-member-leave-requested-at` and
+  `etcd-member-leave-member-id` are now reserved, as `rendered-node-name` is.
+  Before, a template that set one of them put it on every control-plane
+  Machine. A template hook made k3s and single-node Machines wait on a k0s
+  etcd leave when deleted, and could be put back after the controller
+  removed it. The other four made a later leave start as if it had already
+  been requested. If your template sets any of them, remove the entry before
+  you upgrade; the controller ignores it from then on. A control-plane Machine
+  that is already being deleted when you upgrade keeps what the template gave
+  it, because Machines being deleted are left as they are (see below). Check
+  such Machines for these keys: a value equal to the one in your template was
+  put there by the template, and you can remove it with
+  `kubectl annotate machine -n <namespace> <machine-name> <key>-` so that the
+  Machine's etcd leave starts from the beginning.
+- **The etcd-leave annotations are removed from Machines that are not being
+  deleted.** The controller writes them only during a deletion, so on the
+  first reconcile after the upgrade it removes any of the four it finds on
+  another Machine, and logs it. It does not remove the etcd-leave hook from
+  a Machine, because the hook decides whether the Machine gets an etcd leave.
+  If a template put the hook on k3s or single-node control-plane Machines
+  before this release, remove it from each of them yourself:
+
+  ```bash
+  kubectl annotate machine -n <namespace> <machine-name> pre-terminate.delete.hook.machine.cluster.x-k8s.io/kairos-etcd-leave-
+  ```
+
+  On a k3s control plane, until you do, the `KairosControlPlane` holds every
+  membership change with `DistributionMismatch`, and its message names those
+  Machines ("KairosConfig contradicts the k0s etcd-leave hook").
+  Remove the hook; you do not need to delete the Machines.
+- **Machines being deleted no longer receive `machineTemplate.metadata`.**
+  The metadata sync skips them, so another controller's pre-terminate or
+  pre-drain hook in the template is no longer put back after that controller
+  removes it.
 
 ## v0.2.1 → v0.2.2
 
