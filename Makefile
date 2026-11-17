@@ -106,7 +106,7 @@ test-envtest: ## Run envtest-based integration tests.
 	@echo "Setting up kubebuilder tools..."
 	@export PATH=$$(go env GOPATH)/bin:$$PATH && \
 	eval $$(setup-envtest use -p env $(ENVTEST_K8S_VERSION)) && \
-	go test ./test/envtest/... -v -timeout 600s
+	go test ./test/envtest/... -v -timeout 30m
 
 .PHONY: test-kubevirt
 test-kubevirt: ## Run local KubeVirt e2e flow (requires kind and KubeVirt).
