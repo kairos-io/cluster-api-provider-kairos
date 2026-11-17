@@ -25,6 +25,8 @@ This document provides a reference for all Custom Resource Definitions (CRDs) pr
 
 `KairosConfig` is a BootstrapConfig resource that generates Kairos cloud-config for bootstrapping Kubernetes nodes (control-plane or worker) using k0s or k3s. With `distribution: kubeadm` it bootstraps worker nodes only, joining them to a kubeadm control plane that this provider does not run (see [Kubeadm workers](KUBEADM_WORKERS.md)).
 
+Once a `KairosConfig` exists, the CRD rejects, with `Forbidden`, an update that removes `spec`, and the updates to `spec.role`, `spec.distribution` and, on a control-plane config, `spec.hostname` described in the rows below. Creating a `KairosConfig` and every other update are not affected.
+
 ### Spec Fields
 
 | Field | Type | Required | Default | Description |
