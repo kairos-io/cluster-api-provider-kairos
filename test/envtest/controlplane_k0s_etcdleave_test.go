@@ -269,6 +269,9 @@ type k0sLeaveOptions struct {
 	// extraMachines are more control-plane Machines of the KCP, without a
 	// NodeRef or addresses, created next to the leaver.
 	extraMachines []k0sExtraMachine
+	// leaverUnreported: the leaver has a NodeRef but never reported into
+	// etcd-status.
+	leaverUnreported bool
 }
 
 // k0sExtraMachine is a control-plane Machine without a NodeRef whose
@@ -339,7 +342,7 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 		}
 		es.Data = map[string][]byte{}
 		reporters := []string{"keeper-a", "keeper-b"}
-		if !k.unregistered {
+		if !k.unregistered && !opts.leaverUnreported {
 			reporters = append(reporters, "leaver-node")
 		}
 		for _, n := range reporters {

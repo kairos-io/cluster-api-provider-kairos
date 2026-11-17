@@ -320,14 +320,17 @@ func newWorkloadClient(restCfg *rest.Config) (client.Client, error) {
 //     is held (holdUnusableNodeName) for the same bound as the timeout path
 //     below, then the hook is removed with a warning, never delegated.
 //  6. Node acked `left` in the workload ConfigMap → remove hook, done.
-//  7. With a NodeRef only: member gone from etcd-status → remove hook, done.
-//     (A node that never registered may never have reported, so its absence
-//     there means nothing.)
-//  8. Past memberLeaveTimeout → delegateMemberLeave: set spec.leave on the
+//  7. Past memberLeaveTimeout → delegateMemberLeave: set spec.leave on the
 //     member's k0s EtcdMember and remove the hook once k0s reports
 //     Joined=False. Without that API or object, or after etcdMemberLeaveCap,
 //     remove the hook with a warning (the member may be orphaned).
-//  9. Otherwise → keep the sentinel, requeue.
+//  8. Otherwise → keep the sentinel, requeue.
+//
+// The etcd-status Secret is not a terminal signal (KD-94). Each node writes
+// its own key once, at boot, and nothing ever removes one, so a member that
+// left is still listed there. A missing key therefore never means "left":
+// only that the node never reported, reported under another name, or that
+// the Secret was deleted or recreated, and the member may still vote.
 //
 // Identity (ADR 0015 PR-2, PR-3): every connection connectForLeave returns
 // serves the pinned cluster, and with no pin it returns none. One that serves
@@ -404,8 +407,8 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 	conn, connErr := r.connectForLeave(ctx, log, kcp, cluster, machines, target)
 	// An apiserver that serves another cluster froze the control plane
 	// (connectForLeave verifies the identity of every connection). Its
-	// answers must not drive a single step below: not the ack, not the
-	// etcd-status shortcut, and not the timeout, which would remove the hook.
+	// answers must not drive a single step below: not the ack, and not the
+	// timeout, which would remove the hook.
 	if errors.Is(connErr, errWorkloadIdentityChanged) {
 		return false, connErr
 	}
@@ -443,26 +446,11 @@ func (r *KairosControlPlaneReconciler) reconcileMemberLeave(ctx context.Context,
 
 	// (4) This cycle has requested a leave — terminal checks below are now valid for
 	// THIS cycle (a `left` seen here was written by the node in response to our
-	// request, not a stale prior ack). The ack and etcd-status checks need an
-	// answer from the workload cluster; the timeout does not.
-	if connErr == nil {
-		// Node acked the leave → done.
-		if conn.cm.Data[nodeName] == etcdLeftValue {
-			log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
-			return true, r.removeEtcdLeaveHook(ctx, kcp, target)
-		}
-		// Member gone from node-reported etcd-status → treat as left. Best-effort: a
-		// read error leaves the member "present" so we keep waiting, never skip.
-		// Only for a registered node: one without a NodeRef may never have
-		// reported, so its absence says nothing about etcd.
-		if registered {
-			if status, serr := r.readEtcdStatus(ctx, cluster); serr == nil {
-				if _, present := status[nodeName]; !present {
-					log.Info("etcd-leave: member absent from etcd-status; treating as left", "machine", target.Name, "node", nodeName)
-					return true, r.removeEtcdLeaveHook(ctx, kcp, target)
-				}
-			}
-		}
+	// request, not a stale prior ack). The ack needs an answer from the
+	// workload cluster; the timeout does not.
+	if connErr == nil && conn.cm.Data[nodeName] == etcdLeftValue {
+		log.Info("etcd-leave: node acked left; removing hook", "machine", target.Name, "node", nodeName, "via", conn.via)
+		return true, r.removeEtcdLeaveHook(ctx, kcp, target)
 	}
 	// Timeout: the node has not acked in time. Hand the leave to k0s's
 	// EtcdMember, falling back to removing the hook with a warning. This is

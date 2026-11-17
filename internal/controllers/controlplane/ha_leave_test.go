@@ -222,24 +222,6 @@ func TestReconcileMemberLeave_AckRemovesHook(t *testing.T) {
 	assertHookGone(g, mgmt, "cp-0")
 }
 
-// TestReconcileMemberLeave_AbsentFromEtcdStatusRemovesHook: after we have asked
-// the node to leave, its disappearance from node-reported etcd-status is treated
-// as a completed leave (cross-check terminal).
-func TestReconcileMemberLeave_AbsentFromEtcdStatusRemovesHook(t *testing.T) {
-	g := NewWithT(t)
-	scheme := haTestScheme(g)
-	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339)})
-	// etcd-status no longer lists cp-0.
-	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-1", "cp-2")).Build()
-	wc := pinnedWorkloadBuilder(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).Build()
-
-	r := &KairosControlPlaneReconciler{Client: mgmt, Scheme: scheme, WorkloadClientFactory: staticWorkloadClient(wc)}
-	done, err := r.reconcileMemberLeave(context.Background(), log.Log, pinnedK0sKCP(), testCluster(), []*clusterv1.Machine{target}, target)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(done).To(BeTrue())
-	assertHookGone(g, mgmt, "cp-0")
-}
-
 // TestReconcileMemberLeave_TimeoutRemovesHook: a node that never acks within
 // memberLeaveTimeout must not wedge deletion. Here the workload cluster has no
 // EtcdMember to hand the leave to, so the hook is removed (member may be
@@ -249,8 +231,7 @@ func TestReconcileMemberLeave_TimeoutRemovesHook(t *testing.T) {
 	scheme := haTestScheme(g)
 	old := time.Now().Add(-2 * memberLeaveTimeout).UTC().Format(time.RFC3339)
 	target := hookedMachine("cp-0", "cp-0", map[string]string{etcdLeaveRequestedAtAnnotation: old})
-	// Member still present in etcd-status (so the cross-check does NOT short-circuit)
-	// and no `left` ack — only the timeout can fire.
+	// No `left` ack — only the timeout can fire.
 	mgmt := fake.NewClientBuilder().WithScheme(scheme).WithObjects(target, etcdStatusSecretForMembers("cp-0", "cp-1", "cp-2")).Build()
 	wc := pinnedWorkloadBuilder(scheme).WithObjects(leaveConfigMap(map[string]string{"cp-0": etcdLeaveRequestedValue})).Build()
 
