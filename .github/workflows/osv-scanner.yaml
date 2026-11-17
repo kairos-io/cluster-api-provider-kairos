@@ -24,7 +24,8 @@ permissions:
   contents: read
 
 # The reusable workflows are SHA-pinned (and SHA-pin their own actions), but their
-# scanner steps pull docker://ghcr.io/google/osv-scanner-action:v2.7.0 by tag.
+# scanner steps pull the ghcr.io/google/osv-scanner-action image by the release
+# tag matching the pins below, not by digest.
 # Residual risk accepted for org consistency, and bounded because the release
 # job sets `cache: false` on setup-go (release.yaml), so nothing these workflows
 # write to the Actions cache can reach a released artefact.
