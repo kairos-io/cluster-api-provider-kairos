@@ -663,12 +663,27 @@ type KairosConfigInitialization struct {
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready",description="Bootstrap ready"
 // +kubebuilder:printcolumn:name="DataSecretName",type="string",JSONPath=".status.dataSecretName",description="Secret containing bootstrap data"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || has(self.spec)",message="spec cannot be removed",reason=FieldValueForbidden,fieldPath=".spec"
 
 // KairosConfig is the Schema for the kairosconfigs API
+//
+// The spec cannot be removed once set: the transition rules on spec.role,
+// spec.distribution and spec.hostname run only when both the old and the new
+// spec exist.
 type KairosConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// Spec is the desired state of the KairosConfig.
+	//
+	// spec.role and spec.distribution cannot change once set, and on a
+	// control-plane KairosConfig spec.hostname cannot be set, changed or
+	// cleared after creation: they record what the node runs and what it is
+	// called. Replace the Machine to use other values. KairosConfigTemplate
+	// is not restricted this way.
+	// +kubebuilder:validation:XValidation:rule="!has(oldSelf.role) || (has(self.role) && self.role == oldSelf.role)",message="field is immutable; replace the Machine to change it",reason=FieldValueForbidden,fieldPath=".role"
+	// +kubebuilder:validation:XValidation:rule="!has(oldSelf.distribution) || (has(self.distribution) && self.distribution == oldSelf.distribution)",message="field is immutable; replace the Machine to change it",reason=FieldValueForbidden,fieldPath=".distribution"
+	// +kubebuilder:validation:XValidation:rule="!(has(oldSelf.role) && oldSelf.role == 'control-plane') || (has(self.hostname) ? self.hostname : '') == (has(oldSelf.hostname) ? oldSelf.hostname : '')",message="field is immutable on a control-plane KairosConfig, including setting or clearing it; replace the Machine to change it",reason=FieldValueForbidden,fieldPath=".hostname"
 	Spec   KairosConfigSpec   `json:"spec,omitempty"`
 	Status KairosConfigStatus `json:"status,omitempty"`
 }

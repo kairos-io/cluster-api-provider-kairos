@@ -101,6 +101,10 @@ func (*kairosConfigValidator) ValidateCreate(_ context.Context, r *KairosConfig)
 // unrelated updates (status, labels, finalizers).
 func (*kairosConfigValidator) ValidateUpdate(_ context.Context, old, r *KairosConfig) (admission.Warnings, error) {
 	kairosconfigLog.Info("validate update", "name", r.Name)
+	// The CRD's transition rules (KD-88) refuse a change to spec.role, and to
+	// spec.hostname on a control-plane config, before this webhook runs, so
+	// this check can only fire on update where those rules are not installed,
+	// for example against a CRD that was not upgraded.
 	var hostErrs field.ErrorList
 	if old == nil || old.Spec.Hostname != r.Spec.Hostname {
 		hostErrs = r.validateHostname()
