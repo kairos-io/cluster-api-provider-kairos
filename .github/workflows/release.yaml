@@ -8,9 +8,13 @@ name: Release
 #   5. Publishes a GitHub release with the manifest + checksums attached, body
 #      taken from docs/release-notes/<tag>.md.
 #
+# Before any of that, the tag-gate job requires a vMAJOR.MINOR.PATCH[-PRERELEASE]
+# tag name on a commit that is on `main`, and docker-buildx-release refuses to
+# build the image from a tree that differs from that commit.
+#
 # Pre-conditions for a clean release:
-#   * The tag must point at a commit on `main` (or a release branch) whose
-#     CI is green.
+#   * The tag must point at a commit on `main` whose CI is green. The tag-gate
+#     job enforces the first half; nothing here checks CI.
 #   * docs/release-notes/<tag>.md must exist in the tagged commit.
 #   * The GHCR_TOKEN / GITHUB_TOKEN has packages:write to ghcr.io/kairos-io.
 
@@ -24,6 +28,74 @@ on:
 permissions: {}
 
 jobs:
+  # Runs first; osv and release both wait for it. It decides whether the tag is
+  # a release at all, before anything is scanned, built or published:
+  #
+  #   * The tag name has to be vMAJOR.MINOR.PATCH, optionally with a
+  #     dot-separated pre-release suffix (v0.1.0-alpha.1, v0.2.0-rc.1, and the
+  #     v0.0.0-dryrun.N tags of a fork dry run). The name becomes the image tag,
+  #     the release name and the release-notes path, and make expands it
+  #     unquoted into recipe lines (-t $(IMG_REGISTRY):$(VERSION) and
+  #     RELEASE_IMG_REF), so checking it once, here, covers every place it
+  #     lands. The run: block reads it from the environment, never through
+  #     ${{ }} expansion.
+  #   * The tagged commit has to be on main. Release branches are not accepted.
+  #     In a fork, main is the fork's own main.
+  #
+  # The job outputs the commit it checked, and the release job refuses to build
+  # any other.
+  tag-gate:
+    name: release trigger gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.ancestry.outputs.commit }}
+    steps:
+      - name: Check the tag name
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ] || [ "${GITHUB_REF}" != "refs/tags/${GITHUB_REF_NAME}" ]; then
+            echo "::error::This workflow releases tags only. Refusing to release."
+            exit 1
+          fi
+          # Anchored at both ends; bash matches the whole string, not a line.
+          re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
+          if [[ ! "${GITHUB_REF_NAME}" =~ $re ]]; then
+            printf 'Tag name: %q\n' "${GITHUB_REF_NAME}"
+            echo "::error::The tag name is not vMAJOR.MINOR.PATCH[-PRERELEASE]. Refusing to release."
+            exit 1
+          fi
+          echo "Tag name ${GITHUB_REF_NAME} is a release tag."
+
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Depth 1, as in the other jobs; the next step fetches main itself
+          # and relies on this clone being shallow.
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require the tagged commit to be on main
+        id: ancestry
+        run: |
+          # Fetch main's whole history, so the ancestry walk cannot stop at a
+          # shallow boundary, and no tags. The repository is public, so the
+          # fetch needs no credentials. Compare against the full ref name: a
+          # tag or branch named origin/main would shadow the short name, never
+          # refs/remotes/origin/main.
+          git fetch --no-tags --unshallow origin +refs/heads/main:refs/remotes/origin/main
+          commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "${commit}" != "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" ]; then
+            echo "::error::Checked out ${commit}, not the commit the tag push named (${GITHUB_SHA}). Refusing to release."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${commit}" refs/remotes/origin/main; then
+            echo "::error::The tagged commit ${commit} is not on main. Refusing to release."
+            exit 1
+          fi
+          echo "The tagged commit ${commit} is on main."
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
   # A tag push matches none of osv-scanner.yaml's triggers (pull_request, push
   # to main, the Monday cron), and that workflow is the only whole-tree scan in
   # the repository. Without this job a release cut between two Mondays can
@@ -55,6 +127,7 @@ jobs:
   # refs/tags/<tag> would add nothing a failed release job does not already say.
   osv:
     name: osv-scan (release gate)
+    needs: tag-gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -92,8 +165,14 @@ jobs:
           echo "OSV scan completed; ${vulns} unignored vulnerability record(s) in the results."
 
   release:
-    needs: osv
+    needs: [tag-gate, osv]
     runs-on: ubuntu-latest
+    # Deployment protection rules (required reviewers, which refs may deploy)
+    # are configured on the environment in the repository settings, not here.
+    # A job that names an environment the repository does not have creates it
+    # on first use, without protection rules: in a fork dry run the release
+    # then runs as before, with nothing to approve.
+    environment: release
     permissions:
       contents: write  # create the GitHub release
       packages: write  # push to ghcr.io
@@ -109,6 +188,16 @@ jobs:
           # the release is created through the action's token input). Keep the
           # token off disk while the build tools and docker run.
           persist-credentials: false
+
+      - name: Build only the commit the gate checked
+        env:
+          GATED_COMMIT: ${{ needs.tag-gate.outputs.commit }}
+        run: |
+          head="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ -z "${GATED_COMMIT}" ] || [ "${head}" != "${GATED_COMMIT}" ]; then
+            echo "::error::Checked out ${head}, but the tag gate checked '${GATED_COMMIT}'. Refusing to release."
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -140,6 +229,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-arch image
+        # The target fails before docker runs if manifests, generate, fmt or vet
+        # leave the tree different from the checked-out commit.
         run: |
           VERSION="${GITHUB_REF_NAME}" \
           IMG_REGISTRY="${IMG_REGISTRY}" \
@@ -157,11 +248,29 @@ jobs:
           echo "Resolved multi-arch index digest: $DIGEST"
 
       - name: Render release manifests (clusterctl components + flat, digest-pinned)
+        env:
+          IMG_DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           VERSION="${GITHUB_REF_NAME}" \
           IMG_REGISTRY="${IMG_REGISTRY}" \
-          IMG_DIGEST="${{ steps.digest.outputs.digest }}" \
+          IMG_DIGEST="${IMG_DIGEST}" \
           make release-manifests
+
+      - name: Require the tree to still match the tagged commit
+        run: |
+          # release-manifests regenerates the CRDs, RBAC and webhook manifests
+          # before it renders them. docker-buildx-release already checked the
+          # same regeneration before the image push; this repeats the check on
+          # the tree the YAML was rendered from. A difference means the
+          # published YAML is not the YAML in the tagged commit. dist/ is
+          # ignored.
+          status="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${status}" ]; then
+            echo "::error::make release-manifests changed the working tree. Refusing to release."
+            git status --short --untracked-files=all
+            git --no-pager diff
+            exit 1
+          fi
 
       - name: Inspect and verify rendered manifests
         run: |

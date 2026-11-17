@@ -207,7 +207,22 @@ release-manifests: manifests kustomize ## Render clusterctl components (bootstra
 	@ls -la $(RELEASE_DIR)
 
 .PHONY: docker-buildx-release
-docker-buildx-release: generate fmt vet ## Build and push the multi-arch image tagged with VERSION for a release.
+docker-buildx-release: manifests generate fmt vet ## Build and push the multi-arch image tagged with VERSION for a release.
+	@# A release image is built from the commit, not from what generate, fmt and
+	@# vet leave behind. Refuse a tree with modified, staged or untracked files
+	@# once they have run. manifests is not needed for the image; it runs here
+	@# so that CRD, RBAC and webhook drift, which release-manifests would
+	@# publish, also fails before anything is pushed. Ignored files (bin/,
+	@# dist/) do not count; a fresh checkout has none under the paths the
+	@# Dockerfile copies. If git status itself fails (no repository), the target
+	@# fails with it.
+	@status="$$(git status --porcelain --untracked-files=all)" || exit 1; \
+	if [ -n "$$status" ]; then \
+	  echo "The working tree differs from HEAD after manifests, generate, fmt and vet; refusing to build a release image from it:" >&2; \
+	  git status --short --untracked-files=all >&2; \
+	  git --no-pager diff >&2; \
+	  exit 1; \
+	fi
 	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG_REGISTRY):$(VERSION) --push .
 
 ##@ Build Dependencies
