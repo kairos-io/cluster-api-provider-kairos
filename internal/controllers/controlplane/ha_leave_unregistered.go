@@ -102,7 +102,8 @@ func (r *KairosControlPlaneReconciler) inspectUnregisteredLeave(ctx context.Cont
 	// write.
 	raw, source, err := r.unregisteredLeaveName(ctx, target, nodeName)
 	if err != nil {
-		return false, false, err
+		done, err := r.leaveUnreachable(ctx, log, kcp, target, nodeName, "its node name could not be read", err)
+		return false, done, err
 	}
 	if !bootstrapv1beta2.ValidNodeHostname(raw) {
 		log.Info("etcd-leave: the Machine has no NodeRef and its "+source+" cannot be matched to an EtcdMember; holding until the bound",
@@ -135,7 +136,8 @@ func (r *KairosControlPlaneReconciler) inspectUnregisteredLeave(ctx context.Cont
 	}
 	other, err := r.otherMachineWithNodeName(ctx, machines, target, nodeName)
 	if err != nil {
-		return false, false, err
+		done, err := r.leaveUnreachable(ctx, log, kcp, target, nodeName, "another control-plane Machine's node name could not be read", err)
+		return false, done, err
 	}
 	if other != "" {
 		log.Info("etcd-leave: another Machine renders the same node name; not touching its EtcdMember",

@@ -279,6 +279,11 @@ type k0sLeaveOptions struct {
 type k0sExtraMachine struct {
 	name, hostname string
 	annotations    map[string]string
+	// nodeRef, when set, is the Machine's Node name.
+	nodeRef string
+	// notOwned: the KCP does not own the Machine (it has no controller
+	// owner); it still carries the Cluster's control-plane labels.
+	notOwned bool
 }
 
 // leaverNode is the leaving node's name: its NodeRef name, or, when it has
@@ -363,14 +368,19 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	// The Machines. The leaver holds the VIP; a keeper reports the endpoint
 	// host too. Neither address may ever be dialled.
 	kcp := getKCP(g, ctx, c, k.nsName, k.kcpName)
+	ownedByKCP := true
 	mk := func(name, node, hostname string, annotations map[string]string, addrs ...string) *clusterv1.Machine {
+		var owners []metav1.OwnerReference
+		if ownedByKCP {
+			owners = []metav1.OwnerReference{*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane"))}
+		}
 		m := &clusterv1.Machine{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: name, Namespace: k.nsName,
 				Labels:          map[string]string{clusterv1.ClusterNameLabel: clusterName, clusterv1.MachineControlPlaneLabel: ""},
 				Annotations:     annotations,
 				Finalizers:      []string{"test.kairos.io/hold"},
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(kcp, controlplanev1beta2.GroupVersion.WithKind("KairosControlPlane"))},
+				OwnerReferences: owners,
 			},
 			Spec: clusterv1.MachineSpec{
 				ClusterName:       clusterName,
@@ -409,8 +419,10 @@ func startK0sLeaveClusterWith(t *testing.T, name string, opts k0sLeaveOptions) (
 	mk(k.kcpName+"-1", "keeper-a", "", nil, "10.11.0.11", endpointHost)
 	mk(k.kcpName+"-2", "keeper-b", "", nil, "10.11.0.12")
 	for _, x := range opts.extraMachines {
-		mk(x.name, "", x.hostname, x.annotations)
+		ownedByKCP = !x.notOwned
+		mk(x.name, x.nodeRef, x.hostname, x.annotations)
 	}
+	ownedByKCP = true
 	if !opts.keepLeaver {
 		g.Expect(c.Delete(ctx, leaver)).To(Succeed())
 	}

@@ -96,7 +96,7 @@ var etcdMemberGVK = schema.GroupVersionKind{Group: "etcd.k0sproject.io", Version
 //   - Otherwise: stamp, record the member ID, set spec.leave if it is not
 //     set, and remove the hook once k0s reports Joined=False. After
 //     etcdMemberLeaveCap, the old timeout path.
-func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, machines []*clusterv1.Machine, target *clusterv1.Machine, nodeName string, conn leaveConn, connErr error) (bool, error) {
+func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, log logr.Logger, kcp *controlplanev1beta2.KairosControlPlane, guardMachines leaveGuardList, target *clusterv1.Machine, nodeName string, conn leaveConn, connErr error) (bool, error) {
 	if connErr != nil {
 		if err := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); err != nil {
 			return false, err
@@ -124,7 +124,20 @@ func (r *KairosControlPlaneReconciler) delegateMemberLeave(ctx context.Context, 
 		}
 		return false, fmt.Errorf("etcd-leave: read EtcdMember %s via %s: %w", nodeName, conn.via, err)
 	}
-	if owner := etcdMemberPeerOwner(member, machines, target); owner != "" {
+	// Every control-plane Machine of the Cluster, not only this KCP's
+	// (KD-93). Not being able to list them is handled like not being able to
+	// read the EtcdMember: retried, and abandoned without a write at the cap.
+	peers, err := guardMachines()
+	if err != nil {
+		if serr := r.stampAnnotationOnce(ctx, target, etcdMemberLeaveRequestedAtAnnotation); serr != nil {
+			return false, serr
+		}
+		if etcdMemberLeaveCapped(target) {
+			return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, "the control-plane Machines could not be listed")
+		}
+		return false, fmt.Errorf("etcd-leave: %w", err)
+	}
+	if owner := etcdMemberPeerOwner(member, peers, target); owner != "" {
 		log.Info("etcd-leave: EtcdMember named after the node has another Machine's peer address; not touching it",
 			"machine", target.Name, "node", nodeName, "peerOwner", owner)
 		return true, r.abandonMemberLeave(ctx, log, kcp, target, nodeName, fmt.Sprintf("its EtcdMember has the peer address of Machine %q", owner))
