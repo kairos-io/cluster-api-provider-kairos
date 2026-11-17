@@ -2,7 +2,9 @@ name: Release
 
 # Triggered by pushing a `v*` tag (e.g. `v0.1.0-alpha.1`). The workflow:
 #   1. Scans the tagged tree for known vulnerabilities and stops if any are open.
-#   2. Builds and pushes a multi-arch container image tagged with the tag name.
+#   2. Builds and pushes a multi-arch container image tagged with the tag name,
+#      with OCI labels and index annotations naming its source repository,
+#      commit and version (make docker-buildx-release).
 #   3. Renders the all-in-one provider manifest (kustomize) against that image.
 #   4. Computes sha256 checksums.
 #   5. Publishes a GitHub release with the manifest + checksums attached, body
@@ -179,6 +181,10 @@ jobs:
     env:
       GOTOOLCHAIN: local
       IMG_REGISTRY: ghcr.io/kairos-io/cluster-api-provider-kairos
+      # The repository the image's org.opencontainers.image.source label and
+      # annotation name: kairos-io/cluster-api-provider-kairos here, the fork in
+      # a release dry-run on a fork.
+      IMG_SOURCE: ${{ github.server_url }}/${{ github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -17,6 +17,22 @@ RELEASE_IMG_REF := $(IMG_REGISTRY):$(VERSION)
 else
 RELEASE_IMG_REF := $(IMG_REGISTRY)@$(IMG_DIGEST)
 endif
+# OCI metadata for the release image (docker-buildx-release). REVISION is the
+# commit the image is built from; IMG_SOURCE is the repository GHCR links the
+# package to. The release workflow sets IMG_SOURCE from the repository it runs
+# in, so a dry-run on a fork labels the image with the fork.
+REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
+IMG_SOURCE ?= https://github.com/kairos-io/cluster-api-provider-kairos
+# key=value pairs without spaces. Each becomes an image config label, which
+# docker inspect and scanners read, and an annotation on the multi-arch index,
+# which GHCR reads for a multi-arch package.
+OCI_IMAGE_META = \
+	org.opencontainers.image.source=$(IMG_SOURCE) \
+	org.opencontainers.image.revision=$(REVISION) \
+	org.opencontainers.image.version=$(VERSION) \
+	org.opencontainers.image.licenses=Apache-2.0 \
+	org.opencontainers.image.title=cluster-api-provider-kairos
+OCI_IMAGE_DESCRIPTION := org.opencontainers.image.description=Cluster API bootstrap and control-plane providers for Kairos
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:generateEmbeddedObjectMeta=true"
 
@@ -223,7 +239,11 @@ docker-buildx-release: manifests generate fmt vet ## Build and push the multi-ar
 	  git --no-pager diff >&2; \
 	  exit 1; \
 	fi
-	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG_REGISTRY):$(VERSION) --push .
+	@test -n "$(REVISION)" || { echo "REVISION is empty: build from a git checkout or set REVISION=<commit>." >&2; exit 1; }
+	docker buildx build --platform linux/amd64,linux/arm64 \
+	  $(foreach kv,$(OCI_IMAGE_META),--label "$(kv)" --annotation "index:$(kv)") \
+	  --label "$(OCI_IMAGE_DESCRIPTION)" --annotation "index:$(OCI_IMAGE_DESCRIPTION)" \
+	  -t $(IMG_REGISTRY):$(VERSION) --push .
 
 ##@ Build Dependencies
 
