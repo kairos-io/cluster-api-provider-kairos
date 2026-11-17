@@ -12,6 +12,11 @@ then `clusterctl init` with the new one; see
 
 ## v0.2.2 → v0.2.3
 
+Full release notes: [v0.2.3](release-notes/v0.2.3.md). Upgrade with
+`clusterctl upgrade` (both providers), or re-apply the flat manifest for
+v0.2.3. The `KairosConfig` CRD gains validation rules; no field is added or
+removed.
+
 ### Check `KairosConfig` role, distribution and hostname before upgrading
 
 This release adds four validation rules to the `KairosConfig` CRD (KD-88).
