@@ -53,3 +53,5 @@ CODEBASE_KNOWLEDGE.md
 # These files are intentionally project-local and never pushed.
 # See .claude/PROJECT_CONTEXT.md (after creation) for what lives here.
 .claude/
+**/CLAUDE.md
+!/CLAUDE.md
